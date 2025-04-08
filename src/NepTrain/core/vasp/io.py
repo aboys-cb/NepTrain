@@ -59,18 +59,24 @@ class VaspInput(Vasp):
         if 'magmom' in Config:
             items = config.items('magmom')
             if items:
+                element_magmoms = {}
                 for symbol, moment_str in Config['magmom'].items():
                     try:
                         element_magmoms[symbol] = float(moment_str.strip())
                     except ValueError:
                         element_magmoms[symbol] = 0.0
-                magnetic_moments = []
-                for atom in self.atoms:
-                    if atom.symbol in element_magmom.keys():
-                        magnetic_moments.append(element_magmom[atom.symbol])
-                    else:
-                        magnetic_moments.append(0.0)
-                self.atoms.set_initial_magnetic_moments(magnetic_moments)
+                nonzero = False
+                for value in element_magmoms.values():
+                    if value != 0.0:
+                        nonzero = True
+                if nonzero == True:
+                    magnetic_moments = []
+                    for atom in self.atoms:
+                        if atom.symbol in element_magmom.keys():
+                            magnetic_moments.append(element_magmom[atom.symbol])
+                        else:
+                            magnetic_moments.append(0.0)
+                    self.atoms.set_initial_magnetic_moments(magnetic_moments)
                       
         Calculator.calculate(self, atoms, properties, system_changes)
         # Check for zero-length lattice vectors and PBC
