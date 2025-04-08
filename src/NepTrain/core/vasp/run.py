@@ -44,7 +44,12 @@ def calculate_vasp(atoms:Atoms,argparse):
                   math.ceil(argparse.ka[2]/c) ),
              gamma=argparse.use_gamma,
              )
-
+    magmom_line = set_magmom()
+    if magmom_line:
+        vasp.set(
+                ispin=2,
+                magmom=magmom_line,
+                )
 
     if vasp.int_params["ibrion"] ==0:
         #分子动力学
@@ -80,8 +85,7 @@ def run_vasp(argparse):
 
     utils.print_success("VASP calculation task completed!" )
 
-def set_magmom(directory):
-  incar_path=os.path.join(directory,"INCAR")
+def set_magmom():
   if 'magmom' in Config:
       items = config.items('magmom')
       if items:
@@ -117,22 +121,13 @@ def set_magmom(directory):
           
               magmom_string = " ".join(magmom_lines)
               magmom_line = f"MAGMOM = {magmom_string}\n"
-              with open(incar_path,'r') as f:
-                  lines = f.readlines()
-              found_magmom = False
-              found_ispin = False
-              for line in lines:
-                  if line.startwith("MAGMOM"):
-                      line = magmom_line
-                      found_magmom = True
-                  if line.startwith("ISPIN"):
-                      line = "ISPIN = 2\n"
-                      found_ispin = True
-              if found_ispin == False:
-                  lines.append("ISPIN = 2\n")
-              if found_magmom == False:
-                  lines.append(magmom_line)
-              with open(incar_path,'w') as f:
-                  f.writelines(lines)
+              return magmom_line
+          else:
+              return None
+      else:
+          return None
+  else:
+      return None
+
 if __name__ == '__main__':
     calculate_vasp("./")
