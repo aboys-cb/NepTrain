@@ -62,12 +62,18 @@ def calculate_vasp(atoms:Atoms,argparse):
                     magmom_line = f"MAGMOM = {magmom_string}\n"
                     with open(argparse.incar,'r') as f:
                         lines = f.readlines()
-                    found = False
+                    found_magmom = False
+                    found_ispin = False
                     for line in lines:
-                        if line.startwith("MAGMOM = "):
+                        if line.startwith("MAGMOM"):
                             line = magmom_line
-                            found = True
-                    if found == False:
+                            found_magmom = True
+                        if line.startwith("ISPIN"):
+                            line = "ISPIN = 2\n"
+                            found_ispin = True
+                    if found_ispin == False:
+                        lines.append("ISPIN = 2\n")
+                    if found_magmom == False:
                         lines.append(magmom_line)
                     with open(argparse.incar,'w') as f:
                         f.writelines(lines)
