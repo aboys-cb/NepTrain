@@ -10,6 +10,7 @@ import os.path
 import numpy as np
 from ase import Atoms
 from ase.io import write as ase_write
+from ase.io.vasp import read_vasp
 
 from NepTrain import utils, Config, module_path
 from ..utils import check_env
@@ -24,6 +25,49 @@ def calculate_vasp(atoms:Atoms,argparse):
 
     vasp = VaspInput()
     if argparse.incar is not None and os.path.exists(argparse.incar):
+        if 'magmom' in Config:
+            items = config.items('magmom')
+            if items:
+                element_magmoms = {}
+                for symbol, moment_str in Config['magmom'].items():
+                    try:
+                        element_magmoms[symbol] = float(moment_str.strip())
+                    except ValueError:
+                        element_magmoms[symbol] = 0.0
+                nonzero = False
+                for value in element_magmoms.values():
+                    if value != 0.0:
+                        nonzero = True
+                if nonzero == True:
+                    atoms = read_vasp("POSCAR")
+                    symbols = atoms.get_chemical_symbols()
+                    unique_symbols_ordered = []
+                    seen_symbols = set()
+                    for symbol in symbols:
+                        if symbol not in seen_symbols:
+                            unique_symbols_ordered.append(symbol)
+                            seen_symbols.add(symbol)
+                
+                    symbol_counts = {symbol: symbols.count(symbol) for symbol in symbols}
+                
+                    magmom_lines = []
+                    for symbol in unique_symbols_ordered:
+                        count = symbol_counts[symbol]
+                        magmom_lines.append(f"{element_magmoms[symbol]}*{count}")
+                
+                    magmom_string = " ".join(magmom_lines)
+                    magmom_line = f"MAGMOM = {magmom_string}\n"
+                    with open(argparse.incar,'r') as f:
+                        lines = f.readlines()
+                    found = False
+                    for line in lines:
+                        if line.startwith("MAGMOM = "):
+                            line = magmom_line
+                            found = True
+                    if found == False:
+                        lines.append(magmom_line)
+                    with open(argparse.incar,'w') as f:
+                        f.writelines(lines)
         vasp.read_incar(argparse.incar)
     else:
         vasp.read_incar(os.path.join(module_path,"core/vasp/INCAR"))
