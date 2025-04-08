@@ -53,7 +53,10 @@ def calculate_vasp(atoms:Atoms,argparse):
                     magmom_lines = []
                     for symbol in unique_symbols_ordered:
                         count = symbol_counts[symbol]
-                        magmom_lines.append(f"{element_magmoms[symbol]}*{count}")
+                        try:
+                            magmom_lines.append(f"{element_magmoms[symbol]}*{count}")
+                        except:
+                            magmom_lines.append(f"0.0*{count}")
                 
                     magmom_string = " ".join(magmom_lines)
                     magmom_line = f"MAGMOM = {magmom_string}\n"
