@@ -43,7 +43,7 @@ class VaspInput(Vasp):
         super(VaspInput,self).__init__(*args,**kwargs)
         self.input_params["setups"] = {"base": "recommended"}
         self.input_params["pp"] = ''
-
+        
         os.environ[self.VASP_PP_PATH] = os.path.expanduser(Config.get("environ", "potcar_path"))
 
     def calculate(self,
@@ -56,6 +56,22 @@ class VaspInput(Vasp):
         execute VASP. After execution, the energy, forces. etc. are read
         from the VASP output files.
         """
+        if 'magmom' in Config:
+            items = config.items('magmom')
+            if items:
+                for symbol, moment_str in Config['magmom'].items():
+                    try:
+                        element_magmoms[symbol] = float(moment_str.strip())
+                    except ValueError:
+                        element_magmoms[symbol] = 0.0
+                magnetic_moments = []
+                for atom in self.atoms:
+                    if atom.symbol in element_magmom.keys():
+                        magnetic_moments.append(element_magmom[atom.symbol])
+                    else:
+                        magnetic_moments.append(0.0)
+                self.atoms.set_initial_magnetic_moments(magnetic_moments)
+                      
         Calculator.calculate(self, atoms, properties, system_changes)
         # Check for zero-length lattice vectors and PBC
         # and that we actually have an Atoms object.
