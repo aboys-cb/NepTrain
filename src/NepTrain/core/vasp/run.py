@@ -25,62 +25,11 @@ def calculate_vasp(atoms:Atoms,argparse):
 
     vasp = VaspInput()
     if argparse.incar is not None and os.path.exists(argparse.incar):
-        if 'magmom' in Config:
-            items = config.items('magmom')
-            if items:
-                element_magmoms = {}
-                for symbol, moment_str in Config['magmom'].items():
-                    try:
-                        element_magmoms[symbol] = float(moment_str.strip())
-                    except ValueError:
-                        element_magmoms[symbol] = 0.0
-                nonzero = False
-                for value in element_magmoms.values():
-                    if value != 0.0:
-                        nonzero = True
-                if nonzero == True:
-                    atoms = read_vasp("POSCAR")
-                    symbols = atoms.get_chemical_symbols()
-                    unique_symbols_ordered = []
-                    seen_symbols = set()
-                    for symbol in symbols:
-                        if symbol not in seen_symbols:
-                            unique_symbols_ordered.append(symbol)
-                            seen_symbols.add(symbol)
-                
-                    symbol_counts = {symbol: symbols.count(symbol) for symbol in symbols}
-                
-                    magmom_lines = []
-                    for symbol in unique_symbols_ordered:
-                        count = symbol_counts[symbol]
-                        try:
-                            magmom_lines.append(f"{element_magmoms[symbol]}*{count}")
-                        except:
-                            magmom_lines.append(f"0.0*{count}")
-                
-                    magmom_string = " ".join(magmom_lines)
-                    magmom_line = f"MAGMOM = {magmom_string}\n"
-                    with open(argparse.incar,'r') as f:
-                        lines = f.readlines()
-                    found_magmom = False
-                    found_ispin = False
-                    for line in lines:
-                        if line.startwith("MAGMOM"):
-                            line = magmom_line
-                            found_magmom = True
-                        if line.startwith("ISPIN"):
-                            line = "ISPIN = 2\n"
-                            found_ispin = True
-                    if found_ispin == False:
-                        lines.append("ISPIN = 2\n")
-                    if found_magmom == False:
-                        lines.append(magmom_line)
-                    with open(argparse.incar,'w') as f:
-                        f.writelines(lines)
         vasp.read_incar(argparse.incar)
     else:
         vasp.read_incar(os.path.join(module_path,"core/vasp/INCAR"))
     directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.symbols}")
+    set_magmom(directory)
     atoms_index+=1
     command=f"{Config.get('environ','mpirun_path')} -n {argparse.n_cpu} {Config.get('environ','vasp_path')}"
 
@@ -131,6 +80,59 @@ def run_vasp(argparse):
 
     utils.print_success("VASP calculation task completed!" )
 
-
+def set_magmom(directory):
+  incar_path=os.path.join(directory,"INCAR")
+  if 'magmom' in Config:
+      items = config.items('magmom')
+      if items:
+          element_magmoms = {}
+          for symbol, moment_str in Config['magmom'].items():
+              try:
+                  element_magmoms[symbol] = float(moment_str.strip())
+              except ValueError:
+                  element_magmoms[symbol] = 0.0
+          nonzero = False
+          for value in element_magmoms.values():
+              if value != 0.0:
+                  nonzero = True
+          if nonzero == True:
+              atoms = read_vasp("POSCAR")
+              symbols = atoms.get_chemical_symbols()
+              unique_symbols_ordered = []
+              seen_symbols = set()
+              for symbol in symbols:
+                  if symbol not in seen_symbols:
+                      unique_symbols_ordered.append(symbol)
+                      seen_symbols.add(symbol)
+          
+              symbol_counts = {symbol: symbols.count(symbol) for symbol in symbols}
+          
+              magmom_lines = []
+              for symbol in unique_symbols_ordered:
+                  count = symbol_counts[symbol]
+                  try:
+                      magmom_lines.append(f"{element_magmoms[symbol]}*{count}")
+                  except:
+                      magmom_lines.append(f"0.0*{count}")
+          
+              magmom_string = " ".join(magmom_lines)
+              magmom_line = f"MAGMOM = {magmom_string}\n"
+              with open(incar_path,'r') as f:
+                  lines = f.readlines()
+              found_magmom = False
+              found_ispin = False
+              for line in lines:
+                  if line.startwith("MAGMOM"):
+                      line = magmom_line
+                      found_magmom = True
+                  if line.startwith("ISPIN"):
+                      line = "ISPIN = 2\n"
+                      found_ispin = True
+              if found_ispin == False:
+                  lines.append("ISPIN = 2\n")
+              if found_magmom == False:
+                  lines.append(magmom_line)
+              with open(incar_path,'w') as f:
+                  f.writelines(lines)
 if __name__ == '__main__':
     calculate_vasp("./")
