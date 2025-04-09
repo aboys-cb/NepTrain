@@ -29,7 +29,6 @@ def calculate_vasp(atoms:Atoms,argparse):
     else:
         vasp.read_incar(os.path.join(module_path,"core/vasp/INCAR"))
     directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.symbols}")
-    set_magmom(directory)
     atoms_index+=1
     command=f"{Config.get('environ','mpirun_path')} -n {argparse.n_cpu} {Config.get('environ','vasp_path')}"
 
@@ -44,7 +43,7 @@ def calculate_vasp(atoms:Atoms,argparse):
                   math.ceil(argparse.ka[2]/c) ),
              gamma=argparse.use_gamma,
              )
-    magmom_line = set_magmom()
+    magmom_line = set_magmom(directory)
     if magmom_line:
         vasp.set(
                 ispin=2,
@@ -85,7 +84,7 @@ def run_vasp(argparse):
 
     utils.print_success("VASP calculation task completed!" )
 
-def set_magmom():
+def set_magmom(directory):
   if 'magmom' in Config:
       items = config.items('magmom')
       if items:
@@ -100,7 +99,8 @@ def set_magmom():
               if value != 0.0:
                   nonzero = True
           if nonzero == True:
-              atoms = read_vasp("POSCAR")
+              poscar_path = os.path.join(directory, "POSCAR")
+              atoms = read_vasp(poscar_path)
               symbols = atoms.get_chemical_symbols()
               unique_symbols_ordered = []
               seen_symbols = set()
@@ -120,7 +120,7 @@ def set_magmom():
                       magmom_lines.append(f"0.0*{count}")
           
               magmom_string = " ".join(magmom_lines)
-              magmom_line = f"MAGMOM = {magmom_string}\n"
+              magmom_line = f"{magmom_string}\n"
               return magmom_line
           else:
               return None
