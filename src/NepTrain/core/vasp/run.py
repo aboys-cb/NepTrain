@@ -44,6 +44,7 @@ def calculate_vasp(atoms:Atoms,argparse):
              gamma=argparse.use_gamma,
              )
     magmom_line = set_magmom(directory)
+    print(f"Directory: {directory}, magmom_line: {magmom_line}")
     if magmom_line:
         vasp.set(
                 ispin=2,
