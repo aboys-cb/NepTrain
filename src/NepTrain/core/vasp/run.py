@@ -87,7 +87,7 @@ def run_vasp(argparse):
 
 def set_magmom(directory):
   if 'magmom' in Config:
-      items = config.items('magmom')
+      items = Config.items('magmom')
       if items:
           element_magmoms = {}
           for symbol, moment_str in Config['magmom'].items():
