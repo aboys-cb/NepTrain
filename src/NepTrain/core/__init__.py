@@ -4,10 +4,10 @@
 # @Author  : 兵
 # @email    : 1747193328@qq.com
 
-from .gpumd import run_gpumd
-from .nep import run_nep
-from .perturb import run_perturb
-from .template import init_template
-from .train import train_nep
-from .vasp import run_vasp
-from .select import run_select
+from NepTrain.core.gpumd import run_gpumd
+from NepTrain.core.nep import run_nep
+from NepTrain.core.perturb import run_perturb
+from NepTrain.core.template import init_template
+from NepTrain.core.train import train_nep
+from NepTrain.core.vasp import run_vasp
+from NepTrain.core.select import run_select

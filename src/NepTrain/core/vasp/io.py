@@ -57,26 +57,77 @@ class VaspInput(Vasp):
         from the VASP output files.
         """
         if 'magmom' in Config:
-            items = config.items('magmom')
+            items = Config.items('magmom')
+            print (f"items: {items}")
+            # Check if there are any items in the magmom section
+            # If there are, we assume that the user wants to set the
+            # initial magnetic moments
+            # for the atoms in the calculation.
+            # If there are no items, we assume that the user does not
+            # want to set the initial magnetic moments.
             if items:
                 element_magmoms = {}
                 for symbol, moment_str in Config['magmom'].items():
-                    try:
-                        element_magmoms[symbol] = float(moment_str.strip())
-                    except ValueError:
-                        element_magmoms[symbol] = 0.0
-                nonzero = False
-                for value in element_magmoms.values():
-                    if value != 0.0:
-                        nonzero = True
-                if nonzero == True:
-                    magnetic_moments = []
-                    for atom in self.atoms:
-                        if atom.symbol in element_magmom.keys():
-                            magnetic_moments.append(element_magmom[atom.symbol])
-                        else:
-                            magnetic_moments.append(0.0)
-                    self.atoms.set_initial_magnetic_moments(magnetic_moments)
+                    pieces = moment_str.strip().split(' ')
+                    # Check if the moment_str contains more than one piece
+                    if len(pieces) == 1:
+                        try:
+                            element_magmoms[symbol] = float(pieces[0])
+                        except ValueError:
+                            element_magmoms[symbol] = 0.0
+                        nonzero = False
+                        for value in element_magmoms.values():
+                            if value != 0.0:
+                                nonzero = True
+                        if nonzero == True:
+                            magnetic_moments = []
+                            for atom in atoms:
+                                key = atom.symbol.lower()
+                                # Check if the symbol is in the element_magmoms dictionary
+                                # If it is, we set the initial magnetic moment to the value
+                                # in the dictionary. If it is not, we set the initial magnetic
+                                # moment to 0.0.
+                                if key in element_magmoms.keys():
+                                    magnetic_moments.append(element_magmoms[key])
+                                else:
+                                    magnetic_moments.append(0.0)
+                            atoms.set_initial_magnetic_moments(magnetic_moments)
+                    else:
+                        # If it contains more than one piece, we assume that
+                        # the user wants to set the initial magnetic moments
+                        # for each atom in the calculation.
+                        try:
+                            element_magmoms[symbol] = [float(x) for x in pieces]
+                            print ([float(x) for x in pieces])
+                        except ValueError:
+                            element_magmoms[symbol] = [0.0 for x in pieces]
+                        nonzero = False
+                        for value in element_magmoms.values():
+                            if np.all(value != 0.0):
+                                nonzero = True
+                        if nonzero == True:
+                            magnetic_moments = []
+                            for atom in atoms:
+                                key = atom.symbol.lower()
+                                # Check if the symbol is in the element_magmoms dictionary
+                                # If it is, we set the initial magnetic moment to the value
+                                # in the dictionary. If it is not, we set the initial magnetic
+                                # moment to 0.0 0.0 0.0.
+                                if key in element_magmoms.keys():
+                                    magnetic_moments.append(element_magmoms[key])
+                                else:
+                                    magnetic_moments.append([0.0,0.0,0.0])
+                            atoms.set_initial_magnetic_moments(magnetic_moments)
+                            self.set(
+                                    lnoncollinear=True,
+                                    laechg=False,
+                                    lcharg=False,
+                                    lwave=False,
+                                    )
+                    
+                
+        print(f"atoms: {atoms}")
+        print(f"Initial magnetic moments: {atoms.get_initial_magnetic_moments()}")
                       
         Calculator.calculate(self, atoms, properties, system_changes)
         # Check for zero-length lattice vectors and PBC
@@ -120,12 +171,8 @@ class VaspInput(Vasp):
 
         return result.returncode, result.stderr
 
-
 if __name__ == '__main__':
     vasp=VaspInput()
-
-
-
 
     atoms=ase_read("./POSCAR",format='vasp')
     vasp.read_incar("./INCAR")

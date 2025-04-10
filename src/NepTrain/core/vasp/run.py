@@ -13,8 +13,8 @@ from ase.io import write as ase_write
 from ase.io.vasp import read_vasp
 
 from NepTrain import utils, Config, module_path
-from ..utils import check_env
-from .io import VaspInput,write_to_xyz
+from NepTrain.core.utils import check_env
+from NepTrain.core.vasp.io import VaspInput,write_to_xyz
 
 atoms_index=1
 
@@ -22,8 +22,9 @@ atoms_index=1
                  description="VASP calculation progress" )
 def calculate_vasp(atoms:Atoms,argparse):
     global atoms_index
-
+    print(f"atoms_index: {atoms_index}")
     vasp = VaspInput()
+    print("INCAR")
     if argparse.incar is not None and os.path.exists(argparse.incar):
         vasp.read_incar(argparse.incar)
     else:
@@ -43,13 +44,13 @@ def calculate_vasp(atoms:Atoms,argparse):
                   math.ceil(argparse.ka[2]/c) ),
              gamma=argparse.use_gamma,
              )
-    magmom_line = set_magmom(directory)
-    print(f"Directory: {directory}, magmom_line: {magmom_line}")
-    if magmom_line:
-        vasp.set(
-                ispin=2,
-                magmom=magmom_line,
-                )
+    # magmom_line = set_magmom(directory)
+    # print(f"Directory: {directory}, magmom_line: {magmom_line}")
+    # if magmom_line:
+    #     vasp.set(
+    #             ispin=2,
+    #             magmom=magmom_line,
+    #             )
 
     if vasp.int_params["ibrion"] ==0:
         #分子动力学
@@ -116,9 +117,9 @@ def set_magmom(directory):
               for symbol in unique_symbols_ordered:
                   count = symbol_counts[symbol]
                   try:
-                      magmom_lines.append(f"{element_magmoms[symbol]}*{count}")
+                      magmom_lines.append(f"{count}*{element_magmoms[symbol]}")
                   except:
-                      magmom_lines.append(f"0.0*{count}")
+                      magmom_lines.append(f"{count}*0.0")
           
               magmom_string = " ".join(magmom_lines)
               magmom_line = f"{magmom_string}\n"
