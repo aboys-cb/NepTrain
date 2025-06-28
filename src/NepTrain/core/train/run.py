@@ -204,7 +204,7 @@ class NepTrainWorker:
         return params2str(params)
 
 
-    def build_nep_params(self) -> PARAMS:
+    def build_nep_params(self) :
         nep=self.config["nep"]
         params=[]
         params.append("NepTrain")
@@ -241,7 +241,7 @@ class NepTrainWorker:
                 params.append("--continue_step")
                 params.append(self.config["nep"]["nep_restart_step"])
 
-        return params2str(params),[(nep.get("nep_in_path")),self.last_improved_train_xyz_file,(nep.get("test_xyz_path"))]
+        return params2str(params)
     def build_gpumd_params(self,model_path,temperature,n_job=1,):
         gpumd=self.config["gpumd"]
         params=[]
@@ -394,8 +394,13 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=[],
-                                backward_files=[self.__getattr__(f"vasp_cache{i + 1}_path")],
+                                forward_files=[
+                                    self.config["vasp"]["incar_path"],
+                                    self.vasp_learn_add_xyz_file,
+                                    self.__getattr__(f"vasp_learn_add_{i +1}_xyz_file")
+
+                                ],
+                                backward_files=[self.__getattr__(f"vasp_learn_calculated_{n_job}_xyz_file")],
                             )
                         ],
                         submission_dict=dict(
@@ -454,7 +459,11 @@ class NepTrainWorker:
                 utils.copy(self.last_all_learn_calculated_xyz_file,
                             self.last_improved_train_xyz_file)
             utils.print_msg(f"Starting to train the potential function.")
-            cmd, forward_files = self.build_nep_params()
+            cmd = self.build_nep_params()
+            forward_files = [self.config["nep"].get("nep_in_path"),
+                             self.last_improved_train_xyz_file,
+                             self.config["nep"].get("test_xyz_path"),
+             ]
             submit_job(
                 machine_dict = self.config["nep"]["machine"],
                 resources_dict = self.config["nep"]["resources"],
@@ -495,7 +504,11 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files=[self.nep_nep_txt_file, self.all_learn_calculated_xyz_file],
+                        forward_files=[
+                            self.nep_nep_txt_file,
+                            self.all_learn_calculated_xyz_file,
+                            self.config["nep"].get("nep_in_path")
+                        ],
                         backward_files=[self.pred_path],
                     )
                 ],
@@ -527,8 +540,13 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=[],
-                                backward_files=[self.gpumd_path],
+                                forward_files=[
+                                    self.config["gpumd"]["model_path"],
+                                    self.config["gpumd"].get("run_in_path"),
+                                    self.nep_nep_txt_file
+
+                                ],
+                                backward_files=[self.__getattr__(f"select_md_{i}_xyz_file")],
                             )
                         ],
                         submission_dict=dict(
@@ -554,7 +572,12 @@ class NepTrainWorker:
                                 dict(
                                     command=cmd,
                                     task_work_path="./",
-                                    forward_files=[],
+                                    forward_files=[
+                                    os.path.join(self.config["gpumd"]["model_path"], file),
+                                    self.config["gpumd"].get("run_in_path"),
+                                    self.nep_nep_txt_file
+
+                                    ],
                                     backward_files=[self.gpumd_path],
                                 )
                             ],
@@ -566,7 +589,7 @@ class NepTrainWorker:
                         )
                     )
         if tasks:
-            asyncio.run(asyncio.gather(*tasks))
+            asyncio.run( asyncio.gather(*tasks))
 
 
 

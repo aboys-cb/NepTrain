@@ -17,9 +17,10 @@ nep:
     remote_profile:
       email: "1747193328@qq.com"
       password: "a15738017787..."
-      program_id: 65776,
+      program_id: 65776
       keep_backup: False
       input_data:
+        job_name: NepTrain nep job
         job_type: "container"
         scass_type: "c8_m32_1 * NVIDIA V100"
         image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v10"
