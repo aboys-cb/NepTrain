@@ -7,11 +7,13 @@
 自动训练的逻辑
 """
 import os.path
+import subprocess
+import asyncio
 from pathlib import Path
-from typing import List,Tuple
+from typing import List, Tuple
 from ase.io import read as ase_read
 from ase.io import write as ase_write
-from .worker import submit_job
+from .worker import submit_job, async_submit_job
 from ruamel.yaml import YAML
 
 from NepTrain import utils
@@ -355,9 +357,8 @@ class NepTrainWorker:
                   self.select_all_md_dummp_xyz_file
                   )
 
-        worker = LocalWorker()
-        cmd=self.build_select_params()
-        worker.sub_job(cmd, self.select_path)
+        cmd = self.build_select_params()
+        subprocess.run(cmd, shell=True, check=True, cwd=self.select_path)
 
 
 
@@ -376,17 +377,37 @@ class NepTrainWorker:
         if not utils.is_file_empty(self.vasp_learn_add_xyz_file):
 
             if self.config["vasp_job"] != 1:
-                # 这里分割下xyz 方便后面直接vasp计算
+                # Split xyz for parallel submission
                 self.split_vasp_job_xyz(self.vasp_learn_add_xyz_file)
 
+            tasks = []
             for i in range(self.config["vasp_job"]):
                 cmd = self.build_vasp_params(i + 1)
                 if cmd is None:
                     continue
 
-                self.worker.sub_job(cmd, self.vasp_path, job_type="vasp")
+                tasks.append(
+                    async_submit_job(
+                        machine_dict=self.config["nep"]["machine"],
+                        resources_dict=self.config["nep"]["resources"],
+                        task_dict_list=[
+                            dict(
+                                command=cmd,
+                                task_work_path="./",
+                                forward_files=[],
+                                backward_files=[self.__getattr__(f"vasp_cache{i + 1}_path")],
+                            )
+                        ],
+                        submission_dict=dict(
+                            work_base="./",
+                            forward_common_files=[],
+                            backward_common_files=[],
+                        ),
+                    )
+                )
 
-            self.worker.wait()
+            if tasks:
+                asyncio.run(asyncio.gather(*tasks))
 
             utils.cat(self.__getattr__(f"vasp_learn_calculated_*_xyz_file"),
                       self.all_learn_calculated_xyz_file
@@ -467,32 +488,85 @@ class NepTrainWorker:
         if not utils.is_file_empty(self.all_learn_calculated_xyz_file):
             utils.print_msg(f"Starting to predict new dataset.")
             cmd = self.build_pred_params()
-            self.worker.sub_job(cmd, self.pred_path, job_type="nep")
-            self.worker.wait()
+            submit_job(
+                machine_dict=self.config["nep"]["machine"],
+                resources_dict=self.config["nep"]["resources"],
+                task_dict_list=[
+                    dict(
+                        command=cmd,
+                        task_work_path="./",
+                        forward_files=[self.nep_nep_txt_file, self.all_learn_calculated_xyz_file],
+                        backward_files=[self.pred_path],
+                    )
+                ],
+                submission_dict=dict(
+                    work_base="./",
+                    forward_common_files=[],
+                    backward_common_files=[],
+                ),
+            )
         else:
             utils.print_msg(f"The dataset has not changed, skipping prediction.")
 
 
     def sub_gpumd(self):
         utils.print_msg(f"Starting active learning.")
-        if self.config.get("gpumd_split_job","temperature")=="temperature":
-            for i,temp in enumerate(self.config["gpumd"]["temperature_every_step"]):
-                cmd = self.build_gpumd_params(self.config["gpumd"].get("model_path"),
-                                              temp,
-
-                                              i)
-
-                self.worker.sub_job(cmd, self.gpumd_path, job_type="gpumd")
+        tasks = []
+        if self.config.get("gpumd_split_job", "temperature") == "temperature":
+            for i, temp in enumerate(self.config["gpumd"]["temperature_every_step"]):
+                cmd = self.build_gpumd_params(
+                    self.config["gpumd"].get("model_path"),
+                    temp,
+                    i,
+                )
+                tasks.append(
+                    async_submit_job(
+                        machine_dict=self.config["nep"]["machine"],
+                        resources_dict=self.config["nep"]["resources"],
+                        task_dict_list=[
+                            dict(
+                                command=cmd,
+                                task_work_path="./",
+                                forward_files=[],
+                                backward_files=[self.gpumd_path],
+                            )
+                        ],
+                        submission_dict=dict(
+                            work_base="./",
+                            forward_common_files=[],
+                            backward_common_files=[],
+                        ),
+                    )
+                )
         else:
             if os.path.isdir(self.config["gpumd"]["model_path"]):
-                for i,file in enumerate(os.listdir(self.config["gpumd"]["model_path"])):
-                    cmd = self.build_gpumd_params(os.path.join(self.config["gpumd"]["model_path"],
-                                                               file),
-                                                  self.config["gpumd"]["temperature_every_step"] ,
-
-                                                  i)
-
-                    self.worker.sub_job(cmd, self.gpumd_path, job_type="gpumd")
+                for i, file in enumerate(os.listdir(self.config["gpumd"]["model_path"])):
+                    cmd = self.build_gpumd_params(
+                        os.path.join(self.config["gpumd"]["model_path"], file),
+                        self.config["gpumd"]["temperature_every_step"],
+                        i,
+                    )
+                    tasks.append(
+                        async_submit_job(
+                            machine_dict=self.config["nep"]["machine"],
+                            resources_dict=self.config["nep"]["resources"],
+                            task_dict_list=[
+                                dict(
+                                    command=cmd,
+                                    task_work_path="./",
+                                    forward_files=[],
+                                    backward_files=[self.gpumd_path],
+                                )
+                            ],
+                            submission_dict=dict(
+                                work_base="./",
+                                forward_common_files=[],
+                                backward_common_files=[],
+                            ),
+                        )
+                    )
+        if tasks:
+            asyncio.run(asyncio.gather(*tasks))
 
 
 
