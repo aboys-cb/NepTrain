@@ -20,6 +20,11 @@ from NepTrain import utils
 
 from ..utils import check_env
 
+
+async def _run_tasks(tasks):
+    """Helper coroutine to run multiple async tasks."""
+    await asyncio.gather(*tasks)
+
 PARAMS = Tuple[str,list ]
 
 
@@ -412,7 +417,7 @@ class NepTrainWorker:
                 )
 
             if tasks:
-                asyncio.run(asyncio.gather(*tasks))
+                asyncio.run(_run_tasks(tasks))
 
             utils.cat(self.__getattr__(f"vasp_learn_calculated_*_xyz_file"),
                       self.all_learn_calculated_xyz_file
@@ -589,7 +594,7 @@ class NepTrainWorker:
                         )
                     )
         if tasks:
-            asyncio.run( asyncio.gather(*tasks))
+            asyncio.run(_run_tasks(tasks))
 
 
 
