@@ -48,7 +48,7 @@ def run_select(argparse):
             )
 
 
-            if len(filter_structures) >= 0:
+            if len(filter_structures) > 0:
                 utils.print_msg(f"Filtering {len(filter_structures)} structures.")
                 ase_write(os.path.join(os.path.dirname(_path),f"filter_{file_name}.xyz"),filter_structures,append=False)
 
