@@ -40,6 +40,7 @@ def run_select(argparse):
 
         if argparse.filter:
             utils.print_msg(f"Start filtering...")
+            file_name = os.path.basename(_path)
 
             # 使用示例
             trajectory, filter_structures = parallel_filter_trajectory(
@@ -49,7 +50,7 @@ def run_select(argparse):
 
             if len(filter_structures) >= 0:
                 utils.print_msg(f"Filtering {len(filter_structures)} structures.")
-                ase_write(f"filter_{_path}.xyz",filter_structures,append=False)
+                ase_write(os.path.join(os.path.dirname(_path),f"filter_{file_name}.xyz"),filter_structures,append=False)
 
 
 

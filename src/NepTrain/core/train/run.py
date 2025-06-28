@@ -51,8 +51,19 @@ class PathManager:
     def __getattr__(self, item):
         return os.path.join(self.root, item)
 
-
-
+def params2str(params):
+    text=""
+    for i in  params:
+        if isinstance(i, str):
+            text += i
+        elif isinstance(i, (tuple,list)):
+            for j in i:
+                text += str(j)
+                text += " "
+        else:
+            text += str(i)
+        text += " "
+    return text
 
 class NepTrainWorker:
     pass
@@ -188,7 +199,7 @@ class NepTrainWorker:
 
         params.append("--prediction")
 
-        return " ".join(params)
+        return params2str(params)
 
 
     def build_nep_params(self  ):
@@ -220,9 +231,9 @@ class NepTrainWorker:
                 params.append("--restart_file")
                 params.append(self.last_nep_nep_restart_file)
                 params.append("--continue_step")
-                params.append(str(self.config["nep"]["nep_restart_step"]))
+                params.append(self.config["nep"]["nep_restart_step"])
 
-        return " ".join(params)
+        return params2str(params)
     def build_gpumd_params(self,model_path,temperature,n_job=1,):
         gpumd=self.config["gpumd"]
         params=[]
@@ -240,15 +251,13 @@ class NepTrainWorker:
         params.append("--nep")
         params.append( self.nep_nep_txt_file)
         params.append("--time")
-        params.append(str(gpumd.get("step_times")[self.generation-1]))
+        params.append(gpumd.get("step_times")[self.generation-1])
 
         params.append("--temperature")
-        if isinstance(temperature,list):
-            params.append(" ".join([str(i) for i in temperature]))
 
-        else:
+        params.append(temperature)
 
-            params.append( str( temperature))
+
 
 
         params.append("--out")
@@ -257,7 +266,7 @@ class NepTrainWorker:
 
 
 
-        return " ".join(params)
+        return params2str(params)
     def build_select_params(self):
         select=self.config["select"]
         params=[]
@@ -273,9 +282,9 @@ class NepTrainWorker:
         params.append("--base")
         params.append( self.nep_train_xyz_file )
         params.append("--max_selected")
-        params.append(str(select["max_selected"]))
+        params.append(select["max_selected"])
         params.append("--min_distance")
-        params.append(str(select["min_distance"]))
+        params.append(select["min_distance"])
         params.append("--out")
         params.append(self.select_selected_xyz_file)
 
@@ -285,7 +294,7 @@ class NepTrainWorker:
             params.append(select.get("filter" ) if isinstance(select.get("filter" ),float) else 0.6)
 
 
-        return " ".join(params)
+        return params2str(params)
     def build_vasp_params(self,n_job=1):
         vasp=self.config["vasp"]
         params=[]
@@ -309,7 +318,7 @@ class NepTrainWorker:
 
 
         params.append("-np")
-        params.append(str(vasp["cpu_core"]))
+        params.append(vasp["cpu_core"])
         if vasp["kpoints_use_gamma"]:
             params.append("--gamma")
 
@@ -323,17 +332,17 @@ class NepTrainWorker:
                 if isinstance(vasp["kpoints"],list):
                     params.append(",".join([str(i) for i in vasp["kpoints"]]))
                 else:
-                    params.append(str(vasp["kpoints"]))
+                    params.append(vasp["kpoints"])
         else:
 
             if vasp.get("kspacing") :
                 params.append("--kspacing")
-                params.append(str(vasp["kspacing"]))
+                params.append(vasp["kspacing"])
         params.append("--out")
         params.append( self.__getattr__(f"vasp_learn_calculated_{n_job}_xyz_file"))
 
 
-        return " ".join(params)
+        return params2str(params)
 
     def select(self):
         utils.cat(self.__getattr__(f"select_md_*_xyz_file"),
