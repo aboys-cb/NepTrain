@@ -7,14 +7,19 @@
 自动训练的逻辑
 """
 import os.path
-
+from pathlib import Path
+from typing import List,Tuple
 from ase.io import read as ase_read
 from ase.io import write as ase_write
+from .worker import submit_job
 from ruamel.yaml import YAML
 
 from NepTrain import utils
-from .worker import LocalWorker, SlurmWorker
+
 from ..utils import check_env
+
+PARAMS = Tuple[str,list ]
+
 
 
 class Manager:
@@ -72,20 +77,15 @@ class NepTrainWorker:
         self.job_list=["nep","gpumd","select","vasp","pred", ]
         self.manager=Manager(self.job_list)
 
-    def get_worker(self):
-        queue = self.config.get("queue", "local")
-        if queue == "local":
-            return LocalWorker()
-        else:
-            return SlurmWorker(os.path.abspath("./sub_vasp.sh"),os.path.abspath("./sub_gpu.sh"))
+
 
     def __getattr__(self, item):
 
         if item.startswith("last_"):
             item=item.replace("last_","")
-            generation_path=os.path.join(os.path.abspath(self.config.get("work_path")), f"Generation-{self.generation-1}")
+            generation_path=os.path.join((self.config.get("work_path")), f"Generation-{self.generation-1}")
         else:
-            generation_path=os.path.join(os.path.abspath(self.config.get("work_path")), f"Generation-{self.generation}")
+            generation_path=os.path.join((self.config.get("work_path")), f"Generation-{self.generation}")
 
         if item=="generation_path":
 
@@ -179,7 +179,7 @@ class NepTrainWorker:
 
             self.config=YAML().load(f )
 
-    def build_pred_params(self  ):
+    def build_pred_params(self):
         nep=self.config["nep"]
         params=[]
         params.append("NepTrain")
@@ -189,7 +189,7 @@ class NepTrainWorker:
         params.append(self.pred_path)
 
         params.append("--in")
-        params.append(os.path.abspath(nep.get("nep_in_path")))
+        params.append((nep.get("nep_in_path")))
 
         params.append("--train")
         params.append(self.all_learn_calculated_xyz_file)
@@ -202,7 +202,7 @@ class NepTrainWorker:
         return params2str(params)
 
 
-    def build_nep_params(self  ):
+    def build_nep_params(self) -> PARAMS:
         nep=self.config["nep"]
         params=[]
         params.append("NepTrain")
@@ -212,13 +212,19 @@ class NepTrainWorker:
         params.append(self.nep_path)
 
         params.append("--in")
-        params.append(os.path.abspath(nep.get("nep_in_path")))
+        # params.append("nep.in")
+
+        params.append((nep.get("nep_in_path")))
 
         params.append("--train")
+        # params.append("train.xyz")
+
         params.append(self.last_improved_train_xyz_file)
 
         params.append("--test")
-        params.append(os.path.abspath(nep.get("test_xyz_path")))
+        # params.append("test.xyz")
+
+        params.append((nep.get("test_xyz_path")))
 
         if self.config["nep"]["nep_restart"] and self.generation not in [1,len(self.config["gpumd"]["step_times"])+1]:
             #开启续跑
@@ -233,21 +239,21 @@ class NepTrainWorker:
                 params.append("--continue_step")
                 params.append(self.config["nep"]["nep_restart_step"])
 
-        return params2str(params)
+        return params2str(params),[(nep.get("nep_in_path")),self.last_improved_train_xyz_file,(nep.get("test_xyz_path"))]
     def build_gpumd_params(self,model_path,temperature,n_job=1,):
         gpumd=self.config["gpumd"]
         params=[]
         params.append("NepTrain")
         params.append("gpumd")
 
-        params.append(os.path.abspath(model_path))
+        params.append((model_path))
 
         params.append("--directory")
 
         params.append(self.gpumd_path)
 
         params.append("--in")
-        params.append(os.path.abspath(gpumd.get("run_in_path")))
+        params.append((gpumd.get("run_in_path")))
         params.append("--nep")
         params.append( self.nep_nep_txt_file)
         params.append("--time")
@@ -325,7 +331,7 @@ class NepTrainWorker:
         if vasp["incar_path"]:
 
             params.append("--incar")
-            params.append(os.path.abspath(vasp["incar_path"]))
+            params.append((vasp["incar_path"]))
         if vasp["use_k_stype"]=="kpoints":
             if vasp.get("kpoints"):
                 params.append("-ka")
@@ -377,6 +383,7 @@ class NepTrainWorker:
                 cmd = self.build_vasp_params(i + 1)
                 if cmd is None:
                     continue
+
                 self.worker.sub_job(cmd, self.vasp_path, job_type="vasp")
 
             self.worker.wait()
@@ -426,9 +433,27 @@ class NepTrainWorker:
                 utils.copy(self.last_all_learn_calculated_xyz_file,
                             self.last_improved_train_xyz_file)
             utils.print_msg(f"Starting to train the potential function.")
-            cmd = self.build_nep_params()
-            self.worker.sub_job(cmd, self.nep_path, job_type="nep")
-            self.worker.wait()
+            cmd, forward_files = self.build_nep_params()
+            submit_job(
+                machine_dict = self.config["nep"]["machine"],
+                resources_dict = self.config["nep"]["resources"],
+                task_dict_list = [
+                    dict(
+                        command=cmd,
+                        task_work_path="./",
+                        forward_files= forward_files,
+                        backward_files = [self.nep_path],
+                    )
+                ],
+                submission_dict = dict(
+                    work_base="./",
+                    forward_common_files=[],
+                    backward_common_files=[],
+
+                )
+
+            )
+
         else:
             utils.print_warning("The dataset has not changed, directly copying the potential function from the last time!")
 
@@ -468,7 +493,7 @@ class NepTrainWorker:
                                                   i)
 
                     self.worker.sub_job(cmd, self.gpumd_path, job_type="gpumd")
-        self.worker.wait()
+
 
 
 
@@ -479,7 +504,7 @@ class NepTrainWorker:
         self.read_config(config_path)
         self.check_env()
 
-        self.worker=self.get_worker()
+
 
         self.manager.set_next(self.config.get("current_job"))
 

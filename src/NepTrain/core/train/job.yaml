@@ -9,6 +9,25 @@ generation: 1  #Marking resume tasks.
 init_train_xyz: ./train.xyz  #Initial training set; if not calculated, set current_job to vasp.
 init_nep_txt: ./nep.txt  #If current_job is set to gpumd, a potential function must be provided; otherwise, it can be ignored.
 nep:
+  machine:
+    context_type: "Bohrium"
+    batch_type: "Bohrium"
+    local_root: "./"
+    remote_root: "./"
+    remote_profile:
+      email: "1747193328@qq.com"
+      password: "a15738017787..."
+      program_id: 65776,
+      keep_backup: False
+      input_data:
+        job_type: "container"
+        scass_type: "c8_m32_1 * NVIDIA V100"
+        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v10"
+  resources:
+    cpu: 4
+    gpu_per_node: 1
+    group_size: 2
+
   #Does it support restarting? If true, the potential function for the next step will continue from this step for nep_restart_step steps.
   #The program will automatically set lambda_1 to 0.
   #If false, retrain from scratch every time.
