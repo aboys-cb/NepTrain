@@ -9,7 +9,8 @@ sys.path.append('../../')
 from NepTrain.core import *
 from NepTrain import __version__
 import warnings
-
+from dpdispatcher.dlog import dlog_stdout, dlog
+dlog.removeHandler(dlog_stdout)
 # 禁用所有 UserWarning
 warnings.simplefilter('ignore', UserWarning)
 def check_kpoints_number(value):
@@ -34,7 +35,10 @@ def build_init(subparsers):
         "init",
         help="Initialize some file templates",
     )
-
+    parser_init.add_argument("type",
+                             type=str,
+                            choices=["bohrium","slurm","pbs","local"],default="slurm",
+                             help=" ")
 
     parser_init.add_argument("-f", "--force", action='store_true',
                              default=False,
@@ -137,7 +141,7 @@ def build_vasp(subparsers):
     k_group.add_argument("--kspacing", "-kspacing",
 
                          type=float,
-                         help="Set kspacing, which can also be defined in the INCAR template.")
+                         help="Set kspacing, which can also be defined in the INCAR _template.")
     k_group.add_argument("--ka", "-ka",
                          default=[1, 1, 1],
                          type=check_kpoints_number,
@@ -222,7 +226,7 @@ def build_gpumd(subparsers):
                              default="./cache/gpumd"
                              )
     parser_gpumd.add_argument("--in","-in",dest="run_in_path", type=str,
-                              help="The filename for the command template file, default is ./run.in.", default="./run.in")
+                              help="The filename for the command _template file, default is ./run.in.", default="./run.in")
 
     parser_gpumd.add_argument("--nep", "-nep",
                             dest="nep_txt_path",

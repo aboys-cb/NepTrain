@@ -1,0 +1,119 @@
+
+nep:
+  #machine resources字段可参考dpdispatcher的输入内容
+  machine:
+    context_type: "SSHContext"
+    batch_type: "Slurm"
+    local_root: "./"
+    remote_root: "/home/outsider/chenchengbing/jobs/nep-demo/"
+    remote_profile:
+      hostname: "172.16.78.41"
+      username: "chenchengbing"
+      key_filename: "id_ed25519_chenchengbing"
+      port: 20244
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    "custom_flags":
+      - "#SBATCH --qos=normal"
+      - "#SBATCH --job-name=NepTrain-NEP"
+
+    source_list: [
+      "source /opt/envs/anaconda3.env",
+      "conda activate neptrain",
+      "module load cuda/12.4.1",
+      "module load gcc/12.4.0",
+      "export PATH=/home/outsider/chenchengbing/opt/GPUMD-master/src/:$PATH"
+    ]
+
+vasp:
+
+  machine:
+    context_type: "SSHContext"
+    batch_type: "Slurm"
+    local_root: "./"
+    remote_root: "/home/outsider/chenchengbing/jobs/nep-demo/"
+    remote_profile:
+      hostname: "172.16.78.41"
+      username: "chenchengbing"
+      key_filename: "id_ed25519_chenchengbing"
+      port: 20244
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    "custom_flags":
+      - "#SBATCH --qos=normal"
+      - "#SBATCH --job-name=NepTrain-NEP"
+
+    source_list: [
+      "source /opt/envs/anaconda3.env",
+      "conda activate neptrain",
+      "module load vasp/6.4.2-nvhpc24.3-ompi5.0.7",
+
+    ]
+
+gpumd:
+  machine:
+    context_type: "SSHContext"
+    batch_type: "Slurm"
+    local_root: "./"
+    remote_root: "/home/outsider/chenchengbing/jobs/nep-demo/"
+    remote_profile:
+      hostname: "172.16.78.41"
+      username: "chenchengbing"
+      key_filename: "id_ed25519_chenchengbing"
+      port: 20244
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    "custom_flags":
+      - "#SBATCH --qos=normal"
+      - "#SBATCH --job-name=NepTrain-NEP"
+
+    source_list: [
+      "source /opt/envs/anaconda3.env",
+      "conda activate neptrain",
+      "module load cuda/12.4.1",
+      "module load gcc/12.4.0",
+      "export PATH=/home/outsider/chenchengbing/opt/GPUMD-master/src/:$PATH"
+    ]
+
+select:
+  machine:
+    context_type: "SSHContext"
+    batch_type: "Slurm"
+    local_root: "./"
+    remote_root: "/home/outsider/chenchengbing/jobs/nep-demo/"
+    remote_profile:
+      hostname: "172.16.78.41"
+      username: "chenchengbing"
+      key_filename: "id_ed25519_chenchengbing"
+      port: 20244
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    "custom_flags":
+      - "#SBATCH --qos=normal"
+      - "#SBATCH --job-name=NepTrain-select"
+
+    source_list: [
+      "source /opt/envs/anaconda3.env",
+      "conda activate neptrain",
+
+    ]

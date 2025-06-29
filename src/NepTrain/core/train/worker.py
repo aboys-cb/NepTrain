@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from dpdispatcher import Machine, Resources, Task, Submission
 from pathlib import Path
@@ -9,7 +10,9 @@ def remove_sub_file(work_path: str = "./"):
     all_file = Path(work_path).glob("????????????????????????????????????????.sub.*")
     for file in all_file:
         file.unlink()
-
+    all_file = Path(work_path).glob("????????????????????????????????????????.sub")
+    for file in all_file:
+        file.unlink()
 
 def submit_job(
     machine_dict: dict,
@@ -27,7 +30,7 @@ def submit_job(
         task_list=task_list,
         **submission_dict,
     )
-    submission.run_submission(clean=True)
+    submission.run_submission(clean=False)
     remove_sub_file()
     return submission
 
@@ -48,5 +51,5 @@ async def async_submit_job(
         task_list=task_list,
         **submission_dict,
     )
-    await submission.async_run_submission(check_interval=2, clean=True)
+    await submission.async_run_submission(check_interval=2, clean=False)
     remove_sub_file()
