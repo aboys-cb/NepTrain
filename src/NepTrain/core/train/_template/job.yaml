@@ -1,5 +1,4 @@
 version: 1.4.3
-queue: slurm #Select the queuing system, divided into Slurm and local.
 vasp_job: 10 #The number of tasks submitted when calculating single-point energy with VASP.
 #所有任务提交的根目录
 gpumd_split_job: temperature  #Split gpumd tasks by temperature or structure

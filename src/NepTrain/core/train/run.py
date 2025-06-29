@@ -651,7 +651,7 @@ class NepTrainWorker:
 
             #开始循环
             job = next(self.manager)
-            utils.print_msg(f"[Generation {self.generation}] Starting job: {job}")
+            # utils.print_msg(f"[Generation {self.generation}] Starting job: {job}")
             self.config["current_job"]=job
             self.save_restart()
             if job=="vasp":
@@ -675,7 +675,7 @@ class NepTrainWorker:
             else:
                 self.sub_gpumd()
 
-            utils.print_msg(f"[Generation {self.generation}] Finished job: {job}")
+            # utils.print_msg(f"[Generation {self.generation}] Finished job: {job}")
 
 
     def save_restart(self):
@@ -689,7 +689,7 @@ def train_nep(argparse):
     首先检查下当前的进度 看从哪开始
     :return:
     """
-    check_env()
+
 
     worker = NepTrainWorker()
 

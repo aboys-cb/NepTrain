@@ -7,10 +7,10 @@ nep:
     local_root: "./"
     remote_root: "./"
     remote_profile:
-      email: "1747193328@qq.com"
-      password: "a15738017787..."
-      program_id: 65776
-      keep_backup: False
+      email: ""
+      password: ""
+      program_id:
+      keep_backup: True
       input_data:
         job_name: NepTrain nep job
         job_type: "container"
@@ -19,7 +19,7 @@ nep:
   resources:
     cpu: 4
     gpu_per_node: 1
-    group_size: 2
+    group_size: 1
 
 vasp:
 
@@ -29,10 +29,10 @@ vasp:
     local_root: "./"
     remote_root: "./"
     remote_profile:
-      email: "1747193328@qq.com"
-      password: "a15738017787..."
-      program_id: 65776
-      keep_backup: False
+      email: ""
+      password: ""
+      program_id:
+      keep_backup: True
       input_data:
         job_name: NepTrain vasp job
         job_type: "container"
@@ -41,7 +41,7 @@ vasp:
   resources:
     cpu: 4
     gpu_per_node: 1
-    group_size: 2
+    group_size: 1
 gpumd:
   machine:
     context_type: "Bohrium"
@@ -49,10 +49,10 @@ gpumd:
     local_root: "./"
     remote_root: "./"
     remote_profile:
-      email: "1747193328@qq.com"
-      password: "a15738017787..."
-      program_id: 65776
-      keep_backup: False
+      email: ""
+      password: ""
+      program_id:
+      keep_backup: True
       input_data:
         job_name: NepTrain gpumd job
         job_type: "container"
@@ -61,7 +61,7 @@ gpumd:
   resources:
     cpu: 4
     gpu_per_node: 1
-    group_size: 2
+    group_size: 1
 
 select:
   machine:
@@ -70,19 +70,20 @@ select:
     local_root: "./"
     remote_root: "./"
     remote_profile:
-      email: "1747193328@qq.com"
-      password: "a15738017787..."
-      program_id: 65776
+      email: ""
+      password: ""
+      program_id:
       keep_backup: True
       input_data:
         job_name: NepTrain select job
         job_type: "container"
-        scass_type: "c8_m32_1 * NVIDIA V100"
+        scass_type: "c64_m64_cpu"
         image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v10"
+  #Select mainly uses CPU
   resources:
-    cpu: 4
+    cpu: 64
     gpu_per_node: 1
-    group_size: 2
+    group_size: 1
 
 
 
