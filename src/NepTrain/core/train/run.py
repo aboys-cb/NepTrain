@@ -650,7 +650,8 @@ class NepTrainWorker:
         while True:
 
             #开始循环
-            job=next(self.manager)
+            job = next(self.manager)
+            utils.print_msg(f"[Generation {self.generation}] Starting job: {job}")
             self.config["current_job"]=job
             self.save_restart()
             if job=="vasp":
@@ -673,6 +674,8 @@ class NepTrainWorker:
 
             else:
                 self.sub_gpumd()
+
+            utils.print_msg(f"[Generation {self.generation}] Finished job: {job}")
 
 
     def save_restart(self):

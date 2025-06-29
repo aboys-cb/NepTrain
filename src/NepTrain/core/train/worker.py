@@ -3,6 +3,7 @@ import os
 
 from dpdispatcher import Machine, Resources, Task, Submission
 from pathlib import Path
+from NepTrain import utils
 
 
 def remove_sub_file(work_path: str = "./"):
@@ -31,6 +32,9 @@ def submit_job(
         **submission_dict,
     )
     submission.run_submission(clean=False)
+    job_id = getattr(submission, 'job_id', getattr(submission, 'submission_id', 'UNKNOWN'))
+    work_path = getattr(submission, 'work_base', submission_dict.get('work_base', './'))
+    utils.print_msg(f"Submitted job {job_id} in {work_path}")
     remove_sub_file()
     return submission
 
@@ -52,4 +56,7 @@ async def async_submit_job(
         **submission_dict,
     )
     await submission.async_run_submission(check_interval=2, clean=False)
+    job_id = getattr(submission, 'job_id', getattr(submission, 'submission_id', 'UNKNOWN'))
+    work_path = getattr(submission, 'work_base', submission_dict.get('work_base', './'))
+    utils.print_msg(f"Submitted job {job_id} in {work_path}")
     remove_sub_file()
