@@ -35,7 +35,7 @@ def submit_job(
     for job in submission.belonging_jobs:
         utils.print_msg(f"Finished job {job.job_id} in {job.machine.context.remote_root}")
 
-    remove_sub_file()
+
     return submission
 
 
@@ -55,8 +55,8 @@ async def async_submit_job(
         task_list=task_list,
         **submission_dict,
     )
-    await submission.async_run_submission(check_interval=2, clean=False)
+    await submission.async_run_submission(check_interval=1, clean=False)
     for job in submission.belonging_jobs:
         utils.print_msg(f"Finished job {job.job_id} in {job.machine.context.remote_root}")
 
-    remove_sub_file()
+

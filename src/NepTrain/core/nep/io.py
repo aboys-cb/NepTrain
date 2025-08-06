@@ -104,7 +104,9 @@ class RunInput:
         utils.verify_path(directory)
         if self.restart:
             # utils.print_tip("Start the restart mode!")
-            shutil.copy(self.restart_nep_path,os.path.join(directory,"nep.restart"))
+            if utils.is_diff_path(self.restart_nep_path,os.path.join(directory,"nep.restart")):
+
+                utils.copy(self.restart_nep_path,os.path.join(directory,"nep.restart"))
 
 
         self.write_run(os.path.join(directory,"nep.in"))
@@ -114,7 +116,9 @@ class RunInput:
 
             shutil.copy(self.train_xyz_path,os.path.join(directory,"train.xyz"))
         if self.test_xyz_path is not None and os.path.exists(self.test_xyz_path):
-            shutil.copy(self.test_xyz_path, os.path.join(directory, "test.xyz"))
+            if utils.is_diff_path(self.test_xyz_path, os.path.join(directory, "test.xyz")):
+
+                shutil.copy(self.test_xyz_path, os.path.join(directory, "test.xyz"))
         if show_progress:
 
             handler=NepFileMoniter(os.path.join(directory,"loss.out"),self.run_in["generation"])

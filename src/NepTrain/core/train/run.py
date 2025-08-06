@@ -7,6 +7,7 @@
 自动训练的逻辑
 """
 import os.path
+import shutil
 import subprocess
 import asyncio
 from pathlib import Path
@@ -31,8 +32,10 @@ def filter_file_path(forward_files):
         if os.path.exists(forward_file):
             new_files.append(forward_file)
     return new_files
-
-
+def relpath_from_files(files, start):
+    if isinstance(files, (list, tuple)):
+        return [os.path.relpath(file,start) for file in files]
+    return os.path.relpath(files, start)
 PARAMS = Tuple[str,list ]
 
 
@@ -83,13 +86,14 @@ def params2str(params):
         else:
             text += str(i)
         text += " "
+    print(text)
     return text
 
 class NepTrainWorker:
     pass
     def __init__(self):
         self.config={}
-        self.job_list=["nep","gpumd","select","vasp","pred", ]
+        self.job_list=["nep","gpumd","select","dft","pred", ]
         self.manager=Manager(self.job_list)
 
 
@@ -139,14 +143,15 @@ class NepTrainWorker:
 
 
 
-    def split_vasp_job_xyz(self,xyz_file):
+    def split_dft_job_xyz(self,xyz_file):
         addxyz = ase_read(xyz_file, ":", format="extxyz")
 
-        split_addxyz_list = utils.split_list(addxyz, self.config["vasp_job"])
+        split_addxyz_list = utils.split_list(addxyz, self.config["dft_job"])
+
 
         for i, xyz in enumerate(split_addxyz_list):
             if xyz:
-                ase_write(self.__getattr__(f"vasp_learn_add_{i + 1}_xyz_file"), xyz, format="extxyz")
+                ase_write(self.__getattr__(f"dft_learn_add_{i + 1}_xyz_file"), xyz, format="extxyz")
 
     def check_env(self):
 
@@ -159,15 +164,15 @@ class NepTrainWorker:
 
             return
 
-        if self.config["current_job"]=="vasp":
+        if self.config["current_job"]=="dft":
 
             self.generation=0
-            utils.copy(self.config["init_train_xyz"], self.vasp_learn_add_xyz_file)
+            utils.copy(self.config["init_train_xyz"], self.dft_learn_add_xyz_file)
 
-            if self.config["vasp_job"] != 1:
+            if self.config["dft_job"] != 1:
 
 
-                self.split_vasp_job_xyz(self.config["init_train_xyz"])
+                self.split_dft_job_xyz(self.config["init_train_xyz"])
         elif self.config["current_job"]=="nep":
            
 
@@ -184,7 +189,7 @@ class NepTrainWorker:
             else:
                 raise FileNotFoundError("Starting task as gpumd requires specifying a valid potential function path!")
         else:
-            raise ValueError("current_job can only be one of nep, gpumd, or vasp.")
+            raise ValueError("current_job can only be one of nep, gpumd, or dft.")
 
     def read_config(self,config_path):
         if not os.path.exists(config_path):
@@ -193,24 +198,34 @@ class NepTrainWorker:
 
 
             self.config=YAML().load(f )
-
+        if self.config["dft"]["incar_path"]=="auto":
+            if self.config["dft"]["software"]=="abacus":
+                self.config["dft"]["incar_path"]="./INPUT"
+            else:
+                self.config["dft"]["incar_path"]="./INCAR"
+            
     def build_pred_params(self):
         nep=self.config["nep"]
+
+        utils.copy(nep.get("nep_in_path"), self.pred_nep_in_file)
+        utils.copy(self.nep_nep_txt_file, self.pred_nep_txt_file)
+        utils.copy(self.all_learn_calculated_xyz_file, self.pred_train_xyz_file)
+
         params=[]
         params.append("NepTrain")
         params.append("nep")
 
         params.append("--directory")
-        params.append(self.pred_path)
+        params.append("./")
 
         params.append("--in")
-        params.append((nep.get("nep_in_path")))
+        params.append("nep.in")
 
         params.append("--train")
-        params.append(self.all_learn_calculated_xyz_file)
+        params.append("train.xyz")
 
         params.append("--nep")
-        params.append(self.nep_nep_txt_file)
+        params.append("nep.txt")
 
         params.append("--prediction")
 
@@ -219,27 +234,32 @@ class NepTrainWorker:
 
     def build_nep_params(self) :
         nep=self.config["nep"]
+
+        utils.copy(self.last_improved_train_xyz_file, self.nep_train_xyz_file)
+        utils.copy(nep.get("nep_in_path"), self.nep_nep_in_file)
+        utils.copy(nep.get("test"), self.nep_test_xyz_file)
+        utils.copy(self.last_nep_nep_restart_file, self.nep_nep_restart_file)
+
         params=[]
         params.append("NepTrain")
         params.append("nep")
 
         params.append("--directory")
-        params.append(self.nep_path)
+        params.append("./")
 
         params.append("--in")
-        # params.append("nep.in")
+        params.append("nep.in")
 
-        params.append((nep.get("nep_in_path")))
 
         params.append("--train")
-        # params.append("train.xyz")
+        params.append("train.xyz")
 
-        params.append(self.last_improved_train_xyz_file)
+        # params.append(relpath_from_files(self.last_improved_train_xyz_file,self.nep_path))
 
         params.append("--test")
-        # params.append("test.xyz")
-
-        params.append((nep.get("test_xyz_path")))
+        params.append("test.xyz")
+        #
+        # params.append(relpath_from_files(nep.get("test_xyz_path"),self.nep_path))
 
         if self.config["nep"]["nep_restart"] and self.generation not in [1,len(self.config["gpumd"]["step_times"])+1]:
             #开启续跑
@@ -247,30 +267,36 @@ class NepTrainWorker:
 
             if os.path.exists(self.last_nep_nep_restart_file):
                 utils.print_tip("Start the restart mode!")
-
-
                 params.append("--restart_file")
-                params.append(self.last_nep_nep_restart_file)
+                params.append("nep.restart")
+                # params.append(relpath_from_files(self.last_nep_nep_restart_file,self.nep_path))
                 params.append("--continue_step")
                 params.append(self.config["nep"]["nep_restart_step"])
 
         return params2str(params)
     def build_gpumd_params(self,model_path,temperature,n_job=1,):
         gpumd=self.config["gpumd"]
+        base_name = os.path.basename(model_path)
+        utils.copy(model_path, os.path.join(self.gpumd_path, base_name))
+
+        utils.copy(gpumd.get("run_in_path"), self.gpumd_run_in_file)
+
+        utils.copy(self.nep_nep_txt_file, self.gpumd_nep_txt_file)
+
         params=[]
         params.append("NepTrain")
         params.append("gpumd")
 
-        params.append((model_path))
+        params.append(base_name)
 
         params.append("--directory")
 
-        params.append(self.gpumd_path)
+        params.append("./")
 
         params.append("--in")
-        params.append((gpumd.get("run_in_path")))
+        params.append("run.in")
         params.append("--nep")
-        params.append( self.nep_nep_txt_file)
+        params.append( "nep.txt")
         params.append("--time")
         params.append(gpumd.get("step_times")[self.generation-1])
 
@@ -282,7 +308,7 @@ class NepTrainWorker:
 
 
         params.append("--out")
-        params.append(self.__getattr__(f"select_md_{n_job}_xyz_file"))
+        params.append( f"trajectory_{n_job}.xyz")
 
 
 
@@ -290,24 +316,28 @@ class NepTrainWorker:
         return params2str(params)
     def build_select_params(self):
         select=self.config["select"]
+        utils.copy(self.nep_nep_txt_file, self.select_nep_txt_file)
+
+        utils.copy(self.nep_train_xyz_file, self.select_train_xyz_file)
+
         params=[]
         params.append("NepTrain")
         params.append("select")
         #总的
-        # params.append(self.select_all_md_dummp_xyz_file)
+        params.append("trajectorys.xyz")
         #分开
-        params.append(self.__getattr__(f"select_md_*_xyz_file"))
+        # params.append(relpath_from_files(self.__getattr__(f"select_md_*_xyz_file"),self.select_path ))
         params.append("--nep")
-        params.append( self.nep_nep_txt_file)
+        params.append( relpath_from_files(self.select_nep_txt_file,self.select_path ))
 
         params.append("--base")
-        params.append( self.nep_train_xyz_file )
+        params.append( relpath_from_files(self.select_train_xyz_file ,self.select_path ))
         params.append("--max_selected")
         params.append(select["max_selected"])
         params.append("--min_distance")
         params.append(select["min_distance"])
         params.append("--out")
-        params.append(self.select_selected_xyz_file)
+        params.append(relpath_from_files(self.select_selected_xyz_file,self.select_path ))
 
         if select.get("filter",False):
 
@@ -316,55 +346,62 @@ class NepTrainWorker:
 
 
         return params2str(params)
-    def build_vasp_params(self,n_job=1):
-        vasp=self.config["vasp"]
+
+
+    def build_dft_params(self,n_job=1):
+        dft=self.config["dft"]
+
+        shutil.copy(dft["incar_path"], self.dft_path)
+
         params=[]
         params.append("NepTrain")
-        params.append("vasp")
+        params.append("dft")
 
-        if self.config["vasp_job"] == 1:
+        if self.config["dft_job"] == 1:
 
-            if not os.path.exists(self.vasp_learn_add_xyz_file):
+            if not os.path.exists(self.dft_learn_add_xyz_file):
                 return None
-            params.append(self.vasp_learn_add_xyz_file)
+            params.append(relpath_from_files(self.dft_learn_add_xyz_file,self.dft_path ))
         else:
-            path=self.__getattr__(f"vasp_learn_add_{n_job}_xyz_file")
+            path=self.__getattr__(f"dft_learn_add_{n_job}_xyz_file")
             if not os.path.exists(path):
                 return None
-            params.append(path)
+            params.append(relpath_from_files(path,self.dft_path ))
 
         params.append("--directory")
 
-        params.append(self.__getattr__(f"vasp_cache{n_job}_path"))
+        params.append(relpath_from_files(self.__getattr__(f"dft_cache{n_job}_path"),self.dft_path ))
 
 
         params.append("-np")
-        params.append(vasp["cpu_core"])
-        if vasp["kpoints_use_gamma"]:
+        params.append(dft["cpu_core"])
+        if dft["kpoints_use_gamma"]:
             params.append("--gamma")
 
-        if vasp["incar_path"]:
+        if dft["incar_path"]:
 
-            params.append("--incar")
-            params.append((vasp["incar_path"]))
-        if vasp["use_k_stype"]=="kpoints":
-            if vasp.get("kpoints"):
+            params.append("--in")
+
+            params.append(os.path.basename(dft["incar_path"]))
+        if dft["use_k_stype"] == "kpoints":
+            if dft.get("kpoints"):
                 params.append("-ka")
-                if isinstance(vasp["kpoints"],list):
-                    params.append(",".join([str(i) for i in vasp["kpoints"]]))
+                if isinstance(dft["kpoints"],list):
+                    params.append(",".join([str(i) for i in dft["kpoints"]]))
                 else:
-                    params.append(vasp["kpoints"])
+                    params.append(dft["kpoints"])
         else:
 
-            if vasp.get("kspacing") :
+            if dft.get("kspacing") :
                 params.append("--kspacing")
-                params.append(vasp["kspacing"])
+                params.append(dft["kspacing"])
+        # params.append("--software")
+        params.append("--" + dft["software"])
         params.append("--out")
-        params.append( self.__getattr__(f"vasp_learn_calculated_{n_job}_xyz_file"))
+        params.append( relpath_from_files(self.__getattr__(f"dft_learn_calculated_{n_job}_xyz_file"),self.dft_path ))
 
 
         return params2str(params)
-
     def sub_select(self):
         # utils.cat(self.__getattr__(f"select_md_*_xyz_file"),
         #           self.select_all_md_dummp_xyz_file
@@ -373,10 +410,10 @@ class NepTrainWorker:
 
         cmd = self.build_select_params()
 
-        forward_files = filter_file_path([self.select_path,
+        forward_files = relpath_from_files(filter_file_path([self.select_path,
                          self.nep_nep_txt_file,
                          self.nep_train_xyz_file
-                         ])
+                         ]),self.select_path)
         submit_job(
             machine_dict=self.config["select"]["machine"],
             resources_dict=self.config["select"]["resources"],
@@ -384,16 +421,16 @@ class NepTrainWorker:
                 dict(
                     command=cmd,
                     task_work_path="./",
-                    forward_files=forward_files,
-                    backward_files=[
+                    forward_files=["./*"],
+                    backward_files=relpath_from_files([
                         self.select_selected_xyz_file,
                         self.select_selected_png_file,
                                     self.__getattr__(f"select_selected_md_*_*_file")
-                                    ],
+                                    ],self.select_path),
                 )
             ],
             submission_dict=dict(
-                work_base="./",
+                work_base=self.select_path,
                 forward_common_files=[],
                 backward_common_files=[],
 
@@ -403,48 +440,60 @@ class NepTrainWorker:
 
 
         utils.cat(self.select_selected_xyz_file,
-                  self.vasp_learn_add_xyz_file
+                  self.dft_learn_add_xyz_file
                   )
 
 
 
 
 
-    def sub_vasp(self):
+    def sub_dft(self):
         utils.print_msg("Beginning the execution of VASP for single-point energy calculations.")
         # break
 
-        if not utils.is_file_empty(self.vasp_learn_add_xyz_file):
-
-            if self.config["vasp_job"] != 1:
+        if not utils.is_file_empty(self.dft_learn_add_xyz_file):
+            if self.config["dft"]["software"] == "abacus":
+                from NepTrain.core.dft.abacus import StructureVar
+                StructureVar.init(self.config["gpumd"]["model_path"])
+                StructureVar.init("./")
+                for pp in StructureVar.pp_files.values():
+                    curr_p=f"./{pp}"
+                    stru_p=f'{self.config["gpumd"]["model_path"]}/{pp}'
+                    if os.path.exists(curr_p):
+                        shutil.copy(curr_p,self.dft_path)
+                    elif os.path.exists(stru_p):
+                        shutil.copy(stru_p,self.dft_path)
+                for orb in StructureVar.orbs.values():
+                    curr_orb=f"./{orb}"
+                    stru_orb=f'{self.config["gpumd"]["model_path"]}/{orb}'
+                    if os.path.exists(curr_orb):
+                        shutil.copy(curr_orb,self.dft_path)
+                    elif os.path.exists(stru_orb):
+                        shutil.copy(stru_orb,self.dft_path)
+            if self.config["dft_job"] != 1:
                 # Split xyz for parallel submission
-                self.split_vasp_job_xyz(self.vasp_learn_add_xyz_file)
+                self.split_dft_job_xyz(self.dft_learn_add_xyz_file)
 
             tasks = []
-            for i in range(self.config["vasp_job"]):
-                cmd = self.build_vasp_params(i + 1)
+            for i in range(self.config["dft_job"]):
+                cmd = self.build_dft_params(i + 1)
                 if cmd is None:
                     continue
 
                 tasks.append(
                     async_submit_job(
-                        machine_dict=self.config["vasp"]["machine"],
-                        resources_dict=self.config["vasp"]["resources"],
+                        machine_dict=self.config["dft"]["machine"],
+                        resources_dict=self.config["dft"]["resources"],
                         task_dict_list=[
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=filter_file_path([
-                                    self.config["vasp"]["incar_path"],
-                                    self.vasp_learn_add_xyz_file,
-                                    self.__getattr__(f"vasp_learn_add_{i +1}_xyz_file")
-
-                                ]),
-                                backward_files=[self.__getattr__(f"vasp_learn_calculated_{i +1}_xyz_file")],
+                                forward_files=["./*"],
+                                backward_files=[f"learn_calculated_{i +1}.xyz"],
                             )
                         ],
                         submission_dict=dict(
-                            work_base="./",
+                            work_base=self.dft_path,
                             forward_common_files=[],
                             backward_common_files=[],
                         ),
@@ -454,9 +503,8 @@ class NepTrainWorker:
             if tasks:
                 asyncio.run(_await_tasks(tasks))
 
-            utils.cat(self.__getattr__(f"vasp_learn_calculated_*_xyz_file"),
+            utils.cat(self.__getattr__(f"dft_learn_calculated_*_xyz_file"),
                       self.all_learn_calculated_xyz_file
-
                       )
             if self.config.get("limit",{}).get("force") and not utils.is_file_empty(self.all_learn_calculated_xyz_file):
                 bad_structure = []
@@ -476,10 +524,8 @@ class NepTrainWorker:
         else:
             utils.print_warning("Detected that the calculation input file is empty, proceeding directly to the next step!")
 
-            utils.cat(self.vasp_learn_add_xyz_file,
+            utils.cat(self.dft_learn_add_xyz_file,
                       self.all_learn_calculated_xyz_file
-
-
                       )
 
     def sub_nep(self):
@@ -498,13 +544,10 @@ class NepTrainWorker:
             else:
                 utils.copy(self.last_all_learn_calculated_xyz_file,
                             self.last_improved_train_xyz_file)
+
             utils.print_msg(f"Starting to train the potential function.")
             cmd = self.build_nep_params()
-            forward_files = filter_file_path([self.config["nep"].get("nep_in_path"),
-                             self.last_improved_train_xyz_file,
-                             self.config["nep"].get("test_xyz_path"),
-                             self.last_nep_nep_restart_file
-             ] )
+
 
             submit_job(
                 machine_dict = self.config["nep"]["machine"],
@@ -513,12 +556,14 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files= forward_files,
-                        backward_files = [self.nep_path],
+                        forward_files= ["./*"],
+                        backward_files = [
+                            "./*"
+                        ],
                     )
                 ],
                 submission_dict = dict(
-                    work_base="./",
+                    work_base=self.nep_path,
                     forward_common_files=[],
                     backward_common_files=[],
 
@@ -546,16 +591,12 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files=filter_file_path([
-                            self.nep_nep_txt_file,
-                            self.all_learn_calculated_xyz_file,
-                            self.config["nep"].get("nep_in_path")
-                        ]),
-                        backward_files=[self.pred_path],
+                        forward_files=["./*"],
+                        backward_files=["./*"],
                     )
                 ],
                 submission_dict=dict(
-                    work_base="./",
+                    work_base=self.pred_path,
                     forward_common_files=[],
                     backward_common_files=[],
                 ),
@@ -574,6 +615,7 @@ class NepTrainWorker:
                     temp,
                     i,
                 )
+                base_name=os.path.basename(self.config["gpumd"].get("model_path"))
                 tasks.append(
                     async_submit_job(
                         machine_dict=self.config["gpumd"]["machine"],
@@ -582,17 +624,12 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=filter_file_path([
-                                    self.config["gpumd"]["model_path"],
-                                    self.config["gpumd"].get("run_in_path"),
-                                    self.nep_nep_txt_file
-
-                                ]),
-                                backward_files=[self.__getattr__(f"select_md_{i}_xyz_file")],
+                                forward_files=["run.in","nep.txt",base_name],
+                                backward_files=[f"./trajectory_{i}.xyz"],
                             )
                         ],
                         submission_dict=dict(
-                            work_base="./",
+                            work_base=self.gpumd_path,
                             forward_common_files=[],
                             backward_common_files=[],
                         ),
@@ -608,23 +645,18 @@ class NepTrainWorker:
                     )
                     tasks.append(
                         async_submit_job(
-                            machine_dict=self.config["nep"]["machine"],
-                            resources_dict=self.config["nep"]["resources"],
+                            machine_dict=self.config["gpumd"]["machine"],
+                            resources_dict=self.config["gpumd"]["resources"],
                             task_dict_list=[
                                 dict(
                                     command=cmd,
                                     task_work_path="./",
-                                    forward_files=filter_file_path([
-                                    os.path.join(self.config["gpumd"]["model_path"], file),
-                                    self.config["gpumd"].get("run_in_path"),
-                                    self.nep_nep_txt_file
-
-                                    ]),
-                                    backward_files=[self.gpumd_path],
+                                    forward_files=["run.in","nep.txt",file],
+                                    backward_files=[f"./trajectory_{i}.xyz"],
                                 )
                             ],
                             submission_dict=dict(
-                                work_base="./",
+                                work_base= self.gpumd_path,
                                 forward_common_files=[],
                                 backward_common_files=[],
                             ),
@@ -633,8 +665,9 @@ class NepTrainWorker:
         if tasks:
             asyncio.run(_await_tasks(tasks))
 
-
-
+        utils.cat(self.__getattr__(f"gpumd_trajectory_*_xyz_file"),
+                  self.select_trajectorys_xyz_file
+                  )
 
 
     def start(self,config_path):
@@ -654,9 +687,9 @@ class NepTrainWorker:
             # utils.print_msg(f"[Generation {self.generation}] Starting job: {job}")
             self.config["current_job"]=job
             self.save_restart()
-            if job=="vasp":
+            if job=="dft":
 
-                self.sub_vasp()
+                self.sub_dft()
 
             elif job=="pred":
 
@@ -700,4 +733,4 @@ if __name__ == '__main__':
     train.config["work_path"]="./cache"
     print(train.nep_path)
 
-    print(train.__getattr__(f"vasp_learn_calculated_*_xyz_file"))
+    print(train.__getattr__(f"dft_learn_calculated_*_xyz_file"))

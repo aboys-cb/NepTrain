@@ -21,7 +21,7 @@ nep:
     gpu_per_node: 1
     group_size: 1
 
-vasp:
+dft:
 
   machine:
     context_type: "Bohrium"
