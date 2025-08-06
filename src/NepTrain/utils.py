@@ -86,11 +86,19 @@ def verify_path(path):
         os.makedirs(os.path.expanduser(path))
 
 def copy(rc, dst,   follow_symlinks=True):
+    if  rc is None or not os.path.exists(rc):
+        return
 
     parent_path=(os.path.dirname(dst))
     if not os.path.exists(parent_path):
         os.makedirs(parent_path)
-    shutil.copy(rc, dst,  follow_symlinks=follow_symlinks)
+    if os.path.isdir(rc):
+        shutil.copytree(rc, dst ,dirs_exist_ok=True)
+    else:
+        try:
+            shutil.copy(rc, dst,  follow_symlinks=follow_symlinks)
+        except shutil.SameFileError:
+            pass
 def copy_files(src_dir, dst_dir):
     # 遍历源目录中的所有文件
     for filename in os.listdir(src_dir):

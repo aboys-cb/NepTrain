@@ -1,9 +1,9 @@
 version: 1.4.3
-vasp_job: 10 #The number of tasks submitted when calculating single-point energy with VASP.
+dft_job: 10 #The number of tasks submitted when calculating single-point energy with DFT.
 #所有任务提交的根目录
 gpumd_split_job: temperature  #Split gpumd tasks by temperature or structure
 work_path: ./cache  #Root directory for all task submissions.
-current_job: nep  #If the current_job has three states: nep, gpumd, vasp, and if train.xyz has not been calculated, set it to vasp; otherwise, directly set it to use nep to train the potential function, or use gpumd.
+current_job: nep  #If the current_job has three states: nep, gpumd, dft, and if train.xyz has not been calculated, set it to vasp; otherwise, directly set it to use nep to train the potential function, or use gpumd.
 generation: 1  #Marking resume tasks.
 init_train_xyz: ./train.xyz  #Initial training set; if not calculated, set current_job to vasp.
 init_nep_txt: ./nep.txt  #If current_job is set to gpumd, a potential function must be provided; otherwise, it can be ignored.
@@ -18,20 +18,20 @@ nep:
   nep_in_path: ./nep.in
   #Optional
   test_xyz_path: test.xyz
-vasp:
-
+dft:
+  software: vasp #you can switch vasp or abacus
   cpu_core: 64
   kpoints_use_gamma: true  #ASE defaults to using M-point k-mesh, but here we default to using the gamma-centered grid; this can be set to false.
 
-  incar_path: ./INCAR
+  incar_path: auto  #A path should be passed in. If it is auto, the corresponding file name will be switched according to the software, such as INCAR or INPUT
 
-  use_k_stype: kpoints
+  use_k_stype: kspacing
   #--ka
   kpoints:
     - 20 #a
     - 20 #b
     - 20 #c
-  kspacing: 0.1
+  kspacing: 0.2
 gpumd:
 #Time for iterative progressive learning in units of picoseconds.
 #The first active learning is at 10ps, the second at 100ps, with a total of four active learning sessions.

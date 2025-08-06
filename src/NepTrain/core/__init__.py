@@ -9,5 +9,5 @@ from .nep import run_nep
 from .perturb import run_perturb
 from .template import init_template
 from .train import train_nep
-from .vasp import run_vasp
+from .dft import run_vasp,run_dft
 from .select import run_select
