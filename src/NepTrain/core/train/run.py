@@ -26,10 +26,10 @@ async def _await_tasks(tasks):
     """Helper coroutine to run multiple async tasks."""
     await asyncio.gather(*tasks)
 
-def filter_file_path(forward_files):
+def filter_file_path(forward_files,base_dir=""):
     new_files = []
     for forward_file in forward_files:
-        if os.path.exists(forward_file):
+        if os.path.exists(os.path.join(base_dir,forward_file)):
             new_files.append(forward_file)
     return new_files
 def relpath_from_files(files, start):
@@ -407,13 +407,18 @@ class NepTrainWorker:
         #           self.select_all_md_dummp_xyz_file
         #           )
         utils.print_msg(f"Start sampling from the trajectory.")
+        utils.cat(self.__getattr__(f"gpumd_trajectory_*_xyz_file"),
+                  self.select_trajectorys_xyz_file
+                  )
+
+        if utils.is_file_empty(self.select_trajectorys_xyz_file):
+            utils.print_warning(f"No trajectory file, skip sampling")
+
+            return
 
         cmd = self.build_select_params()
 
-        forward_files = relpath_from_files(filter_file_path([self.select_path,
-                         self.nep_nep_txt_file,
-                         self.nep_train_xyz_file
-                         ]),self.select_path)
+
         submit_job(
             machine_dict=self.config["select"]["machine"],
             resources_dict=self.config["select"]["resources"],
@@ -421,7 +426,7 @@ class NepTrainWorker:
                 dict(
                     command=cmd,
                     task_work_path="./",
-                    forward_files=["nep.txt", "*.xyz"],
+                    forward_files=filter_file_path(["nep.txt", "train.xyz","trajectorys.xyz"]),
                     backward_files=relpath_from_files([
                         self.select_selected_xyz_file,
                         self.select_selected_png_file,
@@ -493,7 +498,7 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=forward_files,
+                                forward_files=filter_file_path(forward_files),
                                 backward_files=[f"learn_calculated_{i +1}.xyz"],
                             )
                         ],
@@ -561,7 +566,7 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files= ["nep.in","nep.restart","train.xyz","test.xyz"],
+                        forward_files= filter_file_path(["nep.in","nep.restart","train.xyz","test.xyz"]),
                         backward_files = [
                             "./*"
                         ],
@@ -596,7 +601,7 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files=["nep.in","nep.txt","train.xyz"],
+                        forward_files=filter_file_path(["nep.in","nep.txt","train.xyz"]),
                         backward_files=["./*"],
                     )
                 ],
@@ -611,6 +616,8 @@ class NepTrainWorker:
 
 
     def sub_gpumd(self):
+
+
         utils.print_msg(f"Starting active learning.")
         tasks = []
         if self.config.get("gpumd_split_job", "temperature") == "temperature":
@@ -629,7 +636,7 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=["run.in","nep.txt",base_name],
+                                forward_files=filter_file_path(["run.in","nep.txt",base_name]),
                                 backward_files=[f"./trajectory_{i}.xyz"],
                             )
                         ],
@@ -670,9 +677,9 @@ class NepTrainWorker:
         if tasks:
             asyncio.run(_await_tasks(tasks))
 
-        utils.cat(self.__getattr__(f"gpumd_trajectory_*_xyz_file"),
-                  self.select_trajectorys_xyz_file
-                  )
+        # utils.cat(self.__getattr__(f"gpumd_trajectory_*_xyz_file"),
+        #           self.select_trajectorys_xyz_file
+        #           )
 
 
     def start(self,config_path):
@@ -708,9 +715,13 @@ class NepTrainWorker:
                    utils.print_success("Training completed!")
                    break
             elif job=="select":
+
                 self.sub_select()
 
             else:
+                if utils.is_file_empty(self.nep_nep_txt_file):
+                    utils.print_warning(f"No potential function available, break!!!")
+                    break
                 self.sub_gpumd()
 
             # utils.print_msg(f"[Generation {self.generation}] Finished job: {job}")

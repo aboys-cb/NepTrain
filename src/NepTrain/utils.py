@@ -123,7 +123,7 @@ def remove_file_by_re(src):
 def cat(files,out_file):
 
 
-    # 获取所有以 'file' 开头的文件名
+    #
     if isinstance(files,str):
         file_list = glob.glob(files)
     else:

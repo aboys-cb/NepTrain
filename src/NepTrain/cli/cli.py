@@ -37,7 +37,7 @@ def build_init(subparsers):
     )
     parser_init.add_argument("type",
                              type=str,
-                            choices=["bohrium","slurm","pbs","local"],default="slurm",
+                            choices=["bohrium","slurm","pbs","shell"],default="slurm",
                              help="How to call a task")
 
     parser_init.add_argument("-f", "--force", action='store_true',

@@ -1,0 +1,103 @@
+
+nep:
+  #machine resources字段可参考dpdispatcher的输入内容
+  machine:
+    #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/context.html
+    context_type: "LazyLocal"
+    #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/batch.html
+    batch_type: "Shell"
+    local_root: "./"
+    remote_root: "~/neptrain/"
+    remote_profile:
+      hostname: ""
+      username: ""
+      key_filename: ""
+      port: 22
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+ 
+ 
+
+    prepend_script:
+      - "module load gpumd/master"
+
+
+
+dft:
+
+  machine:
+    context_type: "LazyLocal"
+    batch_type: "Shell"
+    local_root: "./"
+    remote_root: "~/neptrain/"
+    remote_profile:
+      hostname: ""
+      username: ""
+      key_filename: ""
+      port: 22
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+
+
+    prepend_script:
+
+      - "module load vasp/6.4.2-nvhpc24.3-ompi5.0.7"
+
+gpumd:
+  machine:
+    context_type: "LazyLocal"
+    batch_type: "Shell"
+    local_root: "./"
+    remote_root: "~/neptrain/"
+    remote_profile:
+      hostname: ""
+      username: ""
+      key_filename: ""
+      port: 22
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+
+
+    prepend_script:
+
+      - "module load gpumd/master"
+
+
+select:
+  machine:
+    context_type: "LazyLocal"
+    batch_type: "Shell"
+    local_root: "./"
+    remote_root: "~/neptrain/"
+    remote_profile:
+      hostname: ""
+      username: ""
+      key_filename: ""
+      port: 22
+
+
+  resources:
+    #Select mainly uses CPU
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+
+
+
+
