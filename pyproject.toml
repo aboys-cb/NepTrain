@@ -44,8 +44,9 @@ dependencies = [
 "ruamel.yaml",
 "dscribe",
 "umap-learn>=0.5.7",
-    "tqdm",
-    "joblib"
+"tqdm",
+"joblib",
+"dpdispatcher"
 ]
 
 
