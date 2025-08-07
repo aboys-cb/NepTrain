@@ -20,6 +20,10 @@ def get_job_config(job_type):
     job = utils.merge_yaml(base_config, type_config)
     return job
 def init_template(argparse):
+    if argparse.type=="bohrium":
+        utils.print_tip("To use Bohrium, you must install the extra module with 'pip install dpdispatcher[bohrium]'.")
+
+
     if not argparse.force:
         utils.print_tip("For existing files, we choose to skip; if you need to forcibly generate and overwrite, please use -f or --force.")
 
