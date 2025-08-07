@@ -23,17 +23,13 @@ If the filenames are incorrect, please specify them using the appropriate parame
   Path to potential function file. Default: `./nep.txt`.
 - `-t, --time`  
   Molecular dynamics simulation time (ps). Default: `10`.
-- `-T, --temperature`  
+- `-T, --temperature`
   Simulation temperature(s) (K). Default: `300`.
-- `-f, --filter`  
-  Whether to filter based on minimum bond length. Default: `True`.
-- `-o, --out`  
+- `-o, --out`
   Output file for trajectory. Default: `./trajectory.xyz`.
 
 ## Output
-GPUMD will output files in the `directory` (default is `./cache/gpumd`). In addition to GPUMD's standard output files, we also generate an energy vs. step plot, `md_energy.png`.  
-
-If the `filter` option is enabled, an additional file containing filtered-out nonphysical structures, `remove_by_bond_structures.xyz`, will also be generated.
+GPUMD will output files in the `directory` (default is `./cache/gpumd`) along with GPUMD's standard output files. The resulting trajectories are saved to the path specified by `--out`.
 
 
 

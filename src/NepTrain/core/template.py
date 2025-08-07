@@ -8,52 +8,8 @@ import os.path
 from ase.io import read as ase_read
 from ruamel.yaml import YAML
 
-from NepTrain import module_path, utils,__version__
+from NepTrain import module_path, utils, __version__
 from .utils import check_env
-
-
-def create_vasp(force):
-    if   os.path.exists("./sub_vasp.sh") and not force:
-        return
-    utils.print_warning("Please check the queue information and environment settings in sub_vasp.sh!")
-
-    sub_vasp="""#! /bin/bash
-#SBATCH --job-name=NepTrain
-#SBATCH --nodes=1
-#SBATCH --partition=cpu
-#SBATCH --ntasks-per-node=64
-#You can place some environment loading commands here.
-
-
-
-#eg conda activate NepTrain
-
-$@ 
-
-#NepTrain vasp demo.xyz -np 64 --directory ./cache -g --incar=./INCAR --kpoints 35 -o ./result/result.xyz 
-"""
-
-    with open("./sub_vasp.sh", "w",encoding="utf8") as f:
-        f.write(sub_vasp)
-
-
-def create_nep(force):
-    if os.path.exists("./sub_gpu.sh") and not force:
-        return
-    utils.print_warning("Please check the queue information and environment settings in sub_gpu.sh!")
-
-    sub_vasp = """#! /bin/bash
-#SBATCH --job-name=NepTrain-gpu
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --partition=gpu-a800
-#SBATCH --gres=gpu:1
-#You can place some environment loading commands here.
-
- 
-$@ """
-    with open("./sub_gpu.sh", "w", encoding="utf8") as f:
-        f.write(sub_vasp)
 
 def get_job_config(job_type):
     with open(os.path.join(module_path, "core/train/_template/job.yaml"), "r", encoding="utf8") as f:
@@ -71,8 +27,6 @@ def init_template(argparse):
         os.mkdir("./structure")
         utils.print_tip("Create the directory ./structure, please place the expanded structures that need to run MD into this folder!" )
     check_env()
-    # create_vasp(argparse.force)
-    # create_nep(argparse.force)
     if not os.path.exists("./job.yaml") or argparse.force:
         utils.print_tip("You need to check and modify the vasp_job and vasp.cpu_core in the job.yaml file.")
         utils.print_warning("You also need to check and modify the settings for GPUMD active learning in job.yaml!")

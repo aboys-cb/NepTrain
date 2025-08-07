@@ -152,12 +152,10 @@ All template files can be saved by yourself. And all template files can be saved
 :::
 First, we use the following command to initialize
 ```shell
-NepTrain init
+NepTrain init slurm
 <!-- Output is as follows: -->
 [2024-12-29 10:08:27.298365] --  For existing files, we choose to skip; if you need to forcibly generate and overwrite, please use -f or --force.
 [2024-12-29 10:08:27.302688] --  Create the directory ./structure, please place the expanded structures that need to run MD into this folder!
-[2024-12-29 10:08:27.312968] --  Please check the queue information and environment settings in sub_vasp.sh!
-[2024-12-29 10:08:27.317307] --  Please check the queue information and environment settings in sub_gpu.sh!
 [2024-12-29 10:08:27.320868] --  You need to check and modify the vasp_job and vasp.cpu_core in the job.yaml file.
 [2024-12-29 10:08:27.321411] --  You also need to check and modify the settings for GPUMD active learning in job.yaml!
 [2024-12-29 10:08:27.336706] --  Detected that there is no train.xyz in the current directory; please check the directory structure!
@@ -175,35 +173,7 @@ Let's take a look at the current directory:
 ├── run.in
 ├── structure/
 │   └── CsPbI3.vasp
-├── sub_gpu.sh
-├── sub_vasp.sh
 └── train.xyz
-```
-### Modify Submission Scripts
-The sub_gpu.sh is the script for submitting NEP and GPUMD, and the sub_vasp.sh is for submitting VASP.
-Here we only need to modify the queue information and the commands for initializing the environment.
-After modification, it is as follows:
-```shell
-#! /bin/bash
-#SBATCH --job-name=NepTrain
-#SBATCH --nodes=1
-#SBATCH --partition=cpu
-#SBATCH --ntasks-per-node=64 
-#You can place some environment loading commands here.
-source ~/.bashrc
-conda activate NepTrain
-$@ 
-```
-```shell
-#! /bin/bash
-#SBATCH --job-name=NepTrain-gpu
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-source ~/.bashrc
-conda activate NepTrain
-$@
 ```
 ### Modify MD Template [Optional]
 The default run.in  is for npt, and generally, only the `ensemble` needs to be modified, the program will automatically replace the temperature.
@@ -217,7 +187,7 @@ We will not explain each parameter in detail here, only showing how to modify ac
 
 #### VASP Calculation Details
 :::{tip}
-`cpu_core` should be unified with the number of cores applied for in `sub_vasp.sh`.
+`cpu_core` should match the number of CPU cores requested for VASP jobs on your cluster.
 :::
 To accelerate single-point energy calculations, we set the number of tasks through `vasp_job`, and the program will divide the tasks according to this number.
 This depends on your own computational resources.
