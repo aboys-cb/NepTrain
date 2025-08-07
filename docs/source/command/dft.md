@@ -40,6 +40,9 @@ To calculate single-point energies for all structures in the `structure` folder 
 NepTrain dft structure -g
 ```
 To run the same task with ABACUS and a custom input template:
+:::{tip}
+At present, the pseudopotential and orbital files must be placed in the working directory.
+::: 
 ```shell
 NepTrain dft structure --abacus --in ./INPUT
 ```
