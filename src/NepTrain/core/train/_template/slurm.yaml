@@ -24,13 +24,13 @@ nep:
       - "#SBATCH --qos=normal"
       - "#SBATCH --job-name=NepTrain-NEP"
 
-    prepend_script: [
-      "source /opt/envs/anaconda3.env",
-      "conda activate neptrain",
-      "module load cuda/12.4.1",
-      "module load gcc/12.4.0"
+    prepend_script:
+      - "source /opt/envs/anaconda3.env"
+      - "conda activate neptrain"
+      - "module load cuda/12.4.1"
+      - "module load gcc/12.4.0"
 
-    ]
+
 
 dft:
 
@@ -55,12 +55,12 @@ dft:
       - "#SBATCH --qos=normal"
       - "#SBATCH --job-name=NepTrain-NEP"
 
-    prepend_script: [
-      "source /opt/envs/anaconda3.env",
-      "conda activate neptrain",
-      "module load vasp/6.4.2-nvhpc24.3-ompi5.0.7"
+    prepend_script:
+      - "source /opt/envs/anaconda3.env"
+      - "conda activate neptrain"
+      - "module load vasp/6.4.2-nvhpc24.3-ompi5.0.7"
 
-    ]
+
 
 gpumd:
   machine:
@@ -84,12 +84,12 @@ gpumd:
       - "#SBATCH --qos=normal"
       - "#SBATCH --job-name=NepTrain-NEP"
 
-    prepend_script: [
-      "source /opt/envs/anaconda3.env",
-      "conda activate neptrain",
-      "module load cuda/12.4.1",
-      "module load gcc/12.4.0"
-    ]
+    prepend_script:
+      - "source /opt/envs/anaconda3.env"
+      - "conda activate neptrain"
+      - "module load cuda/12.4.1"
+      - "module load gcc/12.4.0"
+
 
 select:
   machine:
@@ -114,8 +114,8 @@ select:
       - "#SBATCH --qos=normal"
       - "#SBATCH --job-name=NepTrain-select"
 
-    prepend_script: [
-      "source /opt/envs/anaconda3.env",
-      "conda activate neptrain",
+    prepend_script:
+      - "source /opt/envs/anaconda3.env"
+      - "conda activate neptrain"
 
-    ]
+
