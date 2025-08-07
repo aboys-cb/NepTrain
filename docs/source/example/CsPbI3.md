@@ -154,14 +154,18 @@ First, we use the following command to initialize
 ```shell
 NepTrain init slurm
 <!-- Output is as follows: -->
-[2024-12-29 10:08:27.298365] --  For existing files, we choose to skip; if you need to forcibly generate and overwrite, please use -f or --force.
-[2024-12-29 10:08:27.302688] --  Create the directory ./structure, please place the expanded structures that need to run MD into this folder!
-[2024-12-29 10:08:27.320868] --  You need to check and modify the vasp_job and vasp.cpu_core in the job.yaml file.
-[2024-12-29 10:08:27.321411] --  You also need to check and modify the settings for GPUMD active learning in job.yaml!
-[2024-12-29 10:08:27.336706] --  Detected that there is no train.xyz in the current directory; please check the directory structure!
-[2024-12-29 10:08:27.337630] --  If there is a training set but the filename is not train.xyz, please unify the job.yaml.
-[2024-12-29 10:08:27.345471] --  Create run.in; you can modify the ensemble settings! Temperature and time will be modified by the program!
-[2024-12-29 10:08:27.351823] --  Initialization is complete. After checking the files, you can run `NepTrain train job.yaml` to proceed.
+[2025-08-07 19:35:53] --  For existing files, we choose to skip; if you need to forcibly generate and overwrite, please use -f or --force.
+[2025-08-07 19:35:53] --  Create the directory ./structure, please place the expanded structures that need to run MD into this folder!
+[2025-08-07 19:35:53] --  The environment variable vasp is not set. If you have set the environment in the submission script, please ignore this warning.
+[2025-08-07 19:35:53] --  The environment variable mpirun is not set. If you have set the environment in the submission script, please ignore this warning.
+[2025-08-07 19:35:53] --  The environment variable nep is not set. If you have set the environment in the submission script, please ignore this warning.
+[2025-08-07 19:35:53] --  The environment variable gpumd is not set. If you have set the environment in the submission script, please ignore this warning.
+[2025-08-07 19:35:53] --  You need to check and modify the vasp_job and vasp.cpu_core in the job.yaml file.
+[2025-08-07 19:35:53] --  You also need to check and modify the settings for GPUMD active learning in job.yaml!
+[2025-08-07 19:35:53] --  Detected that there is no train.xyz in the current directory; please check the directory structure!
+[2025-08-07 19:35:53] --  If there is a training set but the filename is not train.xyz, please unify the job.yaml.
+[2025-08-07 19:35:53] --  Create run.in; you can modify the ensemble settings! Temperature and time will be modified by the program!
+[2025-08-07 19:35:53] --  Initialization is complete. After checking the files, you can run `NepTrain train job.yaml` to proceed.
 ```
 Move `CsPbI3.vasp` to the `structure` directory created by the program:
 ```shell
@@ -187,7 +191,7 @@ We will not explain each parameter in detail here, only showing how to modify ac
 
 #### VASP Calculation Details
 :::{tip}
-`cpu_core` should match the number of CPU cores requested for VASP jobs on your cluster.
+`cpu_core` should match the number of CPU(GPU) cores requested for VASP jobs on your cluster.
 :::
 To accelerate single-point energy calculations, we set the number of tasks through `vasp_job`, and the program will divide the tasks according to this number.
 This depends on your own computational resources.
@@ -195,20 +199,20 @@ This depends on your own computational resources.
 In addition, all calculation details are specified through INCAR, and you can create your own INCAR and place it in this directory(the default working directory or the directory specified for `nep.in` in the `.yaml` file).
 We also need to modify the k-points selection. Here we choose the `kspacing` form. After modification, it is as follows:
 ```yaml
-vasp:
-
-  cpu_core: 64
+dft:
+  software: vasp #you can switch vasp or abacus
+  cpu_core: 1
   kpoints_use_gamma: true  #ASE defaults to using M-point k-mesh, but here we default to using the gamma-centered grid; this can be set to false.
 
-  incar_path: ./INCAR
+  incar_path: auto  #A path should be passed in. If it is auto, the corresponding file name will be switched according to the software, such as INCAR or INPUT
 
   use_k_stype: kspacing
   #--ka
   kpoints:
-    - 20 #a
-    - 20 #b
-    - 20 #c
-  kspacing: 0.1
+  - 20   #a
+  - 20   #b
+  - 20   #c
+  kspacing: 0.2
 ```
 :::{tip}
 Typically, a kspacing value of 0.2 is sufficient for common calculations. However, for metals, the k-point density needs to be increased. Usually, a kspacing value of 0.1 is much sufficient for metals.
@@ -241,7 +245,6 @@ gpumd:
     - 300
   model_path: ./structure
   run_in_path: ./run.in
-  filter_by_bonds: true  #Enable bond length detection, and determine structures with bond lengths below 60% of the equilibrium model bond lengths as non-physical structures.
 ```
 An additional note on `yaml` syntax.
    ```yaml
@@ -271,12 +274,12 @@ select:
 ```
 The complete modified `job.yaml` is as follows
 ```yaml
-version: 1.4.3
-queue: slurm #Select the queuing system, divided into Slurm and local.
-vasp_job: 10 #The number of tasks submitted when calculating single-point energy with VASP.
-#All task submission root directories
+version: 2.0.0
+dft_job: 10 #The number of tasks submitted when calculating single-point energy with DFT.
+#所有任务提交的根目录
+gpumd_split_job: temperature  #Split gpumd tasks by temperature or structure
 work_path: ./cache  #Root directory for all task submissions.
-current_job: vasp  #If the current_job has three states: nep, gpumd, vasp, and if train.xyz has not been calculated, set it to vasp; otherwise, directly set it to use nep to train the potential function, or use gpumd.
+current_job: nep  #If the current_job has three states: nep, gpumd, dft, and if train.xyz has not been calculated, set it to vasp; otherwise, directly set it to use nep to train the potential function, or use gpumd.
 generation: 1  #Marking resume tasks.
 init_train_xyz: ./train.xyz  #Initial training set; if not calculated, set current_job to vasp.
 init_nep_txt: ./nep.txt  #If current_job is set to gpumd, a potential function must be provided; otherwise, it can be ignored.
@@ -290,48 +293,154 @@ nep:
   #If there is no such file, the number of steps will be automatically generated based on the training set.
   nep_in_path: ./nep.in
   #Optional
-  test_xyz_path: ./test.xyz
-vasp:
+  test_xyz_path: test.xyz
+  machine:
+    #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/context.html
+    context_type: LazyLocal
+    #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/batch.html
+    batch_type: Slurm
+    local_root: ./
+    remote_root: ~/neptrain/
+    remote_profile:
+      hostname: ''
+      username: ''
+      key_filename: ''
+      port: 22
 
-  cpu_core: 64
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    custom_flags:
+    - '#SBATCH --qos=normal'
+    - '#SBATCH --job-name=NepTrain-NEP'
+
+    prepend_script:
+    - module load gpumd/4.2.0
+
+
+
+dft:
+  software: vasp #you can switch vasp or abacus
+  cpu_core: 1
   kpoints_use_gamma: true  #ASE defaults to using M-point k-mesh, but here we default to using the gamma-centered grid; this can be set to false.
 
-  incar_path: ./INCAR
+  incar_path: auto  #A path should be passed in. If it is auto, the corresponding file name will be switched according to the software, such as INCAR or INPUT
 
   use_k_stype: kspacing
   #--ka
   kpoints:
-    - 20 #a
-    - 20 #b
-    - 20 #c
-  kspacing: 0.1
+  - 20   #a
+  - 20   #b
+  - 20   #c
+  kspacing: 0.2
+  machine:
+    context_type: LazyLocal
+    batch_type: Slurm
+    local_root: ./
+    remote_root: ~/neptrain/
+    remote_profile:
+      hostname: ''
+      username: ''
+      key_filename: ''
+      port: 22
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    custom_flags:
+    - '#SBATCH --qos=normal'
+    - '#SBATCH --job-name=NepTrain-NEP'
+
+    prepend_script:
+    - module load vasp/6.4.2-nvhpc24.3-ompi5.0.7
+
+
+
 gpumd:
 #Time for iterative progressive learning in units of picoseconds.
 #The first active learning is at 10ps, the second at 100ps, with a total of four active learning sessions.
   step_times:
-    - 10
-    - 100
-    - 500
-    - 1000
+  - 10
+  - 100
+  - 500
+  - 1000
 #Each time active learning is performed, all structures in model_path will undergo molecular dynamics (MD) simulations at the following temperatures, followed by sampling.
   temperature_every_step:
-    - 50
-    - 100
-    - 150
-    - 200
-    - 250
-    - 300
+  - 50
+  - 100
+  - 150
+  - 200
+  - 250
+  - 300
   model_path: ./structure
   run_in_path: ./run.in
-  filter_by_bonds: true  #Enable bond length detection, and determine structures with bond lengths below 60% of the equilibrium model bond lengths as non-physical structures.
+
+  machine:
+    context_type: LazyLocal
+    batch_type: Slurm
+    local_root: ./
+    remote_root: ~/neptrain/
+    remote_profile:
+      hostname: ''
+      username: ''
+      key_filename: ''
+      port: 22
+
+
+  resources:
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    custom_flags:
+    - '#SBATCH --qos=normal'
+    - '#SBATCH --job-name=NepTrain-NEP'
+
+    prepend_script:
+    - module load gpumd/4.2.0
+
 
 select:
   #After completing this round of MD, a maximum of max_selected structures will be selected from all trajectories.
   max_selected: 80
   min_distance: 0.01   #Hyperparameters for farthest point sampling
+  filter: 0.6    #Passing a coefficient enables bond length detection, and bonds shorter than the sum of the covalent radii multiplied by the coefficient are considered unphysical structures.
+  machine:
+    context_type: LazyLocal
+    batch_type: Slurm
+    local_root: ./
+    remote_root: ~/neptrain/
+    remote_profile:
+      hostname: ''
+      username: ''
+      key_filename: ''
+      port: 22
+
+
+  resources:
+    #Select mainly uses CPU
+    number_node: 1
+    gpu_per_node: 1
+    queue_name: 8V100
+    group_size: 1
+    custom_flags:
+    - '#SBATCH --qos=normal'
+    - '#SBATCH --job-name=NepTrain-select'
+
+    prepend_script:
+    - source /opt/envs/anaconda3.env
+    - conda activate neptrain
+
 
 limit:
   force: 20  #Limit the force of the structure to between -force and force
+
 ```
 ## Start Training
 Execute the following command in the terminal of the login node
