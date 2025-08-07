@@ -43,7 +43,7 @@ myst_enable_extensions = [
 ]
 
 templates_path = ['_templates']
-# locale_dirs = ['docs/locales']  # 语言文件目录
+# locale_dirs = ['docs/locales']  # directory for language files
 language = 'en'
 
 
@@ -53,7 +53,7 @@ html_context = {
     "author_name": author,
 }
 html_css_files = [
-    'css/custom.css',  # 你可以在这里指定你的自定义 CSS 文件
+    'css/custom.css',  # specify your custom CSS file here
 ]
 
 source_suffix = {
