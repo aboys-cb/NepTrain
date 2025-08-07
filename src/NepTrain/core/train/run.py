@@ -421,7 +421,7 @@ class NepTrainWorker:
                 dict(
                     command=cmd,
                     task_work_path="./",
-                    forward_files=["./*"],
+                    forward_files=["nep.txt", "*.xyz"],
                     backward_files=relpath_from_files([
                         self.select_selected_xyz_file,
                         self.select_selected_png_file,
@@ -561,7 +561,7 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files= ["./*"],
+                        forward_files= ["nep.in","nep.restart","train.xyz","test.xyz"],
                         backward_files = [
                             "./*"
                         ],
@@ -596,7 +596,7 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files=["./*"],
+                        forward_files=["nep.in","nep.txt","train.xyz"],
                         backward_files=["./*"],
                     )
                 ],

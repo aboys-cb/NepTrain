@@ -14,7 +14,7 @@ nep:
       input_data:
         job_name: NepTrain nep job
         job_type: "container"
-        scass_type: "c8_m32_1 * NVIDIA V100"
+        scass_type: "1 * NVIDIA V100_32g"
         image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v13"
   resources:
     cpu: 4
@@ -36,7 +36,7 @@ dft:
       input_data:
         job_name: NepTrain vasp job
         job_type: "container"
-        scass_type: "1 * NVIDIA V100_32g"
+        scass_type: "4 * NVIDIA V100_32g"
         image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v13"
   resources:
     cpu: 4
@@ -56,7 +56,7 @@ gpumd:
       input_data:
         job_name: NepTrain gpumd job
         job_type: "container"
-        scass_type: "c8_m32_1 * NVIDIA V100"
+        scass_type: "1 * NVIDIA V100_32g"
         image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v13"
   resources:
     cpu: 4

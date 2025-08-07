@@ -9,7 +9,8 @@ import shutil
 import subprocess
 import traceback
 from contextlib import contextmanager
-from datetime import datetime
+import datetime
+
 from pathlib import Path
 from typing import Generator, Union
 
@@ -51,7 +52,7 @@ radius_table = {'H': 0.31, 'He': 0.28, 'Li': 1.28, 'Be': 0.96,
 
 def print(*msg, **kwargs):
 
-    get_console().print(f"[{datetime.now()}] -- ",*msg, **kwargs)
+    get_console().print(f"[{datetime.datetime.now().strftime( '%Y-%m-%d %H:%M:%S' )}] -- ",*msg, **kwargs)
 
 
 def print_warning(*msg):
