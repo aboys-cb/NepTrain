@@ -86,7 +86,7 @@ def params2str(params):
         else:
             text += str(i)
         text += " "
-    print(text)
+    # print(text)
     return text
 
 class NepTrainWorker:
@@ -308,7 +308,7 @@ class NepTrainWorker:
 
 
         params.append("--out")
-        params.append( f"trajectory_{n_job}.xyz")
+        params.append( f"./trajectory_{n_job}.xyz")
 
 
 
@@ -351,7 +351,7 @@ class NepTrainWorker:
     def build_dft_params(self,n_job=1):
         dft=self.config["dft"]
 
-        shutil.copy(dft["incar_path"], self.dft_path)
+        utils.copy(dft["incar_path"], self.dft_path)
 
         params=[]
         params.append("NepTrain")
@@ -439,9 +439,7 @@ class NepTrainWorker:
         )
 
 
-        utils.cat(self.select_selected_xyz_file,
-                  self.dft_learn_add_xyz_file
-                  )
+
 
 
 
@@ -450,6 +448,9 @@ class NepTrainWorker:
     def sub_dft(self):
         utils.print_msg("Beginning the execution of VASP for single-point energy calculations.")
         # break
+        utils.cat(self.select_selected_xyz_file,
+                  self.dft_learn_add_xyz_file
+                  )
 
         if not utils.is_file_empty(self.dft_learn_add_xyz_file):
             if self.config["dft"]["software"] == "abacus":
@@ -479,6 +480,10 @@ class NepTrainWorker:
                 cmd = self.build_dft_params(i + 1)
                 if cmd is None:
                     continue
+                if self.config["dft_job"] == 1:
+                    forward_files=["learn_add.xyz",os.path.basename(self.config["dft"]["incar_path"])]
+                else:
+                    forward_files=[f"learn_add_{i + 1}.xyz",os.path.basename(self.config["dft"]["incar_path"])]
 
                 tasks.append(
                     async_submit_job(
@@ -488,7 +493,7 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=["./*"],
+                                forward_files=forward_files,
                                 backward_files=[f"learn_calculated_{i +1}.xyz"],
                             )
                         ],

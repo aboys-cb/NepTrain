@@ -15,7 +15,7 @@ nep:
         job_name: NepTrain nep job
         job_type: "container"
         scass_type: "c8_m32_1 * NVIDIA V100"
-        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v11"
+        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v13"
   resources:
     cpu: 4
     gpu_per_node: 1
@@ -36,8 +36,8 @@ dft:
       input_data:
         job_name: NepTrain vasp job
         job_type: "container"
-        scass_type: "c8_m32_1 * NVIDIA V100"
-        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v11"
+        scass_type: "1 * NVIDIA V100_32g"
+        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v13"
   resources:
     cpu: 4
     gpu_per_node: 1
@@ -57,7 +57,7 @@ gpumd:
         job_name: NepTrain gpumd job
         job_type: "container"
         scass_type: "c8_m32_1 * NVIDIA V100"
-        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v11"
+        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v13"
   resources:
     cpu: 4
     gpu_per_node: 1
@@ -78,7 +78,7 @@ select:
         job_name: NepTrain select job
         job_type: "container"
         scass_type: "c64_m64_cpu"
-        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v11"
+        image_address: "registry.dp.tech/dptech/dp/native/prod-67686/vasp-gpumd-nep:v13"
   #Select mainly uses CPU
   resources:
     cpu: 64

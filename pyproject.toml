@@ -76,8 +76,10 @@ local_scheme = "no-local-version"  # 或 "node-and-date"
 
 [tool.setuptools.package-data]
 "NepTrain" = ["config.ini" ]
-"NepTrain.core.vasp" = ["INCAR" ]
-"NepTrain.core.train" = ["job.yaml" ]
+"NepTrain.core.dft.vasp" = ["INCAR" ]
+"NepTrain.core.dft.abacus" = ["INPUT" ]
+
+"NepTrain.core.train._template" = ["*.yaml" ]
 "NepTrain.core.gpumd" = ["run.in" ]
 
 
