@@ -59,7 +59,7 @@ NepTrain select perturb.xyz -max 100
 ### 1. Initialization
 First, initialize NepTrain. This will create a submission script in the current directory:
 ```sh
-NepTrain init
+NepTrain init slurm
 ```
 
 ### 3. Submit Job
