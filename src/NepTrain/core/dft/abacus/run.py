@@ -27,7 +27,7 @@ def calculate_abacus(atoms:Atoms,argparse):
         input_dict = read_input_file(argparse.incar)
     else:
         input_dict = read_input_file(os.path.join(module_path,"core/dft/abacus/INPUT"))
-    directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.symbols}")
+    directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.get_chemical_formula()}")
     atoms_index+=1
     command = f"{Config.get('environ','mpirun_path')} -n {argparse.n_cpu} {Config.get('environ','abacus_path',fallback='abacus')}"
     if "NEPTRAIN_ABACUS_COMMAND" in os.environ:
