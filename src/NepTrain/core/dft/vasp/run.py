@@ -13,7 +13,9 @@ from ase.io import write as ase_write
 from ase.io.vasp import read_vasp
 
 from NepTrain import utils, Config, module_path
-from ..utils import check_env
+from NepTrain.core.utils import check_env
+
+
 from .io import VaspInput,write_to_xyz
 
 atoms_index=1
@@ -27,31 +29,26 @@ def calculate_vasp(atoms:Atoms,argparse):
     if argparse.incar is not None and os.path.exists(argparse.incar):
         vasp.read_incar(argparse.incar)
     else:
-        vasp.read_incar(os.path.join(module_path,"core/vasp/INCAR"))
-    directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.get_chemical_formula()}")
-    atoms_index+=1
-    command=f"{Config.get('environ','mpirun_path')} -n {argparse.n_cpu} {Config.get('environ','vasp_path')}"
-    if "NEPTRAIN_VASP_COMMAND" in os.environ:
-        command=os.environ["NEPTRAIN_VASP_COMMAND"]
+        vasp.read_incar(os.path.join(module_path,"core/dft/vasp/INCAR"))
+    directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.symbols}")
 
-    a,b,c,alpha, beta, gamma=atoms.get_cell_lengths_and_angles()
+    atoms_index+=1
+    command = f"{Config.get('environ','mpirun_path')} -n {argparse.n_cpu} {Config.get('environ','vasp_path')}"
+    if "NEPTRAIN_VASP_COMMAND" in os.environ:
+        command = os.environ["NEPTRAIN_VASP_COMMAND"]
+
+    a, b, c, alpha, beta, gamma = atoms.get_cell_lengths_and_angles()
+
     if argparse.kspacing is not None:
         vasp.set(kspacing=argparse.kspacing)
     vasp.set(
-             directory=directory,
-             command=command,
-            kpts=(math.ceil(argparse.ka[0]/a)  ,
+            directory = directory,
+            command = command,
+            kpts = (math.ceil(argparse.ka[0]/a)  ,
                   math.ceil(argparse.ka[1]/b)  ,
                   math.ceil(argparse.ka[2]/c) ),
-             gamma=argparse.use_gamma,
+            gamma = argparse.use_gamma,
              )
-    # magmom_line = set_magmom(atoms)
-    # print(f"Directory: {directory}, magmom_line: {magmom_line}")
-    # if magmom_line:
-    #     vasp.set(
-    #             ispin=2,
-    #             magmom=magmom_line,
-    #             )
 
     if vasp.int_params["ibrion"] ==0:
         #分子动力学

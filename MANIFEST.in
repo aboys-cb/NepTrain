@@ -1,4 +1,4 @@
-# MANIFEST.in 文件
+# MANIFEST.in file
 
 
 recursive-include src *

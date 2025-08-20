@@ -37,7 +37,7 @@ def build_init(subparsers):
     )
     parser_init.add_argument("type",
                              type=str,
-                            choices=["bohrium","slurm","pbs","local"],default="slurm",
+                            choices=["bohrium","slurm","pbs","shell"],default="slurm",
                              help="How to call a task")
 
     parser_init.add_argument("-f", "--force", action='store_true',
@@ -141,11 +141,79 @@ def build_vasp(subparsers):
     k_group.add_argument("--kspacing", "-kspacing",
 
                          type=float,
-                         help="Set kspacing, which can also be defined in the INCAR _template.")
+                         help="Set kspacing, which can also be defined in the INCAR template.")
     k_group.add_argument("--ka", "-ka",
                          default=[1, 1, 1],
                          type=check_kpoints_number,
                          help="ka takes 1 or 3 numbers (comma-separated), sets k-points to (k[0]/a, k[1]/b, k[2]/c). default 1.")
+def build_dft(subparsers):
+    parser_dft = subparsers.add_parser(
+        "dft",
+        help="Calculate single-point energy using DFT software.",
+    )
+    parser_dft.set_defaults(func=run_dft)
+
+    parser_dft.add_argument("model_path",
+                             type=str,
+
+                             help="The required structure path or structure file only supports files in xyz and vasp formats.")
+    parser_dft.add_argument("--directory", "-dir",
+
+                             type=str,
+                             help="Set the VASP calculation path. default ./cache/software.",
+                             default=None
+                             )
+
+    parser_dft.add_argument("--out", "-o",
+                             dest="out_file_path",
+                             type=str,
+                             help="Structure output file after calculation. default ./software_scf.xyz",
+                             default=None
+                             )
+
+    parser_dft.add_argument("--append", "-a",
+                             dest="append", action='store_true', default=False,
+                             help="Write to out_file_path in append mode, default False.",
+
+                             )
+    parser_dft.add_argument("--gamma", "-g",
+                             dest="use_gamma", action='store_true', default=False,
+                             help="Default to using Monkhorst-Pack k-points, add -g to use Gamma-centered k-point scheme.",
+
+                             )
+    parser_dft.add_argument("-n", "-np",
+                             dest="n_cpu",
+                             default=1,
+                             type=int,
+                             help="Set the number of CPU cores, default 1.")
+
+    parser_dft.add_argument("--in",
+                                dest="incar",
+                             help="Input path for INCAR file, default is ./INCAR or ./INPUT.",default=None)
+
+
+
+    k_group = parser_dft.add_mutually_exclusive_group(required=False)
+    k_group.add_argument("--kspacing", "-kspacing",
+
+                         type=float,
+                         help="Set kspacing, which can also be defined in the INCAR template.")
+    k_group.add_argument("--ka", "-ka",
+                         default=[1, 1, 1],
+                         type=check_kpoints_number,
+                         help="ka takes 1 or 3 numbers (comma-separated), sets k-points to (k[0]/a, k[1]/b, k[2]/c). default 1.")
+
+    software_group = parser_dft.add_mutually_exclusive_group(required=False)
+    software_group.add_argument("--vasp" ,
+                                dest="software",
+
+                                action='store_const', const='vasp',
+                         help="use vasp.(default)")
+    software_group.add_argument("--abacus",
+                                dest="software",
+                                action='store_const', const='abacus',
+                                help="use abacus")
+
 
 
 def build_nep(subparsers):
@@ -157,11 +225,11 @@ def build_nep(subparsers):
 
 
     parser_nep.add_argument("--directory", "-dir",
-
                              type=str,
                              help="Set the path for NEP calculations. default ./cache/nep",
                              default="./cache/nep"
                              )
+
     parser_nep.add_argument("--in", "-in",
                             dest="nep_in_path",
                              type=str,
@@ -176,24 +244,28 @@ def build_nep(subparsers):
                              help="Set the path for the train.xyz file, default  ./train.xyz.",
                              default="./train.xyz"
                              )
+
     parser_nep.add_argument("--test", "-test",
                              dest="test_path",
                              type=str,
                              help="Set the path for the test.xyz file, default is ./test.xyz.",
                              default="./test.xyz"
                              )
+
     parser_nep.add_argument("--nep", "-nep",
                             dest="nep_txt_path",
                              type=str,
                              help="restart and prediction require the use of a potential function, default is ./nep.txt.",
                              default="./nep.txt"
                              )
+
     parser_nep.add_argument("--prediction", "-pred","--pred",
 
                              action="store_true",
                              help="Set the forecast mode，default False",
                              default=False
                              )
+
     parser_nep.add_argument("--restart_file", "-restart","--restart",
 
                             type=str,
@@ -201,13 +273,15 @@ def build_nep(subparsers):
                             help="To restart running, simply provide a valid path; default is None.",
                              default=None
                              )
+
     parser_nep.add_argument("--continue_step", "-cs",
-
                             type=int,
-
                             help="If a restart_file is provided, this parameter will take effect, continuing for continue_step steps, with a default value of 10000.",
                              default=10000
                              )
+
+
+
 def build_gpumd(subparsers):
     parser_gpumd = subparsers.add_parser(
         "gpumd",
@@ -331,6 +405,7 @@ def main():
     build_perturb(subparsers)
 
     build_select(subparsers)
+    build_dft(subparsers)
 
     build_vasp(subparsers)
 

@@ -5,6 +5,8 @@
 # @email    : 1747193328@qq.com
 
 import os.path
+import shutil
+
 import numpy as np
 from ase import Atoms
 from ase.io import read as ase_read
@@ -33,7 +35,8 @@ def calculate_gpumd(atoms:Atoms,argparse):
 
     new_atoms=[]
 
-
+    if os.path.exists(argparse.out_file_path):
+        os.remove(argparse.out_file_path)
     for temperature in argparse.temperature:
 
         run = RunInput(argparse.nep_txt_path)
@@ -65,7 +68,7 @@ def calculate_gpumd(atoms:Atoms,argparse):
     return new_atoms
 def run_gpumd(argparse):
     check_env()
-    utils.verify_path(os.path.dirname(argparse.out_file_path))
+    utils.verify_path(os.path.dirname(os.path.abspath(argparse.out_file_path)))
     result = calculate_gpumd(argparse.model_path,argparse)
 
 

@@ -5,7 +5,7 @@ nep:
     #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/context.html
     context_type: "LazyLocal"
     #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/batch.html
-    batch_type: "Slurm"
+    batch_type: "PBS"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -21,8 +21,7 @@ nep:
     queue_name: 8V100
     group_size: 1
     custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
+      - "#PBS -N NepTrain-NEP"
 
     prepend_script:
       - "source /opt/envs/anaconda3.env"
@@ -36,7 +35,7 @@ dft:
 
   machine:
     context_type: "LazyLocal"
-    batch_type: "Slurm"
+    batch_type: "PBS"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -52,8 +51,8 @@ dft:
     queue_name: 8V100
     group_size: 1
     custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
+
+      - "#PBS -N NepTrain-NEP"
 
     prepend_script:
       - "source /opt/envs/anaconda3.env"
@@ -65,7 +64,7 @@ dft:
 gpumd:
   machine:
     context_type: "LazyLocal"
-    batch_type: "Slurm"
+    batch_type: "PBS"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -81,8 +80,7 @@ gpumd:
     queue_name: 8V100
     group_size: 1
     custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
+      - "#PBS -N NepTrain-NEP"
 
     prepend_script:
       - "source /opt/envs/anaconda3.env"
@@ -94,7 +92,7 @@ gpumd:
 select:
   machine:
     context_type: "LazyLocal"
-    batch_type: "Slurm"
+    batch_type: "PBS"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -111,11 +109,11 @@ select:
     queue_name: 8V100
     group_size: 1
     custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-select"
 
-    prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
+      - "#PBS -N NepTrain-select"
 
+    prepend_script: [
+      "source /opt/envs/anaconda3.env",
+      "conda activate neptrain",
 
+    ]

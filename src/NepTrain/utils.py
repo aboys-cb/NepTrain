@@ -9,7 +9,8 @@ import shutil
 import subprocess
 import traceback
 from contextlib import contextmanager
-from datetime import datetime
+import datetime
+
 from pathlib import Path
 from typing import Generator, Union
 
@@ -51,7 +52,7 @@ radius_table = {'H': 0.31, 'He': 0.28, 'Li': 1.28, 'Be': 0.96,
 
 def print(*msg, **kwargs):
 
-    get_console().print(f"[{datetime.now()}] -- ",*msg, **kwargs)
+    get_console().print(f"[{datetime.datetime.now().strftime( '%Y-%m-%d %H:%M:%S' )}] -- ",*msg, **kwargs)
 
 
 def print_warning(*msg):
@@ -86,11 +87,19 @@ def verify_path(path):
         os.makedirs(os.path.expanduser(path))
 
 def copy(rc, dst,   follow_symlinks=True):
+    if  rc is None or not os.path.exists(rc):
+        return
 
     parent_path=(os.path.dirname(dst))
     if not os.path.exists(parent_path):
         os.makedirs(parent_path)
-    shutil.copy(rc, dst,  follow_symlinks=follow_symlinks)
+    if os.path.isdir(rc):
+        shutil.copytree(rc, dst ,dirs_exist_ok=True)
+    else:
+        try:
+            shutil.copy(rc, dst,  follow_symlinks=follow_symlinks)
+        except shutil.SameFileError:
+            pass
 def copy_files(src_dir, dst_dir):
     # 遍历源目录中的所有文件
     for filename in os.listdir(src_dir):
@@ -114,7 +123,7 @@ def remove_file_by_re(src):
 def cat(files,out_file):
 
 
-    # 获取所有以 'file' 开头的文件名
+    #
     if isinstance(files,str):
         file_list = glob.glob(files)
     else:

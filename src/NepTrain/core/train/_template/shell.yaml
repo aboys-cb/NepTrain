@@ -5,7 +5,7 @@ nep:
     #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/context.html
     context_type: "LazyLocal"
     #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/batch.html
-    batch_type: "Slurm"
+    batch_type: "Shell"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -20,15 +20,11 @@ nep:
     gpu_per_node: 1
     queue_name: 8V100
     group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
+ 
+ 
 
     prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
-      - "module load cuda/12.4.1"
-      - "module load gcc/12.4.0"
+      - "module load gpumd/master"
 
 
 
@@ -36,7 +32,7 @@ dft:
 
   machine:
     context_type: "LazyLocal"
-    batch_type: "Slurm"
+    batch_type: "Shell"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -51,21 +47,16 @@ dft:
     gpu_per_node: 1
     queue_name: 8V100
     group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
+
 
     prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
+
       - "module load vasp/6.4.2-nvhpc24.3-ompi5.0.7"
-
-
 
 gpumd:
   machine:
     context_type: "LazyLocal"
-    batch_type: "Slurm"
+    batch_type: "Shell"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -80,21 +71,17 @@ gpumd:
     gpu_per_node: 1
     queue_name: 8V100
     group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
+
 
     prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
-      - "module load cuda/12.4.1"
-      - "module load gcc/12.4.0"
+
+      - "module load gpumd/master"
 
 
 select:
   machine:
     context_type: "LazyLocal"
-    batch_type: "Slurm"
+    batch_type: "Shell"
     local_root: "./"
     remote_root: "~/neptrain/"
     remote_profile:
@@ -110,12 +97,7 @@ select:
     gpu_per_node: 1
     queue_name: 8V100
     group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-select"
 
-    prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
+
 
 
