@@ -28,7 +28,7 @@ def calculate_vasp(atoms:Atoms,argparse):
         vasp.read_incar(argparse.incar)
     else:
         vasp.read_incar(os.path.join(module_path,"core/vasp/INCAR"))
-    directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.symbols}")
+    directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.get_chemical_formula()}")
     atoms_index+=1
     command=f"{Config.get('environ','mpirun_path')} -n {argparse.n_cpu} {Config.get('environ','vasp_path')}"
     if "NEPTRAIN_VASP_COMMAND" in os.environ:
