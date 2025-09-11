@@ -167,12 +167,12 @@ class NepTrainWorker:
         if self.config["current_job"]=="dft":
 
             self.generation=0
-            utils.copy(self.config["init_train_xyz"], self.dft_learn_add_xyz_file)
+            utils.copy(self.config["init_train_xyz"], self.select_selected_xyz_file)
 
-            if self.config["dft_job"] != 1:
-
-
-                self.split_dft_job_xyz(self.config["init_train_xyz"])
+            # if self.config["dft_job"] != 1:
+            #
+            #
+            #     self.split_dft_job_xyz(self.config["init_train_xyz"])
         elif self.config["current_job"]=="nep":
            
 
