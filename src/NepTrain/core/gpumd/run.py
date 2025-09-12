@@ -23,6 +23,10 @@ from .io import RunInput
 from ..utils import check_env
 
 import zlib
+
+from ...utils import print
+
+
 def array_to_id(arr):
     arr = np.ascontiguousarray(arr)  # 确保内存连续
     return zlib.crc32(arr.tobytes())
@@ -35,8 +39,8 @@ def calculate_gpumd(atoms:Atoms,argparse):
 
     new_atoms=[]
 
-    if os.path.exists(argparse.out_file_path):
-        os.remove(argparse.out_file_path)
+    # if os.path.exists(argparse.out_file_path):
+    #     os.remove(argparse.out_file_path)
     for temperature in argparse.temperature:
 
         run = RunInput(argparse.nep_txt_path)
@@ -54,7 +58,6 @@ def calculate_gpumd(atoms:Atoms,argparse):
         dump = ase_read(os.path.join(directory,"dump.xyz"), ":", format="extxyz", do_not_split_by_at_sign=True)
         for i, atom in enumerate(dump):
             atom.info["Config_type"] = f"{atom.symbols}-epoch-{argparse.time}ps-{temperature}k-{i + 1}"
-
 
 
         ase_write(argparse.out_file_path,dump,append=True)
