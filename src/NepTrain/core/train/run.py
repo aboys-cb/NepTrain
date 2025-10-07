@@ -426,7 +426,7 @@ class NepTrainWorker:
                 dict(
                     command=cmd,
                     task_work_path="./",
-                    forward_files=filter_file_path(["nep.txt", "train.xyz","trajectorys.xyz"]),
+                    forward_files=filter_file_path(["nep.txt", "train.xyz","trajectorys.xyz"],self.select_path),
                     backward_files=relpath_from_files([
                         self.select_selected_xyz_file,
                         self.select_selected_png_file,
@@ -498,7 +498,7 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=filter_file_path(forward_files),
+                                forward_files=filter_file_path(forward_files,self.dft_path),
                                 backward_files=[f"learn_calculated_{i +1}.xyz"],
                             )
                         ],
@@ -566,7 +566,7 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files= filter_file_path(["nep.in","nep.restart","train.xyz","test.xyz"]),
+                        forward_files= filter_file_path(["nep.in","nep.restart","train.xyz","test.xyz"],self.nep_path),
                         backward_files = [
                             "./*"
                         ],
@@ -601,7 +601,7 @@ class NepTrainWorker:
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files=filter_file_path(["nep.in","nep.txt","train.xyz"]),
+                        forward_files=filter_file_path(["nep.in","nep.txt","train.xyz"],self.pred_path),
                         backward_files=["./*"],
                     )
                 ],
@@ -636,7 +636,7 @@ class NepTrainWorker:
                             dict(
                                 command=cmd,
                                 task_work_path="./",
-                                forward_files=filter_file_path(["run.in","nep.txt",base_name]),
+                                forward_files=filter_file_path(["run.in","nep.txt",base_name],self.gpumd_path),
                                 backward_files=[f"./trajectory_{i}.xyz"],
                             )
                         ],
