@@ -7,9 +7,32 @@ import contextlib
 import os
 
 import numpy as np
+import numpy.typing as npt
 from ase import Atoms
-
+from functools import partial
+from typing import Iterable
 from NepTrain.nep_cpu import CpuNep
+
+
+
+def split_by_natoms(array, natoms_list:list[int]) -> list[npt.NDArray]:
+    """Split a flat array into sub-arrays according to the number of atoms in each structure."""
+    if array.size == 0:
+        return array
+    counts = np.asarray(list(natoms_list), dtype=int)
+    split_indices = np.cumsum(counts)[:-1]
+    split_arrays = np.split(array, split_indices)
+    return split_arrays
+def aggregate_per_atom_to_structure(
+    array: npt.NDArray[np.float32],
+    atoms_num_list: Iterable[int],
+    map_func=np.linalg.norm,
+    axis: int = 0,
+) -> npt.NDArray[np.float32]:
+    """Aggregate per-atom data into per-structure values based on atom counts."""
+    split_arrays = split_by_natoms(array, atoms_num_list)
+    func = partial(map_func, axis=axis)
+    return np.array(list(map(func, split_arrays)))
 
 class Nep3Calculator:
 
@@ -21,9 +44,35 @@ class Nep3Calculator:
                 self.nep3 = CpuNep(model_file)
         self.element_list=self.nep3.get_element_list()
         self.type_dict = {e: i for i, e in enumerate(self.element_list)}
+    @staticmethod
+    def _ensure_structure_list(
+        structures: Iterable[Atoms] | Atoms,
+    ) -> list[Atoms]:
+        if isinstance(structures, ( Atoms)):
+            return [structures]
+        if isinstance(structures, list):
+            return structures
+        return list(structures)
 
-
-
+    def compose_structures(
+        self,
+        structures: Iterable[Atoms] ,
+    ) -> tuple[list[list[int]], list[list[float]], list[list[float]], list[int]]:
+        structure_list = self._ensure_structure_list(structures)
+        group_sizes: list[int] = []
+        atom_types: list[list[int]] = []
+        boxes: list[list[float]] = []
+        positions: list[list[float]] = []
+        for structure in structure_list:
+            symbols = structure.get_chemical_symbols()
+            mapped_types = [self.type_dict[symbol] for symbol in symbols]
+            box = structure.cell.transpose(1, 0).reshape(-1).tolist()
+            coords = structure.positions.transpose(1, 0).reshape(-1).tolist()
+            atom_types.append(mapped_types)
+            boxes.append(box)
+            positions.append(coords)
+            group_sizes.append(len(mapped_types))
+        return atom_types, boxes, positions, group_sizes
 
     def get_descriptors(self,structure):
         symbols = structure.get_chemical_symbols()
@@ -43,58 +92,45 @@ class Nep3Calculator:
         _boxs=[]
         _positions=[]
 
-        for structure in structures:
-            symbols = structure.get_chemical_symbols()
-            _type = [self.type_dict[k] for k in symbols]
-            _box = structure.cell.transpose(1, 0).reshape(-1).tolist()
-            _position = structure.get_positions().transpose(1, 0).reshape(-1).tolist()
-            _types.append(_type)
-            _boxs.append(_box)
-            _positions.append(_position)
-
-        descriptor = self.nep3.get_descriptors(_types, _boxs, _positions)
-
-        return np.array(descriptor)
+        types, boxes, positions, group_sizes = self.compose_structures(structures)
 
 
-    def calculate(self,structures:list[Atoms]):
-        group_size=[]
-        _types = []
-        _boxs = []
-        _positions = []
-        if isinstance(structures, Atoms):
-            structures = [structures]
-        for structure in structures:
-            symbols = structure.get_chemical_symbols()
-            _type = [self.type_dict[k] for k in symbols]
-            _box = structure.cell.transpose(1, 0).reshape(-1).tolist()
-            _position = structure.get_positions().transpose(1, 0).reshape(-1).tolist()
-            _types.append(_type)
-            _boxs.append(_box)
-            _positions.append(_position)
-            group_size.append(len(_type))
+        descriptor = self.nep3.get_structures_descriptor(types, boxes, positions)
+        descriptor = np.asarray(descriptor, dtype=np.float32)
 
-        potentials, forces, virials = self.nep3.calculate(_types, _boxs, _positions)
+        structure_descriptor = aggregate_per_atom_to_structure(descriptor, group_sizes, map_func=np.mean, axis=0)
 
 
-        split_indices = np.cumsum(group_size)[:-1]
-        #
-        potentials=np.hstack(potentials)
-        split_potential_arrays = np.split(potentials, split_indices)
-        potentials_array = np.array(list(map(np.sum, split_potential_arrays)))
-        # print(potentials_array)
+        return structure_descriptor
 
-        # 处理每个force数组：reshape (3, -1) 和 transpose(1, 0)
-        reshaped_forces = [np.array(force).reshape(3, -1).T for force in forces]
 
-        forces_array = np.vstack(reshaped_forces)
-        # print(forces_array)
+    def calculate(self,structures:list[Atoms],mean_virial=True):
 
-        reshaped_virials = np.vstack([np.array(virial).reshape(9, -1).mean(axis=1) for virial in virials])
+        types, boxes, positions, group_sizes = self.compose_structures(structures)
 
-        # virials_array = reshaped_virials[:,[0,4,8,1,5,6]]
-        virials_array=reshaped_virials
-        return potentials_array,forces_array,virials_array
+
+        potentials, forces, virials = self.nep3.calculate(types, boxes, positions)
+
+
+        potentials_arr = np.asarray(potentials, dtype=np.float32)
+        forces_arr = np.asarray(forces, dtype=np.float32)
+        virials_arr = np.asarray(virials, dtype=np.float32)
+        if potentials_arr.size == 0:
+            return [], [], []
+        if forces_arr.ndim == 1:
+            forces_arr = forces_arr.reshape(-1, 3)
+        if virials_arr.ndim == 1:
+            virials_arr = virials_arr.reshape(-1, 9)
+        potentials_array = aggregate_per_atom_to_structure(potentials_arr, group_sizes, map_func=np.sum,
+                                                           axis=None).tolist()
+        forces_blocks = split_by_natoms(forces_arr, group_sizes)
+        if mean_virial:
+            virials_blocks = aggregate_per_atom_to_structure(virials_arr, group_sizes, map_func=np.mean,
+                                                             axis=0).tolist()
+        else:
+            virials_blocks = split_by_natoms(virials_arr, group_sizes)
+
+        return potentials_array, forces_blocks, virials_blocks
 
 
 class DescriptorCalculator:
@@ -125,6 +161,7 @@ class DescriptorCalculator:
 
 
 if __name__ == '__main__':
+    from NepTrain.core.nep import Nep3Calculator
     nep3 = Nep3Calculator(model_file="/mnt/d/Desktop/vispy/KNbO3/nep.txt")
     from ase.io import read
     import time
