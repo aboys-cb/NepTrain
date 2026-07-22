@@ -21,6 +21,14 @@ except ImportError:
 warnings.simplefilter('ignore', UserWarning)
 
 
+def _warn_legacy_command(command, replacement):
+    print(
+        f"NepTrain: warning: '{command}' is a compatibility command and will "
+        f"be removed in the next release; use '{replacement}' instead.",
+        file=sys.stderr,
+    )
+
+
 def init_template(args):
     from NepTrain.core.template import init_template as implementation
     return implementation(args)
@@ -42,6 +50,7 @@ def run_dft(args):
 
 
 def run_vasp(args):
+    _warn_legacy_command("vasp", "dft --vasp")
     from NepTrain.core.dft.vasp import run_vasp as implementation
     implementation(args)
 
@@ -52,6 +61,7 @@ def run_nep(args):
 
 
 def run_gpumd(args):
+    _warn_legacy_command("gpumd", "md --backend gpumd")
     from NepTrain.core.gpumd import run_gpumd as implementation
     return implementation(args)
 
@@ -636,7 +646,7 @@ def build_perturb(subparsers):
 def build_vasp(subparsers):
     parser_vasp = subparsers.add_parser(
         "vasp",
-        help="Calculate single-point energy using VASP.",
+        help="Compatibility command; use 'dft --vasp' (removed next release).",
     )
     parser_vasp.set_defaults(func=run_vasp)
 
@@ -1023,7 +1033,7 @@ def build_project_commands(subparsers):
 def build_gpumd(subparsers):
     parser_gpumd = subparsers.add_parser(
         "gpumd",
-        help="run molecular dynamics using GPUMD.",
+        help="Compatibility command; use 'md --backend gpumd' (removed next release).",
     )
     parser_gpumd.set_defaults(func=run_gpumd)
 
