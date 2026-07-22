@@ -442,6 +442,40 @@ class GenerationController:
                 accepted=accepted,
             )
 
+    def reopen_rejected(
+        self, plan: GenerationPlan, *, from_stage: str = "retrain"
+    ) -> None:
+        """Reopen a rejected generation without discarding its failed attempt."""
+
+        if from_stage not in STAGES:
+            raise IterationError(f"unknown recovery stage: {from_stage}")
+        with self._lock():
+            self._ledger = self._load()
+            generation_record, _, _, _, _ = self._generation_state(plan)
+            if not generation_record.get("complete") or generation_record.get(
+                "accepted"
+            ) is not False:
+                raise IterationError(
+                    f"generation {plan.generation} is not complete and rejected"
+                )
+            start = STAGES.index(from_stage)
+            archived = {
+                stage: generation_record["stages"].pop(stage)
+                for stage in STAGES[start:]
+            }
+            recoveries = generation_record.setdefault("recovery_attempts", [])
+            recoveries.append(
+                {
+                    "attempt": len(recoveries) + 1,
+                    "from_stage": from_stage,
+                    "accepted": False,
+                    "stages": archived,
+                }
+            )
+            generation_record.pop("complete", None)
+            generation_record.pop("accepted", None)
+            self._write(self._ledger)
+
     def _summary(self, plan: GenerationPlan) -> GenerationSummary:
         generation_record, _, artifacts, metrics, _ = self._generation_state(plan)
         if not generation_record.get("complete"):

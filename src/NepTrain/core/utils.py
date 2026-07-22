@@ -9,14 +9,17 @@ from NepTrain import Config
 from NepTrain import utils
 
 
-def check_env():
+def check_env(*, potcar_path=None, require_potcar=False, commands=()):
+    if require_potcar:
+        configured_potcar = potcar_path or Config.get("environ", "potcar_path")
+        if not os.path.exists(os.path.expanduser(str(configured_potcar))):
+            raise FileNotFoundError(
+                f"VASP pseudopotential root does not exist: {configured_potcar}"
+            )
 
-    if not os.path.exists(os.path.expanduser(Config.get("environ", "potcar_path"))):
-        raise FileNotFoundError("Please edit the pseudopotential file path in ~/.NepTrain to set a valid path!")
-
-    for option in ["vasp_path","abacus_path", "mpirun_path", "nep_path", "gpumd_path"]:
+    for option in commands:
         try:
             if utils.get_command_result(["which", Config.get("environ", option)]) is None:
                 utils.print_warning(f"The environment variable {option.replace('_path', '')} is not set. If you have set the environment in the submission script, please ignore this warning.")
-        except Exception as e:
+        except Exception:
             pass

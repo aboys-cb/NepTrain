@@ -1,93 +1,68 @@
-#!/usr/bin/env python 
-# -*- coding: utf-8 -*-
-# @Time    : 2025/8/2 17:41
-# @Author  : 兵
-# @email    : 1747193328@qq.com
-import math
-import os.path
+"""ABACUS labeling entry point."""
 
-import numpy as np
+import os
+from pathlib import Path
+
 from ase import Atoms
 from ase.io import write as ase_write
-from ase.calculators.abacus import Abacus, AbacusProfile
 
-from NepTrain import utils, Config, module_path
+from NepTrain import Config, module_path, utils
 
-from .io import read_input_file,StructureVar
-from NepTrain.core.spin import (
-    collect_mforce_from_results,
-    prepare_spin_for_dft,
-    validate_spin_dataset,
+from .io import StructureVar, read_input_file
+from .native import NativeAbacusRequest, run_native_abacus
+
+atoms_index = 1
+
+
+@utils.iter_path_to_atoms(
+    ["*.vasp", "*.xyz"],
+    show_progress=True,
+    fail_fast=True,
+    description="ABACUS calculation progress",
 )
-
-atoms_index=1
-
-@utils.iter_path_to_atoms(["*.vasp","*.xyz"],show_progress=True,fail_fast=True,
-                 description="ABACUS calculation progress" )
-def calculate_abacus(atoms:Atoms,argparse):
+def calculate_abacus(atoms: Atoms, args):
     global atoms_index
-    prepare_spin_for_dft(atoms)
-    StructureVar.init("./")
+    StructureVar.init(getattr(args, "resource_dir", None) or "./")
 
-    if argparse.incar is not None and os.path.exists(argparse.incar):
-        input_dict = read_input_file(argparse.incar)
+    if args.incar is not None and os.path.exists(args.incar):
+        input_dict = read_input_file(args.incar)
     else:
-        input_dict = read_input_file(os.path.join(module_path,"core/dft/abacus/INPUT"))
-    directory=os.path.join(argparse.directory,f"{atoms_index}-{atoms.get_chemical_formula()}")
-    atoms_index+=1
-    command = f"{Config.get('environ','mpirun_path')} -n {argparse.n_cpu} {Config.get('environ','abacus_path',fallback='abacus')}"
-    if "NEPTRAIN_ABACUS_COMMAND" in os.environ:
-        command = os.environ["NEPTRAIN_ABACUS_COMMAND"]
-    profile = AbacusProfile(command=command)
+        input_dict = read_input_file(os.path.join(module_path, "core/dft/abacus/INPUT"))
+    command = (
+        f"{Config.get('environ', 'mpirun_path')} -n {args.n_cpu} "
+        f"{Config.get('environ', 'abacus_path', fallback='abacus')}"
+    )
+    command = os.environ.get("NEPTRAIN_ABACUS_COMMAND", command)
+    result = run_native_abacus(
+        atoms,
+        NativeAbacusRequest(
+            work_dir=Path(args.directory).resolve(),
+            resource_dir=Path(getattr(args, "resource_dir", None) or "./").resolve(),
+            command=command,
+            input_parameters=input_dict,
+            use_gamma=bool(args.use_gamma),
+            kpoint_mode=str(getattr(args, "kpoint_mode", "auto")),
+            kspacing=args.kspacing,
+            ka=tuple(int(value) for value in args.ka),
+        ),
+        case_index=atoms_index,
+    )
+    atoms_index += 1
+    return result
 
 
-    a, b, c, alpha, beta, gamma = atoms.get_cell_lengths_and_angles()
-
-    if argparse.kspacing is not None:
-        input_dict["kspacing"]=argparse.kspacing
-
-    pp_files,orb_files  =StructureVar.completion_abacus(atoms=atoms)
-
-
-    calc = Abacus(profile=profile,
-                  directory=directory,
-                  pp=pp_files, basis=orb_files,
-                  kpts=(math.ceil(argparse.ka[0]/a)  ,
-                  math.ceil(argparse.ka[1]/b)  ,
-                  math.ceil(argparse.ka[2]/c) ),
-                  **input_dict
-                  )
-
-
-    calc.calculate(atoms, ('energy',"forces","stress"),None)
-    atoms.calc = calc
-    collect_mforce_from_results(atoms, calc.results)
-    atoms.arrays.pop("initial_magmoms", None)
-
-    xx, yy, zz, yz, xz, xy = -calc.results['stress'] * atoms.get_volume()  # *160.21766
-    atoms.info['virial'] = np.array([(xx, xy, xz), (xy, yy, yz), (xz, yz, zz)])
-    # 这里没想好怎么设计config的格式化  就先使用原来的
-    if "Config_type" not in atoms.info:
-        atoms.info['Config_type'] = "NepTrain scf "
-    atoms.info['Weight'] = 1.0
-    del atoms.calc.results['stress']
-    del atoms.calc.results['free_energy']
-
-    return atoms
-
-
-
-def run_abacus(argparse):
-    result = calculate_abacus(argparse.model_path, argparse)
-    path = os.path.dirname(argparse.out_file_path)
+def run_abacus(args):
+    global atoms_index
+    atoms_index = 1
+    result = calculate_abacus(args.model_path, args)
+    path = os.path.dirname(args.out_file_path)
     if path and not os.path.exists(path):
         os.makedirs(path)
     if len(result) and isinstance(result[0], list):
         result = [atoms for _list in result for atoms in _list]
     if not result:
         raise RuntimeError("ABACUS produced no labeled structures")
-    validate_spin_dataset(result, require_mforce=True)
-    ase_write(argparse.out_file_path, result, format="extxyz", append=argparse.append)
+    ase_write(args.out_file_path, result, format="extxyz", append=args.append)
 
     utils.print_success("ABACUS calculation task completed!")
     return result

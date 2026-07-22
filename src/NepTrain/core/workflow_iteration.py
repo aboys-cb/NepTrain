@@ -179,10 +179,6 @@ class WorkflowIterationAdapter:
                 "post-retrain acceptance requires evaluation.max_rmse for "
                 + ", ".join(missing_thresholds)
             )
-        if self.config.get("dft", {}).get("software", "toy") != "toy":
-            raise WorkflowIterationError(
-                "the first workflow Adapter milestone intentionally requires dft.software=toy"
-            )
         if self.config.get("md", {}).get("spin", False):
             config_path = self._path(self.config.get("training", {}).get("config_path"))
             text = config_path.read_text(encoding="utf-8")
@@ -197,6 +193,23 @@ class WorkflowIterationAdapter:
         path = Path(value).expanduser()
         return (self.base_dir / path).resolve() if not path.is_absolute() else path.resolve()
 
+    def _optional_path(self, value: str | Path | None) -> Path | None:
+        if value in {None, "", "auto"}:
+            return None
+        return self._path(value)
+
+    @staticmethod
+    def _dft_kpoints(options: Mapping[str, Any]) -> tuple[int, int, int]:
+        if options.get("use_k_stype", "kspacing") != "kpoints":
+            return (1, 1, 1)
+        raw = options.get("kpoints", (1, 1, 1))
+        values = [int(raw)] if isinstance(raw, int | float | str) else [int(value) for value in raw]
+        if len(values) == 1:
+            values *= 3
+        if len(values) != 3 or any(value < 1 for value in values):
+            raise WorkflowIterationError("dft.kpoints must contain one or three positive integers")
+        return tuple(values)
+
     def run_stage(self, stage: str, context: StageContext) -> StageOutcome:
         method = getattr(self, f"_{stage}", None)
         if method is None:
@@ -210,11 +223,16 @@ class WorkflowIterationAdapter:
         training_input: Path,
         output_name: str,
         warm_start: Path | None,
-    ) -> tuple[TrainingResult, int]:
+    ) -> tuple[TrainingResult, int, Path]:
         options = self.config.get("training", {})
         backend = str(options.get("backend", "gpumd"))
+        config_file = self._path(options.get("config_path"))
+        if backend == "torchnep" and warm_start is not None:
+            config_file = self._torchnep_finetune_config(
+                config_file, context.generation_dir, output_name, options
+            )
         request = TrainingRequest(
-            config_file=self._path(options.get("config_path")),
+            config_file=config_file,
             train_file=training_input,
             output_dir=context.generation_dir / output_name,
             test_file=self._path(options["test_path"])
@@ -233,7 +251,57 @@ class WorkflowIterationAdapter:
             use_compile=bool(options.get("use_compile", False)),
         )
         result = self.runtime.train(request, backend)
-        return result, len(_read_frames(training_input))
+        return result, len(_read_frames(training_input)), config_file
+
+    @staticmethod
+    def _torchnep_finetune_config(
+        source: Path,
+        generation_dir: Path,
+        output_name: str,
+        options: Mapping[str, Any],
+    ) -> Path:
+        """Lower only the incremental TorchNEP learning rate.
+
+        A newly added high-gradient minibatch can destroy an otherwise good
+        checkpoint before TorchNEP records its first best model. Keep initial
+        training unchanged and make the safer fine-tune rate explicit in the
+        generated artifact for reproducibility.
+        """
+
+        scale = float(options.get("finetune_lr_scale", 0.1))
+        explicit = options.get("finetune_lr")
+        text = source.read_text(encoding="utf-8")
+        output = []
+        replaced = False
+        for line in text.splitlines(keepends=True):
+            newline = "\n" if line.endswith("\n") else ""
+            body = line[:-1] if newline else line
+            match = re.match(r"^(\s*lr\s+)(\S+)(.*)$", body)
+            if match is None:
+                output.append(line)
+                continue
+            current = float(match.group(2))
+            value = float(explicit) if explicit is not None else current * scale
+            output.append(
+                f"{match.group(1)}{value:.12g}{match.group(3)}{newline}"
+            )
+            replaced = True
+        if not replaced:
+            return source
+        suffix = output_name.removeprefix("retraining")
+        path = generation_dir / f"torchnep-finetune{suffix}.in"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(output), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _attempt_output_name(generation_dir: Path, base: str) -> str:
+        if not (generation_dir / base).exists():
+            return base
+        attempt = 2
+        while (generation_dir / f"{base}-attempt-{attempt}").exists():
+            attempt += 1
+        return f"{base}-attempt-{attempt}"
 
     def _train(self, context: StageContext) -> StageOutcome:
         if context.generation > 1:
@@ -256,7 +324,7 @@ class WorkflowIterationAdapter:
             )
 
         training_input = self.initial_training
-        result, frame_count = self._execute_training(
+        result, frame_count, _ = self._execute_training(
             context,
             training_input=training_input,
             output_name="training",
@@ -283,13 +351,69 @@ class WorkflowIterationAdapter:
     def _balanced_cap(
         groups: Sequence[tuple[str, list[Atoms]]], limit: int
     ) -> list[tuple[str, int, Atoms]]:
+        """Cap every source fairly while retaining its full time span.
+
+        ``groups`` may contain trajectories much longer than the candidate
+        budget. Taking their first frames would make a longer MD run pay its
+        full cost while FPS only sees the beginning. Allocate the budget in a
+        round-robin manner, keep pre-failure frames first, and spread the
+        remaining quota over each stable trajectory from start to finish.
+        """
+
+        if limit < 1:
+            return []
+        nonempty = [(source, frames) for source, frames in groups if frames]
+        quotas = [0] * len(nonempty)
+        remaining = min(limit, sum(len(frames) for _, frames in nonempty))
+        while remaining:
+            changed = False
+            for index, (_, frames) in enumerate(nonempty):
+                if quotas[index] >= len(frames):
+                    continue
+                quotas[index] += 1
+                remaining -= 1
+                changed = True
+                if not remaining:
+                    break
+            if not changed:
+                break
+
+        spread_groups: list[tuple[str, list[tuple[int, Atoms]]]] = []
+        for (source, frames), quota in zip(nonempty, quotas):
+            pre_failure = [
+                (index, frame)
+                for index, frame in enumerate(frames)
+                if frame.info.get("md_window") == "pre_failure"
+            ]
+            stable = [
+                (index, frame)
+                for index, frame in enumerate(frames)
+                if frame.info.get("md_window") != "pre_failure"
+            ]
+            if len(pre_failure) >= quota:
+                chosen = pre_failure[-quota:]
+            else:
+                chosen = list(pre_failure)
+                stable_quota = quota - len(chosen)
+                if stable_quota >= len(stable):
+                    chosen.extend(stable)
+                elif stable_quota == 1:
+                    chosen.append(stable[-1])
+                elif stable_quota > 1:
+                    indices = np.linspace(
+                        0, len(stable) - 1, stable_quota
+                    ).round().astype(int)
+                    chosen.extend(stable[int(index)] for index in indices)
+            spread_groups.append((source, chosen))
+
         selected: list[tuple[str, int, Atoms]] = []
-        for frame_index in range(max((len(frames) for _, frames in groups), default=0)):
-            for source, frames in groups:
-                if frame_index < len(frames):
-                    selected.append((source, frame_index, frames[frame_index]))
-                    if len(selected) == limit:
-                        return selected
+        for position in range(
+            max((len(frames) for _, frames in spread_groups), default=0)
+        ):
+            for source, frames in spread_groups:
+                if position < len(frames):
+                    frame_index, frame = frames[position]
+                    selected.append((source, frame_index, frame))
         return selected
 
     def _explore(self, context: StageContext) -> StageOutcome:
@@ -650,16 +774,28 @@ class WorkflowIterationAdapter:
 
     def _label(self, context: StageContext) -> StageOutcome:
         options = self.config.get("dft", {})
+        backend = str(options.get("software", "toy"))
+        use_k_stype = str(options.get("use_k_stype", "kspacing"))
         output = context.generation_dir / "selected-labels.xyz"
         result = self.runtime.label(
             LabelRequest(
                 source=context.artifacts["selected_input"],
                 output_file=output,
                 work_dir=context.generation_dir / "teacher",
-                n_cpu=int(options.get("n_cpu", 1)),
-                options={"profile": options.get("teacher_profile", "spin")},
+                input_file=self._optional_path(
+                    options.get("input_path", options.get("incar_path"))
+                ),
+                resource_dir=self._optional_path(options.get("resource_path")),
+                n_cpu=int(options.get("n_cpu", options.get("cpu_core", 1))),
+                use_gamma=bool(options.get("use_gamma", options.get("kpoints_use_gamma", False))),
+                kpoint_mode=use_k_stype,
+                kspacing=float(options["kspacing"])
+                if use_k_stype != "kpoints" and options.get("kspacing") is not None
+                else None,
+                ka=self._dft_kpoints(options),
+                options={"profile": options.get("teacher_profile", "ordinary")},
             ),
-            "toy",
+            backend,
         )
         validate_spin_dataset(result.frames, require_mforce=True)
         return StageOutcome(
@@ -720,10 +856,13 @@ class WorkflowIterationAdapter:
 
     def _retrain(self, context: StageContext) -> StageOutcome:
         training_input = context.artifacts["training_set"]
-        result, frame_count = self._execute_training(
+        output_name = self._attempt_output_name(
+            context.generation_dir, "retraining"
+        )
+        result, frame_count, config_file = self._execute_training(
             context,
             training_input=training_input,
-            output_name="retraining",
+            output_name=output_name,
             warm_start=context.artifacts.get("checkpoint"),
         )
         artifacts: dict[str, Path] = {"retrained_model": result.best_model}
@@ -731,6 +870,11 @@ class WorkflowIterationAdapter:
             artifacts["retrained_final_model"] = result.final_model
         if result.checkpoint is not None:
             artifacts["retrained_checkpoint"] = result.checkpoint
+        original_config = self._path(
+            self.config.get("training", {}).get("config_path")
+        )
+        if config_file != original_config:
+            artifacts["retraining_config"] = config_file
         return StageOutcome(
             artifacts=artifacts,
             metrics={"backend": result.backend, "training_count": frame_count},
@@ -776,6 +920,11 @@ class WorkflowIterationAdapter:
             "validation_path": str(self.validation),
         }
         artifacts = {}
+        attempt = 1
+        while (context.generation_dir / f"signals-attempt-{attempt}.json").exists():
+            attempt += 1
+        recovering = (context.generation_dir / "signals.json").exists()
+        suffix = f"-attempt-{attempt}" if recovering else ""
         if self.scenario_ladder is not None:
             scenario_plan = json.loads(
                 context.artifacts["scenario_plan"].read_text(encoding="utf-8")
@@ -800,13 +949,13 @@ class WorkflowIterationAdapter:
                 validation=signals,
             )
             maturity_path = _write_json(
-                context.generation_dir / "scenario-maturity.json", history
+                context.generation_dir / f"scenario-maturity{suffix}.json", history
             )
             artifacts["scenario_maturity"] = maturity_path
             signals["scenario_counts_by_maturity"] = history[
                 "counts_by_maturity"
             ]
-        output = _write_json(context.generation_dir / "signals.json", signals)
+        output = _write_json(context.generation_dir / f"signals{suffix}.json", signals)
         artifacts["signals"] = output
         return StageOutcome(artifacts=artifacts, metrics=signals)
 

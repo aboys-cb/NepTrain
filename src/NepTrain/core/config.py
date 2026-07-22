@@ -48,6 +48,7 @@ def migrate_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]
     md.setdefault("backend", "gpumd")
     training.setdefault("device", "cuda")
     training.setdefault("torch_backend", "auto")
+    training.setdefault("finetune_lr_scale", 0.1)
     md.setdefault("inference_backend", "auto")
 
     if "test_xyz_path" in training and "test_path" not in training:
@@ -96,6 +97,12 @@ def validate_config(config: Mapping[str, Any]) -> None:
     dft = config.get("dft", {})
     if training.get("backend") not in {"gpumd", "torchnep"}:
         raise ConfigError("training.backend must be gpumd or torchnep")
+    if float(training.get("finetune_lr_scale", 0.1)) <= 0:
+        raise ConfigError("training.finetune_lr_scale must be positive")
+    if training.get("finetune_lr") is not None and float(
+        training["finetune_lr"]
+    ) <= 0:
+        raise ConfigError("training.finetune_lr must be positive")
     if md.get("backend") not in {"gpumd", "lammps"}:
         raise ConfigError("md.backend must be gpumd or lammps")
     if md.get("inference_backend", "auto") not in {"auto", "cpu", "cuda"}:
@@ -104,6 +111,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ConfigError("dft.software must be vasp, abacus, or toy")
     if dft.get("teacher_profile", "ordinary") not in {"ordinary", "spin"}:
         raise ConfigError("dft.teacher_profile must be ordinary or spin")
+    if int(dft.get("n_cpu", dft.get("cpu_core", 1))) < 1:
+        raise ConfigError("dft.n_cpu/dft.cpu_core must be positive")
+    if dft.get("use_k_stype", "kspacing") not in {"kspacing", "kpoints"}:
+        raise ConfigError("dft.use_k_stype must be kspacing or kpoints")
     if config.get("current_job") not in {"training", "md", "select", "dft", "pred"}:
         raise ConfigError(
             "current_job must be training, md, select, dft, or pred"
@@ -126,6 +137,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError("spin MD currently requires md.backend=lammps")
         if md.get("spin_temperature") is None:
             raise ConfigError("spin MD requires md.spin_temperature")
+        if dft.get("software", "vasp") != "toy":
+            raise ConfigError(
+                "spin campaigns currently require dft.software=toy; "
+                "VASP/ABACUS production labeling is non-magnetic only"
+            )
     try:
         ScenarioLadder.from_campaign(config.get("campaign", {}))
     except ScenarioMaturityError as error:

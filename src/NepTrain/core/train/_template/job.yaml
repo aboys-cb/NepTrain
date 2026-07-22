@@ -52,9 +52,10 @@ md:
 
 dft:
   software: vasp
-  cpu_core: 64
+  cpu_core: 1
   kpoints_use_gamma: true
   incar_path: auto
+  resource_path: null
   use_k_stype: kspacing
   kpoints: [20, 20, 20]
   kspacing: 0.2
@@ -67,7 +68,7 @@ evaluation:
   max_rmse: {}
 
 campaign:
-  id: spin-nep-lite-v1
+  id: ordinary-v1
   generations: 3
   seed: 20260721
   initial_candidates: 200

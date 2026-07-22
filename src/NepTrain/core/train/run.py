@@ -520,7 +520,7 @@ class NepTrainWorker:
             if self.config["dft"]["software"] == "abacus":
                 from NepTrain.core.dft.abacus import StructureVar
                 StructureVar.init(self.config["md"]["structures"])
-                StructureVar.init("./")
+                StructureVar.init("./", reset=False)
                 for pp in StructureVar.pp_files.values():
                     curr_p=f"./{pp}"
                     stru_p=f'{self.config["md"]["structures"]}/{pp}'

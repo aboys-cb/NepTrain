@@ -23,10 +23,26 @@ def test_migrate_legacy_backend_names_and_paths():
     assert config["training"]["backend"] == "gpumd"
     assert config["training"]["test_path"] == "test.xyz"
     assert config["training"]["config_path"] == "nep.in"
+    assert config["training"]["finetune_lr_scale"] == 0.1
     assert config["md"]["duration_ps_every_generation"] == [10, 20]
     assert config["md"]["temperatures"] == [300]
     assert config["md"]["structures"] == "structure"
     assert "nep -> training" in changes
+
+
+def test_torchnep_finetune_learning_rate_must_be_positive(tmp_path: Path):
+    path = tmp_path / "job.yaml"
+    path.write_text(
+        """
+schema_version: 2
+current_job: training
+training: {backend: torchnep, finetune_lr_scale: 0}
+md: {backend: lammps}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="finetune_lr_scale"):
+        load_config(path)
 
 
 def test_spin_md_requires_spin_temperature(tmp_path: Path):
@@ -41,6 +57,22 @@ md: {backend: lammps, spin: true, spin_temperature: null}
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="spin_temperature"):
+        load_config(path)
+
+
+def test_spin_campaign_rejects_unvalidated_production_dft(tmp_path: Path):
+    path = tmp_path / "job.yaml"
+    path.write_text(
+        """
+schema_version: 2
+current_job: md
+training: {backend: torchnep}
+md: {backend: lammps, spin: true, spin_temperature: auto}
+dft: {software: abacus}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="non-magnetic only"):
         load_config(path)
 
 

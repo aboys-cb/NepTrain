@@ -70,10 +70,9 @@ def calculate_gpumd(atoms:Atoms,argparse):
 
     return new_atoms
 def run_gpumd(argparse):
-    check_env()
+    check_env(commands=("gpumd_path",))
     utils.verify_path(os.path.dirname(os.path.abspath(argparse.out_file_path)))
     result = calculate_gpumd(argparse.model_path,argparse)
-
 
 
 

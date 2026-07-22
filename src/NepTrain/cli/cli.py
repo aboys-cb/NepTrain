@@ -204,14 +204,12 @@ def run_iteration_resource_command(args):
     from NepTrain.core.iteration import IterationError
 
     plan, adapter, controller = _iteration_execution(args)
-    allowed = {"train", "retrain"} if args.resource == "training" else {
-        "explore",
-        "select",
-        "label",
-        "diagnose",
-        "merge",
-        "evaluate",
-    }
+    if args.resource == "training":
+        allowed = {"train", "retrain"}
+    elif args.resource == "dft":
+        allowed = {"label"}
+    else:
+        allowed = {"explore", "select", "diagnose", "merge", "evaluate"}
     results = []
     while True:
         stage = controller.next_stage(plan)
@@ -319,6 +317,28 @@ def run_campaign_command(args):
     if args.json and not args.status:
         raise SystemExit("campaign --json requires --status")
 
+    extend_to = getattr(args, "extend_to", None)
+    if extend_to is not None:
+        from NepTrain.core.campaign import CampaignError, extend_campaign
+
+        try:
+            preparation = extend_campaign(args.output, extend_to)
+        except CampaignError as error:
+            raise SystemExit(f"NepTrain: error: {error}") from error
+        print(
+            json.dumps(
+                {
+                    "campaign_id": preparation.campaign_id,
+                    "extended": True,
+                    "total_generations": len(preparation.plans),
+                    "manifest": str(preparation.manifest),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
     if args.status:
         from NepTrain.core.campaign import CampaignError, campaign_status
 
@@ -354,11 +374,14 @@ def run_campaign_command(args):
             print(f"Next: {status.next_action}")
         return
 
-    if args.retry_failed:
+    recover_rejected = getattr(args, "recover_rejected", False)
+    if args.retry_failed or recover_rejected:
         from NepTrain.core.campaign import CampaignError, retry_failed_campaign
 
         try:
-            retry = retry_failed_campaign(args.output)
+            retry = retry_failed_campaign(
+                args.output, recover_rejected=recover_rejected
+            )
         except CampaignError as error:
             raise SystemExit(f"NepTrain: error: {error}") from error
         payload = asdict(retry)
@@ -694,6 +717,13 @@ def build_dft(subparsers):
     parser_dft.add_argument("--in",
                                 dest="incar",
                              help="Input path for INCAR file, default is ./INCAR or ./INPUT.",default=None)
+    parser_dft.add_argument(
+        "--resource-dir",
+        "--resources",
+        dest="resource_dir",
+        help="VASP POTCAR root or ABACUS pseudopotential/orbital directory.",
+        default=None,
+    )
 
 
 
@@ -925,7 +955,9 @@ def build_iteration_resource(subparsers):
     )
     parser.set_defaults(func=run_iteration_resource_command)
     _add_iteration_arguments(parser)
-    parser.add_argument("--resource", choices=["training", "cpu"], required=True)
+    parser.add_argument(
+        "--resource", choices=["training", "cpu", "dft"], required=True
+    )
 
 
 def build_campaign(subparsers):
@@ -959,16 +991,30 @@ def build_campaign(subparsers):
         help="Cancel the stale dependency tail and resume from the ledger breakpoint.",
     )
     action.add_argument(
+        "--recover-rejected",
+        action="store_true",
+        help=(
+            "Preserve the rejected retrain/evaluate attempt and retry from "
+            "retraining with the current code and configuration."
+        ),
+    )
+    action.add_argument(
         "--status",
         action="store_true",
         help="Show ledger progress, live Slurm states, and the next safe action.",
+    )
+    action.add_argument(
+        "--extend-to",
+        type=int,
+        metavar="GENERATIONS",
+        help="Append generations to a completed accepted campaign without rerunning it.",
     )
     parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON with --status.",
     )
-    parser.set_defaults(retry_failed=False, status=False)
+    parser.set_defaults(retry_failed=False, recover_rejected=False, status=False)
 
 
 

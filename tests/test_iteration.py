@@ -27,6 +27,7 @@ from NepTrain.core.workflow_iteration import (
     WorkflowRuntime,
 )
 from NepTrain.core.dft.toy import ToyTeacher
+from NepTrain.core.dft import LabelResult
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 from NepTrain.cli import cli
@@ -194,6 +195,41 @@ def test_rejected_generation_stops_before_next_plan(tmp_path: Path):
     assert not (tmp_path / "rejected/Generation-2").exists()
 
 
+def test_rejected_generation_can_reopen_from_retrain_with_history(tmp_path: Path):
+    class RecoveringAdapter:
+        evaluations = 0
+
+        def run_stage(self, stage, context):
+            attempt = self.evaluations + 1
+            artifact = context.generation_dir / f"{stage}-attempt-{attempt}.json"
+            artifact.write_text("{}\n", encoding="utf-8")
+            metrics = {}
+            if stage == "evaluate":
+                self.evaluations += 1
+                metrics["accepted"] = self.evaluations > 1
+            return StageOutcome({f"{stage}_artifact": artifact}, metrics)
+
+    plan = progressive_plans(1)[0]
+    root = tmp_path / "recover-rejected"
+    adapter = RecoveringAdapter()
+    controller = GenerationController(root, "recover-rejected")
+
+    first = controller.run_generation(plan, adapter)
+    assert first.accepted is False
+    controller.reopen_rejected(plan)
+    assert controller.next_stage(plan) == "retrain"
+
+    recovered = controller.run_generation(plan, adapter)
+    assert recovered.accepted is True
+    ledger = json.loads((root / "campaign-ledger.json").read_text())
+    generation = ledger["generations"]["1"]
+    assert generation["recovery_attempts"][0]["from_stage"] == "retrain"
+    assert generation["recovery_attempts"][0]["stages"]["evaluate"][
+        "metrics"
+    ]["accepted"] is False
+    assert generation["stages"]["evaluate"]["metrics"]["accepted"] is True
+
+
 def test_controller_rejects_plan_change_after_generation_started(tmp_path: Path):
     class AcceptingAdapter:
         def run_stage(self, stage, context):
@@ -302,7 +338,8 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     ase_write(validation, validation_frames, format="extxyz")
     config_file = tmp_path / "nep.in"
     config_file.write_text(
-        "type 1 Fe\nspin_descriptor spin_nep_lite\n", encoding="utf-8"
+        "type 1 Fe\nspin_descriptor spin_nep_lite\nlr 0.003\n",
+        encoding="utf-8",
     )
 
     calls = []
@@ -434,6 +471,9 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert summary.metrics["diagnose"]["current_model_mforce_rmse"] == 4.0
     assert summary.metrics["merge"]["added_count"] == 3
     assert summary.metrics["retrain"]["training_count"] == 6
+    assert summary.artifacts["retraining_config"].read_text(encoding="utf-8").endswith(
+        "lr 0.0003\n"
+    )
     assert summary.metrics["evaluate"]["added_training_count"] == 3
     assert summary.metrics["evaluate"]["mforce_rmse"] == 0.4
     assert summary.metrics["evaluate"]["model_trained_on_current_labels"] is True
@@ -452,6 +492,11 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert len([call for call in calls if call[0] == "train"]) == 2
     assert len([call for call in calls if call[0] == "predict"]) == 2
     assert calls[0] == ("train", "torchnep", "cuda")
+    assert training_requests[0].config_file == config_file
+    assert training_requests[1].config_file.name == "torchnep-finetune.in"
+    assert "lr 0.0003\n" in training_requests[1].config_file.read_text(
+        encoding="utf-8"
+    )
     assert set(calls[1:3]) == {
         ("md", "lammps", 300.0, 40),
         ("md", "lammps", 500.0, 40),
@@ -586,3 +631,123 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     assert outcome.metrics["duplicate_candidate_count"] == 1
     assert outcome.metrics["selected_count"] == 2
     assert "pre_failure" in {frame.info["md_window"] for frame in selected}
+
+
+def test_candidate_cap_spreads_each_source_over_full_trajectory():
+    def frames(source: str, count: int):
+        result = []
+        for step in range(count):
+            frame = toy_candidate_frames("ordinary", step + 100, 1)[0]
+            frame.info.update(source_id=source, lammps_step=step)
+            result.append(frame)
+        return result
+
+    first = frames("first", 10)
+    second = frames("second", 10)
+    selected = WorkflowIterationAdapter._balanced_cap(
+        [("first", first), ("second", second)], 6
+    )
+
+    by_source = {
+        source: [frame.info["lammps_step"] for item_source, _, frame in selected if item_source == source]
+        for source in ("first", "second")
+    }
+    assert by_source == {"first": [0, 4, 9], "second": [0, 4, 9]}
+
+
+def test_candidate_cap_prioritizes_pre_failure_frames():
+    frames = toy_candidate_frames("ordinary", 301, 6)
+    for step, frame in enumerate(frames):
+        frame.info.update(
+            lammps_step=step,
+            md_window="pre_failure" if step >= 4 else "stable_prefix",
+        )
+
+    selected = WorkflowIterationAdapter._balanced_cap([("failed", frames)], 2)
+
+    assert [frame.info["lammps_step"] for _, _, frame in selected] == [4, 5]
+
+
+@pytest.mark.parametrize("backend", ["vasp", "abacus"])
+def test_workflow_label_routes_production_dft_through_label_interface(
+    tmp_path: Path, backend: str
+):
+    initial = tmp_path / "initial.xyz"
+    validation = tmp_path / "validation.xyz"
+    selected_input = tmp_path / "selected.xyz"
+    config_file = tmp_path / "nep.in"
+    input_file = tmp_path / ("INCAR" if backend == "vasp" else "INPUT")
+    resource_dir = tmp_path / "dft-resources"
+    resource_dir.mkdir()
+    config_file.write_text("type 1 Fe\n", encoding="utf-8")
+    input_file.write_text("test input\n", encoding="utf-8")
+    ase_write(
+        initial,
+        [ToyTeacher("ordinary").label(toy_candidate_frames("ordinary", 71, 1)[0])],
+        format="extxyz",
+    )
+    ase_write(
+        validation,
+        [ToyTeacher("ordinary").label(toy_candidate_frames("ordinary", 72, 1)[0])],
+        format="extxyz",
+    )
+    ase_write(
+        selected_input,
+        toy_candidate_frames("ordinary", 73, 2),
+        format="extxyz",
+    )
+    calls = []
+
+    def fake_label(request, selected_backend):
+        frames = [
+            ToyTeacher("ordinary").label(frame)
+            for frame in ase_read(request.source, index=":")
+        ]
+        ase_write(request.output_file, frames, format="extxyz")
+        calls.append((request, selected_backend))
+        return LabelResult(selected_backend, request.output_file, tuple(frames))
+
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {"backend": "gpumd", "config_path": str(config_file)},
+            "md": {"backend": "lammps", "spin": False},
+            "dft": {
+                "software": backend,
+                "cpu_core": 4,
+                "incar_path": str(input_file),
+                "resource_path": str(resource_dir),
+                "kpoints_use_gamma": True,
+                "use_k_stype": "kpoints",
+                "kpoints": [2, 3, 4],
+            },
+            "evaluation": {
+                "validation_path": str(validation),
+                "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
+            },
+        },
+        initial_training=initial,
+        runtime=WorkflowRuntime(label=fake_label),
+    )
+    generation_dir = tmp_path / "Generation-1"
+    generation_dir.mkdir()
+
+    outcome = adapter._label(
+        StageContext(
+            generation=1,
+            generation_dir=generation_dir,
+            plan=GenerationPlan(1, 1, 2, 2, 10, (300.0,)),
+            artifacts={"selected_input": selected_input},
+            previous_artifacts={},
+        )
+    )
+
+    request, selected_backend = calls[0]
+    assert selected_backend == backend
+    assert request.input_file == input_file
+    assert request.resource_dir == resource_dir
+    assert request.n_cpu == 4
+    assert request.use_gamma is True
+    assert request.kpoint_mode == "kpoints"
+    assert request.ka == (2, 3, 4)
+    assert request.kspacing is None
+    assert outcome.metrics == {"backend": backend, "labeled_count": 2}

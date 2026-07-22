@@ -7,9 +7,7 @@ import os
 import re
 from pathlib import Path
 
-import numpy as np
 from ase import Atoms
-from ase.data import atomic_masses, atomic_numbers
 
 
 def read_input_file(file_name: str) -> dict:
@@ -29,7 +27,7 @@ def read_input_file(file_name: str) -> dict:
             m = re.match(pattern, line)
             if m:
                 key, value = m.groups()
-                input_key[key]= value.strip()
+                input_key[key] = (value or "").strip()
 
     return input_key
 
@@ -40,27 +38,31 @@ class StructureVar:
     orbs={}
     # masses={ symbol:atomic_masses[z] for symbol ,z in atomic_numbers.items()}
     @classmethod
-    def init(cls,path):
+    def init(cls, path, *, reset: bool = True):
         path = Path(path)
-        upfs= path.glob("*.upf")
+        if not path.is_dir():
+            raise FileNotFoundError(f"ABACUS resource directory does not exist: {path}")
+        if reset:
+            cls.pp_files = {}
+            cls.orbs = {}
+        upfs = (item for item in path.iterdir() if item.suffix.lower() == ".upf")
         for upf in upfs:
             try:
-                with open( upf,"r") as f:
+                with open(upf, "r", encoding="utf-8", errors="ignore") as f:
                     ufp_content = f.read()
-                elem = re.search('element="(\w+)"',ufp_content).group(1)
+                elem = re.search(r'element\s*=\s*["\'](\w+)["\']', ufp_content).group(1)
                 cls.pp_files[elem] = upf.name
-            except:
+            except (AttributeError, OSError):
                 pass
-        orbs= path.glob("*.orb")
+        orbs = (item for item in path.iterdir() if item.suffix.lower() == ".orb")
         for orb in orbs:
             try:
-                with open( orb,"r") as f:
+                with open(orb, "r", encoding="utf-8", errors="ignore") as f:
                     orb_content = f.read()
-                elem = re.search('Element\s+(\w+)',orb_content).group(1)
+                elem = re.search(r'Element\s+(\w+)', orb_content).group(1)
                 cls.orbs[elem] = orb.name
-            except:
+            except (AttributeError, OSError):
                 pass
-        pass
     @classmethod
     def update(cls,structure):
         atom_names = structure["atom_names"]
@@ -75,9 +77,9 @@ class StructureVar:
         #     for atom ,pp in zip(atom_names,structure["masses"]):
         #         StructureVar.masses[atom]=pp
     @classmethod
-    def completion_abacus(cls,atoms:Atoms):
+    def completion_abacus(cls, atoms: Atoms, *, require_orbitals: bool):
 
-        atom_names =atoms.get_chemical_symbols()
+        atom_names = atoms.get_chemical_symbols()
         pp_files= {}
         orb_files= {}
         # masses=[]
@@ -89,5 +91,15 @@ class StructureVar:
 
             # masses.append(cls.masses[atom])
 
-        return pp_files,orb_files
-
+        elements = set(atom_names)
+        missing_pp = sorted(elements - pp_files.keys())
+        if missing_pp:
+            raise FileNotFoundError(
+                "missing ABACUS pseudopotential for: " + ", ".join(missing_pp)
+            )
+        missing_orb = sorted(elements - orb_files.keys())
+        if require_orbitals and missing_orb:
+            raise FileNotFoundError(
+                "missing ABACUS orbital for: " + ", ".join(missing_orb)
+            )
+        return pp_files, orb_files

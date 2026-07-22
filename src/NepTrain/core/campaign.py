@@ -187,6 +187,10 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
     for key in ("structures", "template_path", "plugin_path"):
         if md.get(key):
             md[key] = _absolute_path(md[key], base_dir)
+    dft = resolved.get("dft", {})
+    for key in ("input_path", "incar_path", "resource_path"):
+        if dft.get(key) and dft[key] != "auto":
+            dft[key] = _absolute_path(dft[key], base_dir)
     evaluation = resolved.get("evaluation", {})
     if evaluation.get("validation_path"):
         evaluation["validation_path"] = _absolute_path(
@@ -194,7 +198,7 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
         )
     campaign = resolved.get("campaign", {})
     slurm = campaign.get("slurm", {})
-    for resource in ("training", "cpu"):
+    for resource in ("training", "cpu", "dft"):
         profile = slurm.get(resource, {})
         if profile.get("setup_script"):
             profile["setup_script"] = _absolute_path(
@@ -204,13 +208,20 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
 
 
 def _slurm_profile(campaign: Mapping[str, Any], name: str) -> dict[str, Any]:
-    profile = dict(campaign.get("slurm", {}).get(name, {}))
+    profiles = campaign.get("slurm", {})
+    selected = profiles.get(name)
+    if name == "dft" and not selected:
+        selected = profiles.get("cpu", {})
+    profile = dict(selected or {})
     if not profile.get("partition"):
         raise CampaignError(f"campaign.slurm.{name}.partition is required")
     profile.setdefault("time", "01:00:00")
     if name == "training":
         profile.setdefault("gpus_per_node", 1)
-    else:
+    elif name == "cpu" or (
+        profile.get("gpus_per_node") is None
+        and profile.get("cpus_per_task") is None
+    ):
         profile.setdefault("cpus_per_task", 4)
     return profile
 
@@ -310,6 +321,7 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     paths: list[tuple[str, Path]] = []
     training = config.get("training", {})
     md = config.get("md", {})
+    dft = config.get("dft", {})
     campaign = config.get("campaign", {})
     evaluation = config.get("evaluation", {})
     for role, value in (
@@ -318,14 +330,17 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
         ("md_structures", md.get("structures")),
         ("md_template", md.get("template_path")),
         ("md_plugin", md.get("plugin_path")),
+        ("dft_input", dft.get("input_path") or dft.get("incar_path")),
+        ("dft_resources", dft.get("resource_path")),
         ("evaluation_validation", evaluation.get("validation_path")),
         (
             "training_setup",
             campaign.get("slurm", {}).get("training", {}).get("setup_script"),
         ),
         ("cpu_setup", campaign.get("slurm", {}).get("cpu", {}).get("setup_script")),
+        ("dft_setup", campaign.get("slurm", {}).get("dft", {}).get("setup_script")),
     ):
-        if value:
+        if value and value != "auto":
             paths.append((role, Path(value)))
     return [_path_record(role, path) for role, path in paths]
 
@@ -341,6 +356,127 @@ def _preparation_from_manifest(path: Path) -> CampaignPreparation:
         scripts=tuple(Path(record["path"]) for record in manifest["scripts"]),
         manifest=path,
     )
+
+
+def _write_campaign_scripts(
+    *,
+    output: Path,
+    config_file: Path,
+    initial_training: Path,
+    campaign_id: str,
+    plans: Sequence[Any],
+    plan_paths: Sequence[Path],
+    command: str,
+    training_profile: Mapping[str, Any],
+    cpu_profile: Mapping[str, Any],
+    dft_profile: Mapping[str, Any],
+) -> list[Path]:
+    """Write one contiguous campaign segment, including its train bootstrap."""
+
+    if not plans or len(plans) != len(plan_paths):
+        raise CampaignError("campaign script segment must contain matching plans")
+    script_paths: list[Path] = []
+    campaign_dir = output / "state"
+    logs = output / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+
+    first_generation = plans[0].generation
+    bootstrap_script = (
+        output / "jobs" / f"generation-{first_generation}-bootstrap.sbatch"
+    )
+    bootstrap_command = _resource_command(
+        command,
+        config_file=config_file,
+        plan_file=plan_paths[0],
+        initial_training=initial_training,
+        campaign_dir=campaign_dir,
+        campaign_id=campaign_id,
+        resource="training",
+    )
+    _write_text(
+        bootstrap_script,
+        _render_script(
+            training_profile,
+            job_name=f"neptrain-g{first_generation}-bootstrap",
+            log_file=logs / f"generation-{first_generation}-bootstrap-%j.out",
+            commands=[bootstrap_command],
+            cpu=False,
+        ),
+    )
+    script_paths.append(bootstrap_script)
+
+    for index, (plan, plan_path) in enumerate(zip(plans, plan_paths)):
+        generation = plan.generation
+        stage_profiles = (
+            ("sample", "cpu", cpu_profile, True),
+            (
+                "label",
+                "dft",
+                dft_profile,
+                dft_profile.get("cpus_per_task") is not None,
+            ),
+            ("merge", "cpu", cpu_profile, True),
+            ("retrain", "training", training_profile, False),
+        )
+        for stage, resource, profile, cpu in stage_profiles:
+            script = output / "jobs" / f"generation-{generation}-{stage}.sbatch"
+            stage_command = _resource_command(
+                command,
+                config_file=config_file,
+                plan_file=plan_path,
+                initial_training=initial_training,
+                campaign_dir=campaign_dir,
+                campaign_id=campaign_id,
+                resource=resource,
+            )
+            _write_text(
+                script,
+                _render_script(
+                    profile,
+                    job_name=f"neptrain-g{generation}-{stage}",
+                    log_file=logs / f"generation-{generation}-{stage}-%j.out",
+                    commands=[stage_command],
+                    cpu=cpu,
+                ),
+            )
+            script_paths.append(script)
+
+        evaluate_script = output / "jobs" / f"generation-{generation}-evaluate.sbatch"
+        evaluate_commands = [
+            _resource_command(
+                command,
+                config_file=config_file,
+                plan_file=plan_path,
+                initial_training=initial_training,
+                campaign_dir=campaign_dir,
+                campaign_id=campaign_id,
+                resource="cpu",
+            )
+        ]
+        if index + 1 < len(plan_paths):
+            evaluate_commands.append(
+                _resource_command(
+                    command,
+                    config_file=config_file,
+                    plan_file=plan_paths[index + 1],
+                    initial_training=initial_training,
+                    campaign_dir=campaign_dir,
+                    campaign_id=campaign_id,
+                    resource="training",
+                )
+            )
+        _write_text(
+            evaluate_script,
+            _render_script(
+                cpu_profile,
+                job_name=f"neptrain-g{generation}-evaluate",
+                log_file=logs / f"generation-{generation}-evaluate-%j.out",
+                commands=evaluate_commands,
+                cpu=True,
+            ),
+        )
+        script_paths.append(evaluate_script)
+    return script_paths
 
 
 def _coerce_preparation(
@@ -379,6 +515,7 @@ def prepare_campaign(
         raise CampaignError("campaign id cannot be empty")
     training_profile = _slurm_profile(settings, "training")
     cpu_profile = _slurm_profile(settings, "cpu")
+    dft_profile = _slurm_profile(settings, "dft")
     plans = _plans(settings)
     command = str(settings.get("command", "NepTrain"))
     dependencies = _dependencies(config)
@@ -417,121 +554,22 @@ def prepare_campaign(
     resolved_config = output / "job.resolved.yaml"
     save_config(config, resolved_config)
     plan_paths: list[Path] = []
-    script_paths: list[Path] = []
-    campaign_dir = output / "state"
-    logs = output / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
     for plan in plans:
         plan_path = output / "plans" / f"generation-{plan.generation}.json"
         _write_json(plan_path, asdict(plan))
         plan_paths.append(plan_path)
-
-    bootstrap_script = output / "jobs" / "generation-1-bootstrap.sbatch"
-    bootstrap_command = _resource_command(
-        command,
+    script_paths = _write_campaign_scripts(
+        output=output,
         config_file=resolved_config,
-        plan_file=plan_paths[0],
         initial_training=initial,
-        campaign_dir=campaign_dir,
         campaign_id=selected_id,
-        resource="training",
+        plans=plans,
+        plan_paths=plan_paths,
+        command=command,
+        training_profile=training_profile,
+        cpu_profile=cpu_profile,
+        dft_profile=dft_profile,
     )
-    _write_text(
-        bootstrap_script,
-        _render_script(
-            training_profile,
-            job_name="neptrain-g1-bootstrap",
-            log_file=logs / "generation-1-bootstrap-%j.out",
-            commands=[bootstrap_command],
-            cpu=False,
-        ),
-    )
-    script_paths.append(bootstrap_script)
-
-    for index, (plan, plan_path) in enumerate(zip(plans, plan_paths)):
-        sample_script = output / "jobs" / f"generation-{plan.generation}-sample.sbatch"
-        sample_command = _resource_command(
-            command,
-            config_file=resolved_config,
-            plan_file=plan_path,
-            initial_training=initial,
-            campaign_dir=campaign_dir,
-            campaign_id=selected_id,
-            resource="cpu",
-        )
-        _write_text(
-            sample_script,
-            _render_script(
-                cpu_profile,
-                job_name=f"neptrain-g{plan.generation}-sample",
-                log_file=logs / f"generation-{plan.generation}-sample-%j.out",
-                commands=[sample_command],
-                cpu=True,
-            ),
-        )
-        script_paths.append(sample_script)
-
-        retrain_script = (
-            output / "jobs" / f"generation-{plan.generation}-retrain.sbatch"
-        )
-        retrain_command = _resource_command(
-            command,
-            config_file=resolved_config,
-            plan_file=plan_path,
-            initial_training=initial,
-            campaign_dir=campaign_dir,
-            campaign_id=selected_id,
-            resource="training",
-        )
-        _write_text(
-            retrain_script,
-            _render_script(
-                training_profile,
-                job_name=f"neptrain-g{plan.generation}-retrain",
-                log_file=logs / f"generation-{plan.generation}-retrain-%j.out",
-                commands=[retrain_command],
-                cpu=False,
-            ),
-        )
-        script_paths.append(retrain_script)
-
-        evaluate_script = (
-            output / "jobs" / f"generation-{plan.generation}-evaluate.sbatch"
-        )
-        evaluate_commands = [
-            _resource_command(
-                command,
-                config_file=resolved_config,
-                plan_file=plan_path,
-                initial_training=initial,
-                campaign_dir=campaign_dir,
-                campaign_id=selected_id,
-                resource="cpu",
-            )
-        ]
-        if index + 1 < len(plan_paths):
-            evaluate_commands.append(
-                _resource_command(
-                    command,
-                    config_file=resolved_config,
-                    plan_file=plan_paths[index + 1],
-                    initial_training=initial,
-                    campaign_dir=campaign_dir,
-                    campaign_id=selected_id,
-                    resource="training",
-                )
-            )
-        _write_text(
-            evaluate_script,
-            _render_script(
-                cpu_profile,
-                job_name=f"neptrain-g{plan.generation}-evaluate",
-                log_file=logs / f"generation-{plan.generation}-evaluate-%j.out",
-                commands=evaluate_commands,
-                cpu=True,
-            ),
-        )
-        script_paths.append(evaluate_script)
 
     manifest = {
         "version": 1,
@@ -550,6 +588,82 @@ def prepare_campaign(
     }
     _write_json(manifest_path, manifest)
     return _preparation_from_manifest(manifest_path)
+
+
+def extend_campaign(
+    preparation: CampaignPreparation | str | Path,
+    total_generations: int,
+) -> CampaignPreparation:
+    """Append immutable generations to a completed, accepted campaign."""
+
+    from .config import load_config
+
+    preparation = _coerce_preparation(preparation)
+    with _campaign_lock(preparation.output_dir):
+        manifest = _validated_manifest(preparation)
+        progress = _campaign_progress(preparation, manifest)
+        if progress.state != "complete":
+            raise CampaignError(
+                "campaign can only be extended after all prepared generations "
+                "completed and passed evaluation"
+            )
+        current_total = len(preparation.plans)
+        if total_generations <= current_total:
+            raise CampaignError(
+                f"extension target must exceed current total {current_total}"
+            )
+
+        config, _ = load_config(preparation.config_file)
+        settings = dict(config.get("campaign", {}))
+        settings["generations"] = int(total_generations)
+        all_plans = _plans(settings)
+        existing_values = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in preparation.plans
+        ]
+        if [
+            _canonical_hash(asdict(plan)) for plan in all_plans[:current_total]
+        ] != [_canonical_hash(value) for value in existing_values]:
+            raise CampaignError("campaign extension changed an existing generation plan")
+
+        new_plans = all_plans[current_total:]
+        new_plan_paths: list[Path] = []
+        for plan in new_plans:
+            path = preparation.output_dir / "plans" / f"generation-{plan.generation}.json"
+            _write_json(path, asdict(plan))
+            new_plan_paths.append(path)
+
+        training_profile = _slurm_profile(settings, "training")
+        cpu_profile = _slurm_profile(settings, "cpu")
+        dft_profile = _slurm_profile(settings, "dft")
+        new_scripts = _write_campaign_scripts(
+            output=preparation.output_dir,
+            config_file=preparation.config_file,
+            initial_training=preparation.initial_training,
+            campaign_id=preparation.campaign_id,
+            plans=new_plans,
+            plan_paths=new_plan_paths,
+            command=str(settings.get("command", "NepTrain")),
+            training_profile=training_profile,
+            cpu_profile=cpu_profile,
+            dft_profile=dft_profile,
+        )
+        manifest["plans"].extend(
+            {"path": str(path), "sha256": _sha256(path)} for path in new_plan_paths
+        )
+        manifest["scripts"].extend(
+            {"path": str(path), "sha256": _sha256(path)} for path in new_scripts
+        )
+        manifest.setdefault("extensions", []).append(
+            {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "from_generations": current_total,
+                "script_start_index": len(manifest["scripts"]) - len(new_scripts),
+                "to_generations": total_generations,
+            }
+        )
+        _write_json(preparation.manifest, manifest)
+        return _preparation_from_manifest(preparation.manifest)
 
 
 def _submit(args: Sequence[str], cwd: Path) -> str:
@@ -631,12 +745,16 @@ def _reconcile_submission_records(
     output: Path,
     resolver: SubmissionResolver,
     persist: Callable[[], None],
+    chain_starts: set[int] | None = None,
 ) -> str | None:
     expected = [str(path) for path in scripts]
     if [record.get("script") for record in records] != expected[: len(records)]:
         raise CampaignError("campaign job history is not a valid script prefix")
+    starts = {0, *(chain_starts or set())}
     dependency = None
-    for record in records:
+    for index, record in enumerate(records):
+        if index in starts:
+            dependency = None
         if record.get("dependency") != dependency:
             raise CampaignError("campaign job history has an invalid dependency chain")
         job_id = record.get("job_id")
@@ -666,11 +784,20 @@ def _submit_missing_records(
     runner: SubmitRunner,
     resolver: SubmissionResolver,
     persist: Callable[[], None],
+    chain_starts: set[int] | None = None,
 ) -> list[dict[str, Any]]:
+    starts = {0, *(chain_starts or set())}
     dependency = _reconcile_submission_records(
-        records, scripts, output=output, resolver=resolver, persist=persist
+        records,
+        scripts,
+        output=output,
+        resolver=resolver,
+        persist=persist,
+        chain_starts=starts,
     )
-    for script in scripts[len(records) :]:
+    for index, script in enumerate(scripts[len(records) :], start=len(records)):
+        if index in starts:
+            dependency = None
         token = _submission_token(campaign_id, script)
         record = {
             "script": str(script),
@@ -700,6 +827,28 @@ def _submit_missing_records(
         persist()
         dependency = str(job_id)
     return records
+
+
+def _submission_chain_starts(
+    manifest: Mapping[str, Any], scripts: Sequence[Path]
+) -> set[int]:
+    """Return scheduler-chain reset points created by accepted extensions."""
+
+    names = [path.name for path in scripts]
+    starts = {0}
+    for extension in manifest.get("extensions", []):
+        index = extension.get("script_start_index")
+        if index is None:
+            generation = int(extension["from_generations"]) + 1
+            bootstrap = f"generation-{generation}-bootstrap.sbatch"
+            try:
+                index = names.index(bootstrap)
+            except ValueError as error:
+                raise CampaignError(
+                    f"campaign extension is missing scheduler bootstrap {bootstrap}"
+                ) from error
+        starts.add(int(index))
+    return starts
 
 
 def _validated_manifest(preparation: CampaignPreparation) -> dict[str, Any]:
@@ -755,6 +904,7 @@ def _submit_campaign_locked(
         runner=runner,
         resolver=submission_resolver,
         persist=persist,
+        chain_starts=_submission_chain_starts(manifest, preparation.scripts),
     )
     return CampaignSubmission(
         campaign_id=preparation.campaign_id,
@@ -1064,13 +1214,19 @@ def _retry_script_index(
     preparation: CampaignPreparation, generation: int, stage: str
 ) -> int:
     if stage == "train":
+        bootstrap = f"generation-{generation}-bootstrap.sbatch"
         filename = (
-            "generation-1-bootstrap.sbatch"
-            if generation == 1
+            bootstrap
+            if any(script.name == bootstrap for script in preparation.scripts)
             else f"generation-{generation - 1}-evaluate.sbatch"
         )
     elif stage in {"explore", "select", "label", "diagnose", "merge"}:
-        filename = f"generation-{generation}-sample.sbatch"
+        if stage in {"explore", "select"}:
+            filename = f"generation-{generation}-sample.sbatch"
+        elif stage == "label":
+            filename = f"generation-{generation}-label.sbatch"
+        else:
+            filename = f"generation-{generation}-merge.sbatch"
     else:
         filename = f"generation-{generation}-{stage}.sbatch"
     for index, script in enumerate(preparation.scripts):
@@ -1254,6 +1410,10 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
     elif progress.state == "rejected":
         state = "rejected"
         reason = progress.reason
+        next_action = (
+            f"NepTrain campaign --output {shlex.quote(str(output))} "
+            "--recover-rejected"
+        )
 
     return CampaignStatus(
         campaign_id=preparation.campaign_id,
@@ -1272,6 +1432,7 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
 def retry_failed_campaign(
     output_dir: str | Path,
     *,
+    recover_rejected: bool = False,
     runner: SubmitRunner = _submit,
     state_runner: JobStateRunner = _job_state,
     cancel_runner: CancelRunner = _cancel,
@@ -1295,6 +1456,7 @@ def retry_failed_campaign(
             state_runner=state_runner,
             cancel_runner=cancel_runner,
             submission_resolver=_resolve_submission,
+            recover_rejected=recover_rejected,
         )
 
 
@@ -1305,6 +1467,7 @@ def _retry_failed_campaign_locked(
     state_runner: JobStateRunner,
     cancel_runner: CancelRunner,
     submission_resolver: SubmissionResolver,
+    recover_rejected: bool = False,
 ) -> CampaignRetry:
     manifest_path = output / "campaign-manifest.json"
     preparation = _preparation_from_manifest(manifest_path)
@@ -1321,7 +1484,31 @@ def _retry_failed_campaign_locked(
         output=output,
         resolver=submission_resolver,
         persist=persist_original,
+        chain_starts=_submission_chain_starts(manifest, preparation.scripts),
     )
+    recovery_started = False
+    progress = _campaign_progress(preparation, manifest)
+    if recover_rejected:
+        if progress.state != "rejected" or progress.generation is None:
+            raise CampaignError(
+                "--recover-rejected requires a completed rejected generation"
+            )
+        from .iteration import GenerationController, GenerationPlan
+
+        value = json.loads(
+            preparation.plans[progress.generation - 1].read_text(encoding="utf-8")
+        )
+        value["temperatures"] = tuple(value["temperatures"])
+        controller = GenerationController(
+            output / "state", preparation.campaign_id
+        )
+        try:
+            controller.reopen_rejected(
+                GenerationPlan(**value), from_stage="retrain"
+            )
+        except Exception as error:
+            raise CampaignError(f"cannot reopen rejected generation: {error}") from error
+        recovery_started = True
     generation, stage = _campaign_breakpoint(preparation, manifest)
     start = _retry_script_index(preparation, generation, stage)
     remaining = preparation.scripts[start:]
@@ -1406,10 +1593,11 @@ def _retry_failed_campaign_locked(
                     "retry is not needed"
                 )
             if state == "COMPLETED":
-                raise CampaignError(
-                    f"job {job_id} completed but the campaign ledger did not "
-                    "advance; inspect the job log"
-                )
+                if not recovery_started:
+                    raise CampaignError(
+                        f"job {job_id} completed but the campaign ledger did not "
+                        "advance; inspect the job log"
+                    )
         elif state == "PENDING":
             cancel_runner(job_id, output)
         elif state in _ACTIVE_JOB_STATES:
@@ -1425,6 +1613,7 @@ def _retry_failed_campaign_locked(
         "replaced_jobs": replaced,
         "jobs": [],
         "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "recovery_of_rejected_generation": recovery_started,
     }
     retries.append(retry)
     manifest["retries"] = retries

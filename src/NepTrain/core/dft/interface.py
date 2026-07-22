@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 from ase import Atoms
+from ase.io import read as ase_read
 
 
 class LabelingError(RuntimeError):
@@ -21,8 +22,10 @@ class LabelRequest:
     work_dir: Path
     append: bool = False
     input_file: Path | None = None
+    resource_dir: Path | None = None
     n_cpu: int = 1
     use_gamma: bool = False
+    kpoint_mode: str = "auto"
     kspacing: float | None = None
     ka: tuple[int, int, int] = (1, 1, 1)
     options: Mapping[str, Any] = field(default_factory=dict)
@@ -38,6 +41,12 @@ class LabelResult:
 LabelAdapter = Callable[[LabelRequest], LabelResult]
 
 
+@dataclass(frozen=True)
+class _AdapterSpec:
+    label: LabelAdapter
+    supports_spin: bool
+
+
 def _namespace(request: LabelRequest) -> SimpleNamespace:
     """Translate the narrow Interface to the legacy calculator arguments."""
 
@@ -47,8 +56,10 @@ def _namespace(request: LabelRequest) -> SimpleNamespace:
         directory=str(request.work_dir),
         append=request.append,
         incar=str(request.input_file) if request.input_file else None,
+        resource_dir=str(request.resource_dir) if request.resource_dir else None,
         n_cpu=request.n_cpu,
         use_gamma=request.use_gamma,
+        kpoint_mode=request.kpoint_mode,
         kspacing=request.kspacing,
         ka=list(request.ka),
     )
@@ -75,25 +86,52 @@ def _label_toy(request: LabelRequest) -> LabelResult:
     return LabelResult("toy", request.output_file, tuple(frames))
 
 
-_ADAPTERS: dict[str, LabelAdapter] = {
-    "vasp": _label_vasp,
-    "abacus": _label_abacus,
-    "toy": _label_toy,
+_ADAPTERS: dict[str, _AdapterSpec] = {
+    "vasp": _AdapterSpec(_label_vasp, supports_spin=False),
+    "abacus": _AdapterSpec(_label_abacus, supports_spin=False),
+    "toy": _AdapterSpec(_label_toy, supports_spin=True),
 }
+
+
+def _source_contains_spin(source: Path) -> bool:
+    paths = [source]
+    if source.is_dir():
+        paths = sorted(
+            {
+                path
+                for pattern in ("*.xyz", "*.extxyz", "*.vasp", "POSCAR*")
+                for path in source.glob(pattern)
+                if path.is_file()
+            }
+        )
+    for path in paths:
+        frames = ase_read(path, index=":")
+        if not isinstance(frames, list):
+            frames = [frames]
+        if any("spin" in frame.arrays for frame in frames):
+            return True
+    return False
 
 
 def label(request: LabelRequest, backend: str) -> LabelResult:
     """Label structures through the selected Adapter."""
 
     try:
-        adapter = _ADAPTERS[backend]
+        spec = _ADAPTERS[backend]
     except KeyError as error:
         raise LabelingError("label backend must be vasp, abacus, or toy") from error
     if not request.source.exists():
         raise LabelingError(f"label source does not exist: {request.source}")
     if request.n_cpu < 1:
         raise LabelingError("n_cpu must be at least 1")
-    result = adapter(request)
+    if request.kpoint_mode not in {"auto", "kspacing", "kpoints"}:
+        raise LabelingError("kpoint_mode must be auto, kspacing, or kpoints")
+    if not spec.supports_spin and _source_contains_spin(request.source):
+        raise LabelingError(
+            f"{backend} production labeling currently supports non-magnetic "
+            "structures only; spin DFT is reserved for a later validated Adapter"
+        )
+    result = spec.label(request)
     if not result.frames:
         raise LabelingError(f"{backend} produced no labeled structures")
     if not result.output_file.is_file():

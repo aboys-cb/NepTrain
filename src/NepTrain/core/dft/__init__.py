@@ -19,8 +19,12 @@ def run_dft(argparse):
             work_dir=work_dir,
             append=argparse.append,
             input_file=Path(argparse.incar) if argparse.incar else None,
+            resource_dir=Path(getattr(argparse, "resource_dir", ""))
+            if getattr(argparse, "resource_dir", None)
+            else None,
             n_cpu=argparse.n_cpu,
             use_gamma=argparse.use_gamma,
+            kpoint_mode="kspacing" if argparse.kspacing is not None else "auto",
             kspacing=argparse.kspacing,
             ka=tuple(argparse.ka),
             options=options,

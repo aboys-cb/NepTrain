@@ -8,8 +8,14 @@ NepTrain 用于组织 NEP 主动学习循环。训练和分子动力学是两个
 | MD | GPUMD、LAMMPS |
 | Python 推理与描述符 | NEPAdapters CPU/CUDA |
 | LAMMPS pair | NEPAdapters `nep/cpu`、`nep/gpu/kk` |
+| DFT 标注 | VASP、ABACUS、Toy Teacher（开发） |
 
 LAMMPS 只是 MD frontend；模型识别、能力检查和计算实现统一由 NEPAdapters 提供。
+
+当前生产保证先收敛在**非磁、固定几何的单点标注**：VASP 和 ABACUS 接受普通
+结构并返回 energy、force、virial。spin/mforce 数据结构、Toy Teacher 与 DynSpin
+工具仍保留用于后续打磨，但生产 VASP/ABACUS Adapter 会明确拒绝 spin 结构，避免
+把尚未真实验收的磁性 DFT 路径误当成可用功能。
 
 ## 安装
 
@@ -48,6 +54,7 @@ training:
   backend: torchnep        # gpumd 或 torchnep
   device: cuda
   config_path: ./nep.in
+  finetune_lr_scale: 0.1   # 只作用于增量 retrain；初始训练不变
 
 md:
   backend: lammps          # gpumd 或 lammps
@@ -74,7 +81,7 @@ md:
 TorchNEP 的 `nep_best.txt` 会复制为循环统一使用的 `nep.txt`。显式选择 CPU/CUDA 时不做静默回退；`auto` 只有在 CUDA runtime 和模型能力都通过时才选择 CUDA。
 训练结束后会立即用 NEPAdapters 加载最佳模型；模型格式或 spin descriptor 与运行时不兼容时当场失败，不会等到 MD 阶段才暴露。
 
-当前普通可变模长 spin 流程使用与 NEPAdapters 一致的 TorchNEP descriptor：
+预留的可变模长 spin 开发流程使用与 NEPAdapters 一致的 TorchNEP descriptor：
 
 ```text
 spin_mode 1
@@ -123,7 +130,7 @@ NepTrain md spin.xyz \
 
 默认提供 `dynspin/glsd/nvt` 和 `dynspin/glsd/npt` 模板，磁矩方向与模长都会演化。高级用法可通过 `--template custom.in` 提供完整 LAMMPS 输入；NepTrain 只替换模板中实际出现的 `{{ variable }}`。
 
-## spin 数据契约
+## 预留的 spin 数据契约
 
 训练和 DFT 标注使用 extxyz：
 
@@ -133,7 +140,8 @@ Properties=species:S:1:pos:R:3:spin:R:3:mforce:R:3
 
 - `spin` 是完整物理磁矩向量，模长为 `|spin|`。
 - `mforce` 是参考磁力 `-dE/dspin`。
-- 结构包含 `spin` 时，DFT 输出必须包含 `mforce`，否则该轮失败且不合并数据。
+- 当前只有 Toy Teacher 使用这套完整标签契约；生产 VASP/ABACUS 暂不接受 spin。
+- 后续磁性 DFT Adapter 启用后，结构包含 `spin` 时必须同时得到 `mforce`，否则失败。
 - MD 轨迹中的模型磁力也统一写为 `mforce`，进入 DFT 标注后必须由参考计算结果替换。
 
 默认 DynSpin dump 的含义由 compute 顺序确定：
@@ -171,11 +179,11 @@ train → explore → select → label → diagnose → merge → retrain → ev
 
 `diagnose` 使用加入新标签前的模型计算 acquisition error，只用于判断这批采样是否确实触及模型薄弱区，不决定该代是否通过。`evaluate` 必须使用合并新标签并重新训练后的模型，以及不进入训练集的固定 validation 数据；只有这个 post-retrain gate 能决定该代是否接受。
 
-通常只需要在 `job.yaml` 增加 campaign 策略和两类 Slurm 资源：
+通常只需要在 `job.yaml` 增加 campaign 策略和训练、采样、DFT 三类 Slurm 资源：
 
 ```yaml
 campaign:
-  id: fe-spin-v1
+  id: ordinary-v1
   generations: 3
   seed: 20260721
   initial_candidates: 200
@@ -203,6 +211,22 @@ campaign:
       qos: rush-cpu
       cpus_per_task: 4
       setup_script: ./env-cpu.sh
+    dft:
+      # Sai 当前的 VASP/ABACUS module 都链接 GPU 运行库，放到单卡 V100。
+      partition: 16V100
+      qos: flood-1o2gpu
+      cpus_per_task: 4
+      gpus_per_node: 1
+      setup_script: ./env-dft.sh
+
+dft:
+  software: vasp            # vasp、abacus 或 toy
+  cpu_core: 1               # DFT 启动的 MPI rank 数
+  incar_path: ./INCAR       # ABACUS 时使用 INPUT
+  resource_path: ./dft-resources
+  kpoints_use_gamma: true
+  use_k_stype: kspacing
+  kspacing: 0.2
 
 evaluation:
   validation_path: ./validation.xyz
@@ -210,16 +234,35 @@ evaluation:
   max_rmse:
     energy_rmse: 0.05
     force_rmse: 0.20
-    mforce_rmse: 0.20
 ```
 
-`evaluation.validation_path`（或 `training.test_path`）是 campaign 必填语义。`evaluation.max_rmse` 至少要给出 energy、force，以及 spin 流程的 mforce 阈值；空阈值会拒绝启动，避免“只要数值有限就自动通过”。validation 与合并后的训练集存在重复结构时也会直接失败，避免用训练误差冒充验收结果。
+VASP 使用 ASE 自带的输入与结果解析能力；`resource_path` 直接指向含
+`<元素或 setup>/POTCAR` 的目录。当前 Sai 的 PBE 64 资源部署在
+`~/hpc-work/potpaw-pbe64-64/install`。VASP Adapter 要求 `IBRION=-1`、
+`NSW=0`、`ISPIN=1`，并为每次重试建立新的 attempt 目录，拒绝把弛豫或磁性模板
+当成单点标签。ABACUS Adapter 原生生成
+`INPUT/STRU/KPT`、执行 `abacus` 并解析 `OUT.*/running_scf.log`，不需要额外
+安装 ASE 插件。ABACUS 的 `resource_path` 放 `.UPF`；`basis_type lcao` 时还
+必须放 `.orb`，文件扩展名大小写均可。Sai 的 `env-dft.sh` 加载实际 module，例如
+`module load abacus/LTSv3.10.1-sm70-auto` 或
+`module load vasp/6.6.0-nvhpc25.7-ompi5.0.10`。module 和赝势是两个独立
+依赖，缺任意一项都会在 label 阶段明确失败。
+
+K 点选择不会再靠参数覆盖顺序碰运气：`use_k_stype: kspacing` 使用配置中的
+`kspacing`，或在配置未给值时读取 `INCAR/INPUT` 模板；`use_k_stype: kpoints`
+则明确生成 KPOINTS/KPT 并忽略模板中的 KSPACING。单独运行 `NepTrain dft` 时，
+未给 `--kspacing` 的 `auto` 模式会优先尊重模板 KSPACING，否则使用 `--ka`。
+
+`evaluation.validation_path`（或 `training.test_path`）是 campaign 必填语义。当前
+非磁生产流程的 `evaluation.max_rmse` 至少要给出 energy 和 force；空阈值会拒绝
+启动，避免“只要数值有限就自动通过”。validation 与合并后的训练集存在重复结构
+时也会直接失败，避免用训练误差冒充验收结果。
 
 场景按“初始结构 × 温度 × 压强”建立稳定 ID，MD 步数作为该次证据强度。每个场景只能依次经过 `untested → smoke_passed → short_stable → long_stable → production_ready`，不能跳级。调度时优先运行成熟度最低的场景，所以新增温度会先跑便宜的 smoke，不会直接继承旧温度的长时间等级；只有 MD 完整结束且该代 post-retrain validation 通过，`scenario-maturity.json` 才会晋级。失败证据会保留，但不会晋级。
 
 LAMMPS 非零退出但 dump 中仍有完整帧时，NepTrain 不会丢掉整条轨迹。它先按物理信号寻找第一个异常帧：原子间距相对共价半径过短、cell 体积相对初始结构突变、原子力或 mforce 过大、spin 模长过大以及非有限数都会触发隔离。异常点之前默认两帧标为 `pre_failure`，异常点及其后全部标为 `bad_tail`；如果进程失败但没有检测到物理异常，则保守隔离最后一帧。单项规则可在 `md.health` 中设为 `null` 关闭。
 
-`bad_tail` 只留在每个 MD run 的原始 `trajectory.xyz` 中，不进入候选池；`pre_failure` 会优先进入候选池且不被普通 `frame_stride` 抽稀。每个 run 的 `trajectory-health.json` 记录第一个异常 timestep、原因、实测值和窗口范围；每代的 `md-attempts.json` 汇总退出原因、最后 timestep 和各窗口帧数。即使 LAMMPS 返回 0，只要轨迹健康检查失败，该场景也不会晋级。若没有任何安全帧，explore 仍会失败关闭。
+`bad_tail` 只留在每个 MD run 的原始 `trajectory.xyz` 中，不进入候选池；`pre_failure` 会优先进入候选池且不被普通 `frame_stride` 抽稀。普通稳定帧会在整条轨迹的时间范围内均匀铺开后再进入 FPS，避免长 MD 只采到开头。每个 run 的 `trajectory-health.json` 记录第一个异常 timestep、原因、实测值和窗口范围；每代的 `md-attempts.json` 汇总退出原因、最后 timestep 和各窗口帧数。即使 LAMMPS 返回 0，只要轨迹健康检查失败，该场景也不会晋级。若没有任何安全帧，explore 仍会失败关闭。
 
 健康报告还会列出 `available_signals` 和 `unavailable_thresholds`。当前默认 spin dump 包含 spin 与 mforce，但不包含原子力，因此 `max_force` 只有在用户模板把 `fx fy fz`（或 compute 对应列）写入 dump 时才实际执行；系统不会把“没有这个信号”误报为“力已通过检查”。
 
@@ -236,7 +279,7 @@ module load lammps/nep-release
 ```bash
 NepTrain campaign job.yaml \
   --initial-training train.initial.xyz \
-  --output campaign/fe-spin-v1
+  --output campaign/ordinary-v1
 ```
 
 确认后一次提交完整依赖链：
@@ -244,13 +287,30 @@ NepTrain campaign job.yaml \
 ```bash
 NepTrain campaign job.yaml \
   --initial-training train.initial.xyz \
-  --output campaign/fe-spin-v1 \
+  --output campaign/ordinary-v1 \
   --submit
 ```
 
 `--submit` 必须在 Slurm 登录节点运行，不能放进另一个 batch 作业里嵌套提交。
 
-训练和 CPU 作业通过 Slurm `afterok` 串联。第一代先在 V100 上 bootstrap；每代依次执行 CPU 采样与诊断、V100 retrain、CPU validation。TorchNEP 的 retrain 从上一 checkpoint 载入权重，但重新开始学习率、优化器和 epoch 计数，确保新增标签真正参与训练；它不是恢复一个已经结束的旧训练任务。下一代直接复用上一代验收模型，不会在 V100 上重复训练同一份数据。任一阶段失败或一代被拒绝，后续作业不会继续。重复执行同一条提交命令不会重复提交已经记入 manifest 的作业。
+已有 campaign 全部通过后可以原地追加代数，不会重跑或改写历史 generation：
+
+```bash
+NepTrain campaign --output campaign/ordinary-v1 --extend-to 4
+NepTrain campaign --output campaign/ordinary-v1 --submit
+```
+
+追加操作只接受更大的总代数，并在 manifest 中记录扩展历史；未完成或被验收门槛拒绝的 campaign 不允许绕过 gate 继续追加。
+
+训练和 CPU 作业通过 Slurm `afterok` 串联。第一代先在 V100 上 bootstrap；每代依次执行 CPU 采样与诊断、V100 retrain、CPU validation。TorchNEP 的 retrain 从上一 checkpoint 载入权重，重新开始优化器和 epoch 计数，并默认使用 `nep.in` 学习率的 `0.1` 倍，避免少量新样本的首批高梯度破坏已验收模型；初始训练学习率不受影响。实际生成的微调配置也会写入 generation ledger 的 artifact。下一代直接复用上一代验收模型，不会在 V100 上重复训练同一份数据。任一阶段失败或一代被拒绝，后续作业不会继续。重复执行同一条提交命令不会重复提交已经记入 manifest 的作业。
+
+如果作业本身失败，用 `--retry-failed` 从未完成阶段续跑；如果 retrain 已完成但 validation gate 拒绝了这一代，在修正训练设置或代码后显式恢复：
+
+```bash
+NepTrain campaign --output campaign/ordinary-v1 --recover-rejected
+```
+
+恢复只重跑 `retrain -> evaluate`，原失败模型、指标和作业号保存在 ledger 的 `recovery_attempts` 中，不会改写成一次虚假的成功记录。
 
 `campaign-manifest.json` 会固定配置、初始训练集、`nep.in`、结构输入、环境脚本、成熟度策略、计划和提交 job id。依赖文件漂移时会拒绝复用原 campaign。每代的 `scenario-plan.json` 记录实际调度的场景和步数，累计的 `scenario-maturity.json` 则保存在同一份 campaign ledger 的产物链中，不需要第二套工作流。
 
@@ -262,7 +322,7 @@ NepTrain iteration-stage job.yaml \
   --plan generation-1.json \
   --initial-training train.initial.xyz \
   --campaign-dir campaign \
-  --campaign-id fe-spin-v1 \
+  --campaign-id ordinary-v1 \
   --stage train
 
 # CPU 作业；其余阶段按同样方式依次调用
@@ -270,7 +330,7 @@ NepTrain iteration-stage job.yaml \
   --plan generation-1.json \
   --initial-training train.initial.xyz \
   --campaign-dir campaign \
-  --campaign-id fe-spin-v1 \
+  --campaign-id ordinary-v1 \
   --stage explore
 ```
 
@@ -290,7 +350,7 @@ NepTrain iteration-stage job.yaml \
 }
 ```
 
-真实 Adapter 会用 TorchNEP/GPUMD 训练、LAMMPS/GPUMD 探索、NEPAdapters 描述符做分层 FPS。MD source 数按候选预算裁剪，已在训练集中的结构不会送入标注。当前第一阶段把 `dft.software` 固定为 `toy`，目的是先打磨开发闭环；生产 DFT Adapter 尚未在这个控制器入口开放。
+真实 Adapter 会用 TorchNEP/GPUMD 训练、LAMMPS/GPUMD 探索、NEPAdapters 描述符做分层 FPS，并根据 `dft.software` 调用 VASP、ABACUS 或 Toy Teacher。MD source 数按候选预算裁剪，已在训练集中的结构不会送入标注。VASP/ABACUS 缺少收敛结果时失败，并且当前会在启动 DFT 前拒绝 spin 结构。
 
 ## 开发闭环 smoke
 
@@ -328,7 +388,7 @@ NepTrain smoke --profile spin --iterations 3 --force
 
 ```bash
 NepTrain smoke \
-  --profile spin \
+  --profile ordinary \
   --workflow-config job.yaml \
   --training-steps 2 \
   --md-steps 2 \
@@ -345,4 +405,4 @@ NepTrain dft candidates.xyz --toy --teacher-profile spin -o labeled.xyz
 
 ## 运行产物
 
-每一代位于 `cache/Generation-N/`。任务成功后才更新 `restart.yaml`；LAMMPS 非零退出且没有可回收安全帧、缺少最佳模型、缺少轨迹或 spin DFT 缺少 `mforce` 都会直接失败。
+每一代位于 `cache/Generation-N/`。任务成功后才更新 `restart.yaml`；LAMMPS 非零退出且没有可回收安全帧、缺少最佳模型、缺少轨迹、DFT 不收敛或把 spin 结构交给当前非磁生产 Adapter 都会直接失败。

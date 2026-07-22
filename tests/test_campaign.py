@@ -13,6 +13,7 @@ import NepTrain.core.campaign as campaign_module
 from NepTrain.core.campaign import (
     CampaignError,
     campaign_status,
+    extend_campaign,
     prepare_campaign,
     retry_failed_campaign,
     submit_campaign,
@@ -40,6 +41,9 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
     (tmp_path / "gpu-env.sh").write_text("export GPU_ENV=1\n", encoding="utf-8")
     (tmp_path / "cpu-env.sh").write_text(
         "module load lammps/nep-release\n", encoding="utf-8"
+    )
+    (tmp_path / "dft-env.sh").write_text(
+        "module load abacus/LTSv3.10.1-sm70-auto\n", encoding="utf-8"
     )
     config = tmp_path / "job.yaml"
     config.write_text(
@@ -88,6 +92,11 @@ campaign:
       qos: rush-cpu
       cpus_per_task: 4
       setup_script: ./cpu-env.sh
+    dft:
+      partition: 16V100
+      qos: flood-1o2gpu
+      gpus_per_node: 1
+      setup_script: ./dft-env.sh
 """,
         encoding="utf-8",
     )
@@ -100,7 +109,7 @@ def test_campaign_prepares_progressive_plans_and_resource_scripts(tmp_path: Path
 
     assert result.campaign_id == "spin-smoke"
     assert len(result.plans) == 3
-    assert len(result.scripts) == 10
+    assert len(result.scripts) == 16
     plans = [json.loads(path.read_text(encoding="utf-8")) for path in result.plans]
     assert [plan["steps"] for plan in plans] == [10, 40, 40]
     assert [plan["dft_budget"] for plan in plans] == [6, 5, 4]
@@ -109,14 +118,21 @@ def test_campaign_prepares_progressive_plans_and_resource_scripts(tmp_path: Path
 
     bootstrap = result.scripts[0].read_text(encoding="utf-8")
     sample = result.scripts[1].read_text(encoding="utf-8")
-    retrain = result.scripts[2].read_text(encoding="utf-8")
-    evaluate = result.scripts[3].read_text(encoding="utf-8")
+    label = result.scripts[2].read_text(encoding="utf-8")
+    merge = result.scripts[3].read_text(encoding="utf-8")
+    retrain = result.scripts[4].read_text(encoding="utf-8")
+    evaluate = result.scripts[5].read_text(encoding="utf-8")
     assert "#SBATCH --partition=16V100" in bootstrap
     assert "#SBATCH --gpus-per-node=1" in bootstrap
     assert "--resource training" in bootstrap
     assert "#SBATCH --partition=DSPRHBM" in sample
     assert "#SBATCH --cpus-per-task=4" in sample
     assert "--resource cpu" in sample
+    assert "--resource dft" in label
+    assert "#SBATCH --partition=16V100" in label
+    assert "#SBATCH --gpus-per-node=1" in label
+    assert f"source {tmp_path / 'dft-env.sh'}" in label
+    assert "--resource cpu" in merge
     assert "#SBATCH --partition=16V100" in retrain
     assert "--resource training" in retrain
     assert evaluate.count("iteration-resource") == 2
@@ -156,14 +172,97 @@ def test_campaign_submission_is_dependency_chained_and_idempotent(tmp_path: Path
     second = submit_campaign(preparation.output_dir, runner=runner)
 
     assert first.job_ids == second.job_ids == tuple(
-        str(9000 + i) for i in range(1, 11)
+        str(9000 + i) for i in range(1, len(preparation.scripts) + 1)
     )
     assert calls[0][0][:2] == ["sbatch", "--parsable"]
     assert calls[0][0][2].startswith("--job-name=nt-")
     assert calls[0][0][-1] == str(preparation.scripts[0])
     assert "--dependency=afterok:9001" in calls[1][0]
-    assert "--dependency=afterok:9009" in calls[-1][0]
-    assert len(calls) == 10
+    assert "--dependency=afterok:9015" in calls[-1][0]
+    assert len(calls) == len(preparation.scripts)
+
+
+def test_completed_campaign_can_be_extended_without_rewriting_history(tmp_path: Path):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    original_plan_bytes = [path.read_bytes() for path in preparation.plans]
+    original_script_bytes = [path.read_bytes() for path in preparation.scripts]
+    initial_calls = []
+
+    def initial_runner(args, cwd):
+        initial_calls.append(list(args))
+        return str(9000 + len(initial_calls))
+
+    submit_campaign(preparation, runner=initial_runner)
+
+    generations = {}
+    for path in preparation.plans:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        generations[str(plan["generation"])] = {
+            "plan_sha256": hashlib.sha256(
+                json.dumps(
+                    plan, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode()
+            ).hexdigest(),
+            "stages": {
+                stage: {}
+                for stage in (
+                    "train",
+                    "explore",
+                    "select",
+                    "label",
+                    "diagnose",
+                    "merge",
+                    "retrain",
+                    "evaluate",
+                )
+            },
+            "complete": True,
+            "accepted": True,
+        }
+    state_dir = preparation.output_dir / "state"
+    state_dir.mkdir()
+    (state_dir / "campaign-ledger.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "campaign_id": preparation.campaign_id,
+                "generations": generations,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    extended = extend_campaign(preparation.output_dir, 4)
+
+    assert len(extended.plans) == 4
+    assert len(extended.scripts) == 22
+    assert [path.read_bytes() for path in extended.plans[:3]] == original_plan_bytes
+    assert [path.read_bytes() for path in extended.scripts[:16]] == original_script_bytes
+    assert extended.scripts[16].name == "generation-4-bootstrap.sbatch"
+    assert "generation-4.json" in extended.scripts[16].read_text(encoding="utf-8")
+
+    calls = []
+
+    def runner(args, cwd):
+        calls.append(list(args))
+        return str(9100 + len(calls))
+
+    submission = submit_campaign(extended, runner=runner)
+    assert len(submission.job_ids) == 22
+    assert len(initial_calls) == 16
+    assert len(calls) == 6
+    assert calls[0][-1].endswith("generation-4-bootstrap.sbatch")
+    assert not any(value.startswith("--dependency=") for value in calls[0])
+    assert "--dependency=afterok:9101" in calls[1]
+
+
+def test_campaign_extension_requires_completed_accepted_prefix(tmp_path: Path):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+
+    with pytest.raises(CampaignError, match="can only be extended"):
+        extend_campaign(preparation, 4)
 
 
 def test_campaign_status_reports_prepared_campaign_without_mutation(tmp_path: Path):
@@ -304,6 +403,7 @@ def test_campaign_status_cli_is_human_readable(tmp_path: Path, capsys):
             status=True,
             json=False,
             retry_failed=False,
+            recover_rejected=False,
             submit=False,
             output=str(preparation.output_dir),
             config_path=None,
@@ -342,6 +442,7 @@ def test_campaign_cli_submits_prepared_output_without_config(
             status=False,
             json=False,
             retry_failed=False,
+            recover_rejected=False,
             submit=True,
             output=str(preparation.output_dir),
             config_path=None,
@@ -399,7 +500,9 @@ def test_campaign_submission_recovers_job_id_after_post_sbatch_crash(
         runner=runner,
     )
 
-    assert result.job_ids == tuple(str(job_id) for job_id in range(9001, 9011))
+    assert result.job_ids == tuple(
+        str(job_id) for job_id in range(9001, 9001 + len(preparation.scripts))
+    )
     assert calls == len(preparation.scripts)
     manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
     assert manifest["jobs"][0]["job_id"] == "9001"
@@ -520,7 +623,7 @@ def test_campaign_retry_resumes_at_ledger_breakpoint_and_preserves_history(
         return str(10000 + len(retry_calls))
 
     def state_runner(job_id, cwd):
-        return "FAILED" if job_id == "9002" else "PENDING"
+        return "FAILED" if job_id == "9004" else "PENDING"
 
     monkeypatch.setattr(campaign_module, "_job_state", state_runner)
     manifest_before_status = preparation.manifest.read_bytes()
@@ -531,7 +634,7 @@ def test_campaign_retry_resumes_at_ledger_breakpoint_and_preserves_history(
     assert status.state == "blocked"
     assert status.generation == 1
     assert status.stage == "retrain"
-    assert "failed job 9002" in status.reason
+    assert "failed job 9004" in status.reason
     assert status.next_action.endswith("--retry-failed")
     assert preparation.manifest.read_bytes() == manifest_before_status
     assert ledger_path.read_bytes() == ledger_before_status
@@ -546,15 +649,15 @@ def test_campaign_retry_resumes_at_ledger_breakpoint_and_preserves_history(
     assert result.from_generation == 1
     assert result.from_stage == "retrain"
     assert retry_calls[0][0][-1].endswith("generation-1-retrain.sbatch")
-    assert len(retry_calls) == 8
-    assert canceled == [str(job_id) for job_id in range(9003, 9011)]
+    assert len(retry_calls) == 12
+    assert canceled == [str(job_id) for job_id in range(9005, 9017)]
     manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
     assert [record["job_id"] for record in manifest["jobs"]] == [
-        str(job_id) for job_id in range(9001, 9011)
+        str(job_id) for job_id in range(9001, 9017)
     ]
     assert manifest["retries"][0]["from_stage"] == "retrain"
     assert [record["job_id"] for record in manifest["retries"][0]["jobs"]] == [
-        str(job_id) for job_id in range(10001, 10009)
+        str(job_id) for job_id in range(10001, 10013)
     ]
 
 
@@ -593,6 +696,86 @@ def test_campaign_retry_is_idempotent_while_recovery_chain_is_active(tmp_path: P
 
     assert second.job_ids == first.job_ids
     assert len(retry_calls) == len(preparation.scripts)
+
+
+def test_campaign_can_recover_a_rejected_generation_from_retrain(tmp_path: Path):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    submitted = 0
+
+    def initial_runner(args, cwd):
+        nonlocal submitted
+        submitted += 1
+        return str(9000 + submitted)
+
+    submit_campaign(preparation, runner=initial_runner)
+    plan = json.loads(preparation.plans[0].read_text(encoding="utf-8"))
+    generation = {
+        "plan_sha256": hashlib.sha256(
+            json.dumps(
+                plan, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode()
+        ).hexdigest(),
+        "stages": {
+            stage: {}
+            for stage in (
+                "train",
+                "explore",
+                "select",
+                "label",
+                "diagnose",
+                "merge",
+                "retrain",
+                "evaluate",
+            )
+        },
+        "complete": True,
+        "accepted": False,
+    }
+    state_dir = preparation.output_dir / "state"
+    state_dir.mkdir()
+    (state_dir / "campaign-ledger.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "campaign_id": preparation.campaign_id,
+                "generations": {"1": generation},
+            }
+        ),
+        encoding="utf-8",
+    )
+    retry_calls = []
+    canceled = []
+
+    def state_runner(job_id, cwd):
+        number = int(job_id)
+        if number <= 9005:
+            return "COMPLETED"
+        if number == 9006:
+            return "FAILED"
+        return "PENDING"
+
+    result = retry_failed_campaign(
+        preparation.output_dir,
+        recover_rejected=True,
+        runner=lambda args, cwd: retry_calls.append(list(args))
+        or str(10000 + len(retry_calls)),
+        state_runner=state_runner,
+        cancel_runner=lambda job_id, cwd: canceled.append(job_id),
+    )
+
+    assert result.from_generation == 1
+    assert result.from_stage == "retrain"
+    assert retry_calls[0][-1].endswith("generation-1-retrain.sbatch")
+    ledger = json.loads(
+        (state_dir / "campaign-ledger.json").read_text(encoding="utf-8")
+    )
+    reopened = ledger["generations"]["1"]
+    assert "complete" not in reopened
+    assert "retrain" not in reopened["stages"]
+    assert reopened["recovery_attempts"][0]["stages"]["evaluate"] == {}
+    manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
+    assert manifest["retries"][-1]["recovery_of_rejected_generation"] is True
 
 
 def test_campaign_retry_recovers_job_id_after_post_sbatch_crash(
@@ -645,7 +828,9 @@ def test_campaign_retry_recovers_job_id_after_post_sbatch_crash(
 
     result = retry_failed_campaign(preparation.output_dir, **arguments)
 
-    assert result.job_ids == tuple(str(job_id) for job_id in range(10001, 10011))
+    assert result.job_ids == tuple(
+        str(job_id) for job_id in range(10001, 10001 + len(preparation.scripts))
+    )
     assert retry_calls == len(preparation.scripts)
     manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
     assert len(manifest["retries"]) == 1
