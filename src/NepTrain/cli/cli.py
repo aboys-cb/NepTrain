@@ -310,57 +310,20 @@ def _print_scientific_progress(generations):
             )
 
 
-def run_campaign_command(args):
-    from dataclasses import asdict
-    import json
-
-    if args.json and not args.status:
-        raise SystemExit("campaign --json requires --status")
-
-    extend_to = getattr(args, "extend_to", None)
-    if extend_to is not None:
-        from NepTrain.core.campaign import CampaignError, extend_campaign
-
-        try:
-            preparation = extend_campaign(args.output, extend_to)
-        except CampaignError as error:
-            raise SystemExit(f"NepTrain: error: {error}") from error
-        print(
-            json.dumps(
-                {
-                    "campaign_id": preparation.campaign_id,
-                    "extended": True,
-                    "total_generations": len(preparation.plans),
-                    "manifest": str(preparation.manifest),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return
-
-    if args.status:
-        from NepTrain.core.campaign import CampaignError, campaign_status
-
-        try:
-            status = campaign_status(args.output)
-        except CampaignError as error:
-            raise SystemExit(f"NepTrain: error: {error}") from error
-        if args.json:
-            print(json.dumps(asdict(status), indent=2, sort_keys=True))
-            return
-        print(f"Campaign: {status.campaign_id}")
-        print(f"State: {status.state}")
-        print(
-            f"Progress: {status.completed_generations}/{status.total_generations} "
-            "generations"
-        )
-        if status.generation is not None:
-            print(f"Ledger: generation {status.generation}, stage {status.stage}")
-        else:
-            print("Ledger: complete")
-        print(f"Reason: {status.reason}")
-        _print_scientific_progress(status.generations)
+def _print_campaign_status(status, *, show_jobs: bool = True):
+    print(f"Campaign: {status.campaign_id}")
+    print(f"State: {status.state}")
+    print(
+        f"Progress: {status.completed_generations}/{status.total_generations} "
+        "generations"
+    )
+    if status.generation is not None:
+        print(f"Ledger: generation {status.generation}, stage {status.stage}")
+    else:
+        print("Ledger: complete")
+    print(f"Reason: {status.reason}")
+    _print_scientific_progress(status.generations)
+    if show_jobs:
         print("Jobs:")
         for job in status.jobs:
             marker = "*" if job["current"] else "-"
@@ -370,77 +333,130 @@ def run_campaign_command(args):
                 f"  {marker} {attempt:13} {job_id:>8} "
                 f"{job['state']:>20}  {Path(job['script']).name}"
             )
-        if status.next_action:
-            print(f"Next: {status.next_action}")
-        return
-
-    recover_rejected = getattr(args, "recover_rejected", False)
-    if args.retry_failed or recover_rejected:
-        from NepTrain.core.campaign import CampaignError, retry_failed_campaign
-
-        try:
-            retry = retry_failed_campaign(
-                args.output, recover_rejected=recover_rejected
-            )
-        except CampaignError as error:
-            raise SystemExit(f"NepTrain: error: {error}") from error
-        payload = asdict(retry)
-        payload["job_ids"] = list(retry.job_ids)
-        payload["manifest"] = str(retry.manifest)
-        payload["retried"] = True
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return
-
-    if args.submit and not args.config_path and not args.initial_training:
-        from NepTrain.core.campaign import CampaignError, submit_campaign
-
-        try:
-            submission = submit_campaign(args.output)
-        except CampaignError as error:
-            raise SystemExit(f"NepTrain: error: {error}") from error
-        print(
-            json.dumps(
-                {
-                    "campaign_id": submission.campaign_id,
-                    "job_ids": list(submission.job_ids),
-                    "manifest": str(submission.manifest),
-                    "submitted": True,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return
-
-    if not args.config_path or not args.initial_training:
-        raise SystemExit(
-            "campaign preparation requires config_path and --initial-training"
-        )
-
-    from NepTrain.core.campaign import prepare_campaign, submit_campaign
-
-    preparation = prepare_campaign(
-        args.config_path,
-        args.initial_training,
-        args.output,
-        campaign_id=args.campaign_id,
-    )
-    payload = asdict(preparation)
-    payload = {
-        key: [str(item) for item in value]
-        if isinstance(value, tuple)
-        else str(value)
-        if isinstance(value, Path)
-        else value
-        for key, value in payload.items()
-    }
-    if args.submit:
-        submission = submit_campaign(preparation)
-        payload["job_ids"] = list(submission.job_ids)
-        payload["submitted"] = True
     else:
-        payload["submitted"] = False
+        active = [
+            job
+            for job in status.jobs
+            if job["current"] and job["state"] not in {"NOT_SUBMITTED", "COMPLETED"}
+        ]
+        if active:
+            job = active[-1]
+            print(
+                f"Scheduler: job {job['job_id'] or '-'} {job['state']} "
+                f"({Path(job['script']).name})"
+            )
+        else:
+            completed = sum(job["state"] == "COMPLETED" for job in status.jobs)
+            print(f"Scheduler: {completed}/{len(status.jobs)} jobs completed")
+    if status.next_action:
+        print(f"Next: {status.next_action}")
+
+
+def run_project_command(args):
+    """Start or continue a campaign through the small user interface."""
+
+    from NepTrain.core.campaign import (
+        CampaignError,
+        prepare_campaign,
+        resume_campaign,
+        submit_campaign,
+    )
+
+    project = Path(args.project).expanduser()
+    try:
+        if project.is_dir():
+            result = resume_campaign(project)
+            payload = {
+                "campaign_id": result.campaign_id,
+                "action": result.action,
+                "job_ids": list(result.job_ids),
+                "manifest": str(result.manifest),
+            }
+        else:
+            initial_training = args.initial_training
+            if not initial_training:
+                from NepTrain.core.config import load_config
+
+                config, _ = load_config(project)
+                value = config.get("training", {}).get("initial_path")
+                if value:
+                    path = Path(value).expanduser()
+                    initial_training = str(
+                        (project.parent / path).resolve()
+                        if not path.is_absolute()
+                        else path.resolve()
+                    )
+            if not initial_training or not args.output:
+                raise CampaignError(
+                    "starting from a project file requires training.initial_path "
+                    "(or --initial-training) and --output"
+                )
+            preparation = prepare_campaign(
+                project,
+                initial_training,
+                args.output,
+                campaign_id=args.campaign_id,
+            )
+            payload = {
+                "campaign_id": preparation.campaign_id,
+                "project": str(preparation.output_dir),
+                "manifest": str(preparation.manifest),
+                "submitted": not args.prepare_only,
+            }
+            if not args.prepare_only:
+                submission = submit_campaign(preparation)
+                payload["job_ids"] = list(submission.job_ids)
+    except CampaignError as error:
+        raise SystemExit(f"NepTrain: error: {error}") from error
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def run_status_command(args):
+    from dataclasses import asdict
+    from NepTrain.core.campaign import CampaignError, campaign_status
+
+    try:
+        status = campaign_status(args.project)
+    except CampaignError as error:
+        raise SystemExit(f"NepTrain: error: {error}") from error
+    if args.json:
+        print(json.dumps(asdict(status), indent=2, sort_keys=True))
+    else:
+        _print_campaign_status(status, show_jobs=args.jobs)
+
+
+def run_resume_command(args):
+    from dataclasses import asdict
+    from NepTrain.core.campaign import CampaignError, resume_campaign
+
+    try:
+        result = resume_campaign(args.project)
+    except CampaignError as error:
+        raise SystemExit(f"NepTrain: error: {error}") from error
+    payload = asdict(result)
+    payload["job_ids"] = list(result.job_ids)
+    payload["manifest"] = str(result.manifest)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def run_extend_command(args):
+    from NepTrain.core.campaign import CampaignError, extend_campaign
+
+    try:
+        preparation = extend_campaign(args.project, args.generations)
+    except CampaignError as error:
+        raise SystemExit(f"NepTrain: error: {error}") from error
+    print(
+        json.dumps(
+            {
+                "campaign_id": preparation.campaign_id,
+                "total_generations": len(preparation.plans),
+                "project": str(preparation.output_dir),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def run_doctor(args):
@@ -960,61 +976,47 @@ def build_iteration_resource(subparsers):
     )
 
 
-def build_campaign(subparsers):
-    parser = subparsers.add_parser(
-        "campaign",
-        help="Prepare an iteration campaign and optionally submit its Slurm chain.",
+def build_project_commands(subparsers):
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Start a project file or continue an existing campaign directory.",
     )
-    parser.set_defaults(func=run_campaign_command)
-    parser.add_argument(
-        "config_path",
-        nargs="?",
-        help=(
-            "Schema-v2 workflow configuration (not needed for prepared "
-            "--submit, --retry-failed, or --status)."
-        ),
+    run_parser.set_defaults(func=run_project_command)
+    run_parser.add_argument("project", help="Project YAML or campaign directory.")
+    run_parser.add_argument(
+        "--initial-training",
+        help="Initial labeled extxyz dataset; overrides training.initial_path.",
     )
-    parser.add_argument(
-        "--initial-training", help="Initial labeled extxyz dataset."
-    )
-    parser.add_argument("--output", required=True, help="Durable campaign directory.")
-    parser.add_argument("--campaign-id", default=None)
-    action = parser.add_mutually_exclusive_group()
-    action.add_argument(
-        "--submit",
+    run_parser.add_argument("--output", help="New campaign project directory.")
+    run_parser.add_argument("--campaign-id", default=None)
+    run_parser.add_argument(
+        "--prepare-only",
         action="store_true",
-        help="Submit all generated jobs as one Slurm afterok chain.",
+        help="Create the project layout and jobs without submitting them.",
     )
-    action.add_argument(
-        "--retry-failed",
-        action="store_true",
-        help="Cancel the stale dependency tail and resume from the ledger breakpoint.",
+
+    status_parser = subparsers.add_parser(
+        "status", help="Show one campaign's scientific and scheduler status."
     )
-    action.add_argument(
-        "--recover-rejected",
-        action="store_true",
-        help=(
-            "Preserve the rejected retrain/evaluate attempt and retry from "
-            "retraining with the current code and configuration."
-        ),
+    status_parser.set_defaults(func=run_status_command)
+    status_parser.add_argument("project", help="Campaign project directory.")
+    status_parser.add_argument("--json", action="store_true")
+    status_parser.add_argument(
+        "--jobs", action="store_true", help="Show the complete scheduler job table."
     )
-    action.add_argument(
-        "--status",
-        action="store_true",
-        help="Show ledger progress, live Slurm states, and the next safe action.",
+
+    resume_parser = subparsers.add_parser(
+        "resume", help="Continue safely from the campaign ledger breakpoint."
     )
-    action.add_argument(
-        "--extend-to",
-        type=int,
-        metavar="GENERATIONS",
-        help="Append generations to a completed accepted campaign without rerunning it.",
+    resume_parser.set_defaults(func=run_resume_command)
+    resume_parser.add_argument("project", help="Campaign project directory.")
+
+    extend_parser = subparsers.add_parser(
+        "extend", help="Append generations after a campaign passed evaluation."
     )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON with --status.",
-    )
-    parser.set_defaults(retry_failed=False, recover_rejected=False, status=False)
+    extend_parser.set_defaults(func=run_extend_command)
+    extend_parser.add_argument("project", help="Campaign project directory.")
+    extend_parser.add_argument("generations", type=int, help="New total generation count.")
 
 
 
@@ -1154,7 +1156,7 @@ def main():
     build_smoke(subparsers)
     build_iteration_stage(subparsers)
     build_iteration_resource(subparsers)
-    build_campaign(subparsers)
+    build_project_commands(subparsers)
 
 
 

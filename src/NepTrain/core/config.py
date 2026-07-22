@@ -51,6 +51,10 @@ def migrate_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]
     training.setdefault("finetune_lr_scale", 0.1)
     md.setdefault("inference_backend", "auto")
 
+    if "initial_path" not in training and migrated.get("init_train_xyz"):
+        training["initial_path"] = migrated["init_train_xyz"]
+        changes.append("init_train_xyz -> training.initial_path")
+
     if "test_xyz_path" in training and "test_path" not in training:
         training["test_path"] = training.pop("test_xyz_path")
         changes.append("training.test_xyz_path -> training.test_path")

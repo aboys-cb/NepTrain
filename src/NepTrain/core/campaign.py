@@ -15,6 +15,8 @@ import subprocess
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
+from .campaign_workspace import CampaignWorkspace
+
 
 class CampaignError(RuntimeError):
     """Raised when campaign preparation or submission is inconsistent."""
@@ -52,6 +54,14 @@ class CampaignRetry:
     retry_number: int
     from_generation: int
     from_stage: str
+    job_ids: tuple[str, ...]
+    manifest: Path
+
+
+@dataclass(frozen=True)
+class CampaignResume:
+    campaign_id: str
+    action: str
     job_ids: tuple[str, ...]
     manifest: Path
 
@@ -103,7 +113,11 @@ _LEDGER_UNSET = object()
 def _campaign_lock(output_dir: Path):
     """Serialize scheduler side effects and manifest updates per campaign."""
 
-    lock_path = output_dir / ".campaign-manifest.lock"
+    try:
+        lock_path = CampaignWorkspace.locate(output_dir).manifest_lock
+    except FileNotFoundError:
+        lock_path = output_dir / ".campaign-manifest.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -347,9 +361,10 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def _preparation_from_manifest(path: Path) -> CampaignPreparation:
     manifest = json.loads(path.read_text(encoding="utf-8"))
+    workspace = CampaignWorkspace.locate(path)
     return CampaignPreparation(
         campaign_id=manifest["campaign_id"],
-        output_dir=path.parent,
+        output_dir=workspace.root,
         config_file=Path(manifest["config"]["path"]),
         initial_training=Path(manifest["initial_training"]["path"]),
         plans=tuple(Path(record["path"]) for record in manifest["plans"]),
@@ -375,14 +390,15 @@ def _write_campaign_scripts(
 
     if not plans or len(plans) != len(plan_paths):
         raise CampaignError("campaign script segment must contain matching plans")
+    workspace = CampaignWorkspace.locate(output)
     script_paths: list[Path] = []
-    campaign_dir = output / "state"
-    logs = output / "logs"
+    campaign_dir = workspace.controller_root
+    logs = workspace.logs_dir
     logs.mkdir(parents=True, exist_ok=True)
 
     first_generation = plans[0].generation
     bootstrap_script = (
-        output / "jobs" / f"generation-{first_generation}-bootstrap.sbatch"
+        workspace.jobs_dir / f"generation-{first_generation}-bootstrap.sbatch"
     )
     bootstrap_command = _resource_command(
         command,
@@ -419,7 +435,7 @@ def _write_campaign_scripts(
             ("retrain", "training", training_profile, False),
         )
         for stage, resource, profile, cpu in stage_profiles:
-            script = output / "jobs" / f"generation-{generation}-{stage}.sbatch"
+            script = workspace.jobs_dir / f"generation-{generation}-{stage}.sbatch"
             stage_command = _resource_command(
                 command,
                 config_file=config_file,
@@ -441,7 +457,7 @@ def _write_campaign_scripts(
             )
             script_paths.append(script)
 
-        evaluate_script = output / "jobs" / f"generation-{generation}-evaluate.sbatch"
+        evaluate_script = workspace.jobs_dir / f"generation-{generation}-evaluate.sbatch"
         evaluate_commands = [
             _resource_command(
                 command,
@@ -485,7 +501,10 @@ def _coerce_preparation(
     if isinstance(preparation, CampaignPreparation):
         return preparation
     path = Path(preparation).expanduser().resolve()
-    manifest = path if path.is_file() else path / "campaign-manifest.json"
+    try:
+        manifest = CampaignWorkspace.locate(path).manifest
+    except FileNotFoundError:
+        manifest = path if path.is_file() else path / ".neptrain" / "manifest.json"
     if not manifest.is_file():
         raise CampaignError(f"prepared campaign manifest does not exist: {manifest}")
     return _preparation_from_manifest(manifest)
@@ -513,12 +532,9 @@ def prepare_campaign(
     selected_id = campaign_id or str(settings.get("id", output.name))
     if not selected_id.strip():
         raise CampaignError("campaign id cannot be empty")
-    training_profile = _slurm_profile(settings, "training")
-    cpu_profile = _slurm_profile(settings, "cpu")
-    dft_profile = _slurm_profile(settings, "dft")
     plans = _plans(settings)
     command = str(settings.get("command", "NepTrain"))
-    dependencies = _dependencies(config)
+    source_dependencies = _dependencies(config)
     spec = {
         "campaign_id": selected_id,
         "config": config,
@@ -526,10 +542,19 @@ def prepare_campaign(
         "initial_training_sha256": _sha256(initial),
         "plans": [asdict(plan) for plan in plans],
         "command": command,
-        "dependencies": dependencies,
+        "dependencies": source_dependencies,
     }
     spec_sha256 = _canonical_hash(spec)
-    manifest_path = output / "campaign-manifest.json"
+    if (output / "campaign-manifest.json").is_file():
+        workspace = CampaignWorkspace.locate(output)
+    elif (output / ".neptrain" / "layout.json").is_file():
+        workspace = CampaignWorkspace.locate(output)
+    else:
+        try:
+            workspace = CampaignWorkspace.create(output)
+        except ValueError as error:
+            raise CampaignError(str(error)) from error
+    manifest_path = workspace.manifest
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if existing.get("spec_sha256") != spec_sha256:
@@ -550,18 +575,24 @@ def prepare_campaign(
                 )
         return _preparation_from_manifest(manifest_path)
 
-    output.mkdir(parents=True, exist_ok=True)
-    resolved_config = output / "job.resolved.yaml"
-    save_config(config, resolved_config)
+    resolved_config = workspace.project_file
+    portable_config, initial_snapshot = workspace.snapshot_inputs(config, initial)
+    save_config(portable_config, resolved_config)
+    runtime_config = _resolved_config(portable_config, workspace.root)
+    runtime_settings = runtime_config.get("campaign", {})
+    training_profile = _slurm_profile(runtime_settings, "training")
+    cpu_profile = _slurm_profile(runtime_settings, "cpu")
+    dft_profile = _slurm_profile(runtime_settings, "dft")
+    dependencies = _dependencies(runtime_config)
     plan_paths: list[Path] = []
     for plan in plans:
-        plan_path = output / "plans" / f"generation-{plan.generation}.json"
+        plan_path = workspace.plans_dir / f"generation-{plan.generation}.json"
         _write_json(plan_path, asdict(plan))
         plan_paths.append(plan_path)
     script_paths = _write_campaign_scripts(
         output=output,
         config_file=resolved_config,
-        initial_training=initial,
+        initial_training=initial_snapshot,
         campaign_id=selected_id,
         plans=plans,
         plan_paths=plan_paths,
@@ -572,11 +603,15 @@ def prepare_campaign(
     )
 
     manifest = {
-        "version": 1,
+        "version": 2 if workspace.version == 2 else 1,
+        "layout_version": workspace.version,
         "campaign_id": selected_id,
         "spec_sha256": spec_sha256,
         "config": {"path": str(resolved_config), "sha256": _sha256(resolved_config)},
-        "initial_training": {"path": str(initial), "sha256": _sha256(initial)},
+        "initial_training": {
+            "path": str(initial_snapshot),
+            "sha256": _sha256(initial_snapshot),
+        },
         "plans": [
             {"path": str(path), "sha256": _sha256(path)} for path in plan_paths
         ],
@@ -596,7 +631,7 @@ def extend_campaign(
 ) -> CampaignPreparation:
     """Append immutable generations to a completed, accepted campaign."""
 
-    from .config import load_config
+    from .config import load_config, save_config
 
     preparation = _coerce_preparation(preparation)
     with _campaign_lock(preparation.output_dir):
@@ -613,9 +648,14 @@ def extend_campaign(
                 f"extension target must exceed current total {current_total}"
             )
 
-        config, _ = load_config(preparation.config_file)
+        portable_config, _ = load_config(preparation.config_file)
+        portable_config.setdefault("campaign", {})["generations"] = int(
+            total_generations
+        )
+        config = _resolved_config(
+            portable_config, preparation.config_file.parent
+        )
         settings = dict(config.get("campaign", {}))
-        settings["generations"] = int(total_generations)
         all_plans = _plans(settings)
         existing_values = [
             json.loads(path.read_text(encoding="utf-8"))
@@ -628,8 +668,9 @@ def extend_campaign(
 
         new_plans = all_plans[current_total:]
         new_plan_paths: list[Path] = []
+        workspace = CampaignWorkspace.locate(preparation.output_dir)
         for plan in new_plans:
-            path = preparation.output_dir / "plans" / f"generation-{plan.generation}.json"
+            path = workspace.plans_dir / f"generation-{plan.generation}.json"
             _write_json(path, asdict(plan))
             new_plan_paths.append(path)
 
@@ -662,6 +703,8 @@ def extend_campaign(
                 "to_generations": total_generations,
             }
         )
+        save_config(portable_config, preparation.config_file)
+        manifest["config"]["sha256"] = _sha256(preparation.config_file)
         _write_json(preparation.manifest, manifest)
         return _preparation_from_manifest(preparation.manifest)
 
@@ -669,7 +712,7 @@ def extend_campaign(
 def _submit(args: Sequence[str], cwd: Path) -> str:
     if os.environ.get("SLURM_JOB_ID"):
         raise _SubmissionRejected(
-            "campaign --submit must run on the Slurm login node, not inside a batch job"
+            "NepTrain run must execute on the Slurm login node, not inside a batch job"
         )
     completed = subprocess.run(
         list(args), cwd=cwd, capture_output=True, text=True, check=False
@@ -920,7 +963,7 @@ def _normalise_job_state(value: str) -> str:
 def _job_state(job_id: str, cwd: Path) -> str:
     if os.environ.get("SLURM_JOB_ID"):
         raise CampaignError(
-            "campaign --retry-failed must run on the Slurm login node, not inside a batch job"
+            "NepTrain resume must execute on the Slurm login node, not inside a batch job"
         )
     completed = subprocess.run(
         [
@@ -956,7 +999,7 @@ def _job_state(job_id: str, cwd: Path) -> str:
 def _cancel(job_id: str, cwd: Path) -> None:
     if os.environ.get("SLURM_JOB_ID"):
         raise CampaignError(
-            "campaign --retry-failed must run on the Slurm login node, not inside a batch job"
+            "NepTrain resume must execute on the Slurm login node, not inside a batch job"
         )
     completed = subprocess.run(
         ["scancel", job_id],
@@ -982,7 +1025,7 @@ class _CampaignProgress:
 def _read_campaign_ledger(
     preparation: CampaignPreparation,
 ) -> Mapping[str, Any] | None:
-    ledger_path = preparation.output_dir / "state" / "campaign-ledger.json"
+    ledger_path = CampaignWorkspace.locate(preparation.output_dir).ledger
     if not ledger_path.exists():
         return None
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
@@ -1371,20 +1414,19 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
                 f"{dependency['job_id']}"
             )
             next_action = (
-                f"NepTrain campaign --output {shlex.quote(str(output))} "
-                "--retry-failed"
+                f"NepTrain resume {shlex.quote(str(output))}"
             )
         elif target_state in _ACTIVE_JOB_STATES or active:
             state = "running"
             reason = f"{len(active)} current Slurm job(s) are active"
             next_action = (
-                f"NepTrain campaign --output {shlex.quote(str(output))} --status"
+                f"NepTrain status {shlex.quote(str(output))}"
             )
         elif target_state in {"NOT_SUBMITTED"}:
             state = "prepared" if not manifest.get("jobs") else "paused"
             reason = f"{Path(target_script).name} has not been submitted"
             next_action = (
-                f"NepTrain campaign --output {shlex.quote(str(output))} --submit"
+                f"NepTrain run {shlex.quote(str(output))}"
             )
         elif target_state in {"SUBMISSION_UNCERTAIN", "UNKNOWN"}:
             state = "uncertain"
@@ -1392,7 +1434,7 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
                 f"Slurm state for {Path(target_script).name} is not yet known"
             )
             next_action = (
-                f"NepTrain campaign --output {shlex.quote(str(output))} --status"
+                f"NepTrain status {shlex.quote(str(output))}"
             )
         elif target_state == "COMPLETED":
             state = "inconsistent"
@@ -1404,15 +1446,13 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
             state = "failed"
             reason = f"job {target.get('job_id')} ended in state {target_state}"
             next_action = (
-                f"NepTrain campaign --output {shlex.quote(str(output))} "
-                "--retry-failed"
+                f"NepTrain resume {shlex.quote(str(output))}"
             )
     elif progress.state == "rejected":
         state = "rejected"
         reason = progress.reason
         next_action = (
-            f"NepTrain campaign --output {shlex.quote(str(output))} "
-            "--recover-rejected"
+            f"NepTrain resume {shlex.quote(str(output))}"
         )
 
     return CampaignStatus(
@@ -1426,6 +1466,44 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
         next_action=next_action,
         generations=generations,
         jobs=jobs,
+    )
+
+
+def resume_campaign(output_dir: str | Path) -> CampaignResume:
+    """Take the only safe continuation without exposing scheduler failure modes."""
+
+    output = Path(output_dir).expanduser().resolve()
+    status = campaign_status(output)
+    if status.state in {"prepared", "paused"}:
+        submission = submit_campaign(output)
+        return CampaignResume(
+            submission.campaign_id,
+            "submit",
+            submission.job_ids,
+            submission.manifest,
+        )
+    if status.state in {"failed", "blocked"}:
+        retry = retry_failed_campaign(output)
+        return CampaignResume(
+            retry.campaign_id,
+            "retry",
+            retry.job_ids,
+            retry.manifest,
+        )
+    if status.state == "rejected":
+        retry = retry_failed_campaign(output, recover_rejected=True)
+        return CampaignResume(
+            retry.campaign_id,
+            "recover_rejected",
+            retry.job_ids,
+            retry.manifest,
+        )
+    if status.state == "complete":
+        raise CampaignError("campaign is already complete")
+    if status.state == "running":
+        raise CampaignError("campaign is already running")
+    raise CampaignError(
+        f"campaign cannot resume safely while state is {status.state}: {status.reason}"
     )
 
 
@@ -1444,10 +1522,15 @@ def retry_failed_campaign(
     """
 
     output = Path(output_dir).expanduser().resolve()
-    manifest_path = output / "campaign-manifest.json"
-    if not manifest_path.is_file():
+    try:
+        workspace = CampaignWorkspace.locate(output)
+    except FileNotFoundError as error:
         raise CampaignError(
-            f"prepared campaign manifest does not exist: {manifest_path}"
+            f"prepared campaign does not exist: {output}"
+        ) from error
+    if not workspace.manifest.is_file():
+        raise CampaignError(
+            f"prepared campaign manifest does not exist: {workspace.manifest}"
         )
     with _campaign_lock(output):
         return _retry_failed_campaign_locked(
@@ -1469,7 +1552,7 @@ def _retry_failed_campaign_locked(
     submission_resolver: SubmissionResolver,
     recover_rejected: bool = False,
 ) -> CampaignRetry:
-    manifest_path = output / "campaign-manifest.json"
+    manifest_path = CampaignWorkspace.locate(output).manifest
     preparation = _preparation_from_manifest(manifest_path)
     manifest = _validated_manifest(preparation)
     original_jobs = list(manifest.get("jobs", []))
@@ -1491,7 +1574,7 @@ def _retry_failed_campaign_locked(
     if recover_rejected:
         if progress.state != "rejected" or progress.generation is None:
             raise CampaignError(
-                "--recover-rejected requires a completed rejected generation"
+                "rejected recovery requires a completed rejected generation"
             )
         from .iteration import GenerationController, GenerationPlan
 
@@ -1500,7 +1583,8 @@ def _retry_failed_campaign_locked(
         )
         value["temperatures"] = tuple(value["temperatures"])
         controller = GenerationController(
-            output / "state", preparation.campaign_id
+            CampaignWorkspace.locate(output).controller_root,
+            preparation.campaign_id,
         )
         try:
             controller.reopen_rejected(
@@ -1563,7 +1647,7 @@ def _retry_failed_campaign_locked(
         latest_by_script[str(record["script"])] = record
     if target not in latest_by_script:
         raise CampaignError(
-            "the unfinished stage has no submitted job history; use campaign --submit"
+            "the unfinished stage has no submitted job history; use NepTrain run"
         )
     replaced = []
     for script in remaining:
@@ -1640,11 +1724,14 @@ def _retry_failed_campaign_locked(
 __all__ = [
     "CampaignError",
     "CampaignPreparation",
+    "CampaignResume",
     "CampaignRetry",
     "CampaignStatus",
     "CampaignSubmission",
     "campaign_status",
+    "extend_campaign",
     "prepare_campaign",
+    "resume_campaign",
     "retry_failed_campaign",
     "submit_campaign",
 ]

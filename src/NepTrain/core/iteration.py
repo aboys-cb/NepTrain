@@ -220,6 +220,17 @@ class StageContext:
     plan: GenerationPlan
     artifacts: Mapping[str, Path]
     previous_artifacts: Mapping[str, Path]
+    stage_dir: Path | None = None
+
+    @property
+    def work_dir(self) -> Path:
+        """Directory owned by the current stage.
+
+        Legacy and direct controller users keep writing to ``generation_dir``;
+        campaign layout v2 gives each stage a focused subdirectory.
+        """
+
+        return self.stage_dir or self.generation_dir
 
 
 class IterationAdapter(Protocol):
@@ -251,8 +262,22 @@ class GenerationController:
     def __init__(self, root: str | Path, campaign_id: str):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.ledger_path = self.root / "campaign-ledger.json"
-        self.lock_path = self.root / ".campaign-ledger.lock"
+        self.workspace = None
+        try:
+            from .campaign_workspace import CampaignWorkspace
+
+            workspace = CampaignWorkspace.locate(self.root)
+        except FileNotFoundError:
+            workspace = None
+        if workspace is not None and workspace.version == 2:
+            self.workspace = workspace
+            self.ledger_path = workspace.ledger
+            self.lock_path = workspace.ledger_lock
+        else:
+            self.ledger_path = self.root / "campaign-ledger.json"
+            self.lock_path = self.root / ".campaign-ledger.lock"
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.campaign_id = campaign_id
         with self._lock():
             self._ledger = self._load()
@@ -323,7 +348,11 @@ class GenerationController:
                     raise IterationError("previous generation has an incomplete stage ledger")
                 previous_artifacts.update(self._restore_artifacts(previous_stage))
 
-        generation_dir = self.root / f"Generation-{plan.generation}"
+        generation_dir = (
+            self.workspace.generation_dir(plan.generation)
+            if self.workspace is not None
+            else self.root / f"Generation-{plan.generation}"
+        )
         artifacts: dict[str, Path] = {}
         metrics: dict[str, Mapping[str, Any]] = {}
         missing_seen = False
@@ -406,7 +435,13 @@ class GenerationController:
                 plan=plan,
                 artifacts=dict(artifacts),
                 previous_artifacts=dict(previous_artifacts),
+                stage_dir=(
+                    self.workspace.stage_dir(plan.generation, requested)
+                    if self.workspace is not None
+                    else generation_dir
+                ),
             )
+            context.work_dir.mkdir(parents=True, exist_ok=True)
             outcome = adapter.run_stage(requested, context)
             overlap = set(artifacts).intersection(outcome.artifacts)
             if overlap:
@@ -429,10 +464,29 @@ class GenerationController:
                 "metrics": dict(outcome.metrics),
             }
             generation_record["stages"][requested] = stage_record
+            complete = requested == STAGES[-1]
+            accepted = None
+            if complete:
+                accepted = stage_record["metrics"].get("accepted")
+                if not isinstance(accepted, bool):
+                    raise IterationError(
+                        "evaluate stage must report an accepted boolean"
+                    )
+                generation_record["accepted"] = accepted
+                generation_record["complete"] = True
+                if self.workspace is not None:
+                    try:
+                        self.workspace.publish_generation(
+                            plan.generation, generation_record
+                        )
+                    except (OSError, ValueError) as error:
+                        generation_record.pop("complete", None)
+                        generation_record.pop("accepted", None)
+                        generation_record["stages"].pop(requested, None)
+                        raise IterationError(
+                            f"cannot publish generation {plan.generation}: {error}"
+                        ) from error
             self._write(self._ledger)
-
-            complete = self._next_stage(plan) is None
-            accepted = generation_record.get("accepted") if complete else None
             return StageSummary(
                 generation=plan.generation,
                 stage=requested,

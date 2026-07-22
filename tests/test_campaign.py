@@ -18,9 +18,14 @@ from NepTrain.core.campaign import (
     retry_failed_campaign,
     submit_campaign,
 )
+from NepTrain.core.campaign_workspace import CampaignWorkspace
 from NepTrain.core.dft.toy import ToyTeacher
 from NepTrain.core.toy_workflow import toy_base_frame, toy_candidate_frames
-from NepTrain.cli.cli import _iteration_execution, run_campaign_command
+from NepTrain.cli.cli import (
+    _iteration_execution,
+    run_project_command,
+    run_status_command,
+)
 
 
 def _inputs(tmp_path: Path) -> tuple[Path, Path]:
@@ -108,6 +113,17 @@ def test_campaign_prepares_progressive_plans_and_resource_scripts(tmp_path: Path
     result = prepare_campaign(config, initial, tmp_path / "campaign")
 
     assert result.campaign_id == "spin-smoke"
+    workspace = CampaignWorkspace.locate(result.output_dir)
+    assert result.manifest == result.output_dir / ".neptrain/manifest.json"
+    assert result.config_file == result.output_dir / "project.yaml"
+    assert result.initial_training == result.output_dir / "inputs/initial-train.xyz"
+    assert all(path.parent == workspace.plans_dir for path in result.plans)
+    assert all(path.parent == workspace.jobs_dir for path in result.scripts)
+    assert (result.output_dir / "README.md").is_file()
+    project_text = result.config_file.read_text(encoding="utf-8")
+    assert "inputs/training/nep.in" in project_text
+    assert "inputs/md/structures.xyz" in project_text
+    assert "inputs/validation/validation.xyz" in project_text
     assert len(result.plans) == 3
     assert len(result.scripts) == 16
     plans = [json.loads(path.read_text(encoding="utf-8")) for path in result.plans]
@@ -131,14 +147,50 @@ def test_campaign_prepares_progressive_plans_and_resource_scripts(tmp_path: Path
     assert "--resource dft" in label
     assert "#SBATCH --partition=16V100" in label
     assert "#SBATCH --gpus-per-node=1" in label
-    assert f"source {tmp_path / 'dft-env.sh'}" in label
+    assert f"source {result.output_dir / 'inputs/platform/dft.sh'}" in label
     assert "--resource cpu" in merge
     assert "#SBATCH --partition=16V100" in retrain
     assert "--resource training" in retrain
     assert evaluate.count("iteration-resource") == 2
     assert "generation-2.json" in evaluate
     assert "module load" not in sample
-    assert f"source {tmp_path / 'cpu-env.sh'}" in sample
+    assert f"source {result.output_dir / 'inputs/platform/cpu.sh'}" in sample
+
+
+def test_simple_run_interface_prepares_a_readable_project_without_submission(
+    tmp_path: Path, capsys
+):
+    config, initial = _inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "training:\n", "training:\n  initial_path: ./initial.xyz\n", 1
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "readable-project"
+
+    run_project_command(
+        SimpleNamespace(
+            project=str(config),
+            initial_training=None,
+            output=str(output),
+            campaign_id=None,
+            prepare_only=True,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project"] == str(output)
+    assert payload["submitted"] is False
+    assert sorted(path.name for path in output.iterdir()) == [
+        ".neptrain",
+        "README.md",
+        "generations",
+        "inputs",
+        "logs",
+        "project.yaml",
+        "results",
+    ]
 
 
 def test_generated_resource_command_can_load_its_plan(tmp_path: Path):
@@ -220,9 +272,8 @@ def test_completed_campaign_can_be_extended_without_rewriting_history(tmp_path: 
             "complete": True,
             "accepted": True,
         }
-    state_dir = preparation.output_dir / "state"
-    state_dir.mkdir()
-    (state_dir / "campaign-ledger.json").write_text(
+    ledger_path = CampaignWorkspace.locate(preparation.output_dir).ledger
+    ledger_path.write_text(
         json.dumps(
             {
                 "version": 1,
@@ -276,7 +327,7 @@ def test_campaign_status_reports_prepared_campaign_without_mutation(tmp_path: Pa
     assert status.completed_generations == 0
     assert status.generation == 1
     assert status.stage == "train"
-    assert status.next_action.endswith("--submit")
+    assert status.next_action.startswith("NepTrain run ")
     assert [generation["state"] for generation in status.generations] == [
         "not_started",
         "not_started",
@@ -363,9 +414,7 @@ def test_campaign_status_summarizes_scientific_progress_without_mutation(
             }
         },
     }
-    state_dir = preparation.output_dir / "state"
-    state_dir.mkdir()
-    ledger_path = state_dir / "campaign-ledger.json"
+    ledger_path = CampaignWorkspace.locate(preparation.output_dir).ledger
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
     before = ledger_path.read_bytes()
 
@@ -394,21 +443,15 @@ def test_campaign_status_summarizes_scientific_progress_without_mutation(
     assert ledger_path.read_bytes() == before
 
 
-def test_campaign_status_cli_is_human_readable(tmp_path: Path, capsys):
+def test_status_cli_is_human_readable_and_concise(tmp_path: Path, capsys):
     config, initial = _inputs(tmp_path)
     preparation = prepare_campaign(config, initial, tmp_path / "campaign")
 
-    run_campaign_command(
+    run_status_command(
         SimpleNamespace(
-            status=True,
+            project=str(preparation.output_dir),
             json=False,
-            retry_failed=False,
-            recover_rejected=False,
-            submit=False,
-            output=str(preparation.output_dir),
-            config_path=None,
-            initial_training=None,
-            campaign_id=None,
+            jobs=False,
         )
     )
 
@@ -417,44 +460,41 @@ def test_campaign_status_cli_is_human_readable(tmp_path: Path, capsys):
     assert "Ledger: generation 1, stage train" in output
     assert "Science:" in output
     assert "G1 not started: plan 12 candidates, DFT budget 6" in output
-    assert "generation-1-bootstrap.sbatch" in output
-    assert "Next: NepTrain campaign" in output
+    assert "Scheduler: 0/16 jobs completed" in output
+    assert "Next: NepTrain run" in output
 
 
-def test_campaign_cli_submits_prepared_output_without_config(
+def test_run_cli_continues_an_existing_project(
     tmp_path: Path, monkeypatch, capsys
 ):
     config, initial = _inputs(tmp_path)
     preparation = prepare_campaign(config, initial, tmp_path / "campaign")
     received = []
 
-    def submit(output):
+    def resume(output):
         received.append(output)
         return SimpleNamespace(
             campaign_id=preparation.campaign_id,
+            action="submit",
             job_ids=("9001",),
             manifest=preparation.manifest,
         )
 
-    monkeypatch.setattr(campaign_module, "submit_campaign", submit)
-    run_campaign_command(
+    monkeypatch.setattr("NepTrain.core.campaign.resume_campaign", resume)
+    run_project_command(
         SimpleNamespace(
-            status=False,
-            json=False,
-            retry_failed=False,
-            recover_rejected=False,
-            submit=True,
-            output=str(preparation.output_dir),
-            config_path=None,
+            project=str(preparation.output_dir),
             initial_training=None,
+            output=None,
             campaign_id=None,
+            prepare_only=False,
         )
     )
 
     payload = json.loads(capsys.readouterr().out)
-    assert received == [str(preparation.output_dir)]
+    assert received == [preparation.output_dir]
     assert payload["job_ids"] == ["9001"]
-    assert payload["submitted"] is True
+    assert payload["action"] == "submit"
 
 
 def test_campaign_submission_recovers_job_id_after_post_sbatch_crash(
@@ -558,7 +598,9 @@ def test_campaign_rejects_runtime_setup_drift(tmp_path: Path):
 def test_campaign_rejects_drift_at_submission_boundary(tmp_path: Path):
     config, initial = _inputs(tmp_path)
     preparation = prepare_campaign(config, initial, tmp_path / "campaign")
-    (tmp_path / "cpu-env.sh").write_text("module load changed\n", encoding="utf-8")
+    (preparation.output_dir / "inputs/platform/cpu.sh").write_text(
+        "module load changed\n", encoding="utf-8"
+    )
 
     with pytest.raises(CampaignError, match="artifact drifted"):
         submit_campaign(preparation, runner=lambda args, cwd: "9001")
@@ -609,9 +651,8 @@ def test_campaign_retry_resumes_at_ledger_breakpoint_and_preserves_history(
             }
         },
     }
-    state_dir = preparation.output_dir / "state"
-    state_dir.mkdir()
-    (state_dir / "campaign-ledger.json").write_text(
+    ledger_path = CampaignWorkspace.locate(preparation.output_dir).ledger
+    ledger_path.write_text(
         json.dumps(ledger), encoding="utf-8"
     )
 
@@ -627,7 +668,6 @@ def test_campaign_retry_resumes_at_ledger_breakpoint_and_preserves_history(
 
     monkeypatch.setattr(campaign_module, "_job_state", state_runner)
     manifest_before_status = preparation.manifest.read_bytes()
-    ledger_path = state_dir / "campaign-ledger.json"
     ledger_before_status = ledger_path.read_bytes()
     status = campaign_status(preparation.output_dir)
 
@@ -635,7 +675,7 @@ def test_campaign_retry_resumes_at_ledger_breakpoint_and_preserves_history(
     assert status.generation == 1
     assert status.stage == "retrain"
     assert "failed job 9004" in status.reason
-    assert status.next_action.endswith("--retry-failed")
+    assert status.next_action.startswith("NepTrain resume ")
     assert preparation.manifest.read_bytes() == manifest_before_status
     assert ledger_path.read_bytes() == ledger_before_status
 
@@ -732,9 +772,8 @@ def test_campaign_can_recover_a_rejected_generation_from_retrain(tmp_path: Path)
         "complete": True,
         "accepted": False,
     }
-    state_dir = preparation.output_dir / "state"
-    state_dir.mkdir()
-    (state_dir / "campaign-ledger.json").write_text(
+    ledger_path = CampaignWorkspace.locate(preparation.output_dir).ledger
+    ledger_path.write_text(
         json.dumps(
             {
                 "version": 1,
@@ -768,7 +807,7 @@ def test_campaign_can_recover_a_rejected_generation_from_retrain(tmp_path: Path)
     assert result.from_stage == "retrain"
     assert retry_calls[0][-1].endswith("generation-1-retrain.sbatch")
     ledger = json.loads(
-        (state_dir / "campaign-ledger.json").read_text(encoding="utf-8")
+        ledger_path.read_text(encoding="utf-8")
     )
     reopened = ledger["generations"]["1"]
     assert "complete" not in reopened
@@ -883,7 +922,7 @@ def test_campaign_retry_requires_submitted_job_history(tmp_path: Path):
     config, initial = _inputs(tmp_path)
     preparation = prepare_campaign(config, initial, tmp_path / "campaign")
 
-    with pytest.raises(CampaignError, match="use campaign --submit"):
+    with pytest.raises(CampaignError, match="use NepTrain run"):
         retry_failed_campaign(preparation.output_dir)
 
 
@@ -916,9 +955,8 @@ def test_campaign_retry_rejects_completed_campaign(tmp_path: Path):
             "complete": True,
             "accepted": True,
         }
-    state_dir = preparation.output_dir / "state"
-    state_dir.mkdir()
-    (state_dir / "campaign-ledger.json").write_text(
+    ledger_path = CampaignWorkspace.locate(preparation.output_dir).ledger
+    ledger_path.write_text(
         json.dumps(
             {
                 "version": 1,

@@ -10,6 +10,7 @@ init_nep_txt: ./nep.txt
 
 training:
   backend: gpumd
+  initial_path: ./train.xyz
   device: cuda
   torch_backend: auto
   precision: float32

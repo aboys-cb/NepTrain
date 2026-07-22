@@ -229,12 +229,12 @@ class WorkflowIterationAdapter:
         config_file = self._path(options.get("config_path"))
         if backend == "torchnep" and warm_start is not None:
             config_file = self._torchnep_finetune_config(
-                config_file, context.generation_dir, output_name, options
+                config_file, context.work_dir, output_name, options
             )
         request = TrainingRequest(
             config_file=config_file,
             train_file=training_input,
-            output_dir=context.generation_dir / output_name,
+            output_dir=context.work_dir / output_name,
             test_file=self._path(options["test_path"])
             if backend != "torchnep" and options.get("test_path")
             else None,
@@ -491,7 +491,7 @@ class WorkflowIterationAdapter:
                 f"g{context.generation}-s{structure_identifier[:8]}-"
                 f"T{temperature:g}-P{context.plan.pressure:g}"
             )
-            run_dir = context.generation_dir / "md" / source
+            run_dir = context.work_dir / "md" / source
             trajectory = run_dir / "trajectory.xyz"
             spin_temperature = options.get("spin_temperature")
             if spin_temperature in {None, "auto"}:
@@ -637,18 +637,18 @@ class WorkflowIterationAdapter:
                     maturity_target=metadata["maturity_target"],
                 )
             output_frames.append(copied)
-        output = context.generation_dir / "candidates.xyz"
+        output = context.work_dir / "candidates.xyz"
         ase_write(output, output_frames, format="extxyz")
         artifacts = {
             "candidates": output,
             "md_attempts": _write_json(
-                context.generation_dir / "md-attempts.json",
+                context.work_dir / "md-attempts.json",
                 {"version": 1, "attempts": attempt_results},
             ),
         }
         if self.scenario_ladder is not None:
             scenario_plan = _write_json(
-                context.generation_dir / "scenario-plan.json",
+                context.work_dir / "scenario-plan.json",
                 {
                     "version": 1,
                     "attempts": self.scenario_ladder.serialize(scenario_attempts),
@@ -755,10 +755,10 @@ class WorkflowIterationAdapter:
             raise WorkflowIterationError(
                 "FPS selected no structures; lower iteration.min_distance"
             )
-        selected_path = context.generation_dir / "selected-input.xyz"
+        selected_path = context.work_dir / "selected-input.xyz"
         ase_write(selected_path, selected, format="extxyz")
         result_path = _write_json(
-            context.generation_dir / "selection-result.json", asdict(result)
+            context.work_dir / "selection-result.json", asdict(result)
         )
         return StageOutcome(
             artifacts={"selected_input": selected_path, "selection_result": result_path},
@@ -776,12 +776,12 @@ class WorkflowIterationAdapter:
         options = self.config.get("dft", {})
         backend = str(options.get("software", "toy"))
         use_k_stype = str(options.get("use_k_stype", "kspacing"))
-        output = context.generation_dir / "selected-labels.xyz"
+        output = context.work_dir / "selected-labels.xyz"
         result = self.runtime.label(
             LabelRequest(
                 source=context.artifacts["selected_input"],
                 output_file=output,
-                work_dir=context.generation_dir / "teacher",
+                work_dir=context.work_dir / "teacher",
                 input_file=self._optional_path(
                     options.get("input_path", options.get("incar_path"))
                 ),
@@ -823,7 +823,7 @@ class WorkflowIterationAdapter:
             "spin_frame_count": spin_count,
         }
         output = _write_json(
-            context.generation_dir / "acquisition-signals.json", signals
+            context.work_dir / "acquisition-signals.json", signals
         )
         return StageOutcome(
             artifacts={"acquisition_signals": output}, metrics=signals
@@ -843,7 +843,7 @@ class WorkflowIterationAdapter:
                 seen.add(identifier)
                 merged.append(frame)
         validate_spin_dataset(merged, require_mforce=True)
-        output = context.generation_dir / "train.xyz"
+        output = context.work_dir / "train.xyz"
         ase_write(output, merged, format="extxyz")
         return StageOutcome(
             artifacts={"training_set": output},
@@ -857,7 +857,7 @@ class WorkflowIterationAdapter:
     def _retrain(self, context: StageContext) -> StageOutcome:
         training_input = context.artifacts["training_set"]
         output_name = self._attempt_output_name(
-            context.generation_dir, "retraining"
+            context.work_dir, "retraining"
         )
         result, frame_count, config_file = self._execute_training(
             context,
@@ -921,9 +921,9 @@ class WorkflowIterationAdapter:
         }
         artifacts = {}
         attempt = 1
-        while (context.generation_dir / f"signals-attempt-{attempt}.json").exists():
+        while (context.work_dir / f"signals-attempt-{attempt}.json").exists():
             attempt += 1
-        recovering = (context.generation_dir / "signals.json").exists()
+        recovering = (context.work_dir / "signals.json").exists()
         suffix = f"-attempt-{attempt}" if recovering else ""
         if self.scenario_ladder is not None:
             scenario_plan = json.loads(
@@ -949,13 +949,13 @@ class WorkflowIterationAdapter:
                 validation=signals,
             )
             maturity_path = _write_json(
-                context.generation_dir / f"scenario-maturity{suffix}.json", history
+                context.work_dir / f"scenario-maturity{suffix}.json", history
             )
             artifacts["scenario_maturity"] = maturity_path
             signals["scenario_counts_by_maturity"] = history[
                 "counts_by_maturity"
             ]
-        output = _write_json(context.generation_dir / f"signals{suffix}.json", signals)
+        output = _write_json(context.work_dir / f"signals{suffix}.json", signals)
         artifacts["signals"] = output
         return StageOutcome(artifacts=artifacts, metrics=signals)
 

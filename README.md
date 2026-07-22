@@ -52,6 +52,7 @@ current_job: training
 
 training:
   backend: torchnep        # gpumd 或 torchnep
+  initial_path: ./train.xyz
   device: cuda
   config_path: ./nep.in
   finetune_lr_scale: 0.1   # 只作用于增量 retrain；初始训练不变
@@ -175,7 +176,7 @@ NepTrain doctor \
 train → explore → select → label → diagnose → merge → retrain → evaluate
 ```
 
-每个阶段都写入带 SHA256 的 `campaign-ledger.json`。阶段只能按顺序执行，已完成产物被修改、plan 发生漂移、或两个作业试图重复同一阶段时都会停止。
+每个阶段都写入带 SHA256 的 `.neptrain/ledger.json`。阶段只能按顺序执行，已完成产物被修改、plan 发生漂移、或两个作业试图重复同一阶段时都会停止。
 
 `diagnose` 使用加入新标签前的模型计算 acquisition error，只用于判断这批采样是否确实触及模型薄弱区，不决定该代是否通过。`evaluate` 必须使用合并新标签并重新训练后的模型，以及不进入训练集的固定 validation 数据；只有这个 post-retrain gate 能决定该代是否接受。
 
@@ -274,62 +275,87 @@ module load lammps/nep-release
 
 如果环境需要解压到节点本地盘，`setup_script` 应按环境包版本复用同一个缓存目录，或在作业退出时清理；不要为每个 generation 永久保留一份完整 PyTorch 环境，否则长 campaign 会逐步耗尽节点本地空间。
 
-先生成计划和 Slurm 脚本进行检查：
+第一次运行可以先只生成自包含项目目录，不提交作业：
 
 ```bash
-NepTrain campaign job.yaml \
-  --initial-training train.initial.xyz \
-  --output campaign/ordinary-v1
+NepTrain run job.yaml \
+  --output ordinary-v1 \
+  --prepare-only
 ```
 
-确认后一次提交完整依赖链：
+确认 `ordinary-v1/project.yaml` 和 `inputs/` 后提交：
 
 ```bash
-NepTrain campaign job.yaml \
-  --initial-training train.initial.xyz \
-  --output campaign/ordinary-v1 \
-  --submit
+NepTrain run ordinary-v1
 ```
 
-`--submit` 必须在 Slurm 登录节点运行，不能放进另一个 batch 作业里嵌套提交。
+也可以省略 `--prepare-only`，创建后立即提交。`NepTrain run` 必须在 Slurm
+登录节点运行，不能放进另一个 batch 作业里嵌套提交。
+
+日常只需要两个状态命令：
+
+```bash
+NepTrain status ordinary-v1
+NepTrain resume ordinary-v1
+```
+
+`status` 默认只显示科学进度和当前调度状态；需要完整作业表时使用
+`NepTrain status ordinary-v1 --jobs`。`resume` 会读取账本，自动选择继续未提交
+作业、重试失败阶段，或从 retrain 恢复被 validation gate 拒绝的一代。用户不需要
+区分 scheduler failure 和 scientific rejection。
+
+项目目录按用户视角组织：
+
+```text
+ordinary-v1/
+├── project.yaml       # 可读的配置快照，路径指向 inputs/
+├── inputs/            # 结构、nep.in、DFT 输入和环境脚本快照
+├── results/           # 最新通过验收的 nep.txt、train.xyz 和指标
+├── generations/       # 0001、0002……每代的采样/标注/训练/评价证据
+├── logs/              # Slurm 输出
+└── .neptrain/         # manifest、ledger、plans、jobs、locks 等内部状态
+```
+
+赝势目录和 LAMMPS 插件等大型外部依赖不会复制进项目，但路径和哈希仍进入
+manifest；其余小型输入会复制到 `inputs/`，因此原始配置文件移动后不影响已经
+准备好的 campaign。
 
 已有 campaign 全部通过后可以原地追加代数，不会重跑或改写历史 generation：
 
 ```bash
-NepTrain campaign --output campaign/ordinary-v1 --extend-to 4
-NepTrain campaign --output campaign/ordinary-v1 --submit
+NepTrain extend ordinary-v1 4
+NepTrain run ordinary-v1
 ```
 
 追加操作只接受更大的总代数，并在 manifest 中记录扩展历史；未完成或被验收门槛拒绝的 campaign 不允许绕过 gate 继续追加。
 
 训练和 CPU 作业通过 Slurm `afterok` 串联。第一代先在 V100 上 bootstrap；每代依次执行 CPU 采样与诊断、V100 retrain、CPU validation。TorchNEP 的 retrain 从上一 checkpoint 载入权重，重新开始优化器和 epoch 计数，并默认使用 `nep.in` 学习率的 `0.1` 倍，避免少量新样本的首批高梯度破坏已验收模型；初始训练学习率不受影响。实际生成的微调配置也会写入 generation ledger 的 artifact。下一代直接复用上一代验收模型，不会在 V100 上重复训练同一份数据。任一阶段失败或一代被拒绝，后续作业不会继续。重复执行同一条提交命令不会重复提交已经记入 manifest 的作业。
 
-如果作业本身失败，用 `--retry-failed` 从未完成阶段续跑；如果 retrain 已完成但 validation gate 拒绝了这一代，在修正训练设置或代码后显式恢复：
+恢复只重跑账本确认尚未完成的阶段；被 gate 拒绝时从 `retrain -> evaluate` 开始。
+原失败模型、指标和作业号保存在 ledger 的 `recovery_attempts` 中，不会改写成
+一次虚假的成功记录。
 
-```bash
-NepTrain campaign --output campaign/ordinary-v1 --recover-rejected
-```
-
-恢复只重跑 `retrain -> evaluate`，原失败模型、指标和作业号保存在 ledger 的 `recovery_attempts` 中，不会改写成一次虚假的成功记录。
-
-`campaign-manifest.json` 会固定配置、初始训练集、`nep.in`、结构输入、环境脚本、成熟度策略、计划和提交 job id。依赖文件漂移时会拒绝复用原 campaign。每代的 `scenario-plan.json` 记录实际调度的场景和步数，累计的 `scenario-maturity.json` 则保存在同一份 campaign ledger 的产物链中，不需要第二套工作流。
+`.neptrain/manifest.json` 会固定配置、初始训练集、`nep.in`、结构输入、环境脚本、
+成熟度策略、计划和提交 job id。依赖文件漂移时会拒绝复用原 campaign。每代的
+`scenario-plan.json` 记录实际调度的场景和步数，累计的
+`scenario-maturity.json` 保存在同一份 ledger 产物链中，不需要第二套工作流。
 
 需要调试单个阶段时，可以使用底层入口：
 
 ```bash
 # V100 作业
-NepTrain iteration-stage job.yaml \
-  --plan generation-1.json \
-  --initial-training train.initial.xyz \
-  --campaign-dir campaign \
+NepTrain iteration-stage ordinary-v1/project.yaml \
+  --plan ordinary-v1/.neptrain/plans/generation-1.json \
+  --initial-training ordinary-v1/inputs/initial-train.xyz \
+  --campaign-dir ordinary-v1 \
   --campaign-id ordinary-v1 \
   --stage train
 
 # CPU 作业；其余阶段按同样方式依次调用
-NepTrain iteration-stage job.yaml \
-  --plan generation-1.json \
-  --initial-training train.initial.xyz \
-  --campaign-dir campaign \
+NepTrain iteration-stage ordinary-v1/project.yaml \
+  --plan ordinary-v1/.neptrain/plans/generation-1.json \
+  --initial-training ordinary-v1/inputs/initial-train.xyz \
+  --campaign-dir ordinary-v1 \
   --campaign-id ordinary-v1 \
   --stage explore
 ```
