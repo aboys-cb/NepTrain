@@ -1,120 +1,26 @@
-
-training:
-  #machine resources字段可参考dpdispatcher的输入内容
-  machine:
-    #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/context.html
-    context_type: "LazyLocal"
-    #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/batch.html
-    batch_type: "Slurm"
-    local_root: "./"
-    remote_root: "~/neptrain/"
-    remote_profile:
-      hostname: ""
-      username: ""
-      key_filename: ""
-      port: 22
-
-
-  resources:
-    number_node: 1
-    gpu_per_node: 1
-    queue_name: 8V100
-    group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
-
-    prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
-      - "module load cuda/12.4.1"
-      - "module load gcc/12.4.0"
-
-
-
-dft:
-
-  machine:
-    context_type: "LazyLocal"
-    batch_type: "Slurm"
-    local_root: "./"
-    remote_root: "~/neptrain/"
-    remote_profile:
-      hostname: ""
-      username: ""
-      key_filename: ""
-      port: 22
-
-
-  resources:
-    number_node: 1
-    gpu_per_node: 1
-    queue_name: 8V100
-    group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
-
-    prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
-      - "module load vasp/6.4.2-nvhpc24.3-ompi5.0.7"
-
-
-
-md:
-  machine:
-    context_type: "LazyLocal"
-    batch_type: "Slurm"
-    local_root: "./"
-    remote_root: "~/neptrain/"
-    remote_profile:
-      hostname: ""
-      username: ""
-      key_filename: ""
-      port: 22
-
-
-  resources:
-    number_node: 1
-    gpu_per_node: 1
-    queue_name: 8V100
-    group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-NEP"
-
-    prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
-      - "module load cuda/12.4.1"
-      - "module load gcc/12.4.0"
-
-
-select:
-  machine:
-    context_type: "LazyLocal"
-    batch_type: "Slurm"
-    local_root: "./"
-    remote_root: "~/neptrain/"
-    remote_profile:
-      hostname: ""
-      username: ""
-      key_filename: ""
-      port: 22
-
-
-  resources:
-    #Select mainly uses CPU
-    number_node: 1
-    gpu_per_node: 1
-    queue_name: 8V100
-    group_size: 1
-    custom_flags:
-      - "#SBATCH --qos=normal"
-      - "#SBATCH --job-name=NepTrain-select"
-
-    prepend_script:
-      - "source /opt/envs/anaconda3.env"
-      - "conda activate neptrain"
-
+execution:
+  poll_interval: 30
+  routes:
+    training: training
+    sampling: cpu
+    labeling: dft
+    analysis: cpu
+  targets:
+    training:
+      executor: slurm
+      partition: gpu
+      time: "24:00:00"
+      gpus_per_node: 1
+      # setup_script: ./env-training.sh
+    cpu:
+      executor: slurm
+      partition: cpu
+      time: "04:00:00"
+      cpus_per_task: 4
+      # setup_script: ./env-cpu.sh
+    dft:
+      executor: slurm
+      partition: cpu
+      time: "24:00:00"
+      cpus_per_task: 4
+      # setup_script: ./env-dft.sh

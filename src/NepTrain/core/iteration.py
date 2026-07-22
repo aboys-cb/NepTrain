@@ -397,6 +397,117 @@ class GenerationController:
             self._ledger = self._load()
             return self._next_stage(plan)
 
+    def stage_context(
+        self, plan: GenerationPlan, stage: str | None = None
+    ) -> tuple[str, StageContext]:
+        """Describe the next stage without executing or mutating it.
+
+        Persistent campaign controllers use this method to build an immutable
+        task for another machine.  The returned paths remain protected by the
+        ledger hashes and are checked again when the result is committed.
+        """
+
+        with self._lock():
+            self._ledger = self._load()
+            expected = self._next_stage(plan)
+            if expected is None:
+                raise IterationError(f"generation {plan.generation} is already complete")
+            requested = expected if stage is None else stage
+            if requested != expected:
+                raise IterationError(
+                    f"generation {plan.generation} expects stage {expected}, not {requested}"
+                )
+            (
+                _,
+                generation_dir,
+                artifacts,
+                _,
+                previous_artifacts,
+            ) = self._generation_state(plan)
+            generation_dir.mkdir(parents=True, exist_ok=True)
+            context = StageContext(
+                generation=plan.generation,
+                generation_dir=generation_dir,
+                plan=plan,
+                artifacts=dict(artifacts),
+                previous_artifacts=dict(previous_artifacts),
+                stage_dir=(
+                    self.workspace.stage_dir(plan.generation, requested)
+                    if self.workspace is not None
+                    else generation_dir
+                ),
+            )
+            context.work_dir.mkdir(parents=True, exist_ok=True)
+            return requested, context
+
+    def commit_stage(
+        self, plan: GenerationPlan, stage: str, outcome: StageOutcome
+    ) -> StageSummary:
+        """Atomically accept one externally executed stage result."""
+
+        with self._lock():
+            self._ledger = self._load()
+            expected = self._next_stage(plan)
+            if expected is None:
+                raise IterationError(f"generation {plan.generation} is already complete")
+            if stage != expected:
+                raise IterationError(
+                    f"generation {plan.generation} expects stage {expected}, not {stage}"
+                )
+            generation_record, _, artifacts, _, _ = self._generation_state(plan)
+            overlap = set(artifacts).intersection(outcome.artifacts)
+            if overlap:
+                raise IterationError(f"duplicate artifact names: {sorted(overlap)}")
+            artifact_records = {}
+            resolved_artifacts = {}
+            for name, raw_path in outcome.artifacts.items():
+                path = Path(raw_path).expanduser().resolve()
+                if not path.is_file():
+                    raise IterationError(
+                        f"stage {stage} did not produce artifact {path}"
+                    )
+                artifact_records[name] = {
+                    "path": str(path),
+                    "sha256": _file_hash(path),
+                }
+                resolved_artifacts[name] = path
+            stage_record = {
+                "artifacts": artifact_records,
+                "metrics": dict(outcome.metrics),
+            }
+            generation_record["stages"][stage] = stage_record
+            complete = stage == STAGES[-1]
+            accepted = None
+            if complete:
+                accepted = stage_record["metrics"].get("accepted")
+                if not isinstance(accepted, bool):
+                    raise IterationError(
+                        "evaluate stage must report an accepted boolean"
+                    )
+                generation_record["accepted"] = accepted
+                generation_record["complete"] = True
+                if self.workspace is not None:
+                    try:
+                        self.workspace.publish_generation(
+                            plan.generation, generation_record
+                        )
+                    except (OSError, ValueError) as error:
+                        generation_record.pop("complete", None)
+                        generation_record.pop("accepted", None)
+                        generation_record["stages"].pop(stage, None)
+                        raise IterationError(
+                            f"cannot publish generation {plan.generation}: {error}"
+                        ) from error
+            self._write(self._ledger)
+            return StageSummary(
+                generation=plan.generation,
+                stage=stage,
+                artifacts=resolved_artifacts,
+                metrics=stage_record["metrics"],
+                generation_complete=complete,
+                accepted=accepted,
+            )
+
     def run_stage(
         self,
         plan: GenerationPlan,
@@ -443,6 +554,9 @@ class GenerationController:
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
             outcome = adapter.run_stage(requested, context)
+            # Direct execution keeps the lock for its whole stage, preserving
+            # the historical single-process contract.  External controllers
+            # use ``stage_context`` + ``commit_stage`` instead.
             overlap = set(artifacts).intersection(outcome.artifacts)
             if overlap:
                 raise IterationError(f"duplicate artifact names: {sorted(overlap)}")
@@ -469,16 +583,12 @@ class GenerationController:
             if complete:
                 accepted = stage_record["metrics"].get("accepted")
                 if not isinstance(accepted, bool):
-                    raise IterationError(
-                        "evaluate stage must report an accepted boolean"
-                    )
+                    raise IterationError("evaluate stage must report an accepted boolean")
                 generation_record["accepted"] = accepted
                 generation_record["complete"] = True
                 if self.workspace is not None:
                     try:
-                        self.workspace.publish_generation(
-                            plan.generation, generation_record
-                        )
+                        self.workspace.publish_generation(plan.generation, generation_record)
                     except (OSError, ValueError) as error:
                         generation_record.pop("complete", None)
                         generation_record.pop("accepted", None)

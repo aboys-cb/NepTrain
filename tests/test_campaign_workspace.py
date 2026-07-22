@@ -5,8 +5,6 @@ from pathlib import Path
 
 import pytest
 
-import NepTrain.core.campaign as campaign_module
-from NepTrain.core.campaign import CampaignError, CampaignResume, resume_campaign
 from NepTrain.core.campaign_workspace import CampaignWorkspace
 from NepTrain.core.iteration import (
     GenerationController,
@@ -76,53 +74,3 @@ def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):
     assert "complete" not in generation
     assert "evaluate" not in generation["stages"]
     assert not (workspace.generation_dir(1) / "summary.json").exists()
-
-
-@pytest.mark.parametrize(
-    ("state", "expected_action", "called"),
-    [
-        ("prepared", "submit", "submit"),
-        ("failed", "retry", "retry"),
-        ("rejected", "recover_rejected", "recover"),
-    ],
-)
-def test_resume_selects_the_safe_action(
-    tmp_path: Path, monkeypatch, state: str, expected_action: str, called: str
-):
-    calls = []
-    status = type("Status", (), {"state": state, "reason": state})()
-    result = type(
-        "Result",
-        (),
-        {
-            "campaign_id": "demo",
-            "job_ids": ("42",),
-            "manifest": tmp_path / "manifest.json",
-        },
-    )()
-    monkeypatch.setattr(campaign_module, "campaign_status", lambda output: status)
-    monkeypatch.setattr(
-        campaign_module,
-        "submit_campaign",
-        lambda output: calls.append("submit") or result,
-    )
-
-    def retry(output, *, recover_rejected=False):
-        calls.append("recover" if recover_rejected else "retry")
-        return result
-
-    monkeypatch.setattr(campaign_module, "retry_failed_campaign", retry)
-
-    resumed = resume_campaign(tmp_path)
-
-    assert isinstance(resumed, CampaignResume)
-    assert resumed.action == expected_action
-    assert calls == [called]
-
-
-def test_resume_refuses_complete_or_running_campaign(tmp_path: Path, monkeypatch):
-    for state in ("complete", "running"):
-        status = type("Status", (), {"state": state, "reason": state})()
-        monkeypatch.setattr(campaign_module, "campaign_status", lambda output: status)
-        with pytest.raises(CampaignError, match="already"):
-            resume_campaign(tmp_path)

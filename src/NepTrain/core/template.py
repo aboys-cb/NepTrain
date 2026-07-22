@@ -18,10 +18,15 @@ def get_job_config(job_type):
     with open(os.path.join(module_path, f"core/train/_template/{job_type}.yaml"), "r", encoding="utf8") as f:
         type_config = YAML().load(f)
     job = utils.merge_yaml(base_config, type_config)
+    if "execution" in type_config:
+        job["execution"] = type_config["execution"]
     return job
 def init_template(argparse):
     if argparse.type=="bohrium":
-        utils.print_tip("To use Bohrium, you must install the extra module with 'pip install dpdispatcher[bohrium]'.")
+        utils.print_tip(
+            "The legacy Bohrium template requires "
+            "'pip install NepTrain[bohrium]'."
+        )
 
 
     if not argparse.force:
@@ -77,4 +82,13 @@ def init_template(argparse):
                 destination,
             )
 
-    utils.print_success("Initialization is complete. After checking the files, you can run `NepTrain train job.yaml` to proceed.")
+    if argparse.type in {"pbs", "bohrium"}:
+        utils.print_warning(
+            "PBS and Bohrium templates are legacy compatibility inputs. "
+            "The persistent campaign controller currently supports process and Slurm targets."
+        )
+    utils.print_success(
+        "Initialization is complete. Check job.yaml, run "
+        "`NepTrain doctor --project job.yaml`, then start with "
+        "`NepTrain run job.yaml --output <campaign>`."
+    )

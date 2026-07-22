@@ -18,7 +18,8 @@ def test_migrate_legacy_backend_names_and_paths():
         },
     }
     config, changes = migrate_config(legacy)
-    assert config["schema_version"] == 2
+    assert config["schema_version"] == 3
+    assert config["execution"]["targets"]["local"]["executor"] == "process"
     assert config["current_job"] == "training"
     assert config["training"]["backend"] == "gpumd"
     assert config["training"]["test_path"] == "test.xyz"

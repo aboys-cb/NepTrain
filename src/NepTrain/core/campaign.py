@@ -64,6 +64,8 @@ class CampaignResume:
     action: str
     job_ids: tuple[str, ...]
     manifest: Path
+    controller_pid: int | None = None
+    controller_exit_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,11 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
             profile["setup_script"] = _absolute_path(
                 profile["setup_script"], base_dir
             )
+    for profile in resolved.get("execution", {}).get("targets", {}).values():
+        if profile.get("setup_script"):
+            profile["setup_script"] = _absolute_path(
+                profile["setup_script"], base_dir
+            )
     return resolved
 
 
@@ -356,6 +363,10 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     ):
         if value and value != "auto":
             paths.append((role, Path(value)))
+    for name, target in config.get("execution", {}).get("targets", {}).items():
+        setup_script = target.get("setup_script")
+        if setup_script and setup_script != "auto":
+            paths.append((f"execution_setup_{name}", Path(setup_script)))
     return [_path_record(role, path) for role, path in paths]
 
 
@@ -517,16 +528,19 @@ def prepare_campaign(
     *,
     campaign_id: str | None = None,
 ) -> CampaignPreparation:
-    """Prepare immutable plans and resource-specific Slurm scripts."""
+    """Prepare immutable plans for the persistent campaign controller."""
 
-    from .config import load_config, save_config
+    from .config import ConfigError, load_config, save_config
 
     source_config = Path(config_path).expanduser().resolve()
     initial = Path(initial_training).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
     if not initial.is_file():
         raise CampaignError(f"initial training set does not exist: {initial}")
-    config, _ = load_config(source_config)
+    try:
+        config, _ = load_config(source_config)
+    except ConfigError as error:
+        raise CampaignError(f"invalid project configuration: {error}") from error
     config = _resolved_config(config, source_config.parent)
     settings = config.get("campaign", {})
     selected_id = campaign_id or str(settings.get("id", output.name))
@@ -579,32 +593,18 @@ def prepare_campaign(
     portable_config, initial_snapshot = workspace.snapshot_inputs(config, initial)
     save_config(portable_config, resolved_config)
     runtime_config = _resolved_config(portable_config, workspace.root)
-    runtime_settings = runtime_config.get("campaign", {})
-    training_profile = _slurm_profile(runtime_settings, "training")
-    cpu_profile = _slurm_profile(runtime_settings, "cpu")
-    dft_profile = _slurm_profile(runtime_settings, "dft")
     dependencies = _dependencies(runtime_config)
     plan_paths: list[Path] = []
     for plan in plans:
         plan_path = workspace.plans_dir / f"generation-{plan.generation}.json"
         _write_json(plan_path, asdict(plan))
         plan_paths.append(plan_path)
-    script_paths = _write_campaign_scripts(
-        output=output,
-        config_file=resolved_config,
-        initial_training=initial_snapshot,
-        campaign_id=selected_id,
-        plans=plans,
-        plan_paths=plan_paths,
-        command=command,
-        training_profile=training_profile,
-        cpu_profile=cpu_profile,
-        dft_profile=dft_profile,
-    )
+    script_paths: list[Path] = []
 
     manifest = {
-        "version": 2 if workspace.version == 2 else 1,
+        "version": 3 if workspace.version == 2 else 1,
         "layout_version": workspace.version,
+        "orchestration": "controller-v1",
         "campaign_id": selected_id,
         "spec_sha256": spec_sha256,
         "config": {"path": str(resolved_config), "sha256": _sha256(resolved_config)},
@@ -674,35 +674,38 @@ def extend_campaign(
             _write_json(path, asdict(plan))
             new_plan_paths.append(path)
 
-        training_profile = _slurm_profile(settings, "training")
-        cpu_profile = _slurm_profile(settings, "cpu")
-        dft_profile = _slurm_profile(settings, "dft")
-        new_scripts = _write_campaign_scripts(
-            output=preparation.output_dir,
-            config_file=preparation.config_file,
-            initial_training=preparation.initial_training,
-            campaign_id=preparation.campaign_id,
-            plans=new_plans,
-            plan_paths=new_plan_paths,
-            command=str(settings.get("command", "NepTrain")),
-            training_profile=training_profile,
-            cpu_profile=cpu_profile,
-            dft_profile=dft_profile,
-        )
+        if manifest.get("orchestration") == "controller-v1":
+            new_scripts = []
+        else:
+            training_profile = _slurm_profile(settings, "training")
+            cpu_profile = _slurm_profile(settings, "cpu")
+            dft_profile = _slurm_profile(settings, "dft")
+            new_scripts = _write_campaign_scripts(
+                output=preparation.output_dir,
+                config_file=preparation.config_file,
+                initial_training=preparation.initial_training,
+                campaign_id=preparation.campaign_id,
+                plans=new_plans,
+                plan_paths=new_plan_paths,
+                command=str(settings.get("command", "NepTrain")),
+                training_profile=training_profile,
+                cpu_profile=cpu_profile,
+                dft_profile=dft_profile,
+            )
         manifest["plans"].extend(
             {"path": str(path), "sha256": _sha256(path)} for path in new_plan_paths
         )
         manifest["scripts"].extend(
             {"path": str(path), "sha256": _sha256(path)} for path in new_scripts
         )
-        manifest.setdefault("extensions", []).append(
-            {
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "from_generations": current_total,
-                "script_start_index": len(manifest["scripts"]) - len(new_scripts),
-                "to_generations": total_generations,
-            }
-        )
+        extension = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "from_generations": current_total,
+            "to_generations": total_generations,
+        }
+        if new_scripts:
+            extension["script_start_index"] = len(manifest["scripts"]) - len(new_scripts)
+        manifest.setdefault("extensions", []).append(extension)
         save_config(portable_config, preparation.config_file)
         manifest["config"]["sha256"] = _sha256(preparation.config_file)
         _write_json(preparation.manifest, manifest)
@@ -918,6 +921,12 @@ def submit_campaign(
     """Submit the prepared scripts as one strict afterok dependency chain."""
 
     preparation = _coerce_preparation(preparation)
+    manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
+    if manifest.get("orchestration") == "controller-v1":
+        raise CampaignError(
+            "controller campaigns do not submit a Slurm dependency chain; "
+            "start the persistent controller instead"
+        )
     with _campaign_lock(preparation.output_dir):
         return _submit_campaign_locked(
             preparation,
@@ -1372,6 +1381,93 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
     ledger = _read_campaign_ledger(preparation)
     progress = _campaign_progress(preparation, manifest, ledger=ledger)
     generations = _scientific_progress(preparation, manifest, ledger=ledger)
+    if manifest.get("orchestration") == "controller-v1":
+        from .controller import controller_running
+
+        workspace = CampaignWorkspace.locate(preparation.output_dir)
+        controller = (
+            json.loads(workspace.controller_file.read_text(encoding="utf-8"))
+            if workspace.controller_file.is_file()
+            else {}
+        )
+        active = controller_running(workspace.root)
+        controller_state = str(controller.get("state", "prepared"))
+        current = controller.get("current")
+        jobs = []
+        for item in controller.get("history", []):
+            handle = item.get("handle") or {}
+            jobs.append(
+                {
+                    "attempt": f"attempt-{item.get('attempt', 1)}",
+                    "script": f"{item.get('target', '-')}/{item.get('stage', '-')}",
+                    "job_id": handle.get("execution_id"),
+                    "dependency": None,
+                    "state": "COMPLETED" if item.get("completed_at") else "FAILED",
+                    "current": False,
+                    "detail": item.get("failure"),
+                }
+            )
+        if current:
+            handle = current.get("handle") or {}
+            observed = str(current.get("observed_state", controller_state)).upper()
+            jobs.append(
+                {
+                    "attempt": f"attempt-{current.get('attempt', 1)}",
+                    "script": f"{current.get('target', '-')}/{current.get('stage', '-')}",
+                    "job_id": handle.get("execution_id"),
+                    "dependency": None,
+                    "state": observed,
+                    "current": True,
+                    "detail": current.get("detail"),
+                }
+            )
+        state = progress.state
+        reason = progress.reason
+        next_action = None
+        if progress.state == "complete":
+            state = "complete"
+        elif progress.state == "rejected" or controller_state == "rejected":
+            state = "rejected"
+            reason = str(controller.get("reason", progress.reason))
+            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+        elif active:
+            state = "degraded" if controller_state == "degraded" else "running"
+            reason = str(
+                controller.get("last_transport_error")
+                or controller.get("reason")
+                or "persistent controller is active"
+            )
+            next_action = f"NepTrain status {shlex.quote(str(preparation.output_dir))}"
+        elif controller_state == "failed":
+            state = "failed"
+            reason = str(controller.get("reason", "controller failed"))
+            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+        elif controller_state == "stopped":
+            state = "paused"
+            reason = str(controller.get("reason", "controller is stopped"))
+            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+        elif controller_state in {"running", "launching", "degraded"}:
+            state = "paused"
+            reason = "controller process is not running; remote work is preserved"
+            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+        else:
+            state = "prepared"
+            reason = "campaign is prepared and controller has not started"
+            next_action = f"NepTrain run {shlex.quote(str(preparation.output_dir))}"
+        return CampaignStatus(
+            campaign_id=preparation.campaign_id,
+            state=state,
+            completed_generations=progress.completed_generations,
+            total_generations=len(preparation.plans),
+            generation=int(current["generation"])
+            if current
+            else progress.generation,
+            stage=str(current["stage"]) if current else progress.stage,
+            reason=reason,
+            next_action=next_action,
+            generations=generations,
+            jobs=tuple(jobs),
+        )
     jobs = _status_job_records(preparation, manifest)
     next_action = None
     state = progress.state
@@ -1469,10 +1565,53 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
     )
 
 
-def resume_campaign(output_dir: str | Path) -> CampaignResume:
+def resume_campaign(
+    output_dir: str | Path,
+    *,
+    foreground: bool = False,
+    poll_interval: float | None = None,
+) -> CampaignResume:
     """Take the only safe continuation without exposing scheduler failure modes."""
 
     output = Path(output_dir).expanduser().resolve()
+    preparation = _coerce_preparation(output)
+    manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
+    if manifest.get("orchestration") == "controller-v1":
+        from .controller import (
+            PersistentController,
+            controller_running,
+            start_controller,
+        )
+
+        status = campaign_status(output)
+        if status.state == "complete":
+            raise CampaignError("campaign is already complete")
+        if controller_running(output):
+            raise CampaignError("campaign controller is already running")
+        controller = PersistentController(output)
+        action = "resume"
+        if status.state == "failed":
+            controller.retry()
+            action = "retry"
+        elif status.state == "rejected":
+            controller.retry(recover_rejected=True)
+            action = "recover_rejected"
+        try:
+            controller_result = start_controller(
+                output,
+                foreground=foreground,
+                poll_interval=poll_interval,
+            )
+        except Exception as error:
+            raise CampaignError(str(error)) from error
+        return CampaignResume(
+            preparation.campaign_id,
+            action,
+            (),
+            preparation.manifest,
+            controller_pid=None if foreground else controller_result,
+            controller_exit_code=controller_result if foreground else None,
+        )
     status = campaign_status(output)
     if status.state in {"prepared", "paused"}:
         submission = submit_campaign(output)

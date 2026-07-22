@@ -67,8 +67,17 @@ def run_gpumd(args):
 
 
 def train_nep(args):
+    _warn_legacy_command("train", "run")
     from NepTrain.core.train import train_nep as implementation
-    return implementation(args)
+    try:
+        return implementation(args)
+    except ImportError as error:
+        if error.name and error.name.startswith("dpdispatcher"):
+            raise SystemExit(
+                "NepTrain: error: the legacy 'train' command requires "
+                "'pip install NepTrain[legacy]'; use 'NepTrain run' for new projects."
+            ) from error
+        raise
 
 
 def run_md_command(args):
@@ -130,7 +139,7 @@ def run_migrate(args):
     save_config(config, output)
     if changes:
         print("Migrated: " + ", ".join(changes))
-    print(f"Wrote schema-v2 config: {output}")
+    print(f"Wrote schema-v3 config: {output}")
 
 
 def run_smoke_command(args):
@@ -334,7 +343,7 @@ def _print_campaign_status(status, *, show_jobs: bool = True):
     print(f"Reason: {status.reason}")
     _print_scientific_progress(status.generations)
     if show_jobs:
-        print("Jobs:")
+        print("Executions:")
         for job in status.jobs:
             marker = "*" if job["current"] else "-"
             attempt = job["attempt"] or "not-submitted"
@@ -352,12 +361,12 @@ def _print_campaign_status(status, *, show_jobs: bool = True):
         if active:
             job = active[-1]
             print(
-                f"Scheduler: job {job['job_id'] or '-'} {job['state']} "
+                f"Executor: {job['job_id'] or '-'} {job['state']} "
                 f"({Path(job['script']).name})"
             )
         else:
             completed = sum(job["state"] == "COMPLETED" for job in status.jobs)
-            print(f"Scheduler: {completed}/{len(status.jobs)} jobs completed")
+            print(f"Executor: {completed}/{len(status.jobs)} stages completed")
     if status.next_action:
         print(f"Next: {status.next_action}")
 
@@ -369,25 +378,40 @@ def run_project_command(args):
         CampaignError,
         prepare_campaign,
         resume_campaign,
-        submit_campaign,
     )
+    from NepTrain.core.controller import start_controller
 
     project = Path(args.project).expanduser()
     try:
         if project.is_dir():
-            result = resume_campaign(project)
+            resume_options = {}
+            if getattr(args, "foreground", False):
+                resume_options["foreground"] = True
+            if getattr(args, "poll_interval", None) is not None:
+                resume_options["poll_interval"] = args.poll_interval
+            result = resume_campaign(project, **resume_options)
             payload = {
                 "campaign_id": result.campaign_id,
                 "action": result.action,
-                "job_ids": list(result.job_ids),
                 "manifest": str(result.manifest),
             }
+            if result.controller_pid is not None:
+                payload["controller_pid"] = result.controller_pid
+            elif result.controller_exit_code is not None:
+                payload["controller_exit_code"] = result.controller_exit_code
+            else:
+                payload["job_ids"] = list(result.job_ids)
         else:
             initial_training = args.initial_training
             if not initial_training:
-                from NepTrain.core.config import load_config
+                from NepTrain.core.config import ConfigError, load_config
 
-                config, _ = load_config(project)
+                try:
+                    config, _ = load_config(project)
+                except ConfigError as error:
+                    raise CampaignError(
+                        f"invalid project configuration: {error}"
+                    ) from error
                 value = config.get("training", {}).get("initial_path")
                 if value:
                     path = Path(value).expanduser()
@@ -411,11 +435,21 @@ def run_project_command(args):
                 "campaign_id": preparation.campaign_id,
                 "project": str(preparation.output_dir),
                 "manifest": str(preparation.manifest),
-                "submitted": not args.prepare_only,
+                "started": not args.prepare_only,
             }
             if not args.prepare_only:
-                submission = submit_campaign(preparation)
-                payload["job_ids"] = list(submission.job_ids)
+                try:
+                    controller_result = start_controller(
+                        preparation.output_dir,
+                        foreground=getattr(args, "foreground", False),
+                        poll_interval=getattr(args, "poll_interval", None),
+                    )
+                except Exception as error:
+                    raise CampaignError(str(error)) from error
+                if getattr(args, "foreground", False):
+                    payload["controller_exit_code"] = controller_result
+                else:
+                    payload["controller_pid"] = controller_result
     except CampaignError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     print(json.dumps(payload, indent=2, sort_keys=True))
@@ -446,6 +480,15 @@ def run_resume_command(args):
     payload = asdict(result)
     payload["job_ids"] = list(result.job_ids)
     payload["manifest"] = str(result.manifest)
+    if result.controller_pid is not None:
+        payload.pop("job_ids", None)
+        payload.pop("controller_exit_code", None)
+    elif result.controller_exit_code is not None:
+        payload.pop("job_ids", None)
+        payload.pop("controller_pid", None)
+    else:
+        payload.pop("controller_pid", None)
+        payload.pop("controller_exit_code", None)
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
@@ -467,6 +510,28 @@ def run_extend_command(args):
             sort_keys=True,
         )
     )
+
+
+def run_stop_command(args):
+    from NepTrain.core.controller import ControllerError, stop_controller
+
+    try:
+        stop_controller(args.project)
+    except ControllerError as error:
+        raise SystemExit(f"NepTrain: error: {error}") from error
+    print(json.dumps({"project": str(Path(args.project).resolve()), "stopped": True}, indent=2))
+
+
+def run_controller_command(args):
+    from NepTrain.core.controller import run_controller
+
+    return run_controller(args.project, poll_interval=args.poll_interval)
+
+
+def run_stage_worker_command(args):
+    from NepTrain.core.execution import run_stage_worker
+
+    return run_stage_worker(args.bundle)
 
 
 def run_doctor(args):
@@ -491,6 +556,84 @@ def run_doctor(args):
             failures.append("torchnep")
     selected_inference = args.inference_backend
     model_info = None
+    if args.project:
+        from NepTrain.core.config import ConfigError, load_config
+        from NepTrain.core.execution import ExecutionTarget
+
+        project = Path(args.project).expanduser().resolve()
+        try:
+            config, _ = load_config(project)
+        except ConfigError as error:
+            raise SystemExit(f"NepTrain: error: invalid project configuration: {error}") from error
+        for name, raw_target in config.get("execution", {}).get("targets", {}).items():
+            value = dict(raw_target)
+            setup = value.get("setup_script")
+            setup_is_local = False
+            if setup:
+                candidate = Path(setup).expanduser()
+                local = (project.parent / candidate).resolve() if not candidate.is_absolute() else candidate
+                if local.is_file():
+                    value["setup_script"] = str(local)
+                    setup_is_local = True
+            target = ExecutionTarget.from_mapping(str(name), value)
+            required = []
+            if target.executor == "slurm":
+                required.extend(["sbatch", "squeue", "sacct"])
+                if not target.setup_script:
+                    required.append(shlex.split(target.command)[0])
+            else:
+                required.append(shlex.split(target.command)[0])
+            setup_line = ""
+            path_check = ""
+            if target.setup_script and target.executor == "process":
+                setup_path = target.setup_script
+                if Path(setup_path).is_file():
+                    setup_line = Path(setup_path).read_text(encoding="utf-8") + "\n"
+                else:
+                    setup_line = f"source {shlex.quote(setup_path)}\n"
+            elif target.setup_script and not setup_is_local:
+                path_check = f"test -r {shlex.quote(target.setup_script)}\n"
+            probe = (
+                "set -eo pipefail\n"
+                + setup_line
+                + path_check
+                + "for tool in "
+                + " ".join(shlex.quote(tool) for tool in required)
+                + "; do command -v \"$tool\" >/dev/null; done\n"
+            )
+            if target.host:
+                completed = subprocess.run(
+                    [
+                        "ssh",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=10",
+                        target.host,
+                        "bash",
+                        "-s",
+                    ],
+                    input=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            else:
+                completed = subprocess.run(
+                    ["bash", "-s"],
+                    input=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            available = completed.returncode == 0
+            location = target.host or "local"
+            print(
+                f"{'OK' if available else 'FAIL'} execution target {name} "
+                f"({target.executor} on {location})"
+            )
+            if not available:
+                failures.append(f"execution target {name}")
     if args.model and package_status["nep_adapters"]:
         from nep_adapters import inspect_model
         from NepTrain.core.nep.calculator import resolve_backend
@@ -903,10 +1046,15 @@ def build_doctor(subparsers):
     parser.add_argument("--mpiexec", default="mpirun")
     parser.add_argument("--mpi-ranks", type=int, default=1)
     parser.add_argument("--plugin-path", default=None)
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Check every execution target in a project YAML.",
+    )
 
 
 def build_migrate(subparsers):
-    parser = subparsers.add_parser("migrate", help="Migrate a legacy job config to schema v2.")
+    parser = subparsers.add_parser("migrate", help="Migrate a legacy job config to schema v3.")
     parser.set_defaults(func=run_migrate)
     parser.add_argument("config_path")
     parser.add_argument("--output", "-o", default="job.v2.yaml")
@@ -946,6 +1094,7 @@ def build_iteration_stage(subparsers):
         "iteration-stage",
         help="Run the next hash-checked iteration stage (for split Slurm jobs).",
     )
+    subparsers._choices_actions.pop()
     parser.set_defaults(func=run_iteration_stage_command)
     _add_iteration_arguments(parser)
     parser.add_argument(
@@ -979,6 +1128,7 @@ def build_iteration_resource(subparsers):
         "iteration-resource",
         help="Resume every pending stage assigned to one Slurm resource class.",
     )
+    subparsers._choices_actions.pop()
     parser.set_defaults(func=run_iteration_resource_command)
     _add_iteration_arguments(parser)
     parser.add_argument(
@@ -1002,17 +1152,28 @@ def build_project_commands(subparsers):
     run_parser.add_argument(
         "--prepare-only",
         action="store_true",
-        help="Create the project layout and jobs without submitting them.",
+        help="Create the project layout and plans without starting the controller.",
+    )
+    run_parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Keep the persistent controller attached to this terminal.",
+    )
+    run_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=None,
+        help="Override execution.poll_interval for this controller.",
     )
 
     status_parser = subparsers.add_parser(
-        "status", help="Show one campaign's scientific and scheduler status."
+        "status", help="Show one campaign's scientific and execution status."
     )
     status_parser.set_defaults(func=run_status_command)
     status_parser.add_argument("project", help="Campaign project directory.")
     status_parser.add_argument("--json", action="store_true")
     status_parser.add_argument(
-        "--jobs", action="store_true", help="Show the complete scheduler job table."
+        "--jobs", action="store_true", help="Show the complete stage execution table."
     )
 
     resume_parser = subparsers.add_parser(
@@ -1027,6 +1188,27 @@ def build_project_commands(subparsers):
     extend_parser.set_defaults(func=run_extend_command)
     extend_parser.add_argument("project", help="Campaign project directory.")
     extend_parser.add_argument("generations", type=int, help="New total generation count.")
+
+    stop_parser = subparsers.add_parser(
+        "stop", help="Stop the controller without cancelling remote work."
+    )
+    stop_parser.set_defaults(func=run_stop_command)
+    stop_parser.add_argument("project", help="Campaign project directory.")
+
+    controller_parser = subparsers.add_parser(
+        "controller", help=argparse.SUPPRESS
+    )
+    subparsers._choices_actions.pop()
+    controller_parser.set_defaults(func=run_controller_command)
+    controller_parser.add_argument("project")
+    controller_parser.add_argument("--poll-interval", type=float, default=None)
+
+    worker_parser = subparsers.add_parser(
+        "stage-worker", help=argparse.SUPPRESS
+    )
+    subparsers._choices_actions.pop()
+    worker_parser.set_defaults(func=run_stage_worker_command)
+    worker_parser.add_argument("bundle")
 
 
 
@@ -1070,7 +1252,7 @@ def build_gpumd(subparsers):
 def build_train(subparsers):
     parser_train = subparsers.add_parser(
         "train",
-        help="Automatic training.",
+        help="Compatibility command; use 'run' (removed next release).",
     )
     parser_train.set_defaults(func=train_nep)
 
@@ -1145,7 +1327,9 @@ def main():
 
 
 
-    subparsers = parser.add_subparsers()
+    subparsers = parser.add_subparsers(
+        metavar="{init,perturb,select,dft,vasp,nep,gpumd,md,train,doctor,migrate,smoke,run,status,resume,extend,stop}"
+    )
 
 
     build_init(subparsers)
@@ -1190,16 +1374,31 @@ def main():
         return args.func(args)
     except Exception as error:
         from NepTrain.core.config import ConfigError
-        from NepTrain.core.md import MdError
-        from NepTrain.core.spin import SpinDataError
-        from NepTrain.core.training import TrainingError
-        from NepTrain.core.dft import LabelingError
-        from NepTrain.core.smoke import SmokeError
         from NepTrain.core.iteration import IterationError
-        from NepTrain.core.workflow_iteration import WorkflowIterationError
         from NepTrain.core.campaign import CampaignError
+        from NepTrain.core.controller import ControllerError
+        from NepTrain.core.execution import ExecutionError
 
-        if isinstance(error, (ConfigError, MdError, SpinDataError, TrainingError, LabelingError, SmokeError, IterationError, WorkflowIterationError, CampaignError)):
+        lightweight_errors = (
+            ConfigError,
+            IterationError,
+            CampaignError,
+            ControllerError,
+            ExecutionError,
+        )
+        scientific_error_names = {
+            "LabelingError",
+            "MdError",
+            "SmokeError",
+            "SpinDataError",
+            "TrainingError",
+            "WorkflowIterationError",
+        }
+        is_scientific_error = (
+            type(error).__module__.startswith("NepTrain.core.")
+            and type(error).__name__ in scientific_error_names
+        )
+        if isinstance(error, lightweight_errors) or is_scientific_error:
             parser.exit(2, f"NepTrain: error: {error}\n")
         raise
 

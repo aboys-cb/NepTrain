@@ -23,6 +23,10 @@ LAMMPS 只是 MD frontend；模型识别、能力检查和计算实现统一由 
 pip install NepTrain
 ```
 
+新的 `run/status/resume` campaign 不依赖 `dpdispatcher`。只有计划在下个版本删除的
+旧 `train` 命令需要 `pip install 'NepTrain[legacy]'`；旧 Bohrium 入口使用
+`NepTrain[bohrium]`。
+
 TorchNEP 训练需要先安装与机器 CUDA 匹配的 PyTorch，再安装额外依赖：
 
 ```bash
@@ -40,11 +44,12 @@ export LAMMPS_PLUGIN_PATH=/path/to/nepadapters/lib
 
 ```bash
 NepTrain init slurm
-NepTrain doctor --training-backend torchnep
-NepTrain train job.yaml
+NepTrain doctor --project job.yaml --training-backend torchnep
+NepTrain run job.yaml --output my-campaign
 ```
 
-`job.yaml` 使用 schema v2。常改参数集中在 `training` 和 `md`：
+`job.yaml` 使用 schema v3。常改参数集中在 `training`、`md`、`dft` 和
+`execution`：
 
 ```yaml
 schema_version: 2
@@ -97,7 +102,7 @@ TorchNEP 的实验性 `vector_field` descriptor 不是现有 NEPAdapters/LAMMPS 
 旧配置显式迁移，不在运行期永久维护两套字段：
 
 ```bash
-NepTrain migrate old-job.yaml -o job.v2.yaml
+NepTrain migrate old-job.yaml -o job.v3.yaml
 ```
 
 ## 单独运行 MD
@@ -180,7 +185,13 @@ train → explore → select → label → diagnose → merge → retrain → ev
 
 `diagnose` 使用加入新标签前的模型计算 acquisition error，只用于判断这批采样是否确实触及模型薄弱区，不决定该代是否通过。`evaluate` 必须使用合并新标签并重新训练后的模型，以及不进入训练集的固定 validation 数据；只有这个 post-retrain gate 能决定该代是否接受。
 
-通常只需要在 `job.yaml` 增加 campaign 策略和训练、采样、DFT 三类 Slurm 资源：
+Controller 是唯一负责推进状态机的进程；训练、MD、DFT 和分析只是一次只跑一个
+stage 的执行任务。Controller 默认脱离终端运行，只做轮询、账本提交和小文件传输，
+不占计算节点，也不依赖 Slurm `afterok`。每一类 stage 可以指向本机进程、本机 Slurm，
+或另一台可 SSH 登录的 Slurm 集群。
+
+单集群常用配置如下。Controller 放在该集群登录节点运行，训练用单张 V100，MD 和
+分析用 4 核 CPU，DFT 可以独立选择资源：
 
 ```yaml
 campaign:
@@ -201,19 +212,28 @@ campaign:
       long_stable: 160000
       production_ready: 640000
 
-  slurm:
-    training:
+execution:
+  poll_interval: 30
+  routes:
+    training: v100
+    sampling: cpu
+    labeling: dft
+    analysis: cpu
+  targets:
+    v100:
+      executor: slurm
       partition: 16V100
       qos: flood-1o2gpu
       gpus_per_node: 1
       setup_script: ./env-v100.sh
     cpu:
+      executor: slurm
       partition: DSPRHBM
       qos: rush-cpu
       cpus_per_task: 4
       setup_script: ./env-cpu.sh
     dft:
-      # Sai 当前的 VASP/ABACUS module 都链接 GPU 运行库，放到单卡 V100。
+      executor: slurm
       partition: 16V100
       qos: flood-1o2gpu
       cpus_per_task: 4
@@ -235,6 +255,59 @@ evaluation:
   max_rmse:
     energy_rmse: 0.05
     force_rmse: 0.20
+```
+
+如果 DFT 在另一台超算运行，只改目标和路由，不改科学流程。远端必须能用 SSH alias
+登录，并在 `command` 指定的环境中安装相同版本的 NepTrain：
+
+```yaml
+execution:
+  routes:
+    training: sai-v100
+    sampling: sai-cpu
+    labeling: other-dft
+    analysis: local
+  targets:
+    local:
+      executor: process
+    sai-v100:
+      executor: slurm
+      host: sai
+      work_root: ~/hpc-work/neptrain-tasks
+      command: /path/to/python -m NepTrain.cli.cli
+      partition: 16V100
+      qos: flood-1o2gpu
+      gpus_per_node: 1
+      setup_script: /remote/path/env-v100.sh
+    sai-cpu:
+      executor: slurm
+      host: sai
+      work_root: ~/hpc-work/neptrain-tasks
+      command: /path/to/python -m NepTrain.cli.cli
+      partition: DSPRHBM
+      qos: rush-cpu
+      cpus_per_task: 4
+      setup_script: /remote/path/env-cpu.sh
+    other-dft:
+      executor: slurm
+      host: other-cluster
+      work_root: ~/neptrain-tasks
+      command: NepTrain
+      partition: compute
+      cpus_per_task: 32
+```
+
+没有排队系统时使用 `executor: process`；加上 `host` 和 `work_root` 就是在远端后台
+进程中运行。`overrides` 可替换目标机上的安装路径，例如大型赝势库或 LAMMPS plugin，
+避免把它们随每个 task 重复传输：
+
+```yaml
+    other-dft:
+      executor: process
+      host: other-cluster
+      work_root: ~/neptrain-tasks
+      overrides:
+        dft.resource_path: /shared/pseudopotentials/PBE
 ```
 
 VASP 使用 ASE 自带的输入与结果解析能力；`resource_path` 直接指向含
@@ -289,20 +362,23 @@ NepTrain run job.yaml \
 NepTrain run ordinary-v1
 ```
 
-也可以省略 `--prepare-only`，创建后立即提交。`NepTrain run` 必须在 Slurm
-登录节点运行，不能放进另一个 batch 作业里嵌套提交。
+也可以省略 `--prepare-only`，创建后立即启动后台 Controller。命令会很快返回，
+不会堵住当前终端；需要在容器或服务管理器中观察前台日志时使用 `--foreground`。
+Controller 应运行在允许长驻轻量进程的登录节点，不能放进另一个 batch 作业里嵌套
+提交。
 
-日常只需要两个状态命令：
+日常只需要下面三个命令：
 
 ```bash
 NepTrain status ordinary-v1
 NepTrain resume ordinary-v1
+NepTrain stop ordinary-v1
 ```
 
-`status` 默认只显示科学进度和当前调度状态；需要完整作业表时使用
-`NepTrain status ordinary-v1 --jobs`。`resume` 会读取账本，自动选择继续未提交
-作业、重试失败阶段，或从 retrain 恢复被 validation gate 拒绝的一代。用户不需要
-区分 scheduler failure 和 scientific rejection。
+`status` 默认只显示科学进度和当前执行状态；需要完整 stage 表时使用
+`NepTrain status ordinary-v1 --jobs`。`stop` 只停 Controller，不取消已经在本机、
+Slurm 或远端运行的 task；随后 `resume` 会接管同一个 task，不重复提交。执行失败时
+`resume` 创建带新 attempt ID 的重试；validation gate 拒绝时则从 retrain 恢复。
 
 项目目录按用户视角组织：
 
@@ -312,8 +388,8 @@ ordinary-v1/
 ├── inputs/            # 结构、nep.in、DFT 输入和环境脚本快照
 ├── results/           # 最新通过验收的 nep.txt、train.xyz 和指标
 ├── generations/       # 0001、0002……每代的采样/标注/训练/评价证据
-├── logs/              # Slurm 输出
-└── .neptrain/         # manifest、ledger、plans、jobs、locks 等内部状态
+├── logs/              # Controller 和执行后端日志
+└── .neptrain/         # manifest、ledger、plans、tasks、locks 等内部状态
 ```
 
 赝势目录和 LAMMPS 插件等大型外部依赖不会复制进项目，但路径和哈希仍进入
@@ -329,36 +405,26 @@ NepTrain run ordinary-v1
 
 追加操作只接受更大的总代数，并在 manifest 中记录扩展历史；未完成或被验收门槛拒绝的 campaign 不允许绕过 gate 继续追加。
 
-训练和 CPU 作业通过 Slurm `afterok` 串联。第一代先在 V100 上 bootstrap；每代依次执行 CPU 采样与诊断、V100 retrain、CPU validation。TorchNEP 的 retrain 从上一 checkpoint 载入权重，重新开始优化器和 epoch 计数，并默认使用 `nep.in` 学习率的 `0.1` 倍，避免少量新样本的首批高梯度破坏已验收模型；初始训练学习率不受影响。实际生成的微调配置也会写入 generation ledger 的 artifact。下一代直接复用上一代验收模型，不会在 V100 上重复训练同一份数据。任一阶段失败或一代被拒绝，后续作业不会继续。重复执行同一条提交命令不会重复提交已经记入 manifest 的作业。
+Controller 只在前一 stage 的结果通过哈希、任务身份和账本校验后创建下一 stage，
+因此不需要调度器依赖语法。第一代先 bootstrap；每代依次执行采样、选择、标注、
+诊断、合并、retrain 和 validation。TorchNEP retrain 从上一 checkpoint 载入权重，
+重新开始优化器和 epoch 计数，并默认使用 `nep.in` 学习率的 `0.1` 倍。下一代直接
+复用上一代验收模型。重复启动 Controller 会通过确定性 task ID 和后端查询接管已有
+执行，不会重复提交。
 
 恢复只重跑账本确认尚未完成的阶段；被 gate 拒绝时从 `retrain -> evaluate` 开始。
 原失败模型、指标和作业号保存在 ledger 的 `recovery_attempts` 中，不会改写成
 一次虚假的成功记录。
 
 `.neptrain/manifest.json` 会固定配置、初始训练集、`nep.in`、结构输入、环境脚本、
-成熟度策略、计划和提交 job id。依赖文件漂移时会拒绝复用原 campaign。每代的
+成熟度策略和计划；`.neptrain/controller.json` 保存当前 target、task ID、执行句柄和
+append-only 历史。依赖文件漂移时会拒绝启动。每代的
 `scenario-plan.json` 记录实际调度的场景和步数，累计的
 `scenario-maturity.json` 保存在同一份 ledger 产物链中，不需要第二套工作流。
 
-需要调试单个阶段时，可以使用底层入口：
-
-```bash
-# V100 作业
-NepTrain iteration-stage ordinary-v1/project.yaml \
-  --plan ordinary-v1/.neptrain/plans/generation-1.json \
-  --initial-training ordinary-v1/inputs/initial-train.xyz \
-  --campaign-dir ordinary-v1 \
-  --campaign-id ordinary-v1 \
-  --stage train
-
-# CPU 作业；其余阶段按同样方式依次调用
-NepTrain iteration-stage ordinary-v1/project.yaml \
-  --plan ordinary-v1/.neptrain/plans/generation-1.json \
-  --initial-training ordinary-v1/inputs/initial-train.xyz \
-  --campaign-dir ordinary-v1 \
-  --campaign-id ordinary-v1 \
-  --stage explore
-```
+内部的 `controller` 和 `stage-worker` 命令只供生成的任务使用，不是用户接口。排障时
+优先查看 `NepTrain status --jobs`、`logs/controller.log`、当前 task 的
+`execution.json` 和 Slurm 输出。
 
 `generation-1.json` 是 campaign 自动生成的不可变计划，例如：
 

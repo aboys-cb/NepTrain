@@ -9,7 +9,7 @@ from typing import Any, Mapping
 from ruamel.yaml import YAML
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class ConfigError(ValueError):
@@ -21,7 +21,7 @@ def _copy_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def migrate_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Return schema-v2 configuration and a list of performed migrations."""
+    """Return schema-v3 configuration and a list of performed migrations."""
 
     migrated = _copy_mapping(config)
     changes: list[str] = []
@@ -50,6 +50,51 @@ def migrate_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]
     training.setdefault("torch_backend", "auto")
     training.setdefault("finetune_lr_scale", 0.1)
     md.setdefault("inference_backend", "auto")
+
+    campaign = migrated.setdefault("campaign", {})
+    if "execution" not in migrated:
+        legacy_slurm = campaign.pop("slurm", None)
+        if legacy_slurm:
+            command = str(campaign.get("command", "NepTrain"))
+
+            def target(profile_name: str, fallback: str | None = None) -> dict[str, Any]:
+                profile = dict(
+                    legacy_slurm.get(profile_name)
+                    or (legacy_slurm.get(fallback) if fallback else {})
+                    or {}
+                )
+                profile["executor"] = "slurm"
+                profile.setdefault("command", command)
+                return profile
+
+            migrated["execution"] = {
+                "poll_interval": 30,
+                "routes": {
+                    "training": "training",
+                    "sampling": "sampling",
+                    "labeling": "labeling",
+                    "analysis": "analysis",
+                },
+                "targets": {
+                    "training": target("training"),
+                    "sampling": target("cpu"),
+                    "labeling": target("dft", "cpu"),
+                    "analysis": target("cpu"),
+                },
+            }
+            changes.append("campaign.slurm -> execution targets/routes")
+        else:
+            migrated["execution"] = {
+                "poll_interval": 30,
+                "routes": {
+                    "training": "local",
+                    "sampling": "local",
+                    "labeling": "local",
+                    "analysis": "local",
+                },
+                "targets": {"local": {"executor": "process"}},
+            }
+            changes.append("default local execution target")
 
     if "initial_path" not in training and migrated.get("init_train_xyz"):
         training["initial_path"] = migrated["init_train_xyz"]
@@ -93,12 +138,15 @@ def migrate_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
-    from .md.health import TrajectoryHealthError, TrajectoryHealthPolicy
+    from .execution import ExecutionError, ExecutionTarget
+    from .md_policy import TrajectoryHealthError, TrajectoryHealthPolicy
     from .scenario import ScenarioLadder, ScenarioMaturityError
 
     training = config.get("training", {})
     md = config.get("md", {})
     dft = config.get("dft", {})
+    campaign = config.get("campaign", {})
+    evaluation = config.get("evaluation", {})
     if training.get("backend") not in {"gpumd", "torchnep"}:
         raise ConfigError("training.backend must be gpumd or torchnep")
     if float(training.get("finetune_lr_scale", 0.1)) <= 0:
@@ -146,10 +194,55 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 "spin campaigns currently require dft.software=toy; "
                 "VASP/ABACUS production labeling is non-magnetic only"
             )
+    if campaign:
+        if not (
+            evaluation.get("validation_path") or training.get("test_path")
+        ):
+            raise ConfigError(
+                "campaign requires evaluation.validation_path or training.test_path"
+            )
+        thresholds = dict(evaluation.get("max_rmse") or {})
+        required_thresholds = {"energy_rmse", "force_rmse"}
+        if md.get("spin", False):
+            required_thresholds.add("mforce_rmse")
+        missing_thresholds = sorted(required_thresholds - set(thresholds))
+        if missing_thresholds:
+            raise ConfigError(
+                "campaign evaluation.max_rmse is missing "
+                + ", ".join(missing_thresholds)
+            )
     try:
-        ScenarioLadder.from_campaign(config.get("campaign", {}))
+        ScenarioLadder.from_campaign(campaign)
     except ScenarioMaturityError as error:
         raise ConfigError(str(error)) from error
+    execution = config.get("execution", {})
+    try:
+        interval = float(execution.get("poll_interval", 30))
+    except (TypeError, ValueError) as error:
+        raise ConfigError("execution.poll_interval must be numeric") from error
+    if interval < 0.2:
+        raise ConfigError("execution.poll_interval must be at least 0.2 seconds")
+    targets = execution.get("targets", {})
+    routes = execution.get("routes", {})
+    required_routes = {"training", "sampling", "labeling", "analysis"}
+    missing_routes = sorted(required_routes - set(routes))
+    if missing_routes:
+        raise ConfigError(
+            "execution.routes is missing " + ", ".join(missing_routes)
+        )
+    try:
+        parsed_targets = {
+            str(name): ExecutionTarget.from_mapping(str(name), value)
+            for name, value in dict(targets).items()
+        }
+    except (ExecutionError, TypeError, ValueError) as error:
+        raise ConfigError(str(error)) from error
+    unknown_targets = sorted(set(routes.values()) - set(parsed_targets))
+    if unknown_targets:
+        raise ConfigError(
+            "execution.routes refers to unknown targets: "
+            + ", ".join(str(value) for value in unknown_targets)
+        )
 
 
 def load_config(path: str | Path) -> tuple[dict[str, Any], list[str]]:

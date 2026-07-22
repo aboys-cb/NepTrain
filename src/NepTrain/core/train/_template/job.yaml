@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 version: 0
 dft_job: 10
 md_split_job: temperature
@@ -86,6 +86,17 @@ campaign:
       short_stable: 40000
       long_stable: 160000
       production_ready: 640000
+
+execution:
+  poll_interval: 30
+  routes:
+    training: local
+    sampling: local
+    labeling: local
+    analysis: local
+  targets:
+    local:
+      executor: process
 
 select:
   max_selected: 50

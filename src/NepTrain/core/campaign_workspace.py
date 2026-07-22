@@ -67,6 +67,7 @@ class CampaignWorkspace:
             workspace.logs_dir,
             workspace.plans_dir,
             workspace.jobs_dir,
+            workspace.tasks_dir,
             workspace.locks_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -85,9 +86,9 @@ class CampaignWorkspace:
             "- `inputs/`：进入 campaign 的输入快照。\n"
             "- `results/`：最新通过验收的模型、训练集和指标。\n"
             "- `generations/`：按代组织的采样、标注、训练和评价证据。\n"
-            "- `logs/`：Slurm 标准输出。\n"
-            "- `.neptrain/`：账本、计划和作业脚本等内部状态，通常无需编辑。\n"
-            "\n常用命令：`NepTrain status .`、`NepTrain resume .`。\n",
+            "- `logs/`：Controller 与执行后端日志。\n"
+            "- `.neptrain/`：账本、计划、可移植任务和执行状态，通常无需编辑。\n"
+            "\n常用命令：`NepTrain status .`、`NepTrain resume .`、`NepTrain stop .`。\n",
             encoding="utf-8",
         )
         return workspace
@@ -157,6 +158,10 @@ class CampaignWorkspace:
         return self.internal_dir / "jobs" if self.version == 2 else self.root / "jobs"
 
     @property
+    def tasks_dir(self) -> Path:
+        return self.internal_dir / "tasks" if self.version == 2 else self.root / "tasks"
+
+    @property
     def locks_dir(self) -> Path:
         return self.internal_dir / "locks" if self.version == 2 else self.root
 
@@ -183,6 +188,22 @@ class CampaignWorkspace:
             if self.version == 2
             else self.root / "state" / ".campaign-ledger.lock"
         )
+
+    @property
+    def controller_file(self) -> Path:
+        return self.internal_dir / "controller.json"
+
+    @property
+    def controller_lock(self) -> Path:
+        return self.locks_dir / "controller.lock"
+
+    @property
+    def controller_pid(self) -> Path:
+        return self.internal_dir / "controller.pid"
+
+    @property
+    def controller_log(self) -> Path:
+        return self.logs_dir / "controller.log"
 
     @property
     def controller_root(self) -> Path:
@@ -242,6 +263,18 @@ class CampaignWorkspace:
             if not source.is_file():
                 continue
             target = self.inputs_dir / "platform" / f"{resource}.sh"
+            _copy_file(source, target)
+            profile["setup_script"] = str(target.relative_to(self.root))
+        for name, profile in snapshot.get("execution", {}).get(
+            "targets", {}
+        ).items():
+            value = profile.get("setup_script")
+            if value in {None, ""}:
+                continue
+            source = Path(value)
+            if not source.is_file():
+                continue
+            target = self.inputs_dir / "platform" / f"{name}.sh"
             _copy_file(source, target)
             profile["setup_script"] = str(target.relative_to(self.root))
         snapshot.setdefault("training", {})["initial_path"] = str(
