@@ -1,0 +1,1461 @@
+"""High-level preparation and Slurm submission for iteration campaigns."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+from typing import Any, Callable, Mapping, Sequence
+import uuid
+
+
+class CampaignError(RuntimeError):
+    """Raised when campaign preparation or submission is inconsistent."""
+
+
+class _SubmissionRejected(CampaignError):
+    """Raised when Slurm definitively rejected a submission."""
+
+
+class _SubmissionUncertain(CampaignError):
+    """Raised when Slurm may have accepted a submission without returning its id."""
+
+
+@dataclass(frozen=True)
+class CampaignPreparation:
+    campaign_id: str
+    output_dir: Path
+    config_file: Path
+    initial_training: Path
+    plans: tuple[Path, ...]
+    scripts: tuple[Path, ...]
+    manifest: Path
+
+
+@dataclass(frozen=True)
+class CampaignSubmission:
+    campaign_id: str
+    job_ids: tuple[str, ...]
+    manifest: Path
+
+
+@dataclass(frozen=True)
+class CampaignRetry:
+    campaign_id: str
+    retry_number: int
+    from_generation: int
+    from_stage: str
+    job_ids: tuple[str, ...]
+    manifest: Path
+
+
+@dataclass(frozen=True)
+class CampaignStatus:
+    campaign_id: str
+    state: str
+    completed_generations: int
+    total_generations: int
+    generation: int | None
+    stage: str | None
+    reason: str
+    next_action: str | None
+    generations: tuple[Mapping[str, Any], ...]
+    jobs: tuple[Mapping[str, Any], ...]
+
+
+SubmitRunner = Callable[[Sequence[str], Path], str]
+JobStateRunner = Callable[[str, Path], str]
+CancelRunner = Callable[[str, Path], None]
+SubmissionResolver = Callable[[Mapping[str, Any], Path], str | None]
+
+
+_STAGES = (
+    "train",
+    "explore",
+    "select",
+    "label",
+    "diagnose",
+    "merge",
+    "retrain",
+    "evaluate",
+)
+_ACTIVE_JOB_STATES = {
+    "PENDING",
+    "RUNNING",
+    "CONFIGURING",
+    "COMPLETING",
+    "REQUEUED",
+    "RESIZING",
+    "STAGE_OUT",
+    "SUSPENDED",
+}
+_LEDGER_UNSET = object()
+
+
+@contextmanager
+def _campaign_lock(output_dir: Path):
+    """Serialize scheduler side effects and manifest updates per campaign."""
+
+    lock_path = output_dir / ".campaign-manifest.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _canonical_hash(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _path_record(role: str, path: Path) -> dict[str, Any]:
+    if path.is_file():
+        return {
+            "role": role,
+            "kind": "file",
+            "path": str(path),
+            "sha256": _sha256(path),
+        }
+    if path.is_dir():
+        files = sorted(item for item in path.rglob("*") if item.is_file())
+        entries = [
+            {"path": str(item.relative_to(path)), "sha256": _sha256(item)}
+            for item in files
+        ]
+        return {
+            "role": role,
+            "kind": "directory",
+            "path": str(path),
+            "sha256": _canonical_hash(entries),
+            "file_count": len(entries),
+        }
+    raise CampaignError(f"campaign dependency does not exist: {path}")
+
+
+def _record_matches(record: Mapping[str, Any]) -> bool:
+    path = Path(record["path"])
+    if record.get("kind", "file") == "file":
+        return path.is_file() and _sha256(path) == record["sha256"]
+    if not path.is_dir():
+        return False
+    current = _path_record(str(record.get("role", "dependency")), path)
+    return current["sha256"] == record["sha256"]
+
+
+def _write_text(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _write_json(path: Path, value: Any) -> Path:
+    return _write_text(
+        path,
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
+    )
+
+
+def _absolute_path(value: Any, base_dir: Path) -> str | None:
+    if value in {None, ""}:
+        return None
+    path = Path(value).expanduser()
+    return str((base_dir / path).resolve() if not path.is_absolute() else path.resolve())
+
+
+def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any]:
+    resolved = json.loads(json.dumps(config))
+    training = resolved.get("training", {})
+    for key in ("config_path", "test_path"):
+        if training.get(key):
+            training[key] = _absolute_path(training[key], base_dir)
+    md = resolved.get("md", {})
+    for key in ("structures", "template_path", "plugin_path"):
+        if md.get(key):
+            md[key] = _absolute_path(md[key], base_dir)
+    evaluation = resolved.get("evaluation", {})
+    if evaluation.get("validation_path"):
+        evaluation["validation_path"] = _absolute_path(
+            evaluation["validation_path"], base_dir
+        )
+    campaign = resolved.get("campaign", {})
+    slurm = campaign.get("slurm", {})
+    for resource in ("training", "cpu"):
+        profile = slurm.get(resource, {})
+        if profile.get("setup_script"):
+            profile["setup_script"] = _absolute_path(
+                profile["setup_script"], base_dir
+            )
+    return resolved
+
+
+def _slurm_profile(campaign: Mapping[str, Any], name: str) -> dict[str, Any]:
+    profile = dict(campaign.get("slurm", {}).get(name, {}))
+    if not profile.get("partition"):
+        raise CampaignError(f"campaign.slurm.{name}.partition is required")
+    profile.setdefault("time", "01:00:00")
+    if name == "training":
+        profile.setdefault("gpus_per_node", 1)
+    else:
+        profile.setdefault("cpus_per_task", 4)
+    return profile
+
+
+def _slurm_header(
+    profile: Mapping[str, Any], *, job_name: str, output: Path
+) -> list[str]:
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={job_name}",
+        f"#SBATCH --output={output}",
+        f"#SBATCH --time={profile['time']}",
+        f"#SBATCH --partition={profile['partition']}",
+    ]
+    if profile.get("qos"):
+        lines.append(f"#SBATCH --qos={profile['qos']}")
+    if profile.get("gpus_per_node") is not None:
+        lines.append(f"#SBATCH --gpus-per-node={int(profile['gpus_per_node'])}")
+    if profile.get("cpus_per_task") is not None:
+        lines.append(f"#SBATCH --cpus-per-task={int(profile['cpus_per_task'])}")
+    for directive in profile.get("directives", []):
+        directive = str(directive).strip()
+        lines.append(
+            directive if directive.startswith("#SBATCH ") else f"#SBATCH {directive}"
+        )
+    return lines
+
+
+def _resource_command(
+    command: str,
+    *,
+    config_file: Path,
+    plan_file: Path,
+    initial_training: Path,
+    campaign_dir: Path,
+    campaign_id: str,
+    resource: str,
+) -> str:
+    tokens = [
+        *shlex.split(command),
+        "iteration-resource",
+        str(config_file),
+        "--plan",
+        str(plan_file),
+        "--initial-training",
+        str(initial_training),
+        "--campaign-dir",
+        str(campaign_dir),
+        "--campaign-id",
+        campaign_id,
+        "--resource",
+        resource,
+    ]
+    if not shlex.split(command):
+        raise CampaignError("campaign.command cannot be empty")
+    return shlex.join(tokens)
+
+
+def _render_script(
+    profile: Mapping[str, Any],
+    *,
+    job_name: str,
+    log_file: Path,
+    commands: Sequence[str],
+    cpu: bool,
+) -> str:
+    lines = _slurm_header(profile, job_name=job_name, output=log_file)
+    lines.extend(["", "set -euo pipefail"])
+    setup_script = profile.get("setup_script")
+    if setup_script:
+        lines.append(f"source {shlex.quote(str(setup_script))}")
+    if cpu:
+        lines.append('export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"')
+    lines.extend(["", *commands, ""])
+    return "\n".join(lines)
+
+
+def _plans(settings: Mapping[str, Any]) -> tuple[Any, ...]:
+    from .iteration import progressive_plans
+
+    plans = progressive_plans(
+        int(settings.get("generations", 1)),
+        seed=int(settings.get("seed", 20260721)),
+        initial_candidates=int(settings.get("initial_candidates", 24)),
+        initial_budget=int(settings.get("dft_budget", 8)),
+        minimum_budget=int(settings.get("minimum_dft_budget", 4)),
+        initial_steps=int(settings.get("initial_steps", 100)),
+        temperatures=tuple(float(value) for value in settings.get("temperatures", [300])),
+        pressure=float(settings.get("pressure", 0.0)),
+        min_distance=float(settings.get("min_distance", 0.0)),
+        frame_stride=int(settings.get("frame_stride", 2)),
+    )
+    return plans
+
+
+def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    paths: list[tuple[str, Path]] = []
+    training = config.get("training", {})
+    md = config.get("md", {})
+    campaign = config.get("campaign", {})
+    evaluation = config.get("evaluation", {})
+    for role, value in (
+        ("training_config", training.get("config_path")),
+        ("training_test", training.get("test_path")),
+        ("md_structures", md.get("structures")),
+        ("md_template", md.get("template_path")),
+        ("md_plugin", md.get("plugin_path")),
+        ("evaluation_validation", evaluation.get("validation_path")),
+        (
+            "training_setup",
+            campaign.get("slurm", {}).get("training", {}).get("setup_script"),
+        ),
+        ("cpu_setup", campaign.get("slurm", {}).get("cpu", {}).get("setup_script")),
+    ):
+        if value:
+            paths.append((role, Path(value)))
+    return [_path_record(role, path) for role, path in paths]
+
+
+def _preparation_from_manifest(path: Path) -> CampaignPreparation:
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    return CampaignPreparation(
+        campaign_id=manifest["campaign_id"],
+        output_dir=path.parent,
+        config_file=Path(manifest["config"]["path"]),
+        initial_training=Path(manifest["initial_training"]["path"]),
+        plans=tuple(Path(record["path"]) for record in manifest["plans"]),
+        scripts=tuple(Path(record["path"]) for record in manifest["scripts"]),
+        manifest=path,
+    )
+
+
+def _coerce_preparation(
+    preparation: CampaignPreparation | str | Path,
+) -> CampaignPreparation:
+    if isinstance(preparation, CampaignPreparation):
+        return preparation
+    path = Path(preparation).expanduser().resolve()
+    manifest = path if path.is_file() else path / "campaign-manifest.json"
+    if not manifest.is_file():
+        raise CampaignError(f"prepared campaign manifest does not exist: {manifest}")
+    return _preparation_from_manifest(manifest)
+
+
+def prepare_campaign(
+    config_path: str | Path,
+    initial_training: str | Path,
+    output_dir: str | Path,
+    *,
+    campaign_id: str | None = None,
+) -> CampaignPreparation:
+    """Prepare immutable plans and resource-specific Slurm scripts."""
+
+    from .config import load_config, save_config
+
+    source_config = Path(config_path).expanduser().resolve()
+    initial = Path(initial_training).expanduser().resolve()
+    output = Path(output_dir).expanduser().resolve()
+    if not initial.is_file():
+        raise CampaignError(f"initial training set does not exist: {initial}")
+    config, _ = load_config(source_config)
+    config = _resolved_config(config, source_config.parent)
+    settings = config.get("campaign", {})
+    selected_id = campaign_id or str(settings.get("id", output.name))
+    if not selected_id.strip():
+        raise CampaignError("campaign id cannot be empty")
+    training_profile = _slurm_profile(settings, "training")
+    cpu_profile = _slurm_profile(settings, "cpu")
+    plans = _plans(settings)
+    command = str(settings.get("command", "NepTrain"))
+    dependencies = _dependencies(config)
+    spec = {
+        "campaign_id": selected_id,
+        "config": config,
+        "initial_training": str(initial),
+        "initial_training_sha256": _sha256(initial),
+        "plans": [asdict(plan) for plan in plans],
+        "command": command,
+        "dependencies": dependencies,
+    }
+    spec_sha256 = _canonical_hash(spec)
+    manifest_path = output / "campaign-manifest.json"
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if existing.get("spec_sha256") != spec_sha256:
+            raise CampaignError(
+                "campaign preparation changed; choose a new output directory or "
+                "restore the original inputs"
+            )
+        for record in [
+            existing["config"],
+            existing["initial_training"],
+            *existing["plans"],
+            *existing["scripts"],
+            *existing.get("dependencies", []),
+        ]:
+            if not _record_matches(record):
+                raise CampaignError(
+                    f"prepared campaign artifact drifted: {record['path']}"
+                )
+        return _preparation_from_manifest(manifest_path)
+
+    output.mkdir(parents=True, exist_ok=True)
+    resolved_config = output / "job.resolved.yaml"
+    save_config(config, resolved_config)
+    plan_paths: list[Path] = []
+    script_paths: list[Path] = []
+    campaign_dir = output / "state"
+    logs = output / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    for plan in plans:
+        plan_path = output / "plans" / f"generation-{plan.generation}.json"
+        _write_json(plan_path, asdict(plan))
+        plan_paths.append(plan_path)
+
+    bootstrap_script = output / "jobs" / "generation-1-bootstrap.sbatch"
+    bootstrap_command = _resource_command(
+        command,
+        config_file=resolved_config,
+        plan_file=plan_paths[0],
+        initial_training=initial,
+        campaign_dir=campaign_dir,
+        campaign_id=selected_id,
+        resource="training",
+    )
+    _write_text(
+        bootstrap_script,
+        _render_script(
+            training_profile,
+            job_name="neptrain-g1-bootstrap",
+            log_file=logs / "generation-1-bootstrap-%j.out",
+            commands=[bootstrap_command],
+            cpu=False,
+        ),
+    )
+    script_paths.append(bootstrap_script)
+
+    for index, (plan, plan_path) in enumerate(zip(plans, plan_paths)):
+        sample_script = output / "jobs" / f"generation-{plan.generation}-sample.sbatch"
+        sample_command = _resource_command(
+            command,
+            config_file=resolved_config,
+            plan_file=plan_path,
+            initial_training=initial,
+            campaign_dir=campaign_dir,
+            campaign_id=selected_id,
+            resource="cpu",
+        )
+        _write_text(
+            sample_script,
+            _render_script(
+                cpu_profile,
+                job_name=f"neptrain-g{plan.generation}-sample",
+                log_file=logs / f"generation-{plan.generation}-sample-%j.out",
+                commands=[sample_command],
+                cpu=True,
+            ),
+        )
+        script_paths.append(sample_script)
+
+        retrain_script = (
+            output / "jobs" / f"generation-{plan.generation}-retrain.sbatch"
+        )
+        retrain_command = _resource_command(
+            command,
+            config_file=resolved_config,
+            plan_file=plan_path,
+            initial_training=initial,
+            campaign_dir=campaign_dir,
+            campaign_id=selected_id,
+            resource="training",
+        )
+        _write_text(
+            retrain_script,
+            _render_script(
+                training_profile,
+                job_name=f"neptrain-g{plan.generation}-retrain",
+                log_file=logs / f"generation-{plan.generation}-retrain-%j.out",
+                commands=[retrain_command],
+                cpu=False,
+            ),
+        )
+        script_paths.append(retrain_script)
+
+        evaluate_script = (
+            output / "jobs" / f"generation-{plan.generation}-evaluate.sbatch"
+        )
+        evaluate_commands = [
+            _resource_command(
+                command,
+                config_file=resolved_config,
+                plan_file=plan_path,
+                initial_training=initial,
+                campaign_dir=campaign_dir,
+                campaign_id=selected_id,
+                resource="cpu",
+            )
+        ]
+        if index + 1 < len(plan_paths):
+            evaluate_commands.append(
+                _resource_command(
+                    command,
+                    config_file=resolved_config,
+                    plan_file=plan_paths[index + 1],
+                    initial_training=initial,
+                    campaign_dir=campaign_dir,
+                    campaign_id=selected_id,
+                    resource="training",
+                )
+            )
+        _write_text(
+            evaluate_script,
+            _render_script(
+                cpu_profile,
+                job_name=f"neptrain-g{plan.generation}-evaluate",
+                log_file=logs / f"generation-{plan.generation}-evaluate-%j.out",
+                commands=evaluate_commands,
+                cpu=True,
+            ),
+        )
+        script_paths.append(evaluate_script)
+
+    manifest = {
+        "version": 1,
+        "campaign_id": selected_id,
+        "spec_sha256": spec_sha256,
+        "config": {"path": str(resolved_config), "sha256": _sha256(resolved_config)},
+        "initial_training": {"path": str(initial), "sha256": _sha256(initial)},
+        "plans": [
+            {"path": str(path), "sha256": _sha256(path)} for path in plan_paths
+        ],
+        "scripts": [
+            {"path": str(path), "sha256": _sha256(path)} for path in script_paths
+        ],
+        "dependencies": dependencies,
+        "jobs": [],
+    }
+    _write_json(manifest_path, manifest)
+    return _preparation_from_manifest(manifest_path)
+
+
+def _submit(args: Sequence[str], cwd: Path) -> str:
+    if os.environ.get("SLURM_JOB_ID"):
+        raise _SubmissionRejected(
+            "campaign --submit must run on the Slurm login node, not inside a batch job"
+        )
+    completed = subprocess.run(
+        list(args), cwd=cwd, capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise _SubmissionRejected(f"Slurm submission failed: {detail}")
+    job_id = completed.stdout.strip().split(";", 1)[0]
+    if not job_id.isdigit():
+        raise _SubmissionUncertain(
+            f"cannot parse Slurm job id: {completed.stdout.strip()}"
+        )
+    return job_id
+
+
+def _submission_token(campaign_id: str, script: Path) -> str:
+    campaign = hashlib.sha256(campaign_id.encode()).hexdigest()[:8]
+    stage = "".join(character for character in script.stem if character.isalnum())[:24]
+    return f"nt-{campaign}-{stage}-{uuid.uuid4().hex[:12]}"
+
+
+def _resolve_submission(record: Mapping[str, Any], cwd: Path) -> str | None:
+    """Find a write-ahead submission intent in Slurm by its unique job name."""
+
+    if os.environ.get("SLURM_JOB_ID"):
+        raise CampaignError(
+            "campaign submission reconciliation must run on the Slurm login node"
+        )
+    token = str(record.get("submission_token", ""))
+    if not token:
+        raise CampaignError("pending campaign job is missing its submission token")
+    submitted_at = datetime.fromisoformat(str(record["submitted_at"]))
+    accounting_start = (submitted_at - timedelta(days=1)).date().isoformat()
+    commands = [
+        ["squeue", "--noheader", "--name", token, "--format", "%A|%j"],
+        [
+            "sacct",
+            "--noheader",
+            "--parsable2",
+            "--starttime",
+            accounting_start,
+            "--name",
+            token,
+            "--format",
+            "JobIDRaw,JobName",
+        ],
+    ]
+    job_ids = set()
+    for command in commands:
+        completed = subprocess.run(
+            command, cwd=cwd, capture_output=True, text=True, check=False
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise CampaignError(
+                f"cannot reconcile Slurm submission {token}: {detail}"
+            )
+        for line in completed.stdout.splitlines():
+            columns = line.strip().split("|")
+            if len(columns) >= 2 and columns[0].isdigit() and columns[1] == token:
+                job_ids.add(columns[0])
+    if len(job_ids) > 1:
+        raise CampaignError(
+            f"submission token {token} matched multiple Slurm jobs: {sorted(job_ids)}"
+        )
+    return next(iter(job_ids), None)
+
+
+def _reconcile_submission_records(
+    records: list[dict[str, Any]],
+    scripts: Sequence[Path],
+    *,
+    output: Path,
+    resolver: SubmissionResolver,
+    persist: Callable[[], None],
+) -> str | None:
+    expected = [str(path) for path in scripts]
+    if [record.get("script") for record in records] != expected[: len(records)]:
+        raise CampaignError("campaign job history is not a valid script prefix")
+    dependency = None
+    for record in records:
+        if record.get("dependency") != dependency:
+            raise CampaignError("campaign job history has an invalid dependency chain")
+        job_id = record.get("job_id")
+        if job_id is None:
+            job_id = resolver(record, output)
+            if job_id is None:
+                raise CampaignError(
+                    "submission outcome is still uncertain; Slurm has no job for "
+                    f"token {record.get('submission_token')}. Retry after accounting updates."
+                )
+            record["job_id"] = str(job_id)
+            record["submission_state"] = "submitted"
+            record["reconciled_at"] = datetime.now(timezone.utc).isoformat()
+            persist()
+        if not str(job_id).isdigit():
+            raise CampaignError(f"invalid Slurm job id in campaign history: {job_id}")
+        dependency = str(job_id)
+    return dependency
+
+
+def _submit_missing_records(
+    records: list[dict[str, Any]],
+    scripts: Sequence[Path],
+    *,
+    campaign_id: str,
+    output: Path,
+    runner: SubmitRunner,
+    resolver: SubmissionResolver,
+    persist: Callable[[], None],
+) -> list[dict[str, Any]]:
+    dependency = _reconcile_submission_records(
+        records, scripts, output=output, resolver=resolver, persist=persist
+    )
+    for script in scripts[len(records) :]:
+        token = _submission_token(campaign_id, script)
+        record = {
+            "script": str(script),
+            "dependency": dependency,
+            "submission_token": token,
+            "submission_state": "intent",
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        records.append(record)
+        persist()
+        args = ["sbatch", "--parsable", f"--job-name={token}"]
+        if dependency is not None:
+            args.append(f"--dependency=afterok:{dependency}")
+        args.append(str(script))
+        try:
+            job_id = runner(args, output)
+        except _SubmissionRejected:
+            records.pop()
+            persist()
+            raise
+        if not str(job_id).isdigit():
+            raise _SubmissionUncertain(
+                f"submission {token} returned invalid Slurm job id {job_id}"
+            )
+        record["job_id"] = str(job_id)
+        record["submission_state"] = "submitted"
+        persist()
+        dependency = str(job_id)
+    return records
+
+
+def _validated_manifest(preparation: CampaignPreparation) -> dict[str, Any]:
+    manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
+    for record in [
+        manifest["config"],
+        manifest["initial_training"],
+        *manifest["plans"],
+        *manifest["scripts"],
+        *manifest.get("dependencies", []),
+    ]:
+        if not _record_matches(record):
+            raise CampaignError(
+                f"prepared campaign artifact drifted: {record['path']}"
+            )
+    return manifest
+
+
+def submit_campaign(
+    preparation: CampaignPreparation | str | Path,
+    *,
+    runner: SubmitRunner = _submit,
+) -> CampaignSubmission:
+    """Submit the prepared scripts as one strict afterok dependency chain."""
+
+    preparation = _coerce_preparation(preparation)
+    with _campaign_lock(preparation.output_dir):
+        return _submit_campaign_locked(
+            preparation,
+            runner=runner,
+            submission_resolver=_resolve_submission,
+        )
+
+
+def _submit_campaign_locked(
+    preparation: CampaignPreparation,
+    *,
+    runner: SubmitRunner,
+    submission_resolver: SubmissionResolver,
+) -> CampaignSubmission:
+    manifest = _validated_manifest(preparation)
+    jobs = list(manifest.get("jobs", []))
+
+    def persist() -> None:
+        manifest["jobs"] = jobs
+        _write_json(preparation.manifest, manifest)
+
+    _submit_missing_records(
+        jobs,
+        preparation.scripts,
+        campaign_id=preparation.campaign_id,
+        output=preparation.output_dir,
+        runner=runner,
+        resolver=submission_resolver,
+        persist=persist,
+    )
+    return CampaignSubmission(
+        campaign_id=preparation.campaign_id,
+        job_ids=tuple(record["job_id"] for record in jobs),
+        manifest=preparation.manifest,
+    )
+
+
+def _normalise_job_state(value: str) -> str:
+    return value.strip().split("+", 1)[0].split(maxsplit=1)[0].upper()
+
+
+def _job_state(job_id: str, cwd: Path) -> str:
+    if os.environ.get("SLURM_JOB_ID"):
+        raise CampaignError(
+            "campaign --retry-failed must run on the Slurm login node, not inside a batch job"
+        )
+    completed = subprocess.run(
+        [
+            "sacct",
+            "--noheader",
+            "--parsable2",
+            "--jobs",
+            job_id,
+            "--format",
+            "JobIDRaw,State",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise CampaignError(f"cannot query Slurm job {job_id}: {detail}")
+    fallback = None
+    for line in completed.stdout.splitlines():
+        columns = line.strip().split("|")
+        if len(columns) < 2:
+            continue
+        fallback = fallback or columns[1]
+        if columns[0] == job_id:
+            return _normalise_job_state(columns[1])
+    if fallback:
+        return _normalise_job_state(fallback)
+    raise CampaignError(f"Slurm has no accounting record for job {job_id}")
+
+
+def _cancel(job_id: str, cwd: Path) -> None:
+    if os.environ.get("SLURM_JOB_ID"):
+        raise CampaignError(
+            "campaign --retry-failed must run on the Slurm login node, not inside a batch job"
+        )
+    completed = subprocess.run(
+        ["scancel", job_id],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise CampaignError(f"cannot cancel stale Slurm job {job_id}: {detail}")
+
+
+@dataclass(frozen=True)
+class _CampaignProgress:
+    state: str
+    completed_generations: int
+    generation: int | None
+    stage: str | None
+    reason: str
+
+
+def _read_campaign_ledger(
+    preparation: CampaignPreparation,
+) -> Mapping[str, Any] | None:
+    ledger_path = preparation.output_dir / "state" / "campaign-ledger.json"
+    if not ledger_path.exists():
+        return None
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    if ledger.get("campaign_id") != preparation.campaign_id:
+        raise CampaignError("campaign_id does not match the existing ledger")
+    if not isinstance(ledger.get("generations", {}), Mapping):
+        raise CampaignError("campaign generations must be a mapping")
+    return ledger
+
+
+def _campaign_progress(
+    preparation: CampaignPreparation,
+    manifest: Mapping[str, Any],
+    *,
+    ledger: Mapping[str, Any] | None | object = _LEDGER_UNSET,
+) -> _CampaignProgress:
+    plans = [
+        json.loads(Path(record["path"]).read_text(encoding="utf-8"))
+        for record in manifest["plans"]
+    ]
+    if ledger is _LEDGER_UNSET:
+        ledger = _read_campaign_ledger(preparation)
+    if ledger is None:
+        return _CampaignProgress(
+            "prepared", 0, int(plans[0]["generation"]), "train", "ledger not started"
+        )
+    assert isinstance(ledger, Mapping)
+    generations = ledger.get("generations", {})
+    for plan in plans:
+        generation = int(plan["generation"])
+        record = generations.get(str(generation))
+        if record is None:
+            return _CampaignProgress(
+                "incomplete",
+                generation - 1,
+                generation,
+                "train",
+                f"generation {generation} has not started",
+            )
+        if record.get("plan_sha256") != _canonical_hash(plan):
+            raise CampaignError(
+                f"generation {generation} plan changed after it entered the ledger"
+            )
+        stages = record.get("stages", {})
+        completed = []
+        missing_seen = False
+        for stage in _STAGES:
+            if stage not in stages:
+                missing_seen = True
+            elif missing_seen:
+                raise CampaignError(
+                    "generation stage ledger is not a contiguous prefix"
+                )
+            else:
+                completed.append(stage)
+        if len(completed) < len(_STAGES):
+            if record.get("complete"):
+                raise CampaignError(
+                    "generation is marked complete before all stages finished"
+                )
+            stage = _STAGES[len(completed)]
+            return _CampaignProgress(
+                "incomplete",
+                generation - 1,
+                generation,
+                stage,
+                f"generation {generation} is waiting for stage {stage}",
+            )
+        if not record.get("complete"):
+            raise CampaignError(
+                f"generation {generation} has all stages but is not marked complete"
+            )
+        if record.get("accepted") is False:
+            return _CampaignProgress(
+                "rejected",
+                generation - 1,
+                generation,
+                None,
+                f"generation {generation} failed its evaluation acceptance gate",
+            )
+        if record.get("accepted") is not True:
+            raise CampaignError(
+                f"generation {generation} completion is missing accepted=true/false"
+            )
+    return _CampaignProgress(
+        "complete",
+        len(plans),
+        None,
+        None,
+        "all generations completed and passed evaluation",
+    )
+
+
+def _generation_science(
+    plan: Mapping[str, Any], record: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Normalize one ledger generation into a stable scientific summary."""
+
+    stages = {} if record is None else record.get("stages", {})
+    if not isinstance(stages, Mapping):
+        raise CampaignError("generation stages must be a mapping")
+
+    def metrics(stage: str) -> Mapping[str, Any]:
+        stage_record = stages.get(stage, {})
+        if not isinstance(stage_record, Mapping):
+            raise CampaignError(f"generation stage {stage} must be a mapping")
+        value = stage_record.get("metrics", {})
+        if not isinstance(value, Mapping):
+            raise CampaignError(f"generation stage {stage} metrics must be a mapping")
+        return value
+
+    train = metrics("train")
+    explore = metrics("explore")
+    select = metrics("select")
+    label = metrics("label")
+    diagnose = metrics("diagnose")
+    merge = metrics("merge")
+    retrain = metrics("retrain")
+    evaluate = metrics("evaluate")
+
+    if record is None:
+        state = "not_started"
+    elif record.get("complete") and record.get("accepted") is True:
+        state = "accepted"
+    elif record.get("complete") and record.get("accepted") is False:
+        state = "rejected"
+    else:
+        state = "in_progress"
+
+    acquisition_rmse = {
+        name: diagnose.get(f"current_model_{name}")
+        for name in ("energy_rmse", "force_rmse", "virial_rmse", "mforce_rmse")
+    }
+    validation_rmse = {
+        name: evaluate.get(name)
+        for name in ("energy_rmse", "force_rmse", "virial_rmse", "mforce_rmse")
+    }
+    return {
+        "generation": int(plan["generation"]),
+        "state": state,
+        "completed_stages": tuple(stage for stage in _STAGES if stage in stages),
+        "plan": {
+            "candidate_target": int(plan["candidate_count"]),
+            "dft_budget": int(plan["dft_budget"]),
+            "steps": int(plan["steps"]),
+            "temperatures": tuple(float(value) for value in plan["temperatures"]),
+            "pressure": float(plan.get("pressure", 0.0)),
+            "frame_stride": int(plan.get("frame_stride", 1)),
+        },
+        "sampling": {
+            "candidate_count": explore.get("candidate_count"),
+            "candidate_counts_by_window": dict(
+                explore.get("candidate_counts_by_window", {})
+            ),
+            "scheduled_source_count": explore.get("scheduled_source_count"),
+            "completed_source_count": explore.get("completed_source_count"),
+            "failed_source_count": explore.get("failed_source_count"),
+            "candidate_count_before_thinning": select.get(
+                "candidate_count_before_thinning"
+            ),
+            "candidate_count_after_thinning": select.get(
+                "candidate_count_after_thinning"
+            ),
+            "duplicate_candidate_count": select.get("duplicate_candidate_count"),
+            "selected_count": select.get("selected_count"),
+            "counts_by_stratum": dict(select.get("counts_by_stratum", {})),
+            "labeled_count": label.get("labeled_count"),
+        },
+        "training": {
+            "before_count": train.get("training_count"),
+            "merged_count": merge.get("training_count"),
+            "after_count": retrain.get("training_count"),
+            "added_count": evaluate.get("added_training_count", merge.get("added_count")),
+        },
+        "quality": {
+            "acquisition_rmse": acquisition_rmse,
+            "validation_rmse": validation_rmse,
+            "accepted": evaluate.get("accepted"),
+            "validation_count": evaluate.get("evaluated_count"),
+            "spin_validation_count": evaluate.get("spin_frame_count"),
+        },
+        "scenarios": {
+            "target_maturities": tuple(explore.get("scenario_targets", ())),
+            "attempted_steps": tuple(explore.get("scenario_steps", ())),
+            "counts_by_maturity": dict(
+                evaluate.get("scenario_counts_by_maturity", {})
+            ),
+        },
+    }
+
+
+def _scientific_progress(
+    preparation: CampaignPreparation,
+    manifest: Mapping[str, Any],
+    *,
+    ledger: Mapping[str, Any] | None | object = _LEDGER_UNSET,
+) -> tuple[Mapping[str, Any], ...]:
+    plans = [
+        json.loads(Path(record["path"]).read_text(encoding="utf-8"))
+        for record in manifest["plans"]
+    ]
+    generations: Mapping[str, Any] = {}
+    if ledger is _LEDGER_UNSET:
+        ledger = _read_campaign_ledger(preparation)
+    if ledger is not None:
+        assert isinstance(ledger, Mapping)
+        generations = ledger.get("generations", {})
+    return tuple(
+        _generation_science(plan, generations.get(str(plan["generation"])))
+        for plan in plans
+    )
+
+
+def _campaign_breakpoint(
+    preparation: CampaignPreparation, manifest: Mapping[str, Any]
+) -> tuple[int, str]:
+    progress = _campaign_progress(preparation, manifest)
+    if progress.state in {"prepared", "incomplete"}:
+        assert progress.generation is not None and progress.stage is not None
+        return progress.generation, progress.stage
+    if progress.state == "rejected":
+        raise CampaignError(
+            f"{progress.reason}; retry cannot bypass the acceptance gate"
+        )
+    raise CampaignError("campaign is already complete; nothing to retry")
+
+
+def _retry_script_index(
+    preparation: CampaignPreparation, generation: int, stage: str
+) -> int:
+    if stage == "train":
+        filename = (
+            "generation-1-bootstrap.sbatch"
+            if generation == 1
+            else f"generation-{generation - 1}-evaluate.sbatch"
+        )
+    elif stage in {"explore", "select", "label", "diagnose", "merge"}:
+        filename = f"generation-{generation}-sample.sbatch"
+    else:
+        filename = f"generation-{generation}-{stage}.sbatch"
+    for index, script in enumerate(preparation.scripts):
+        if script.name == filename:
+            return index
+    raise CampaignError(
+        f"prepared campaign has no job script for generation {generation} stage {stage}"
+    )
+
+
+def _job_records(manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    records = list(manifest.get("jobs", []))
+    for retry in manifest.get("retries", []):
+        records.extend(retry.get("jobs", []))
+    return records
+
+
+def _retry_result(
+    preparation: CampaignPreparation, retry: Mapping[str, Any]
+) -> CampaignRetry:
+    return CampaignRetry(
+        campaign_id=preparation.campaign_id,
+        retry_number=int(retry["retry"]),
+        from_generation=int(retry["from_generation"]),
+        from_stage=str(retry["from_stage"]),
+        job_ids=tuple(str(record["job_id"]) for record in retry.get("jobs", [])),
+        manifest=preparation.manifest,
+    )
+
+
+def _status_job_records(
+    preparation: CampaignPreparation, manifest: Mapping[str, Any]
+) -> tuple[dict[str, Any], ...]:
+    records: list[tuple[str, Mapping[str, Any]]] = [
+        ("initial", record) for record in manifest.get("jobs", [])
+    ]
+    for retry in manifest.get("retries", []):
+        attempt = f"retry-{retry['retry']}"
+        records.extend((attempt, record) for record in retry.get("jobs", []))
+    latest_index = {
+        str(record["script"]): index
+        for index, (_, record) in enumerate(records)
+    }
+    statuses = []
+    seen_scripts = set()
+    for index, (attempt, record) in enumerate(records):
+        script = str(record["script"])
+        seen_scripts.add(script)
+        job_id = record.get("job_id")
+        detail = None
+        if job_id is None:
+            try:
+                job_id = _resolve_submission(record, preparation.output_dir)
+            except CampaignError as error:
+                state = "UNKNOWN"
+                detail = str(error)
+            else:
+                state = "SUBMISSION_UNCERTAIN" if job_id is None else "UNKNOWN"
+        else:
+            state = "UNKNOWN"
+        if job_id is not None:
+            try:
+                state = _normalise_job_state(
+                    _job_state(str(job_id), preparation.output_dir)
+                )
+            except CampaignError as error:
+                detail = str(error)
+        statuses.append(
+            {
+                "attempt": attempt,
+                "script": script,
+                "job_id": str(job_id) if job_id is not None else None,
+                "dependency": record.get("dependency"),
+                "state": state,
+                "current": latest_index[script] == index,
+                "detail": detail,
+            }
+        )
+    for script in preparation.scripts:
+        if str(script) not in seen_scripts:
+            statuses.append(
+                {
+                    "attempt": None,
+                    "script": str(script),
+                    "job_id": None,
+                    "dependency": None,
+                    "state": "NOT_SUBMITTED",
+                    "current": True,
+                    "detail": None,
+                }
+            )
+    return tuple(statuses)
+
+
+def campaign_status(output_dir: str | Path) -> CampaignStatus:
+    """Return a read-only ledger and Slurm summary for one prepared campaign."""
+
+    preparation = _coerce_preparation(output_dir)
+    manifest = _validated_manifest(preparation)
+    ledger = _read_campaign_ledger(preparation)
+    progress = _campaign_progress(preparation, manifest, ledger=ledger)
+    generations = _scientific_progress(preparation, manifest, ledger=ledger)
+    jobs = _status_job_records(preparation, manifest)
+    next_action = None
+    state = progress.state
+    reason = progress.reason
+    output = preparation.output_dir
+
+    if progress.state in {"prepared", "incomplete"}:
+        assert progress.generation is not None and progress.stage is not None
+        target_index = _retry_script_index(
+            preparation, progress.generation, progress.stage
+        )
+        target_script = str(preparation.scripts[target_index])
+        target = next(
+            job
+            for job in reversed(jobs)
+            if job["script"] == target_script and job["current"]
+        )
+        current_by_id = {
+            job["job_id"]: job
+            for job in jobs
+            if job["current"] and job["job_id"] is not None
+        }
+        active = [
+            job
+            for job in jobs
+            if job["current"] and job["state"] in _ACTIVE_JOB_STATES
+        ]
+        target_state = str(target["state"])
+        dependency = current_by_id.get(target.get("dependency"))
+        dependency_failed = (
+            target_state == "PENDING"
+            and dependency is not None
+            and dependency["state"] not in _ACTIVE_JOB_STATES
+            and dependency["state"] != "COMPLETED"
+        )
+        if dependency_failed:
+            state = "blocked"
+            reason = (
+                f"{Path(target_script).name} is blocked by failed job "
+                f"{dependency['job_id']}"
+            )
+            next_action = (
+                f"NepTrain campaign --output {shlex.quote(str(output))} "
+                "--retry-failed"
+            )
+        elif target_state in _ACTIVE_JOB_STATES or active:
+            state = "running"
+            reason = f"{len(active)} current Slurm job(s) are active"
+            next_action = (
+                f"NepTrain campaign --output {shlex.quote(str(output))} --status"
+            )
+        elif target_state in {"NOT_SUBMITTED"}:
+            state = "prepared" if not manifest.get("jobs") else "paused"
+            reason = f"{Path(target_script).name} has not been submitted"
+            next_action = (
+                f"NepTrain campaign --output {shlex.quote(str(output))} --submit"
+            )
+        elif target_state in {"SUBMISSION_UNCERTAIN", "UNKNOWN"}:
+            state = "uncertain"
+            reason = target.get("detail") or (
+                f"Slurm state for {Path(target_script).name} is not yet known"
+            )
+            next_action = (
+                f"NepTrain campaign --output {shlex.quote(str(output))} --status"
+            )
+        elif target_state == "COMPLETED":
+            state = "inconsistent"
+            reason = (
+                f"{Path(target_script).name} completed but ledger still expects "
+                f"stage {progress.stage}"
+            )
+        else:
+            state = "failed"
+            reason = f"job {target.get('job_id')} ended in state {target_state}"
+            next_action = (
+                f"NepTrain campaign --output {shlex.quote(str(output))} "
+                "--retry-failed"
+            )
+    elif progress.state == "rejected":
+        state = "rejected"
+        reason = progress.reason
+
+    return CampaignStatus(
+        campaign_id=preparation.campaign_id,
+        state=state,
+        completed_generations=progress.completed_generations,
+        total_generations=len(preparation.plans),
+        generation=progress.generation,
+        stage=progress.stage,
+        reason=reason,
+        next_action=next_action,
+        generations=generations,
+        jobs=jobs,
+    )
+
+
+def retry_failed_campaign(
+    output_dir: str | Path,
+    *,
+    runner: SubmitRunner = _submit,
+    state_runner: JobStateRunner = _job_state,
+    cancel_runner: CancelRunner = _cancel,
+) -> CampaignRetry:
+    """Resume a prepared campaign from its first unfinished ledger stage.
+
+    Scheduler history remains append-only. Pending jobs from the obsolete
+    dependency tail are canceled before a fresh strict afterok chain is made.
+    """
+
+    output = Path(output_dir).expanduser().resolve()
+    manifest_path = output / "campaign-manifest.json"
+    if not manifest_path.is_file():
+        raise CampaignError(
+            f"prepared campaign manifest does not exist: {manifest_path}"
+        )
+    with _campaign_lock(output):
+        return _retry_failed_campaign_locked(
+            output,
+            runner=runner,
+            state_runner=state_runner,
+            cancel_runner=cancel_runner,
+            submission_resolver=_resolve_submission,
+        )
+
+
+def _retry_failed_campaign_locked(
+    output: Path,
+    *,
+    runner: SubmitRunner,
+    state_runner: JobStateRunner,
+    cancel_runner: CancelRunner,
+    submission_resolver: SubmissionResolver,
+) -> CampaignRetry:
+    manifest_path = output / "campaign-manifest.json"
+    preparation = _preparation_from_manifest(manifest_path)
+    manifest = _validated_manifest(preparation)
+    original_jobs = list(manifest.get("jobs", []))
+
+    def persist_original() -> None:
+        manifest["jobs"] = original_jobs
+        _write_json(manifest_path, manifest)
+
+    _reconcile_submission_records(
+        original_jobs,
+        preparation.scripts,
+        output=output,
+        resolver=submission_resolver,
+        persist=persist_original,
+    )
+    generation, stage = _campaign_breakpoint(preparation, manifest)
+    start = _retry_script_index(preparation, generation, stage)
+    remaining = preparation.scripts[start:]
+    target = str(remaining[0])
+
+    retries = list(manifest.get("retries", []))
+    if retries and retries[-1].get("from_script") == target:
+        latest_retry = retries[-1]
+        retry_jobs = list(latest_retry.get("jobs", []))
+
+        def persist_retry() -> None:
+            latest_retry["jobs"] = retry_jobs
+            manifest["retries"] = retries
+            _write_json(manifest_path, manifest)
+
+        _reconcile_submission_records(
+            retry_jobs,
+            remaining,
+            output=output,
+            resolver=submission_resolver,
+            persist=persist_retry,
+        )
+        states = [
+            _normalise_job_state(state_runner(str(record["job_id"]), output))
+            for record in retry_jobs
+        ]
+        failed = any(
+            state not in _ACTIVE_JOB_STATES and state != "COMPLETED"
+            for state in states
+        )
+        if not failed:
+            if len(retry_jobs) == len(remaining):
+                if states and all(state == "COMPLETED" for state in states):
+                    raise CampaignError(
+                        "retry jobs completed but the campaign ledger did not "
+                        "advance; inspect the job logs"
+                    )
+                return _retry_result(preparation, latest_retry)
+            _submit_missing_records(
+                retry_jobs,
+                remaining,
+                campaign_id=preparation.campaign_id,
+                output=output,
+                runner=runner,
+                resolver=submission_resolver,
+                persist=persist_retry,
+            )
+            return _retry_result(preparation, latest_retry)
+
+    latest_by_script: dict[str, Mapping[str, Any]] = {}
+    for record in _job_records(manifest):
+        latest_by_script[str(record["script"])] = record
+    if target not in latest_by_script:
+        raise CampaignError(
+            "the unfinished stage has no submitted job history; use campaign --submit"
+        )
+    replaced = []
+    for script in remaining:
+        record = latest_by_script.get(str(script))
+        if record is None:
+            continue
+        job_id = str(record["job_id"])
+        state = _normalise_job_state(state_runner(job_id, output))
+        replaced.append({"script": str(script), "job_id": job_id, "state": state})
+        if script == remaining[0]:
+            dependency = record.get("dependency")
+            blocked_by_failed_dependency = False
+            if state == "PENDING" and dependency is not None:
+                dependency_state = _normalise_job_state(
+                    state_runner(str(dependency), output)
+                )
+                blocked_by_failed_dependency = (
+                    dependency_state not in _ACTIVE_JOB_STATES
+                    and dependency_state != "COMPLETED"
+                )
+                replaced[-1]["dependency_state"] = dependency_state
+            if blocked_by_failed_dependency:
+                cancel_runner(job_id, output)
+            elif state in _ACTIVE_JOB_STATES:
+                raise CampaignError(
+                    f"job {job_id} for the unfinished stage is still {state}; "
+                    "retry is not needed"
+                )
+            if state == "COMPLETED":
+                raise CampaignError(
+                    f"job {job_id} completed but the campaign ledger did not "
+                    "advance; inspect the job log"
+                )
+        elif state == "PENDING":
+            cancel_runner(job_id, output)
+        elif state in _ACTIVE_JOB_STATES:
+            raise CampaignError(
+                f"downstream job {job_id} is already {state}; refusing concurrent recovery"
+            )
+
+    retry = {
+        "retry": len(retries) + 1,
+        "from_generation": generation,
+        "from_stage": stage,
+        "from_script": target,
+        "replaced_jobs": replaced,
+        "jobs": [],
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    retries.append(retry)
+    manifest["retries"] = retries
+    _write_json(manifest_path, manifest)
+
+    retry_jobs = []
+
+    def persist_retry() -> None:
+        retry["jobs"] = retry_jobs
+        _write_json(manifest_path, manifest)
+
+    _submit_missing_records(
+        retry_jobs,
+        remaining,
+        campaign_id=preparation.campaign_id,
+        output=output,
+        runner=runner,
+        resolver=submission_resolver,
+        persist=persist_retry,
+    )
+    return _retry_result(preparation, retry)
+
+
+__all__ = [
+    "CampaignError",
+    "CampaignPreparation",
+    "CampaignRetry",
+    "CampaignStatus",
+    "CampaignSubmission",
+    "campaign_status",
+    "prepare_campaign",
+    "retry_failed_campaign",
+    "submit_campaign",
+]

@@ -155,7 +155,7 @@ def cd(path: Union[str, Path]) -> Generator:
         yield
     finally:
         os.chdir(cwd)
-def iter_path_to_atoms(glob_strs: list,show_progress=True,**kkwargs):
+def iter_path_to_atoms(glob_strs: list,show_progress=True,fail_fast=False,**kkwargs):
     def decorator(func):
         def wrapper(path: Path | str, *args, **kwargs):
             if isinstance(path, str):
@@ -200,6 +200,8 @@ def iter_path_to_atoms(glob_strs: list,show_progress=True,**kkwargs):
                 except KeyboardInterrupt:
                     return result
                 except Exception as e:
+                    if fail_fast:
+                        raise
 
                     print_warning(traceback.format_exc())
                     pass
@@ -247,5 +249,4 @@ def is_diff_path(path,path1):
 def split_list(lst, n):
     k, m = divmod(len(lst), n)
     return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
-
 

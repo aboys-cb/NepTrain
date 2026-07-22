@@ -14,13 +14,19 @@ from ase.calculators.abacus import Abacus, AbacusProfile
 from NepTrain import utils, Config, module_path
 
 from .io import read_input_file,StructureVar
+from NepTrain.core.spin import (
+    collect_mforce_from_results,
+    prepare_spin_for_dft,
+    validate_spin_dataset,
+)
 
 atoms_index=1
 
-@utils.iter_path_to_atoms(["*.vasp","*.xyz"],show_progress=True,
+@utils.iter_path_to_atoms(["*.vasp","*.xyz"],show_progress=True,fail_fast=True,
                  description="ABACUS calculation progress" )
 def calculate_abacus(atoms:Atoms,argparse):
     global atoms_index
+    prepare_spin_for_dft(atoms)
     StructureVar.init("./")
 
     if argparse.incar is not None and os.path.exists(argparse.incar):
@@ -55,6 +61,8 @@ def calculate_abacus(atoms:Atoms,argparse):
 
     calc.calculate(atoms, ('energy',"forces","stress"),None)
     atoms.calc = calc
+    collect_mforce_from_results(atoms, calc.results)
+    atoms.arrays.pop("initial_magmoms", None)
 
     xx, yy, zz, yz, xz, xy = -calc.results['stress'] * atoms.get_volume()  # *160.21766
     atoms.info['virial'] = np.array([(xx, xy, xz), (xy, yy, yz), (xz, yz, zz)])
@@ -76,7 +84,10 @@ def run_abacus(argparse):
         os.makedirs(path)
     if len(result) and isinstance(result[0], list):
         result = [atoms for _list in result for atoms in _list]
+    if not result:
+        raise RuntimeError("ABACUS produced no labeled structures")
+    validate_spin_dataset(result, require_mforce=True)
     ase_write(argparse.out_file_path, result, format="extxyz", append=argparse.append)
 
     utils.print_success("ABACUS calculation task completed!")
-
+    return result

@@ -7,16 +7,15 @@ import configparser
 import os
 import shutil
 
-from watchdog.observers import Observer
-
-from NepTrain import utils
 
 
+from importlib.metadata import PackageNotFoundError, version
 
-from importlib.metadata import version
-
-__version__ = version("NepTrain")
-config_path = utils.get_config_path()
+try:
+    __version__ = version("NepTrain")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+config_path = os.path.join(os.path.expanduser("~"), ".NepTrain")
 
 module_path = os.path.dirname(__file__)
 
@@ -36,4 +35,9 @@ Config.read(config_path,encoding="utf8")
 #     observer = Observer()
 
 
-observer = Observer()
+try:
+    from watchdog.observers import Observer
+
+    observer = Observer()
+except ImportError:
+    observer = None

@@ -1,10 +1,26 @@
-#!/usr/bin/env python 
-# -*- coding: utf-8 -*-
-# @Time    : 2024/10/29 15:20
-# @Author  : 兵
-# @email    : 1747193328@qq.com
+"""NEP training and NEPAdapters calculation helpers."""
 
-from .io import RunInput,PredictionRunInput
-from .run import run_nep
-from .plot import plot_nep_result
-from .calculator import Nep3Calculator
+from __future__ import annotations
+
+from importlib import import_module
+
+
+_EXPORTS = {
+    "RunInput": ("NepTrain.core.nep.io", "RunInput"),
+    "run_nep": ("NepTrain.core.nep.run", "run_nep"),
+    "plot_nep_result": ("NepTrain.core.nep.plot", "plot_nep_result"),
+    "Nep3Calculator": ("NepTrain.core.nep.calculator", "Nep3Calculator"),
+}
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(name) from error
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+__all__ = list(_EXPORTS)

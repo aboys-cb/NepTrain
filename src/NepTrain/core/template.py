@@ -30,10 +30,8 @@ def init_template(argparse):
     if not os.path.exists("./structure"):
         os.mkdir("./structure")
         utils.print_tip("Create the directory ./structure, please place the expanded structures that need to run MD into this folder!" )
-    check_env()
     if not os.path.exists("./job.yaml") or argparse.force:
-        utils.print_tip("You need to check and modify the vasp_job and vasp.cpu_core in the job.yaml file.")
-        utils.print_warning("You also need to check and modify the settings for GPUMD active learning in job.yaml!")
+        utils.print_tip("Check the training, md, and dft sections in job.yaml before running.")
 
 
         config = get_job_config(argparse.type)
@@ -43,8 +41,8 @@ def init_template(argparse):
             atoms=ase_read("./train.xyz",0,format="extxyz")
 
             if not (atoms.calc and "energy"   in atoms.calc.results):
-                config["current_job"]="vasp"
-                utils.print_warning("Check that the first structure in train.xyz has not been calculated; set the initial task to vasp!")
+                config["current_job"]="dft"
+                utils.print_warning("The first frame has no energy label; set current_job to dft.")
         else:
             utils.print_warning("Detected that there is no train.xyz in the current directory; please check the directory structure!")
             utils.print_tip("If there is a training set but the filename is not train.xyz, please unify the job.yaml.")
@@ -67,8 +65,16 @@ def init_template(argparse):
 
 
     if not os.path.exists("./run.in")  or argparse.force:
-        utils.print_tip("Create run.in; you can modify the ensemble settings! Temperature and time will be modified by the program!")
+        utils.print_tip("Create the default GPUMD run.in template.")
 
         utils.copy(os.path.join(module_path,"core/gpumd/run.in"),"./run.in")
+
+    for template_name in ("nvt.in", "npt.in", "spin-nvt.in", "spin-npt.in"):
+        destination = f"./lammps-{template_name}"
+        if not os.path.exists(destination) or argparse.force:
+            utils.copy(
+                os.path.join(module_path, "core/md/templates", template_name),
+                destination,
+            )
 
     utils.print_success("Initialization is complete. After checking the files, you can run `NepTrain train job.yaml` to proceed.")

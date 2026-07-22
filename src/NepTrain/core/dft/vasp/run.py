@@ -14,17 +14,23 @@ from ase.io.vasp import read_vasp
 
 from NepTrain import utils, Config, module_path
 from NepTrain.core.utils import check_env
+from NepTrain.core.spin import (
+    collect_mforce_from_results,
+    prepare_spin_for_dft,
+    validate_spin_dataset,
+)
 
 
 from .io import VaspInput,write_to_xyz
 
 atoms_index=1
 
-@utils.iter_path_to_atoms(["*.vasp","*.xyz"],show_progress=True,
+@utils.iter_path_to_atoms(["*.vasp","*.xyz"],show_progress=True,fail_fast=True,
                  description="VASP calculation progress" )
 def calculate_vasp(atoms:Atoms,argparse):
     global atoms_index
 
+    prepare_spin_for_dft(atoms)
     vasp = VaspInput()
     if argparse.incar is not None and os.path.exists(argparse.incar):
         vasp.read_incar(argparse.incar)
@@ -59,6 +65,8 @@ def calculate_vasp(atoms:Atoms,argparse):
     else:
         vasp.calculate(atoms, ('energy'))
         atoms.calc = vasp._xml_calc
+        collect_mforce_from_results(atoms, atoms.calc.results)
+        atoms.arrays.pop("initial_magmoms", None)
         xx, yy, zz, yz, xz, xy = -vasp.results['stress'] * atoms.get_volume()  # *160.21766
         atoms.info['virial'] = np.array([(xx, xy, xz), (xy, yy, yz), (xz, yz, zz)])
         # 这里没想好怎么设计config的格式化  就先使用原来的
@@ -80,9 +88,13 @@ def run_vasp(argparse):
         os.makedirs(path)
     if len(result) and isinstance(result[0],list):
         result=[atoms for _list in result for atoms in _list]
+    if not result:
+        raise RuntimeError("VASP produced no labeled structures")
+    validate_spin_dataset(result, require_mforce=True)
     ase_write(argparse.out_file_path,result,format="extxyz",append=argparse.append)
 
     utils.print_success("VASP calculation task completed!" )
+    return result
 
 def set_magmom(directory):
   if 'magmom' in Config:

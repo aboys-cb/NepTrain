@@ -54,7 +54,7 @@ class RunInput:
     def read_run(self,file_name):
         self.run_in.clear()
         with open(file_name,'r',encoding="utf8") as f:
-            groups=re.findall("^([A-Za-z_]+)\s+(.*)",f.read() ,re.MULTILINE)
+            groups=re.findall(r"^([A-Za-z_]+)\s+(.*)",f.read() ,re.MULTILINE)
 
             for group in groups:
 
@@ -107,6 +107,12 @@ class RunInput:
                                         stdout=f_std,
                                         stderr=f_err,
                                         cwd=directory)
+
+        if errorcode != 0:
+            raise RuntimeError(
+                f"GPUMD MD failed with exit code {errorcode}; "
+                f"see {os.path.join(directory, 'gpumd.err')}"
+            )
 
         plot_md_thermo(os.path.join(directory,"thermo.out") )
 

@@ -1,31 +1,45 @@
-#!/usr/bin/env python 
-# -*- coding: utf-8 -*-
-# @Time    : 2025/8/2 11:07
-# @Author  : 兵
-# @email    : 1747193328@qq.com
-from .vasp import run_vasp
+"""Structure labeling through a stable Adapter seam."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from .interface import LabelRequest, LabelResult, LabelingError, label
+
+
 def run_dft(argparse):
-    # 默认是 vasp
+    backend = argparse.software or "vasp"
+    output = Path(argparse.out_file_path or f"./{backend}_scf.xyz")
+    work_dir = Path(argparse.directory or f"./cache/{backend}")
+    options = {"profile": getattr(argparse, "teacher_profile", "ordinary")}
+    return label(
+        LabelRequest(
+            source=Path(argparse.model_path),
+            output_file=output,
+            work_dir=work_dir,
+            append=argparse.append,
+            input_file=Path(argparse.incar) if argparse.incar else None,
+            n_cpu=argparse.n_cpu,
+            use_gamma=argparse.use_gamma,
+            kspacing=argparse.kspacing,
+            ka=tuple(argparse.ka),
+            options=options,
+        ),
+        backend,
+    )
 
-    if argparse.software is None:
 
-        argparse.software = 'vasp'
+def run_vasp(argparse):
+    from .vasp import run_vasp as implementation
+
+    return implementation(argparse)
 
 
-    if argparse.directory is None:
-        argparse.directory = f"./cache/{argparse.software}"
-    if argparse.out_file_path is None:
-        argparse.out_file_path = f"./{argparse.software}_scf.xyz"
-
-    if argparse.software =="vasp":
-
-        if argparse.incar is None:
-            argparse.incar=f"./INCAR"
-
-        return run_vasp(argparse)
-    elif argparse.software =="abacus":
-        from .abacus import run_abacus
-
-        if argparse.incar is None:
-            argparse.incar=f"./INPUT"
-        return run_abacus(argparse)
+__all__ = [
+    "LabelRequest",
+    "LabelResult",
+    "LabelingError",
+    "label",
+    "run_dft",
+    "run_vasp",
+]

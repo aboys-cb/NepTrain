@@ -1,12 +1,20 @@
-#!/usr/bin/env python 
-# -*- coding: utf-8 -*-
-# @Time    : 2024/11/13 19:09
-# @Author  : 兵
-# @email    : 1747193328@qq.com
+"""Selection helpers with the CLI implementation loaded only on demand."""
+
+from __future__ import annotations
+
+from .select import farthest_point_sampling, filter_by_bonds, process_trajectory, select_structures
 
 
+def run_select(args):
+    from .run import run_select as implementation
 
-from .select import select_structures,process_trajectory,filter_by_bonds
+    return implementation(args)
 
-from .run import run_select
 
+__all__ = [
+    "farthest_point_sampling",
+    "filter_by_bonds",
+    "process_trajectory",
+    "run_select",
+    "select_structures",
+]

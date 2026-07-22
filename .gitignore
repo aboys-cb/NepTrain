@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+build/
+dist/
+*.egg-info/
+
+# NepTrain runtime artifacts
+cache/
+restart.yaml
+diagnostics/
+outputs/
+log.lammps
+dump.lammpstrj

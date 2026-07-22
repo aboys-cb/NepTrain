@@ -1,5 +1,5 @@
 
-nep:
+training:
   #machine resources字段可参考dpdispatcher的输入内容
   machine:
     context_type: "Bohrium"
@@ -42,7 +42,7 @@ dft:
     cpu: 4
     gpu_per_node: 1
     group_size: 1
-gpumd:
+md:
   machine:
     context_type: "Bohrium"
     batch_type: "Bohrium"
@@ -84,6 +84,5 @@ select:
     cpu: 64
     gpu_per_node: 1
     group_size: 1
-
 
 

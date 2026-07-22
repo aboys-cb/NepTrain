@@ -1,182 +1,130 @@
-#!/usr/bin/env python 
-# -*- coding: utf-8 -*-
-# @Time    : 2024/11/21 14:22
-# @Author  : 兵
-# @email    : 1747193328@qq.com
-import contextlib
-import os
+"""NEPAdapters-backed calculation and descriptor compatibility interface."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
-import numpy.typing as npt
 from ase import Atoms
-from functools import partial
-from typing import Iterable
-from NepTrain.nep_cpu import CpuNep
 
 
+def _nep_adapters():
+    try:
+        import nep_adapters
+    except ImportError as error:  # pragma: no cover - installation failure path
+        raise RuntimeError(
+            "NEPAdapters is required. Install a matching nep-adapters wheel."
+        ) from error
+    return nep_adapters
 
-def split_by_natoms(array, natoms_list:list[int]) -> list[npt.NDArray]:
-    """Split a flat array into sub-arrays according to the number of atoms in each structure."""
-    if array.size == 0:
-        return array
-    counts = np.asarray(list(natoms_list), dtype=int)
-    split_indices = np.cumsum(counts)[:-1]
-    split_arrays = np.split(array, split_indices)
-    return split_arrays
-def aggregate_per_atom_to_structure(
-    array: npt.NDArray[np.float32],
-    atoms_num_list: Iterable[int],
-    map_func=np.linalg.norm,
-    axis: int = 0,
-) -> npt.NDArray[np.float32]:
-    """Aggregate per-atom data into per-structure values based on atom counts."""
-    split_arrays = split_by_natoms(array, atoms_num_list)
-    func = partial(map_func, axis=axis)
-    return np.array(list(map(func, split_arrays)))
+
+def resolve_backend(model_file: str | Path, requested: str = "auto") -> str:
+    """Resolve auto/cpu/cuda without silently changing explicit choices."""
+
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError("backend must be auto, cpu, or cuda")
+    nep_adapters = _nep_adapters()
+    if requested != "auto":
+        status = nep_adapters.backend_status(requested)
+        if not status.available:
+            raise RuntimeError(f"NEPAdapters {requested} backend unavailable: {status.detail}")
+        # Loading is the model-capability gate. Explicit choices fail closed.
+        with nep_adapters.NEPCalculator(model_file, backend=requested):
+            pass
+        return requested
+
+    status = nep_adapters.backend_status("cuda")
+    if status.available:
+        try:
+            with nep_adapters.NEPCalculator(model_file, backend="cuda"):
+                pass
+            return "cuda"
+        except nep_adapters.NepAdaptersError:
+            pass
+    return "cpu"
+
 
 class Nep3Calculator:
+    """Compatibility facade whose implementation is entirely NEPAdapters."""
 
-    def __init__(self, model_file="nep.txt"):
-        if not isinstance(model_file, str):
-            model_file=str(model_file,encoding="utf-8")
-        with open(os.devnull, 'w') as devnull:
-            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                self.nep3 = CpuNep(model_file)
-        self.element_list=self.nep3.get_element_list()
-        self.type_dict = {e: i for i, e in enumerate(self.element_list)}
+    def __init__(self, model_file: str | Path = "nep.txt", backend: str = "auto"):
+        nep_adapters = _nep_adapters()
+        self.backend = resolve_backend(model_file, backend)
+        self._calculator = nep_adapters.NEPCalculator(model_file, backend=self.backend)
+        self.model_info = self._calculator.model_info
+        self.element_list = list(self.model_info.elements)
+        self.type_dict = dict(self._calculator.type_dict)
+
+    def close(self) -> None:
+        self._calculator.close()
+
+    def __enter__(self) -> "Nep3Calculator":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
     @staticmethod
-    def _ensure_structure_list(
-        structures: Iterable[Atoms] | Atoms,
-    ) -> list[Atoms]:
-        if isinstance(structures, ( Atoms)):
+    def _structures(structures: Iterable[Atoms] | Atoms) -> list[Atoms]:
+        if isinstance(structures, Atoms):
             return [structures]
-        if isinstance(structures, list):
-            return structures
         return list(structures)
 
-    def compose_structures(
-        self,
-        structures: Iterable[Atoms] ,
-    ) -> tuple[list[list[int]], list[list[float]], list[list[float]], list[int]]:
-        structure_list = self._ensure_structure_list(structures)
-        group_sizes: list[int] = []
-        atom_types: list[list[int]] = []
-        boxes: list[list[float]] = []
-        positions: list[list[float]] = []
-        for structure in structure_list:
-            symbols = structure.get_chemical_symbols()
-            mapped_types = [self.type_dict[symbol] for symbol in symbols]
-            box = structure.cell.transpose(1, 0).reshape(-1).tolist()
-            coords = structure.positions.transpose(1, 0).reshape(-1).tolist()
-            atom_types.append(mapped_types)
-            boxes.append(box)
-            positions.append(coords)
-            group_sizes.append(len(mapped_types))
-        return atom_types, boxes, positions, group_sizes
+    def get_descriptors(self, structure: Atoms) -> np.ndarray:
+        if self.model_info.supports("spin"):
+            return self._calculator.get_spin_descriptor(structure)
+        return self._calculator.get_descriptor(structure)
 
-    def get_descriptors(self,structure):
-        symbols = structure.get_chemical_symbols()
-        _type = [self.type_dict[k] for k in symbols]
-        _box = structure.cell.transpose(1, 0).reshape(-1).tolist()
-        _position = structure.get_positions().transpose(1, 0).reshape(-1).tolist()
-        descriptor = self.nep3.get_descriptor(_type, _box, _position)
-        descriptors_per_atom = np.array(descriptor).reshape(-1, len(structure)).T
+    def get_structure_descriptors(self, structure: Atoms) -> np.ndarray:
+        return self.get_descriptors(structure).mean(axis=0)
 
-        return descriptors_per_atom
-    def get_structure_descriptors(self, structure):
-        descriptors_per_atom=self.get_descriptors(structure)
-        return descriptors_per_atom.mean(axis=0)
+    def get_structures_descriptors(self, structures: Iterable[Atoms]) -> np.ndarray:
+        frames = self._structures(structures)
+        if self.model_info.supports("spin"):
+            return self._calculator.get_spin_structures_descriptor(frames)
+        return self._calculator.get_structures_descriptor(frames)
 
-    def get_structures_descriptors(self,structures:[Atoms]):
-        _types=[]
-        _boxs=[]
-        _positions=[]
-
-        types, boxes, positions, group_sizes = self.compose_structures(structures)
-
-
-        descriptor = self.nep3.get_structures_descriptor(types, boxes, positions)
-        descriptor = np.asarray(descriptor, dtype=np.float32)
-
-        structure_descriptor = aggregate_per_atom_to_structure(descriptor, group_sizes, map_func=np.mean, axis=0)
-
-
-        return structure_descriptor
-
-
-    def calculate(self,structures:list[Atoms],mean_virial=True):
-
-        types, boxes, positions, group_sizes = self.compose_structures(structures)
-
-
-        potentials, forces, virials = self.nep3.calculate(types, boxes, positions)
-
-
-        potentials_arr = np.asarray(potentials, dtype=np.float32)
-        forces_arr = np.asarray(forces, dtype=np.float32)
-        virials_arr = np.asarray(virials, dtype=np.float32)
-        if potentials_arr.size == 0:
-            return [], [], []
-        if forces_arr.ndim == 1:
-            forces_arr = forces_arr.reshape(-1, 3)
-        if virials_arr.ndim == 1:
-            virials_arr = virials_arr.reshape(-1, 9)
-        potentials_array = aggregate_per_atom_to_structure(potentials_arr, group_sizes, map_func=np.sum,
-                                                           axis=None).tolist()
-        forces_blocks = split_by_natoms(forces_arr, group_sizes)
-        if mean_virial:
-            virials_blocks = aggregate_per_atom_to_structure(virials_arr, group_sizes, map_func=np.mean,
-                                                             axis=0).tolist()
+    def calculate(self, structures: Iterable[Atoms] | Atoms, mean_virial: bool = True):
+        frames = self._structures(structures)
+        if self.model_info.supports("spin"):
+            prediction = self._calculator.predict_spin_structures(frames)
         else:
-            virials_blocks = split_by_natoms(virials_arr, group_sizes)
+            prediction = self._calculator.predict_structures(frames)
+        return (
+            prediction.energy,
+            prediction.force_blocks(),
+            prediction.virial_blocks(mean=mean_virial),
+        )
 
-        return potentials_array, forces_blocks, virials_blocks
+    def calculate_spin(
+        self, structures: Iterable[Atoms] | Atoms, mean_virial: bool = True
+    ):
+        prediction = self._calculator.predict_spin_structures(self._structures(structures))
+        return (
+            prediction.energy,
+            prediction.force_blocks(),
+            prediction.virial_blocks(mean=mean_virial),
+            prediction.mforce_blocks(),
+        )
 
 
 class DescriptorCalculator:
-    def __init__(self, calculator_type="nep",**calculator_kwargs):
-        self.calculator_type=calculator_type
+    def __init__(self, calculator_type: str = "nep", **calculator_kwargs):
+        self.calculator_type = calculator_type
         if calculator_type == "nep":
-            self.calculator=Nep3Calculator(**calculator_kwargs)
+            self.calculator = Nep3Calculator(**calculator_kwargs)
         elif calculator_type == "soap":
             from dscribe.descriptors import SOAP
 
-            self.calculator = SOAP(
-                **calculator_kwargs,dtype="float32"
-            )
+            self.calculator = SOAP(**calculator_kwargs, dtype="float32")
         else:
             raise ValueError("calculator_type must be nep or soap")
 
-
-    def get_structures_descriptors(self,structures:[Atoms]):
-
-        if len(structures)==0:
+    def get_structures_descriptors(self, structures: Iterable[Atoms]) -> np.ndarray:
+        frames = list(structures)
+        if not frames:
             return np.array([])
-
         if self.calculator_type == "nep":
-            return self.calculator.get_structures_descriptors(structures)
-        else:
-
-            return  np.array([self.calculator.create_single(structure).mean(0) for structure in structures])
-
-
-if __name__ == '__main__':
-    from NepTrain.core.nep import Nep3Calculator
-    nep3 = Nep3Calculator(model_file="/mnt/d/Desktop/vispy/KNbO3/nep.txt")
-    from ase.io import read
-    import time
-    structures = read("/mnt/d/Desktop/vispy/KNbO3/train.xyz",index=":")
-    start=time.time()
-
-    descriptors = nep3.get_structures_descriptors(structures)
-    print(f"计算描述符：{len(structures)}个结构，耗时：{time.time()-start:.3f}s")
-    print("descriptors",descriptors.shape)
-    start=time.time()
-
-    potentials ,forces ,virials   = nep3.calculate(structures)
-
-    print(f"计算性质：{len(structures)}个结构，耗时：{time.time()-start:.3f}s")
-    print("potentials",potentials.shape)
-    print("forces",forces.shape)
-    print("virials",virials.shape)
-
+            return self.calculator.get_structures_descriptors(frames)
+        return np.asarray([self.calculator.create_single(frame).mean(0) for frame in frames])

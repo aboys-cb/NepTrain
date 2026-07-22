@@ -1,5 +1,5 @@
 
-nep:
+training:
   #machine resources字段可参考dpdispatcher的输入内容
   machine:
     #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/context.html
@@ -53,7 +53,7 @@ dft:
 
       - "module load vasp/6.4.2-nvhpc24.3-ompi5.0.7"
 
-gpumd:
+md:
   machine:
     context_type: "LazyLocal"
     batch_type: "Shell"
@@ -97,7 +97,6 @@ select:
     gpu_per_node: 1
     queue_name: 8V100
     group_size: 1
-
 
 
 

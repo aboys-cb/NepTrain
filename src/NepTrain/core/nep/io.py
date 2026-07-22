@@ -69,7 +69,7 @@ class RunInput:
     def read_run(self,file_name):
         with open(file_name,'r',encoding="utf8") as f:
             # groups=re.findall("(\w+)\s+(.*?)\n",f.read()+"\n")
-            groups=re.findall("^([A-Za-z_]+)\s+(.*)",f.read() ,re.MULTILINE)
+            groups=re.findall(r"^([A-Za-z_]+)\s+(.*)",f.read() ,re.MULTILINE)
 
             for group in groups:
                 self.run_in[group[0].strip()]=group[1].strip()
@@ -119,7 +119,7 @@ class RunInput:
             if utils.is_diff_path(self.test_xyz_path, os.path.join(directory, "test.xyz")):
 
                 shutil.copy(self.test_xyz_path, os.path.join(directory, "test.xyz"))
-        if show_progress:
+        if show_progress and observer is not None:
 
             handler=NepFileMoniter(os.path.join(directory,"loss.out"),self.run_in["generation"])
             watch=observer.schedule(handler, os.path.abspath(directory) , recursive=False)
@@ -137,33 +137,19 @@ class RunInput:
                                         stderr=f_err,
                                         cwd=directory)
 
+        if errorcode != 0:
+            raise RuntimeError(
+                f"GPUMD NEP training failed with exit code {errorcode}; "
+                f"see {os.path.join(directory, 'nep.err')}"
+            )
 
-        if show_progress:
+
+        if show_progress and observer is not None:
 
             handler.finish()
             observer.unschedule(watch)
             observer.stop()
 
-class PredictionRunInput(RunInput):
-    def __init__(self,nep_txt_path,*args,**kwargs):
-        self.nep_txt_path=nep_txt_path
-        super().__init__(*args,**kwargs)
-
-    def write_run(self,file_name):
-
-        self.run_in["prediction"]=1
-        super().write_run(file_name)
-
-    def calculate(self,directory,show_progress=False ):
-        utils.verify_path(directory)
-
-        if self.nep_txt_path is not None and os.path.exists(self.nep_txt_path):
-            if utils.is_diff_path(self.nep_txt_path, os.path.join(directory, "nep.txt")):
-
-                shutil.copy(self.nep_txt_path, os.path.join(directory, "nep.txt"))
-        else:
-            raise ValueError("In prediction mode, a potential function must be specified, please specify it via the `--nep nep_path` option.")
-        super().calculate(directory,show_progress)
 if __name__ == '__main__':
     run=RunInput("./train1.xyz")
     # run.read_run("./nep.in")

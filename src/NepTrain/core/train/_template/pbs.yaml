@@ -1,5 +1,5 @@
 
-nep:
+training:
   #machine resources字段可参考dpdispatcher的输入内容
   machine:
     #https://docs.deepmodeling.com/projects/dpdispatcher/en/latest/context.html
@@ -61,7 +61,7 @@ dft:
 
 
 
-gpumd:
+md:
   machine:
     context_type: "LazyLocal"
     batch_type: "PBS"

@@ -8,18 +8,32 @@
 """
 import os.path
 import shutil
+import shlex
 import subprocess
 import asyncio
 from pathlib import Path
 from typing import List, Tuple
 from ase.io import read as ase_read
 from ase.io import write as ase_write
-from .worker import submit_job, async_submit_job
 from ruamel.yaml import YAML
 
 from NepTrain import utils
+from ..config import load_config, save_config
+from ..spin import validate_spin_dataset
 
 from ..utils import check_env
+
+
+def submit_job(*args, **kwargs):
+    from .worker import submit_job as implementation
+
+    return implementation(*args, **kwargs)
+
+
+async def async_submit_job(*args, **kwargs):
+    from .worker import async_submit_job as implementation
+
+    return await implementation(*args, **kwargs)
 
 
 async def _await_tasks(tasks):
@@ -63,6 +77,9 @@ class Manager:
         else:
             raise IndexError("Index out of range.")
 
+    def peek(self):
+        return self.options[self.index % len(self.options)]
+
 
 class PathManager:
 
@@ -75,25 +92,19 @@ class PathManager:
         return os.path.join(self.root, item)
 
 def params2str(params):
-    text=""
-    for i in  params:
-        if isinstance(i, str):
-            text += i
-        elif isinstance(i, (tuple,list)):
-            for j in i:
-                text += str(j)
-                text += " "
+    tokens = []
+    for item in params:
+        if isinstance(item, (tuple, list)):
+            tokens.extend(str(value) for value in item)
         else:
-            text += str(i)
-        text += " "
-    # print(text)
-    return text
+            tokens.append(str(item))
+    return shlex.join(tokens)
 
 class NepTrainWorker:
     pass
     def __init__(self):
         self.config={}
-        self.job_list=["nep","gpumd","select","dft","pred", ]
+        self.job_list=["training","md","select","dft","pred", ]
         self.manager=Manager(self.job_list)
 
 
@@ -111,8 +122,11 @@ class NepTrainWorker:
             return generation_path
 
         items= item.split("_")
-        if items[0] in self.job_list:
-            job_path=os.path.join(generation_path, items.pop(0))
+        path_alias = {"nep": "training", "gpumd": "md"}
+        path_job = path_alias.get(items[0], items[0])
+        if path_job in self.job_list:
+            items.pop(0)
+            job_path=os.path.join(generation_path, path_job)
         else:
             job_path=generation_path
         fin_path=os.path.join(job_path, "_".join(items[:-1]) )
@@ -173,13 +187,13 @@ class NepTrainWorker:
             #
             #
             #     self.split_dft_job_xyz(self.config["init_train_xyz"])
-        elif self.config["current_job"]=="nep":
+        elif self.config["current_job"]=="training":
            
 
             utils.copy(self.config["init_train_xyz"], self.last_all_learn_calculated_xyz_file)
             # utils.copy(self.config["init_train_xyz"], self.last_all_learn_calculated_xyz_file )
             #如果势函数有效  直接先复制过来
-        elif self.config["current_job"]=="gpumd":
+        elif self.config["current_job"]=="md":
 
             utils.copy(self.config["init_train_xyz"],self.nep_train_xyz_file )
 
@@ -189,25 +203,26 @@ class NepTrainWorker:
             else:
                 raise FileNotFoundError("Starting task as gpumd requires specifying a valid potential function path!")
         else:
-            raise ValueError("current_job can only be one of nep, gpumd, or dft.")
+            raise ValueError("current_job can only be training, md, or dft.")
 
     def read_config(self,config_path):
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"The file at {config_path} does not exist.")
-        with open(config_path,"r",encoding="utf8") as f:
-
-
-            self.config=YAML().load(f )
-        if self.config["dft"]["incar_path"]=="auto":
+        self.config, changes = load_config(config_path)
+        if changes:
+            utils.print_tip("Config migrated in memory: " + ", ".join(changes))
+        if self.config["dft"]["software"] == "toy":
+            self.config["dft"]["incar_path"] = None
+        elif self.config["dft"]["incar_path"]=="auto":
             if self.config["dft"]["software"]=="abacus":
                 self.config["dft"]["incar_path"]="./INPUT"
             else:
                 self.config["dft"]["incar_path"]="./INCAR"
             
     def build_pred_params(self):
-        nep=self.config["nep"]
+        nep=self.config["training"]
 
-        utils.copy(nep.get("nep_in_path"), self.pred_nep_in_file)
+        utils.copy(nep.get("config_path"), self.pred_nep_in_file)
         utils.copy(self.nep_nep_txt_file, self.pred_nep_txt_file)
         utils.copy(self.all_learn_calculated_xyz_file, self.pred_train_xyz_file)
 
@@ -233,16 +248,20 @@ class NepTrainWorker:
 
 
     def build_nep_params(self) :
-        nep=self.config["nep"]
+        nep=self.config["training"]
 
         utils.copy(self.last_improved_train_xyz_file, self.nep_train_xyz_file)
-        utils.copy(nep.get("nep_in_path"), self.nep_nep_in_file)
-        utils.copy(nep.get("test"), self.nep_test_xyz_file)
-        utils.copy(self.last_nep_nep_restart_file, self.nep_nep_restart_file)
+        utils.copy(nep.get("config_path"), self.nep_nep_in_file)
+        utils.copy(nep.get("test_path"), self.nep_test_xyz_file)
+        if nep.get("backend") == "torchnep":
+            utils.copy(self.last_nep_checkpoint_pt_file, self.nep_checkpoint_pt_file)
+        else:
+            utils.copy(self.last_nep_nep_restart_file, self.nep_nep_restart_file)
 
         params=[]
         params.append("NepTrain")
         params.append("nep")
+        params.extend(["--backend", nep.get("backend", "gpumd")])
 
         params.append("--directory")
         params.append("./")
@@ -256,53 +275,88 @@ class NepTrainWorker:
 
         # params.append(relpath_from_files(self.last_improved_train_xyz_file,self.nep_path))
 
-        params.append("--test")
-        params.append("test.xyz")
+        if nep.get("test_path"):
+            params.append("--test")
+            params.append("test.xyz")
         #
         # params.append(relpath_from_files(nep.get("test_xyz_path"),self.nep_path))
 
-        if self.config["nep"]["nep_restart"] and self.generation not in [1,len(self.config["gpumd"]["step_times"])+1]:
+        if nep.get("restart", True) and self.generation not in [1,len(self.config["md"]["duration_ps_every_generation"])+1]:
             #开启续跑
             #如果上一级的势函数路径有效  就传入一下续跑的参数
 
-            if os.path.exists(self.last_nep_nep_restart_file):
+            restart_file = (
+                self.last_nep_checkpoint_pt_file
+                if nep.get("backend") == "torchnep"
+                else self.last_nep_nep_restart_file
+            )
+            if os.path.exists(restart_file):
                 utils.print_tip("Start the restart mode!")
                 params.append("--restart_file")
-                params.append("nep.restart")
+                params.append("checkpoint.pt" if nep.get("backend") == "torchnep" else "nep.restart")
                 # params.append(relpath_from_files(self.last_nep_nep_restart_file,self.nep_path))
                 params.append("--continue_step")
-                params.append(self.config["nep"]["nep_restart_step"])
+                params.append(nep.get("restart_steps", 20000))
+        if nep.get("backend") == "torchnep":
+            params.extend(["--device", nep.get("device", "cuda")])
+            params.extend(["--torch-backend", nep.get("torch_backend", "auto")])
+            params.extend(["--precision", nep.get("precision", "float32")])
+            if nep.get("use_compile", False):
+                params.append("--compile")
 
         return params2str(params)
     def build_gpumd_params(self,model_path,temperature,n_job=1,):
-        gpumd=self.config["gpumd"]
+        gpumd=self.config["md"]
         base_name = os.path.basename(model_path)
         utils.copy(model_path, os.path.join(self.gpumd_path, base_name))
 
-        utils.copy(gpumd.get("run_in_path"), self.gpumd_run_in_file)
+        utils.copy(gpumd.get("template_path"), self.gpumd_run_in_file)
 
         utils.copy(self.nep_nep_txt_file, self.gpumd_nep_txt_file)
 
         params=[]
         params.append("NepTrain")
-        params.append("gpumd")
+        params.append("md")
 
         params.append(base_name)
+
+        params.extend(["--backend", gpumd.get("backend", "gpumd")])
 
         params.append("--directory")
 
         params.append("./")
 
-        params.append("--in")
-        params.append("run.in")
+        if gpumd.get("template_path"):
+            params.append("--template")
+            params.append("run.in")
         params.append("--nep")
         params.append( "nep.txt")
-        params.append("--time")
-        params.append(gpumd.get("step_times")[self.generation-1])
+        duration_ps = gpumd.get("duration_ps_every_generation")[self.generation-1]
+        timestep = float(gpumd.get("timestep", 0.001))
+        params.append("--steps")
+        params.append(int(float(duration_ps) / timestep))
+        params.extend(["--timestep", timestep])
 
         params.append("--temperature")
 
         params.append(temperature)
+
+        params.extend(["--ensemble", gpumd.get("ensemble", "nvt")])
+        params.extend(["--pressure", gpumd.get("pressure", 0.0)])
+        params.extend(["--dump-interval", gpumd.get("dump_interval", 100)])
+        params.extend(["--inference-backend", gpumd.get("inference_backend", "auto")])
+        if gpumd.get("spin", False):
+            params.append("--spin")
+            params.extend(["--spin-temperature", gpumd["spin_temperature"]])
+            params.extend(["--spin-alpha", gpumd.get("spin_alpha", 0.01)])
+            params.extend(["--spin-seed", gpumd.get("spin_seed", 12345)])
+            params.extend(["--midpoint-iter", gpumd.get("midpoint_iter", 3)])
+        if gpumd.get("backend") == "lammps":
+            params.extend(["--lmp", gpumd.get("lmp", "lmp")])
+            params.extend(["--mpiexec", gpumd.get("mpiexec", "mpirun")])
+            params.extend(["--mpi-ranks", gpumd.get("mpi_ranks", 1)])
+            if gpumd.get("plugin_path"):
+                params.extend(["--plugin-path", gpumd["plugin_path"]])
 
 
 
@@ -351,7 +405,8 @@ class NepTrainWorker:
     def build_dft_params(self,n_job=1):
         dft=self.config["dft"]
 
-        utils.copy(dft["incar_path"], self.dft_path)
+        if dft.get("incar_path"):
+            utils.copy(dft["incar_path"], self.dft_path)
 
         params=[]
         params.append("NepTrain")
@@ -397,6 +452,8 @@ class NepTrainWorker:
                 params.append(dft["kspacing"])
         # params.append("--software")
         params.append("--" + dft["software"])
+        if dft["software"] == "toy":
+            params.extend(["--teacher-profile", dft.get("teacher_profile", "ordinary")])
         params.append("--out")
         params.append( relpath_from_files(self.__getattr__(f"dft_learn_calculated_{n_job}_xyz_file"),self.dft_path ))
 
@@ -451,7 +508,9 @@ class NepTrainWorker:
 
 
     def sub_dft(self):
-        utils.print_msg("Beginning the execution of VASP for single-point energy calculations.")
+        utils.print_msg(
+            f"Beginning {self.config['dft']['software']} single-point labeling."
+        )
         # break
         utils.cat(self.select_selected_xyz_file,
                   self.dft_learn_add_xyz_file
@@ -460,18 +519,18 @@ class NepTrainWorker:
         if not utils.is_file_empty(self.dft_learn_add_xyz_file):
             if self.config["dft"]["software"] == "abacus":
                 from NepTrain.core.dft.abacus import StructureVar
-                StructureVar.init(self.config["gpumd"]["model_path"])
+                StructureVar.init(self.config["md"]["structures"])
                 StructureVar.init("./")
                 for pp in StructureVar.pp_files.values():
                     curr_p=f"./{pp}"
-                    stru_p=f'{self.config["gpumd"]["model_path"]}/{pp}'
+                    stru_p=f'{self.config["md"]["structures"]}/{pp}'
                     if os.path.exists(curr_p):
                         shutil.copy(curr_p,self.dft_path)
                     elif os.path.exists(stru_p):
                         shutil.copy(stru_p,self.dft_path)
                 for orb in StructureVar.orbs.values():
                     curr_orb=f"./{orb}"
-                    stru_orb=f'{self.config["gpumd"]["model_path"]}/{orb}'
+                    stru_orb=f'{self.config["md"]["structures"]}/{orb}'
                     if os.path.exists(curr_orb):
                         shutil.copy(curr_orb,self.dft_path)
                     elif os.path.exists(stru_orb):
@@ -485,10 +544,15 @@ class NepTrainWorker:
                 cmd = self.build_dft_params(i + 1)
                 if cmd is None:
                     continue
+                input_name = (
+                    [os.path.basename(self.config["dft"]["incar_path"])]
+                    if self.config["dft"].get("incar_path")
+                    else []
+                )
                 if self.config["dft_job"] == 1:
-                    forward_files=["learn_add.xyz",os.path.basename(self.config["dft"]["incar_path"])]
+                    forward_files=["learn_add.xyz", *input_name]
                 else:
-                    forward_files=[f"learn_add_{i + 1}.xyz",os.path.basename(self.config["dft"]["incar_path"])]
+                    forward_files=[f"learn_add_{i + 1}.xyz", *input_name]
 
                 tasks.append(
                     async_submit_job(
@@ -516,13 +580,18 @@ class NepTrainWorker:
             utils.cat(self.__getattr__(f"dft_learn_calculated_*_xyz_file"),
                       self.all_learn_calculated_xyz_file
                       )
+            if not utils.is_file_empty(self.all_learn_calculated_xyz_file):
+                validate_spin_dataset(
+                    ase_read(self.all_learn_calculated_xyz_file, ":", format="extxyz"),
+                    require_mforce=True,
+                )
             if self.config.get("limit",{}).get("force") and not utils.is_file_empty(self.all_learn_calculated_xyz_file):
                 bad_structure = []
                 good_structure = []
                 structures=ase_read(self.all_learn_calculated_xyz_file,":")
                 for structure in structures:
 
-                    if structure.calc.results["forces"].max() <= self.config.get("limit",{}).get("force"):
+                    if abs(structure.calc.results["forces"]).max() <= self.config.get("limit",{}).get("force"):
                         good_structure.append(structure)
                     else:
                         bad_structure.append(structure)
@@ -560,16 +629,14 @@ class NepTrainWorker:
 
 
             submit_job(
-                machine_dict = self.config["nep"]["machine"],
-                resources_dict = self.config["nep"]["resources"],
+                machine_dict = self.config["training"]["machine"],
+                resources_dict = self.config["training"]["resources"],
                 task_dict_list = [
                     dict(
                         command=cmd,
                         task_work_path="./",
-                        forward_files= filter_file_path(["nep.in","nep.restart","train.xyz","test.xyz"],self.nep_path),
-                        backward_files = [
-                            "./*"
-                        ],
+                        forward_files= filter_file_path(["nep.in","nep.restart","checkpoint.pt","train.xyz","test.xyz"],self.nep_path),
+                        backward_files = ["nep*.txt", "nep.restart", "*.pt", "loss.out", "output.log"],
                     )
                 ],
                 submission_dict = dict(
@@ -595,14 +662,14 @@ class NepTrainWorker:
             utils.print_msg(f"Starting to predict new dataset.")
             cmd = self.build_pred_params()
             submit_job(
-                machine_dict=self.config["nep"]["machine"],
-                resources_dict=self.config["nep"]["resources"],
+                machine_dict=self.config["training"]["machine"],
+                resources_dict=self.config["training"]["resources"],
                 task_dict_list=[
                     dict(
                         command=cmd,
                         task_work_path="./",
                         forward_files=filter_file_path(["nep.in","nep.txt","train.xyz"],self.pred_path),
-                        backward_files=["./*"],
+                        backward_files=["energy_train.out", "force_train.out", "virial_train.out", "mforce_train.out"],
                     )
                 ],
                 submission_dict=dict(
@@ -620,18 +687,18 @@ class NepTrainWorker:
 
         utils.print_msg(f"Starting active learning.")
         tasks = []
-        if self.config.get("gpumd_split_job", "temperature") == "temperature":
-            for i, temp in enumerate(self.config["gpumd"]["temperature_every_step"]):
+        if self.config.get("md_split_job", "temperature") == "temperature":
+            for i, temp in enumerate(self.config["md"]["temperatures"]):
                 cmd = self.build_gpumd_params(
-                    self.config["gpumd"].get("model_path"),
+                    self.config["md"].get("structures"),
                     temp,
                     i,
                 )
-                base_name=os.path.basename(self.config["gpumd"].get("model_path"))
+                base_name=os.path.basename(self.config["md"].get("structures"))
                 tasks.append(
                     async_submit_job(
-                        machine_dict=self.config["gpumd"]["machine"],
-                        resources_dict=self.config["gpumd"]["resources"],
+                        machine_dict=self.config["md"]["machine"],
+                        resources_dict=self.config["md"]["resources"],
                         task_dict_list=[
                             dict(
                                 command=cmd,
@@ -648,17 +715,17 @@ class NepTrainWorker:
                     )
                 )
         else:
-            if os.path.isdir(self.config["gpumd"]["model_path"]):
-                for i, file in enumerate(os.listdir(self.config["gpumd"]["model_path"])):
+            if os.path.isdir(self.config["md"]["structures"]):
+                for i, file in enumerate(os.listdir(self.config["md"]["structures"])):
                     cmd = self.build_gpumd_params(
-                        os.path.join(self.config["gpumd"]["model_path"], file),
-                        self.config["gpumd"]["temperature_every_step"],
+                        os.path.join(self.config["md"]["structures"], file),
+                        self.config["md"]["temperatures"],
                         i,
                     )
                     tasks.append(
                         async_submit_job(
-                            machine_dict=self.config["gpumd"]["machine"],
-                            resources_dict=self.config["gpumd"]["resources"],
+                            machine_dict=self.config["md"]["machine"],
+                            resources_dict=self.config["md"]["resources"],
                             task_dict_list=[
                                 dict(
                                     command=cmd,
@@ -698,7 +765,6 @@ class NepTrainWorker:
             job = next(self.manager)
             # utils.print_msg(f"[Generation {self.generation}] Starting job: {job}")
             self.config["current_job"]=job
-            self.save_restart()
             if job=="dft":
 
                 self.sub_dft()
@@ -708,10 +774,10 @@ class NepTrainWorker:
                 self.sub_nep_pred()
                 self.generation += 1
 
-            elif job=="nep":
+            elif job=="training":
 
                 self.sub_nep()
-                if self.generation>len(self.config["gpumd"]["step_times"]):
+                if self.generation>len(self.config["md"]["duration_ps_every_generation"]):
                    utils.print_success("Training completed!")
                    break
             elif job=="select":
@@ -724,14 +790,13 @@ class NepTrainWorker:
                     break
                 self.sub_gpumd()
 
-            # utils.print_msg(f"[Generation {self.generation}] Finished job: {job}")
+            self.config["current_job"] = self.manager.peek()
+            self.save_restart()
 
 
     def save_restart(self):
-        with open("./restart.yaml","w",encoding="utf-8") as f:
-            self.config["restart"]=True
-
-            YAML().dump(self.config,f)
+        self.config["restart"]=True
+        save_config(self.config, "./restart.yaml")
 
 def train_nep(argparse):
     """

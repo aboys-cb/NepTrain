@@ -1,10 +1,7 @@
 [build-system]
 requires = [
 "wheel",
-"numpy",
-
 "setuptools>=68.0.0",
-"pybind11>=2.12.0",
 "setuptools-scm>=7"
 ]
 build-backend = "setuptools.build_meta"
@@ -19,7 +16,7 @@ description = """
 Automatic training for NEP
 """
 readme = "README.md"
-requires-python = ">=3.8,<3.13"
+requires-python = ">=3.10"
 license= { "file"="LICENSE" }
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -46,8 +43,13 @@ dependencies = [
 "umap-learn>=0.5.7",
 "tqdm",
 "joblib",
-"dpdispatcher"
+"dpdispatcher",
+"nep-adapters>=0.1.0"
 ]
+
+[project.optional-dependencies]
+torchnep = ["torchnep>=1.0.0"]
+test = ["pytest>=8"]
 
 
 [project.urls]
@@ -82,8 +84,15 @@ local_scheme = "no-local-version"  # or "node-and-date"
 
 "NepTrain.core.train._template" = ["*.yaml" ]
 "NepTrain.core.gpumd" = ["run.in" ]
+"NepTrain.core.md" = ["templates/*.in"]
 
 
 [tool.cibuildwheel.linux]
 archs = ["auto64"]
 
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore:Setting the shape on a NumPy array has been deprecated.*:DeprecationWarning:ase\\..*"
+]

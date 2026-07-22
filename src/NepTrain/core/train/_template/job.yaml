@@ -1,64 +1,94 @@
-version: 1.4.3
-dft_job: 10 #The number of tasks submitted when calculating single-point energy with DFT.
-#所有任务提交的根目录
-gpumd_split_job: temperature  #Split gpumd tasks by temperature or structure
-work_path: ./cache  #Root directory for all task submissions.
-current_job: nep  #If the current_job has three states: nep, gpumd, dft, and if train.xyz has not been calculated, set it to vasp; otherwise, directly set it to use nep to train the potential function, or use gpumd.
-generation: 1  #Marking resume tasks.
-init_train_xyz: ./train.xyz  #Initial training set; if not calculated, set current_job to vasp.
-init_nep_txt: ./nep.txt  #If current_job is set to gpumd, a potential function must be provided; otherwise, it can be ignored.
-nep:
-  #Does it support restarting? If true, the potential function for the next step will continue from this step for nep_restart_step steps.
-  #The program will automatically set lambda_1 to 0.
-  #If false, retrain from scratch every time.
-  nep_restart: true
-  nep_restart_step: 20000
-  #Optional; if you need to modify the number of steps, simply provide a file in the current path.
-  #If there is no such file, the number of steps will be automatically generated based on the training set.
-  nep_in_path: ./nep.in
-  #Optional
-  test_xyz_path: test.xyz
+schema_version: 2
+version: 0
+dft_job: 10
+md_split_job: temperature
+work_path: ./cache
+current_job: training
+generation: 1
+init_train_xyz: ./train.xyz
+init_nep_txt: ./nep.txt
+
+training:
+  backend: gpumd
+  device: cuda
+  torch_backend: auto
+  precision: float32
+  use_compile: false
+  restart: true
+  restart_steps: 20000
+  config_path: ./nep.in
+  test_path: null
+
+md:
+  backend: gpumd
+  inference_backend: auto
+  duration_ps_every_generation: [10, 100, 500, 1000]
+  temperatures: [50, 100, 150, 200, 250, 300]
+  structures: ./structure
+  template_path: ./run.in
+  ensemble: nvt
+  timestep: 0.001
+  pressure: 0.0
+  dump_interval: 100
+  spin: false
+  spin_temperature: null
+  spin_alpha: 0.01
+  spin_seed: 12345
+  midpoint_iter: 3
+  lmp: lmp
+  mpiexec: mpirun
+  mpi_ranks: 1
+  plugin_path: null
+  # Failed LAMMPS runs retain two boundary frames; the final frame is quarantined.
+  pre_failure_frames: 2
+  bad_tail_frames: 1
+  health:
+    min_distance_ratio: 0.5
+    min_volume_ratio: 0.5
+    max_volume_ratio: 2.0
+    max_force: 100.0
+    max_mforce: 100.0
+    max_spin_magnitude: 20.0
+
 dft:
-  software: vasp #you can switch vasp or abacus
+  software: vasp
   cpu_core: 64
-  kpoints_use_gamma: true  #ASE defaults to using M-point k-mesh, but here we default to using the gamma-centered grid; this can be set to false.
-
-  incar_path: auto  #A path should be passed in. If it is auto, the corresponding file name will be switched according to the software, such as INCAR or INPUT
-
+  kpoints_use_gamma: true
+  incar_path: auto
   use_k_stype: kspacing
-  #--ka
-  kpoints:
-    - 20 #a
-    - 20 #b
-    - 20 #c
+  kpoints: [20, 20, 20]
   kspacing: 0.2
-gpumd:
-#Time for iterative progressive learning in units of picoseconds.
-#The first active learning is at 10ps, the second at 100ps, with a total of four active learning sessions.
-  step_times:
-    - 10
-    - 100
-    - 500
-    - 1000
-#Each time active learning is performed, all structures in model_path will undergo molecular dynamics (MD) simulations at the following temperatures, followed by sampling.
-  temperature_every_step:
-    - 50
-    - 100
-    - 150
-    - 200
-    - 250
-    - 300
-  model_path: ./structure
-  run_in_path: ./run.in
+
+evaluation:
+  # Campaign acceptance must use data that are not merged into training.
+  validation_path: ./validation.xyz
+  inference_backend: auto
+  # Fill these before starting a campaign; empty thresholds are rejected.
+  max_rmse: {}
+
+campaign:
+  id: spin-nep-lite-v1
+  generations: 3
+  seed: 20260721
+  initial_candidates: 200
+  dft_budget: 20
+  minimum_dft_budget: 8
+  initial_steps: 10000
+  temperatures: [300, 500, 700]
+  frame_stride: 2
+  maturity:
+    # Defaults are initial_steps multiplied by 1, 4, 16, and 64.
+    enabled: true
+    levels:
+      smoke_passed: 10000
+      short_stable: 40000
+      long_stable: 160000
+      production_ready: 640000
 
 select:
-  #After completing this round of MD, a maximum of max_selected structures will be selected from all trajectories.
   max_selected: 50
-  min_distance: 0.01   #Hyperparameters for farthest point sampling
-  filter: 0.6    #Passing a coefficient enables bond length detection, and bonds shorter than the sum of the covalent radii multiplied by the coefficient are considered unphysical structures.
+  min_distance: 0.01
+  filter: 0.6
+
 limit:
-  force: 20  #Limit the force of the structure to between -force and force
-
-
-
-
+  force: 20
