@@ -327,6 +327,68 @@ def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     assert manifest["scripts"] == []
 
 
+class SameSchedulerIdExecutor(ImmediateExecutor):
+    """Model independent Slurm namespaces that reuse one numeric job id."""
+
+    def launch(self, task):
+        handle = super().launch(task)
+        return ExecutionHandle(
+            handle.task_id,
+            handle.target,
+            "slurm",
+            "12345",
+            handle.local_bundle,
+        )
+
+
+def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    launches = []
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: SameSchedulerIdExecutor(target, launches),
+    )
+
+    for _ in range(20):
+        if controller.tick().state == "complete":
+            break
+    else:
+        raise AssertionError("controller did not complete")
+
+    state = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert len(state["history"]) == 8
+    assert {item["handle"]["execution_id"] for item in state["history"]} == {
+        "12345"
+    }
+    assert [item["target"] for item in state["history"]] == [
+        "gpu",
+        "md",
+        "cpu",
+        "dft",
+        "cpu",
+        "cpu",
+        "gpu",
+        "cpu",
+    ]
+
+    status = campaign_status(preparation.output_dir)
+    assert len(status.jobs) == 8
+    assert {job["job_id"] for job in status.jobs} == {"12345"}
+    assert [job["script"] for job in status.jobs] == [
+        "gpu/train",
+        "md/explore",
+        "cpu/select",
+        "dft/label",
+        "cpu/diagnose",
+        "cpu/merge",
+        "gpu/retrain",
+        "cpu/evaluate",
+    ]
+
+
 def test_controller_refuses_drifted_campaign_inputs(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_campaign(config, initial, tmp_path / "campaign")
