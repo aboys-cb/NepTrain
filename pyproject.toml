@@ -13,7 +13,7 @@ authors = [{ name = "Chen Cheng bing", email = "1747193328@qq.com" }]
 dynamic = ["version"]
 
 description = """
-Automatic training for NEP
+Composable NEP training, MD, DFT labeling, sampling, and active-learning workflows
 """
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,8 +48,6 @@ dependencies = [
 
 [project.optional-dependencies]
 torchnep = ["torchnep>=1.0.0"]
-legacy = ["dpdispatcher"]
-bohrium = ["dpdispatcher[bohrium]"]
 test = ["pytest>=8"]
 
 
@@ -62,7 +60,6 @@ Issues = "https://github.com/aboys-cb/NepTrain/issues"
 
 
 [project.scripts]
-NepTrain = "NepTrain.cli.cli:main"
 neptrain = "NepTrain.cli.cli:main"
 
 [tool.setuptools]
@@ -79,11 +76,9 @@ tag_regex = "^v(?P<version>[0-9.]+(?:b[0-9]+)?)$"
 local_scheme = "no-local-version"  # or "node-and-date"
 
 [tool.setuptools.package-data]
-"NepTrain" = ["config.ini" ]
 "NepTrain.core.dft.vasp" = ["INCAR" ]
 "NepTrain.core.dft.abacus" = ["INPUT" ]
 
-"NepTrain.core.train._template" = ["*.yaml" ]
 "NepTrain.core.gpumd" = ["run.in" ]
 "NepTrain.core.md" = ["templates/*.in"]
 

@@ -1,14 +1,43 @@
-from NepTrain.core.template import get_job_config
+from pathlib import Path
+
+import pytest
+
+from NepTrain.core.config import load_config
+from NepTrain.core.template import init_project
 
 
-def test_slurm_template_uses_controller_execution_targets_only():
-    config = get_job_config("slurm")
+def test_init_project_writes_a_valid_narrow_schema_v4(tmp_path):
+    project = init_project("local", tmp_path)
+    config, changes = load_config(project)
 
-    assert config["schema_version"] == 3
-    assert set(config["execution"]["targets"]) == {"training", "cpu", "dft"}
-    assert config["execution"]["routes"] == {
-        "training": "training",
-        "sampling": "cpu",
-        "labeling": "dft",
-        "analysis": "cpu",
-    }
+    assert changes == []
+    assert config["schema_version"] == 4
+    assert config["training"]["backend"] == "torchnep"
+    assert config["md"]["backend"] == "lammps"
+    assert config["md"]["temperatures"] == [300]
+    assert config["md"]["initial_steps"] == 10000
+    assert "current_job" not in config
+    assert "duration_ps_every_generation" not in config["md"]
+    assert (tmp_path / "lammps-nvt.in").is_file()
+    assert (tmp_path / "INCAR").is_file()
+    assert (tmp_path / "INPUT").is_file()
+
+
+def test_init_never_rewrites_an_existing_project_without_force(tmp_path):
+    project = init_project("local", tmp_path)
+    original = project.read_bytes()
+
+    with pytest.raises(FileExistsError, match="--force"):
+        init_project("slurm", tmp_path)
+
+    assert project.read_bytes() == original
+
+
+def test_slurm_profile_creates_editable_environment_scripts(tmp_path):
+    project = init_project("slurm", tmp_path)
+    config, _ = load_config(project)
+
+    for target in config["execution"]["targets"].values():
+        setup = tmp_path / target["setup_script"]
+        assert setup.is_file()
+        assert setup.stat().st_mode & 0o100

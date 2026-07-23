@@ -4,29 +4,10 @@
 # @Author  : 兵
 # @email    : 1747193328@qq.com
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
-import sys
-sys.path.append('../../')
 from NepTrain import __version__
-import warnings
-try:
-    from dpdispatcher.dlog import dlog_stdout, dlog
-    dlog.removeHandler(dlog_stdout)
-except ImportError:
-    pass
-# 禁用所有 UserWarning
-warnings.simplefilter('ignore', UserWarning)
-
-
-def _warn_legacy_command(command, replacement):
-    print(
-        f"NepTrain: warning: '{command}' is a compatibility command and will "
-        f"be removed in the next release; use '{replacement}' instead.",
-        file=sys.stderr,
-    )
 
 
 def init_template(args):
@@ -44,109 +25,11 @@ def run_select(args):
     return implementation(args)
 
 
-def run_dft(args):
-    from NepTrain.core.dft import run_dft as implementation
-    implementation(args)
-
-
-def run_vasp(args):
-    _warn_legacy_command("vasp", "dft --vasp")
-    from NepTrain.core.dft.vasp import run_vasp as implementation
-    implementation(args)
-
-
-def run_nep(args):
-    from NepTrain.core.nep import run_nep as implementation
-    return implementation(args)
-
-
-def run_gpumd(args):
-    _warn_legacy_command("gpumd", "md --backend gpumd")
-    from NepTrain.core.gpumd import run_gpumd as implementation
-    return implementation(args)
-
-
-def train_nep(args):
-    _warn_legacy_command("train", "run")
-    from NepTrain.core.train import train_nep as implementation
-    try:
-        return implementation(args)
-    except ImportError as error:
-        if error.name and error.name.startswith("dpdispatcher"):
-            raise SystemExit(
-                "NepTrain: error: the legacy 'train' command requires "
-                "'pip install NepTrain[legacy]'; use 'NepTrain run' for new projects."
-            ) from error
-        raise
-
-
-def run_md_command(args):
-    from ase.io import read as ase_read
-    from NepTrain.core.md import MdRequest, run_md
-
-    source = Path(args.model_path)
-    paths = sorted(
-        path for pattern in ("*.xyz", "*.vasp", "POSCAR*") for path in source.glob(pattern)
-    ) if source.is_dir() else [source]
-    frames = []
-    for path in paths:
-        loaded = ase_read(path, index=":", format=None)
-        frames.extend(loaded if isinstance(loaded, list) else [loaded])
-    if not frames:
-        raise FileNotFoundError(f"no readable structures found in {source}")
-    output = Path(args.out_file_path)
-    if output.exists() and not args.append:
-        output.unlink()
-    for frame_index, atoms in enumerate(frames):
-        digest = hashlib.sha256(atoms.positions.tobytes()).hexdigest()[:12]
-        for temperature in args.temperature:
-            directory = Path(args.directory) / f"{frame_index}-{digest}-{temperature:g}K"
-            request = MdRequest(
-                atoms=atoms,
-                model_file=Path(args.nep_txt_path),
-                output_dir=directory,
-                output_file=output,
-                temperature=temperature,
-                spin_temperature=args.spin_temperature,
-                steps=args.steps,
-                timestep=args.timestep,
-                ensemble=args.ensemble,
-                pressure=args.pressure,
-                tdamp=args.tdamp,
-                pdamp=args.pdamp,
-                dump_interval=args.dump_interval,
-                spin=args.spin,
-                spin_alpha=args.spin_alpha,
-                spin_seed=args.spin_seed,
-                midpoint_iter=args.midpoint_iter,
-                template_path=Path(args.template) if args.template else None,
-                inference_backend=args.inference_backend,
-                lmp_command=args.lmp,
-                mpiexec=args.mpiexec,
-                mpi_ranks=args.mpi_ranks,
-                plugin_path=args.plugin_path,
-            )
-            run_md(request, args.backend)
-
-
-def run_migrate(args):
-    from NepTrain.core.config import load_config, save_config
-
-    config, changes = load_config(args.config_path)
-    output = Path(args.output)
-    if output.exists() and not args.force:
-        raise FileExistsError(f"{output} already exists; pass --force to overwrite")
-    save_config(config, output)
-    if changes:
-        print("Migrated: " + ", ".join(changes))
-    print(f"Wrote schema-v3 config: {output}")
-
-
 def run_smoke_command(args):
     from dataclasses import asdict
     import json
 
-    from NepTrain.core.smoke import run_backend_workflow_smoke, run_smoke
+    from NepTrain.core.smoke import run_smoke
 
     report = run_smoke(
         args.output,
@@ -168,90 +51,6 @@ def run_smoke_command(args):
             force=args.force,
         )
         print(json.dumps(asdict(iteration), indent=2, sort_keys=True))
-    if args.workflow_config:
-        workflow = run_backend_workflow_smoke(
-            args.workflow_config,
-            args.output,
-            profile="spin" if args.profile == "recovery" else args.profile,
-            training_steps=args.training_steps,
-            md_steps=args.md_steps,
-            dft_budget=args.dft_budget,
-        )
-        print(json.dumps(asdict(workflow), indent=2, sort_keys=True))
-
-
-def _iteration_execution(args):
-    from NepTrain.core.config import load_config
-    from NepTrain.core.iteration import GenerationController, GenerationPlan
-    from NepTrain.core.workflow_iteration import WorkflowIterationAdapter
-
-    config_path = Path(args.config_path).expanduser().resolve()
-    config, _ = load_config(config_path)
-    plan_data = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-    plan_data["temperatures"] = tuple(plan_data["temperatures"])
-    plan = GenerationPlan(**plan_data)
-    adapter = WorkflowIterationAdapter(
-        config,
-        initial_training=args.initial_training,
-        base_dir=config_path.parent,
-    )
-    controller = GenerationController(args.campaign_dir, args.campaign_id)
-    return plan, adapter, controller
-
-
-def run_iteration_stage_command(args):
-    from dataclasses import asdict
-    import json
-
-    plan, adapter, controller = _iteration_execution(args)
-    result = controller.run_stage(plan, adapter, args.stage)
-    payload = asdict(result)
-    payload["artifacts"] = {
-        name: str(path) for name, path in result.artifacts.items()
-    }
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    if result.generation_complete and result.accepted is False:
-        raise SystemExit(
-            f"Generation {result.generation} was rejected; dependent jobs will not run."
-        )
-
-
-def run_iteration_resource_command(args):
-    from dataclasses import asdict
-    import json
-
-    from NepTrain.core.iteration import IterationError
-
-    plan, adapter, controller = _iteration_execution(args)
-    if args.resource == "training":
-        allowed = {"train", "retrain"}
-    elif args.resource == "dft":
-        allowed = {"label"}
-    else:
-        allowed = {"explore", "select", "diagnose", "merge", "evaluate"}
-    results = []
-    while True:
-        stage = controller.next_stage(plan)
-        if stage is None:
-            break
-        if stage not in allowed:
-            if results or args.resource == "training":
-                break
-            raise IterationError(
-                f"resource {args.resource} cannot execute pending stage {stage}"
-            )
-        result = controller.run_stage(plan, adapter, stage)
-        payload = asdict(result)
-        payload["artifacts"] = {
-            name: str(path) for name, path in result.artifacts.items()
-        }
-        results.append(payload)
-        if result.generation_complete and result.accepted is False:
-            print(json.dumps(results, indent=2, sort_keys=True))
-            raise SystemExit(
-                f"Generation {result.generation} was rejected; dependent jobs will not run."
-            )
-    print(json.dumps(results, indent=2, sort_keys=True))
 
 
 def _science_value(value):
@@ -329,8 +128,8 @@ def _print_scientific_progress(generations):
             )
 
 
-def _print_campaign_status(status, *, show_jobs: bool = True):
-    print(f"Campaign: {status.campaign_id}")
+def _print_workflow_status(status, *, show_jobs: bool = True):
+    print(f"Workflow: {status.workflow_id}")
     print(f"State: {status.state}")
     print(
         f"Progress: {status.completed_generations}/{status.total_generations} "
@@ -372,12 +171,12 @@ def _print_campaign_status(status, *, show_jobs: bool = True):
 
 
 def run_project_command(args):
-    """Start or continue a campaign through the small user interface."""
+    """Start or continue a workflow through the small user interface."""
 
-    from NepTrain.core.campaign import (
-        CampaignError,
-        prepare_campaign,
-        resume_campaign,
+    from NepTrain.core.workflow import (
+        WorkflowError,
+        prepare_workflow,
+        resume_workflow,
     )
     from NepTrain.core.controller import start_controller
 
@@ -389,9 +188,9 @@ def run_project_command(args):
                 resume_options["foreground"] = True
             if getattr(args, "poll_interval", None) is not None:
                 resume_options["poll_interval"] = args.poll_interval
-            result = resume_campaign(project, **resume_options)
+            result = resume_workflow(project, **resume_options)
             payload = {
-                "campaign_id": result.campaign_id,
+                "workflow_id": result.workflow_id,
                 "action": result.action,
                 "manifest": str(result.manifest),
             }
@@ -403,13 +202,14 @@ def run_project_command(args):
                 payload["job_ids"] = list(result.job_ids)
         else:
             initial_training = args.initial_training
-            if not initial_training:
+            output = args.output
+            if not initial_training or not output:
                 from NepTrain.core.config import ConfigError, load_config
 
                 try:
                     config, _ = load_config(project)
                 except ConfigError as error:
-                    raise CampaignError(
+                    raise WorkflowError(
                         f"invalid project configuration: {error}"
                     ) from error
                 value = config.get("training", {}).get("initial_path")
@@ -420,19 +220,23 @@ def run_project_command(args):
                         if not path.is_absolute()
                         else path.resolve()
                     )
-            if not initial_training or not args.output:
-                raise CampaignError(
+                if not output:
+                    workflow_id = str(config.get("workflow", {}).get("id", "")).strip()
+                    if workflow_id:
+                        output = str((project.parent / workflow_id).resolve())
+            if not initial_training or not output:
+                raise WorkflowError(
                     "starting from a project file requires training.initial_path "
-                    "(or --initial-training) and --output"
+                    "(or --initial-training) and workflow.id (or --output)"
                 )
-            preparation = prepare_campaign(
+            preparation = prepare_workflow(
                 project,
                 initial_training,
-                args.output,
-                campaign_id=args.campaign_id,
+                output,
+                workflow_id=args.workflow_id,
             )
             payload = {
-                "campaign_id": preparation.campaign_id,
+                "workflow_id": preparation.workflow_id,
                 "project": str(preparation.output_dir),
                 "manifest": str(preparation.manifest),
                 "started": not args.prepare_only,
@@ -445,37 +249,37 @@ def run_project_command(args):
                         poll_interval=getattr(args, "poll_interval", None),
                     )
                 except Exception as error:
-                    raise CampaignError(str(error)) from error
+                    raise WorkflowError(str(error)) from error
                 if getattr(args, "foreground", False):
                     payload["controller_exit_code"] = controller_result
                 else:
                     payload["controller_pid"] = controller_result
-    except CampaignError as error:
+    except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def run_status_command(args):
     from dataclasses import asdict
-    from NepTrain.core.campaign import CampaignError, campaign_status
+    from NepTrain.core.workflow import WorkflowError, workflow_status
 
     try:
-        status = campaign_status(args.project)
-    except CampaignError as error:
+        status = workflow_status(args.project)
+    except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     if args.json:
         print(json.dumps(asdict(status), indent=2, sort_keys=True))
     else:
-        _print_campaign_status(status, show_jobs=args.jobs)
+        _print_workflow_status(status, show_jobs=args.jobs)
 
 
 def run_resume_command(args):
     from dataclasses import asdict
-    from NepTrain.core.campaign import CampaignError, resume_campaign
+    from NepTrain.core.workflow import WorkflowError, resume_workflow
 
     try:
-        result = resume_campaign(args.project)
-    except CampaignError as error:
+        result = resume_workflow(args.project)
+    except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     payload = asdict(result)
     payload["job_ids"] = list(result.job_ids)
@@ -493,16 +297,16 @@ def run_resume_command(args):
 
 
 def run_extend_command(args):
-    from NepTrain.core.campaign import CampaignError, extend_campaign
+    from NepTrain.core.workflow import WorkflowError, extend_workflow
 
     try:
-        preparation = extend_campaign(args.project, args.generations)
-    except CampaignError as error:
+        preparation = extend_workflow(args.project, args.generations)
+    except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     print(
         json.dumps(
             {
-                "campaign_id": preparation.campaign_id,
+                "workflow_id": preparation.workflow_id,
                 "total_generations": len(preparation.plans),
                 "project": str(preparation.output_dir),
             },
@@ -513,13 +317,15 @@ def run_extend_command(args):
 
 
 def run_stop_command(args):
-    from NepTrain.core.controller import ControllerError, stop_controller
+    from NepTrain.core.controller import ControllerError, stop_workflow
 
     try:
-        stop_controller(args.project)
+        result = stop_workflow(
+            args.project, cancel_jobs=bool(args.cancel_jobs)
+        )
     except ControllerError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
-    print(json.dumps({"project": str(Path(args.project).resolve()), "stopped": True}, indent=2))
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def run_controller_command(args):
@@ -579,10 +385,7 @@ def run_doctor(args):
             required = []
             if target.executor == "slurm":
                 required.extend(["sbatch", "squeue", "sacct"])
-                if not target.setup_script:
-                    required.append(shlex.split(target.command)[0])
-            else:
-                required.append(shlex.split(target.command)[0])
+            required.append(shlex.split(target.command)[0])
             setup_line = ""
             path_check = ""
             if target.setup_script and target.executor == "process":
@@ -709,41 +512,6 @@ def run_doctor(args):
     if failures:
         raise SystemExit("Doctor failed: " + ", ".join(failures))
     print("Doctor completed successfully.")
-def check_kpoints_number(value):
-    """检查值是否为单个数字或三个数字的字符串"""
-
-    if isinstance(value, str):
-        values = value.split(',')
-
-        if len(values) == 3 and all(v.isdigit() for v in values):
-            return list(map(int, values))
-        elif len(values) == 1 and value.isdigit():
-            return [int(value),int(value),int(value)]
-        else:
-            raise argparse.ArgumentTypeError("The ka parameter must be a single number or three numbers separated by `,`.")
-    elif isinstance(value, int):
-        return value
-    else:
-        raise argparse.ArgumentTypeError("The ka parameter must be a single number or three numbers separated by `,`.")
-
-def build_init(subparsers):
-    parser_init = subparsers.add_parser(
-        "init",
-        help="Initialize some file templates",
-    )
-    parser_init.add_argument("type",
-                             type=str,
-                            choices=["bohrium","slurm","pbs","shell"],default="slurm",
-                             help="How to call a task")
-
-    parser_init.add_argument("-f", "--force", action='store_true',
-                             default=False,
-                             help="Force overwriting of generated templates"
-                             )
-
-    parser_init.set_defaults(func=init_template)
-
-
 
 def build_perturb(subparsers):
     parser_perturb = subparsers.add_parser(
@@ -786,254 +554,6 @@ def build_perturb(subparsers):
 
                              )
 
-def build_vasp(subparsers):
-    parser_vasp = subparsers.add_parser(
-        "vasp",
-        help="Compatibility command; use 'dft --vasp' (removed next release).",
-    )
-    parser_vasp.set_defaults(func=run_vasp)
-
-    parser_vasp.add_argument("model_path",
-                             type=str,
-
-                             help="The required structure path or structure file only supports files in xyz and vasp formats.")
-    parser_vasp.add_argument("--directory", "-dir",
-
-                             type=str,
-                             help="Set the VASP calculation path. default ./cache/vasp.",
-                             default="./cache/vasp"
-                             )
-
-    parser_vasp.add_argument("--out", "-o",
-                             dest="out_file_path",
-                             type=str,
-                             help="Structure output file after calculation. default ./vasp_scf.xyz",
-                             default="./vasp_scf.xyz"
-                             )
-
-    parser_vasp.add_argument("--append", "-a",
-                             dest="append", action='store_true', default=False,
-                             help="Write to out_file_path in append mode, default False.",
-
-                             )
-    parser_vasp.add_argument("--gamma", "-g",
-                             dest="use_gamma", action='store_true', default=False,
-                             help="Default to using Monkhorst-Pack k-points, add -g to use Gamma-centered k-point scheme.",
-
-                             )
-    parser_vasp.add_argument("-n", "-np",
-                             dest="n_cpu",
-                             default=1,
-                             type=int,
-                             help="Set the number of CPU cores, default 1.")
-
-    parser_vasp.add_argument("--incar",
-
-                             help="Input path for INCAR file, default is ./INCAR.",default="./INCAR")
-
-
-
-    k_group = parser_vasp.add_mutually_exclusive_group(required=False)
-    k_group.add_argument("--kspacing", "-kspacing",
-
-                         type=float,
-                         help="Set kspacing, which can also be defined in the INCAR template.")
-    k_group.add_argument("--ka", "-ka",
-                         default=[1, 1, 1],
-                         type=check_kpoints_number,
-                         help="ka takes 1 or 3 numbers (comma-separated), sets k-points to (k[0]/a, k[1]/b, k[2]/c). default 1.")
-def build_dft(subparsers):
-    parser_dft = subparsers.add_parser(
-        "dft",
-        help="Calculate single-point energy using DFT software.",
-    )
-    parser_dft.set_defaults(func=run_dft)
-
-    parser_dft.add_argument("model_path",
-                             type=str,
-
-                             help="The required structure path or structure file only supports files in xyz and vasp formats.")
-    parser_dft.add_argument("--directory", "-dir",
-
-                             type=str,
-                             help="Set the VASP calculation path. default ./cache/software.",
-                             default=None
-                             )
-
-    parser_dft.add_argument("--out", "-o",
-                             dest="out_file_path",
-                             type=str,
-                             help="Structure output file after calculation. default ./software_scf.xyz",
-                             default=None
-                             )
-
-    parser_dft.add_argument("--append", "-a",
-                             dest="append", action='store_true', default=False,
-                             help="Write to out_file_path in append mode, default False.",
-
-                             )
-    parser_dft.add_argument("--gamma", "-g",
-                             dest="use_gamma", action='store_true', default=False,
-                             help="Default to using Monkhorst-Pack k-points, add -g to use Gamma-centered k-point scheme.",
-
-                             )
-    parser_dft.add_argument("-n", "-np",
-                             dest="n_cpu",
-                             default=1,
-                             type=int,
-                             help="Set the number of CPU cores, default 1.")
-
-    parser_dft.add_argument("--in",
-                                dest="incar",
-                             help="Input path for INCAR file, default is ./INCAR or ./INPUT.",default=None)
-    parser_dft.add_argument(
-        "--resource-dir",
-        "--resources",
-        dest="resource_dir",
-        help="VASP POTCAR root or ABACUS pseudopotential/orbital directory.",
-        default=None,
-    )
-
-
-
-    k_group = parser_dft.add_mutually_exclusive_group(required=False)
-    k_group.add_argument("--kspacing", "-kspacing",
-
-                         type=float,
-                         help="Set kspacing, which can also be defined in the INCAR template.")
-    k_group.add_argument("--ka", "-ka",
-                         default=[1, 1, 1],
-                         type=check_kpoints_number,
-                         help="ka takes 1 or 3 numbers (comma-separated), sets k-points to (k[0]/a, k[1]/b, k[2]/c). default 1.")
-
-    software_group = parser_dft.add_mutually_exclusive_group(required=False)
-    software_group.add_argument("--vasp" ,
-                                dest="software",
-
-                                action='store_const', const='vasp',
-                         help="use vasp.(default)")
-    software_group.add_argument("--abacus",
-                                dest="software",
-                                action='store_const', const='abacus',
-                                help="use abacus")
-    software_group.add_argument("--toy",
-                                dest="software",
-                                action="store_const", const="toy",
-                                help="use the deterministic development teacher")
-    parser_dft.add_argument(
-        "--teacher-profile",
-        choices=["ordinary", "spin"],
-        default="ordinary",
-        help="Toy teacher contract; ignored by production DFT Adapters.",
-    )
-
-
-
-def build_nep(subparsers):
-    parser_nep = subparsers.add_parser(
-        "nep",
-        help="Train potential functions using NEP.",
-    )
-    parser_nep.set_defaults(func=run_nep)
-
-
-    parser_nep.add_argument("--directory", "-dir",
-                             type=str,
-                             help="Set the path for NEP calculations. default ./cache/nep",
-                             default="./cache/nep"
-                             )
-
-    parser_nep.add_argument("--in", "-in",
-                            dest="nep_in_path",
-                             type=str,
-                             help="Set the path for the nep.in file; if not present, generate it based on train.xyz. default ./nep.in",
-                             default="./nep.in"
-                             )
-
-    parser_nep.add_argument("--train", "-train",
-                             dest="train_path",
-
-                             type=str,
-                             help="Set the path for the train.xyz file, default  ./train.xyz.",
-                             default="./train.xyz"
-                             )
-
-    parser_nep.add_argument("--test", "-test",
-                             dest="test_path",
-                             type=str,
-                             help="Set the path for the test.xyz file, default is ./test.xyz.",
-                             default="./test.xyz"
-                             )
-
-    parser_nep.add_argument("--nep", "-nep",
-                            dest="nep_txt_path",
-                             type=str,
-                             help="restart and prediction require the use of a potential function, default is ./nep.txt.",
-                             default="./nep.txt"
-                             )
-
-    parser_nep.add_argument("--prediction", "-pred","--pred",
-
-                             action="store_true",
-                             help="Set the forecast mode，default False",
-                             default=False
-                             )
-
-    parser_nep.add_argument("--restart_file", "-restart","--restart",
-
-                            type=str,
-
-                            help="To restart running, simply provide a valid path; default is None.",
-                             default=None
-                             )
-
-    parser_nep.add_argument("--continue_step", "-cs",
-                            type=int,
-                            help="If a restart_file is provided, this parameter will take effect, continuing for continue_step steps, with a default value of 10000.",
-                             default=10000
-                             )
-    parser_nep.add_argument("--backend", choices=["gpumd", "torchnep"], default="gpumd")
-    parser_nep.add_argument("--device", default="cuda")
-    parser_nep.add_argument("--torch-backend", choices=["auto", "loop", "bmm"], default="auto")
-    parser_nep.add_argument("--precision", choices=["float32", "float64"], default="float32")
-    parser_nep.add_argument("--compile", dest="use_compile", action="store_true")
-    parser_nep.add_argument(
-        "--inference-backend", choices=["auto", "cpu", "cuda"], default="auto"
-    )
-
-
-def build_md(subparsers):
-    parser_md = subparsers.add_parser("md", help="Run MD with GPUMD or LAMMPS.")
-    parser_md.set_defaults(func=run_md_command)
-    parser_md.add_argument("model_path", help="Input structure or extxyz path.")
-    parser_md.add_argument("--backend", choices=["gpumd", "lammps"], default="gpumd")
-    parser_md.add_argument("--nep", dest="nep_txt_path", default="./nep.txt")
-    parser_md.add_argument("--directory", default="./cache/md")
-    parser_md.add_argument("--out", dest="out_file_path", default="./trajectory.xyz")
-    parser_md.add_argument("--append", action="store_true")
-    parser_md.add_argument("--template", default=None)
-    parser_md.add_argument("--temperature", type=float, nargs="+", default=[300.0])
-    parser_md.add_argument("--spin-temperature", type=float, default=None)
-    parser_md.add_argument("--steps", type=int, default=10000)
-    parser_md.add_argument("--timestep", type=float, default=0.001)
-    parser_md.add_argument("--ensemble", choices=["nvt", "npt"], default="nvt")
-    parser_md.add_argument("--pressure", type=float, default=0.0)
-    parser_md.add_argument("--tdamp", type=float, default=0.1)
-    parser_md.add_argument("--pdamp", type=float, default=1.0)
-    parser_md.add_argument("--dump-interval", type=int, default=100)
-    parser_md.add_argument("--spin", action="store_true")
-    parser_md.add_argument("--spin-alpha", type=float, default=0.01)
-    parser_md.add_argument("--spin-seed", type=int, default=12345)
-    parser_md.add_argument("--midpoint-iter", type=int, default=3)
-    parser_md.add_argument(
-        "--inference-backend", choices=["auto", "cpu", "cuda"], default="auto"
-    )
-    parser_md.add_argument("--lmp", default="lmp")
-    parser_md.add_argument("--mpiexec", default="mpirun")
-    parser_md.add_argument("--mpi-ranks", type=int, default=1)
-    parser_md.add_argument("--plugin-path", default=None)
-
-
 def build_doctor(subparsers):
     parser = subparsers.add_parser("doctor", help="Check selected runtime capabilities.")
     parser.set_defaults(func=run_doctor)
@@ -1052,15 +572,6 @@ def build_doctor(subparsers):
         help="Check every execution target in a project YAML.",
     )
 
-
-def build_migrate(subparsers):
-    parser = subparsers.add_parser("migrate", help="Migrate a legacy job config to schema v3.")
-    parser.set_defaults(func=run_migrate)
-    parser.add_argument("config_path")
-    parser.add_argument("--output", "-o", default="job.v2.yaml")
-    parser.add_argument("--force", action="store_true")
-
-
 def build_smoke(subparsers):
     parser = subparsers.add_parser(
         "smoke",
@@ -1077,189 +588,9 @@ def build_smoke(subparsers):
         "--iterations",
         type=int,
         default=0,
-        help="Also run a resumable progressive Toy campaign for this many generations.",
+        help="Also run a resumable progressive Toy workflow for this many generations.",
     )
-    parser.add_argument(
-        "--workflow-config",
-        default=None,
-        help="Run the real configured training/MD workflow with Toy Teacher labeling.",
-    )
-    parser.add_argument("--training-steps", type=int, default=2)
-    parser.add_argument("--md-steps", type=int, default=2)
     parser.add_argument("--force", action="store_true")
-
-
-def build_iteration_stage(subparsers):
-    parser = subparsers.add_parser(
-        "iteration-stage",
-        help="Run the next hash-checked iteration stage (for split Slurm jobs).",
-    )
-    subparsers._choices_actions.pop()
-    parser.set_defaults(func=run_iteration_stage_command)
-    _add_iteration_arguments(parser)
-    parser.add_argument(
-        "--stage",
-        choices=[
-            "train",
-            "explore",
-            "select",
-            "label",
-            "diagnose",
-            "merge",
-            "retrain",
-            "evaluate",
-        ],
-        help="Expected stage; omit to execute the ledger's next stage.",
-    )
-
-
-def _add_iteration_arguments(parser):
-    parser.add_argument("config_path", help="Schema-v2 workflow configuration.")
-    parser.add_argument("--plan", required=True, help="GenerationPlan JSON file.")
-    parser.add_argument(
-        "--initial-training", required=True, help="Initial labeled extxyz dataset."
-    )
-    parser.add_argument("--campaign-dir", required=True)
-    parser.add_argument("--campaign-id", required=True)
-
-
-def build_iteration_resource(subparsers):
-    parser = subparsers.add_parser(
-        "iteration-resource",
-        help="Resume every pending stage assigned to one Slurm resource class.",
-    )
-    subparsers._choices_actions.pop()
-    parser.set_defaults(func=run_iteration_resource_command)
-    _add_iteration_arguments(parser)
-    parser.add_argument(
-        "--resource", choices=["training", "cpu", "dft"], required=True
-    )
-
-
-def build_project_commands(subparsers):
-    run_parser = subparsers.add_parser(
-        "run",
-        help="Start a project file or continue an existing campaign directory.",
-    )
-    run_parser.set_defaults(func=run_project_command)
-    run_parser.add_argument("project", help="Project YAML or campaign directory.")
-    run_parser.add_argument(
-        "--initial-training",
-        help="Initial labeled extxyz dataset; overrides training.initial_path.",
-    )
-    run_parser.add_argument("--output", help="New campaign project directory.")
-    run_parser.add_argument("--campaign-id", default=None)
-    run_parser.add_argument(
-        "--prepare-only",
-        action="store_true",
-        help="Create the project layout and plans without starting the controller.",
-    )
-    run_parser.add_argument(
-        "--foreground",
-        action="store_true",
-        help="Keep the persistent controller attached to this terminal.",
-    )
-    run_parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=None,
-        help="Override execution.poll_interval for this controller.",
-    )
-
-    status_parser = subparsers.add_parser(
-        "status", help="Show one campaign's scientific and execution status."
-    )
-    status_parser.set_defaults(func=run_status_command)
-    status_parser.add_argument("project", help="Campaign project directory.")
-    status_parser.add_argument("--json", action="store_true")
-    status_parser.add_argument(
-        "--jobs", action="store_true", help="Show the complete stage execution table."
-    )
-
-    resume_parser = subparsers.add_parser(
-        "resume", help="Continue safely from the campaign ledger breakpoint."
-    )
-    resume_parser.set_defaults(func=run_resume_command)
-    resume_parser.add_argument("project", help="Campaign project directory.")
-
-    extend_parser = subparsers.add_parser(
-        "extend", help="Append generations after a campaign passed evaluation."
-    )
-    extend_parser.set_defaults(func=run_extend_command)
-    extend_parser.add_argument("project", help="Campaign project directory.")
-    extend_parser.add_argument("generations", type=int, help="New total generation count.")
-
-    stop_parser = subparsers.add_parser(
-        "stop", help="Stop the controller without cancelling remote work."
-    )
-    stop_parser.set_defaults(func=run_stop_command)
-    stop_parser.add_argument("project", help="Campaign project directory.")
-
-    controller_parser = subparsers.add_parser(
-        "controller", help=argparse.SUPPRESS
-    )
-    subparsers._choices_actions.pop()
-    controller_parser.set_defaults(func=run_controller_command)
-    controller_parser.add_argument("project")
-    controller_parser.add_argument("--poll-interval", type=float, default=None)
-
-    worker_parser = subparsers.add_parser(
-        "stage-worker", help=argparse.SUPPRESS
-    )
-    subparsers._choices_actions.pop()
-    worker_parser.set_defaults(func=run_stage_worker_command)
-    worker_parser.add_argument("bundle")
-
-
-
-def build_gpumd(subparsers):
-    parser_gpumd = subparsers.add_parser(
-        "gpumd",
-        help="Compatibility command; use 'md --backend gpumd' (removed next release).",
-    )
-    parser_gpumd.set_defaults(func=run_gpumd)
-
-    parser_gpumd.add_argument("model_path",
-                             type=str,
-
-                             help="The required structure path or structure file only supports files in xyz and vasp formats.")
-    parser_gpumd.add_argument("--directory", "-dir",
-
-                             type=str,
-                             help="Set the GPUMD calculation path, default is ./cache/gpumd.",
-                             default="./cache/gpumd"
-                             )
-    parser_gpumd.add_argument("--in","-in",dest="run_in_path", type=str,
-                              help="The filename for the command _template file, default is ./run.in.", default="./run.in")
-
-    parser_gpumd.add_argument("--nep", "-nep",
-                            dest="nep_txt_path",
-                             type=str,
-                             help="Potential function path, default is ./nep.txt.",
-                             default="./nep.txt"
-                             )
-    parser_gpumd.add_argument("--time", "-t", type=int, help="Molecular dynamics time, unit ps, default 10 ps.", default=10)
-    parser_gpumd.add_argument("--temperature", "-T", type=int, help="Molecular dynamics temperature in Kelvin,multiple integers can be input. default is 300 K", nargs="*", default=[300])
-
-    parser_gpumd.add_argument("--out", "-o",
-                               dest="out_file_path",
-
-                               type=str,
-                               default="./trajectory.xyz",
-                               help="Output path for structures."
-                               )
-
-def build_train(subparsers):
-    parser_train = subparsers.add_parser(
-        "train",
-        help="Compatibility command; use 'run' (removed next release).",
-    )
-    parser_train.set_defaults(func=train_nep)
-
-    parser_train.add_argument("config_path",
-                             type=str,
-
-                             help="The required structure path or structure file only supports files in XYZ and VASP formats.")
 
 
 def build_select(subparsers):
@@ -1315,76 +646,488 @@ def build_select(subparsers):
     group.add_argument("--n_max", "-n", type=int, help="The number of radial basis functions,default 8", default=8)
     group.add_argument("--l_max", "-l", type=int, help="The maximum degree of spherical harmonics,default 6", default=6)
 
+def _print_manual_status(value):
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _manual_project(project):
+    if not project:
+        return {}, Path.cwd()
+    from NepTrain.core.config import load_config
+
+    path = Path(project).expanduser().resolve()
+    config, _ = load_config(path)
+    return config, path.parent
+
+
+def _project_path(base, value):
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else (base / path).resolve())
+
+
+def run_manual_train_command(args):
+    from NepTrain.core.manual import (
+        prepare_training,
+        submit_operation,
+        target_from_project,
+    )
+
+    project, base = _manual_project(args.project)
+    settings = project.get("training", {})
+    target = target_from_project(args.project, args.target, route="training")
+    operation = prepare_training(
+        args.input,
+        backend=args.backend or settings.get("backend", "torchnep"),
+        config_file=args.config
+        or _project_path(base, settings.get("config_path"))
+        or "./nep.in",
+        output=args.output,
+        workdir=args.workdir,
+        target=target,
+        test_file=args.test or _project_path(base, settings.get("test_path")),
+        restart_file=args.restart,
+        device=args.device or settings.get("device", "cuda"),
+        torch_backend=args.torch_backend
+        or settings.get("torch_backend", "auto"),
+        precision=args.precision or settings.get("precision", "float32"),
+        use_compile=(
+            args.use_compile
+            if args.use_compile is not None
+            else bool(settings.get("use_compile", False))
+        ),
+        seed=args.seed if args.seed is not None else int(settings.get("seed", 20260723)),
+        force=args.force,
+    )
+    _print_manual_status(
+        submit_operation(
+            operation, wait=args.wait, poll_interval=args.poll_interval
+        )
+    )
+
+
+def run_manual_md_command(args):
+    from NepTrain.core.manual import (
+        prepare_md,
+        submit_operation,
+        target_from_project,
+    )
+
+    project, base = _manual_project(args.project)
+    settings = project.get("md", {})
+    target = target_from_project(args.project, args.target, route="sampling")
+    operation = prepare_md(
+        args.input,
+        backend=args.backend or settings.get("backend", "lammps"),
+        model_file=args.model,
+        temperatures=args.temperature or settings.get("temperatures", [300.0]),
+        output=args.output,
+        workdir=args.workdir,
+        target=target,
+        steps=args.steps
+        if args.steps is not None
+        else int(settings.get("initial_steps", 10000)),
+        pressure=args.pressure
+        if args.pressure is not None
+        else float(settings.get("pressure", 0.0)),
+        timestep=args.timestep
+        if args.timestep is not None
+        else float(settings.get("timestep", 0.001)),
+        tdamp=args.tdamp
+        if args.tdamp is not None
+        else float(settings.get("tdamp", 0.1)),
+        pdamp=args.pdamp
+        if args.pdamp is not None
+        else float(settings.get("pdamp", 1.0)),
+        ensemble=args.ensemble or settings.get("ensemble", "nvt"),
+        dump_interval=args.dump_interval
+        if args.dump_interval is not None
+        else int(settings.get("dump_interval", 100)),
+        template_path=args.template
+        or _project_path(base, settings.get("template_path")),
+        spin=args.spin
+        if args.spin is not None
+        else bool(settings.get("spin", False)),
+        spin_temperature=args.spin_temperature
+        if args.spin_temperature is not None
+        else settings.get("spin_temperature"),
+        spin_alpha=args.spin_alpha
+        if args.spin_alpha is not None
+        else float(settings.get("spin_alpha", 0.01)),
+        spin_seed=args.spin_seed
+        if args.spin_seed is not None
+        else int(settings.get("spin_seed", 12345)),
+        midpoint_iter=args.midpoint_iter
+        if args.midpoint_iter is not None
+        else int(settings.get("midpoint_iter", 3)),
+        inference_backend=args.inference_backend
+        or settings.get("inference_backend", "auto"),
+        lmp=args.lmp or settings.get("lmp", "lmp"),
+        mpiexec=args.mpiexec or settings.get("mpiexec", "mpirun"),
+        mpi_ranks=args.mpi_ranks
+        if args.mpi_ranks is not None
+        else int(settings.get("mpi_ranks", 1)),
+        plugin_path=args.plugin_path
+        or _project_path(base, settings.get("plugin_path")),
+        pre_failure_frames=(
+            args.pre_failure_frames
+            if args.pre_failure_frames is not None
+            else int(settings.get("pre_failure_frames", 2))
+        ),
+        bad_tail_frames=(
+            args.bad_tail_frames
+            if args.bad_tail_frames is not None
+            else int(settings.get("bad_tail_frames", 1))
+        ),
+        health=dict(settings.get("health") or {}),
+        max_concurrent=args.max_concurrent,
+        force=args.force,
+    )
+    _print_manual_status(
+        submit_operation(
+            operation, wait=args.wait, poll_interval=args.poll_interval
+        )
+    )
+
+
+def run_manual_dft_command(args):
+    from NepTrain.core.manual import (
+        prepare_dft,
+        submit_operation,
+        target_from_project,
+    )
+
+    project, base = _manual_project(args.project)
+    settings = project.get("dft", {})
+    target = target_from_project(args.project, args.target, route="labeling")
+    use_k_stype = settings.get("use_k_stype", "kspacing")
+    kspacing = (
+        args.kspacing
+        if args.kspacing is not None
+        else settings.get("kspacing")
+    )
+    operation = prepare_dft(
+        args.input,
+        backend=args.backend or settings.get("backend", "vasp"),
+        output=args.output,
+        workdir=args.workdir,
+        target=target,
+        input_file=args.dft_input
+        or _project_path(base, settings.get("input_path")),
+        resource_dir=args.resources
+        or _project_path(base, settings.get("resource_path")),
+        n_cpu=args.cpus,
+        use_gamma=(
+            args.gamma
+            if args.gamma is not None
+            else bool(settings.get("kpoints_use_gamma", False))
+        ),
+        kpoint_mode=(
+            "kspacing" if args.kspacing is not None else use_k_stype
+        ),
+        kspacing=kspacing,
+        ka=args.ka or settings.get("kpoints", [1, 1, 1]),
+        structures_per_job=args.structures_per_job,
+        max_concurrent=args.max_concurrent,
+        teacher_profile=args.teacher_profile
+        or settings.get("teacher_profile", "ordinary"),
+        force=args.force,
+    )
+    _print_manual_status(
+        submit_operation(
+            operation, wait=args.wait, poll_interval=args.poll_interval
+        )
+    )
+
+
+def run_task_command(args):
+    from NepTrain.core.manual import (
+        cancel_operation,
+        load_operation,
+        operation_logs,
+        refresh_operation,
+        retry_failed,
+        wait_operation,
+    )
+
+    operation = load_operation(args.run)
+    if args.task_action == "status":
+        value = refresh_operation(operation)
+    elif args.task_action == "wait":
+        value = wait_operation(operation, poll_interval=args.poll_interval)
+    elif args.task_action == "retry":
+        value = retry_failed(operation)
+    elif args.task_action == "cancel":
+        value = cancel_operation(operation)
+    elif args.task_action == "logs":
+        value = {"run_directory": str(operation.root), "logs": operation_logs(operation)}
+    else:  # pragma: no cover - argparse owns this invariant
+        raise ValueError(args.task_action)
+    _print_manual_status(value)
+
+
+def run_manual_worker_command(args):
+    from NepTrain.core.manual import run_manual_worker
+
+    return run_manual_worker(args.run, args.index)
+
+
+def _add_execution_options(parser):
+    parser.add_argument(
+        "--project",
+        help="Schema-v4 project providing reusable execution targets.",
+    )
+    parser.add_argument("--target", help="Execution target name from project.yaml.")
+    parser.add_argument("--workdir", help="Durable run directory.")
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for submitted Slurm work and publish the final result.",
+    )
+    parser.add_argument("--poll-interval", type=float, default=10.0)
+
+
+def _parse_ka(value):
+    values = [item.strip() for item in str(value).split(",")]
+    if len(values) == 1:
+        values *= 3
+    if len(values) != 3 or any(not item.isdigit() for item in values):
+        raise argparse.ArgumentTypeError("--ka must be one integer or x,y,z")
+    return [int(item) for item in values]
+
+
+def build_manual_train(subparsers):
+    parser = subparsers.add_parser(
+        "train", help="Train one NEP model locally or on a configured target."
+    )
+    parser.set_defaults(func=run_manual_train_command)
+    parser.add_argument("input", help="Labeled training extxyz.")
+    parser.add_argument("--backend", choices=["gpumd", "torchnep"])
+    parser.add_argument("--config")
+    parser.add_argument("--test")
+    parser.add_argument("--restart")
+    parser.add_argument("--device")
+    parser.add_argument("--torch-backend", choices=["auto", "loop", "bmm"])
+    parser.add_argument("--precision", choices=["float32", "float64"])
+    parser.add_argument(
+        "--compile",
+        dest="use_compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--output", "-o", default="./nep.txt")
+    parser.add_argument("--force", action="store_true")
+    _add_execution_options(parser)
+
+
+def build_manual_md(subparsers):
+    parser = subparsers.add_parser(
+        "md", help="Run GPUMD or LAMMPS over structures and temperatures."
+    )
+    parser.set_defaults(func=run_manual_md_command)
+    parser.add_argument("input", help="Structure file, extxyz, or directory.")
+    parser.add_argument("--backend", choices=["gpumd", "lammps"])
+    parser.add_argument("--model", default="./nep.txt")
+    parser.add_argument("--temperature", type=float, nargs="+")
+    parser.add_argument("--pressure", type=float)
+    parser.add_argument("--steps", type=int)
+    parser.add_argument("--timestep", type=float)
+    parser.add_argument("--tdamp", type=float)
+    parser.add_argument("--pdamp", type=float)
+    parser.add_argument("--ensemble", choices=["nvt", "npt"])
+    parser.add_argument("--dump-interval", type=int)
+    parser.add_argument("--template")
+    parser.add_argument(
+        "--spin", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument("--spin-temperature", type=float)
+    parser.add_argument("--spin-alpha", type=float)
+    parser.add_argument("--spin-seed", type=int)
+    parser.add_argument("--midpoint-iter", type=int)
+    parser.add_argument("--inference-backend", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--lmp")
+    parser.add_argument("--mpiexec")
+    parser.add_argument("--mpi-ranks", type=int)
+    parser.add_argument("--plugin-path")
+    parser.add_argument("--pre-failure-frames", type=int)
+    parser.add_argument("--bad-tail-frames", type=int)
+    parser.add_argument("--max-concurrent", type=int, default=20)
+    parser.add_argument("--output", "-o", default="./trajectory.xyz")
+    parser.add_argument("--force", action="store_true")
+    _add_execution_options(parser)
+
+
+def build_manual_dft(subparsers):
+    parser = subparsers.add_parser(
+        "dft", help="Label structures with VASP, ABACUS, or the development teacher."
+    )
+    parser.set_defaults(func=run_manual_dft_command)
+    parser.add_argument("input", help="Structure file, extxyz, or directory.")
+    parser.add_argument("--backend", choices=["vasp", "abacus", "toy"])
+    parser.add_argument("--teacher-profile", choices=["ordinary", "spin"])
+    parser.add_argument("--input-file", dest="dft_input")
+    parser.add_argument("--resources")
+    parser.add_argument("--cpus", type=int)
+    parser.add_argument(
+        "--gamma", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument("--kspacing", type=float)
+    parser.add_argument("--ka", type=_parse_ka)
+    parser.add_argument("--structures-per-job", type=int, default=1)
+    parser.add_argument("--max-concurrent", type=int, default=20)
+    parser.add_argument("--output", "-o", default="./labeled.xyz")
+    parser.add_argument("--force", action="store_true")
+    _add_execution_options(parser)
+
+
+def build_task_commands(subparsers):
+    parser = subparsers.add_parser(
+        "task", help="Inspect and control a detached manual step."
+    )
+    actions = parser.add_subparsers(dest="task_action", required=True)
+    action_help = {
+        "status": "Refresh scheduler state and collect completed results.",
+        "logs": "List scheduler log files for the run.",
+        "retry": "Resubmit only failed Slurm array elements.",
+        "cancel": "Cancel the active Slurm job for the run.",
+    }
+    for name, help_text in action_help.items():
+        command = actions.add_parser(name, help=help_text)
+        command.set_defaults(func=run_task_command)
+        command.add_argument("run", help="Manual run directory.")
+    wait = actions.add_parser(
+        "wait", help="Wait until the run completes, fails, or is cancelled."
+    )
+    wait.set_defaults(func=run_task_command)
+    wait.add_argument("run", help="Manual run directory.")
+    wait.add_argument("--poll-interval", type=float, default=10.0)
+
+
+def build_workflow_commands(subparsers):
+    parser = subparsers.add_parser(
+        "workflow", help="Prepare and control an automated active-learning workflow."
+    )
+    actions = parser.add_subparsers(dest="workflow_action", required=True)
+    init = actions.add_parser("init", help="Create a strict schema-v4 project.")
+    init.set_defaults(func=init_template)
+    init.add_argument("--profile", choices=["local", "slurm"], default="slurm")
+    init.add_argument("--directory", default=".")
+    init.add_argument("--force", action="store_true")
+
+    run = actions.add_parser(
+        "run", help="Prepare a workflow and start its persistent controller."
+    )
+    run.set_defaults(func=run_project_command)
+    run.add_argument("project", help="Project YAML or workflow directory.")
+    run.add_argument("--initial-training")
+    run.add_argument("--output")
+    run.add_argument("--workflow-id")
+    run.add_argument("--prepare-only", action="store_true")
+    run.add_argument("--foreground", action="store_true")
+    run.add_argument("--poll-interval", type=float)
+
+    status = actions.add_parser(
+        "status", help="Show scientific progress and current execution state."
+    )
+    status.set_defaults(func=run_status_command)
+    status.add_argument("project")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--jobs", action="store_true")
+
+    resume = actions.add_parser(
+        "resume", help="Restart a stopped or failed workflow controller."
+    )
+    resume.set_defaults(func=run_resume_command)
+    resume.add_argument("project")
+
+    extend = actions.add_parser(
+        "extend", help="Append generations after the accepted workflow prefix."
+    )
+    extend.set_defaults(func=run_extend_command)
+    extend.add_argument("project")
+    extend.add_argument("generations", type=int)
+
+    stop = actions.add_parser(
+        "stop", help="Stop the controller without cancelling compute jobs."
+    )
+    stop.set_defaults(func=run_stop_command)
+    stop.add_argument("project")
+    stop.add_argument(
+        "--cancel-jobs",
+        action="store_true",
+        help="Also cancel the workflow's current process or Slurm job.",
+    )
+
+
+def build_internal_commands(subparsers):
+    controller = subparsers.add_parser("controller", help=argparse.SUPPRESS)
+    subparsers._choices_actions.pop()
+    controller.set_defaults(func=run_controller_command)
+    controller.add_argument("project")
+    controller.add_argument("--poll-interval", type=float)
+
+    worker = subparsers.add_parser("stage-worker", help=argparse.SUPPRESS)
+    subparsers._choices_actions.pop()
+    worker.set_defaults(func=run_stage_worker_command)
+    worker.add_argument("bundle")
+
+    manual = subparsers.add_parser("manual-worker", help=argparse.SUPPRESS)
+    subparsers._choices_actions.pop()
+    manual.set_defaults(func=run_manual_worker_command)
+    manual.add_argument("run")
+    manual.add_argument("index", type=int)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="""
-        NepTrain is a tool for automatically training NEP potential functions""",
-
+        prog="neptrain",
+        description=(
+            "Run individual NEP training, MD, DFT and sampling steps, or compose "
+            "the same steps into an automated workflow."
+        ),
     )
-    parser.add_argument(
-        "-v", "--version", action="version", version=__version__
-    )
-
-
-
+    parser.add_argument("-v", "--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(
-        metavar="{init,perturb,select,dft,vasp,nep,gpumd,md,train,doctor,migrate,smoke,run,status,resume,extend,stop}"
+        dest="command",
+        required=True,
+        metavar="{train,md,dft,select,perturb,workflow,task,doctor,smoke}",
     )
-
-
-    build_init(subparsers)
-
-    build_perturb(subparsers)
-
+    build_manual_train(subparsers)
+    build_manual_md(subparsers)
+    build_manual_dft(subparsers)
     build_select(subparsers)
-    build_dft(subparsers)
-
-    build_vasp(subparsers)
-
-    build_nep(subparsers)
-    build_gpumd(subparsers)
-    build_md(subparsers)
-    build_train(subparsers)
+    build_perturb(subparsers)
+    build_workflow_commands(subparsers)
+    build_task_commands(subparsers)
     build_doctor(subparsers)
-    build_migrate(subparsers)
     build_smoke(subparsers)
-    build_iteration_stage(subparsers)
-    build_iteration_resource(subparsers)
-    build_project_commands(subparsers)
-
-
-
+    build_internal_commands(subparsers)
     try:
         import argcomplete
 
         argcomplete.autocomplete(parser)
     except ImportError:
-
         pass
-
-
     args = parser.parse_args()
-
-    try:
-        _ = args.func
-    except AttributeError as exc:
-        parser.print_help()
-        raise SystemExit("Please specify a command.") from exc
     try:
         return args.func(args)
     except Exception as error:
+        from NepTrain.core.workflow import WorkflowError
         from NepTrain.core.config import ConfigError
-        from NepTrain.core.iteration import IterationError
-        from NepTrain.core.campaign import CampaignError
         from NepTrain.core.controller import ControllerError
         from NepTrain.core.execution import ExecutionError
+        from NepTrain.core.iteration import IterationError
+        from NepTrain.core.manual import ManualTaskError
 
         lightweight_errors = (
+            WorkflowError,
             ConfigError,
-            IterationError,
-            CampaignError,
             ControllerError,
             ExecutionError,
+            IterationError,
+            ManualTaskError,
         )
         scientific_error_names = {
             "LabelingError",

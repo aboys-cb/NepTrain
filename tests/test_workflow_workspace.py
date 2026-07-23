@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from NepTrain.core.campaign_workspace import CampaignWorkspace
+from NepTrain.core.workflow_workspace import WorkflowWorkspace
 from NepTrain.core.iteration import (
     GenerationController,
     GenerationPlan,
@@ -43,7 +43,7 @@ class _PublishingAdapter:
 
 
 def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: Path):
-    workspace = CampaignWorkspace.create(tmp_path / "al-nonmag")
+    workspace = WorkflowWorkspace.create(tmp_path / "al-nonmag")
     controller = GenerationController(workspace.root, "al-nonmag")
     plan = GenerationPlan(1, 7, 4, 2, 10, (300.0,))
 
@@ -62,7 +62,7 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
 
 
 def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):
-    workspace = CampaignWorkspace.create(tmp_path / "broken")
+    workspace = WorkflowWorkspace.create(tmp_path / "broken")
     controller = GenerationController(workspace.root, "broken")
     plan = GenerationPlan(1, 7, 4, 2, 10, (300.0,))
 
@@ -74,3 +74,12 @@ def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):
     assert "complete" not in generation
     assert "evaluate" not in generation["stages"]
     assert not (workspace.generation_dir(1) / "summary.json").exists()
+
+
+def test_workspace_rejects_legacy_layout(tmp_path: Path):
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "workflow-manifest.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="workflow does not exist"):
+        WorkflowWorkspace.locate(legacy)

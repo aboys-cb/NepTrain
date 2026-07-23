@@ -1,4 +1,4 @@
-"""Portable stage tasks and execution adapters for persistent campaigns."""
+"""Portable stage tasks and execution adapters for persistent workflows."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import time
 import traceback
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -61,7 +62,7 @@ _STAGE_CONFIG_PATH_FIELDS = {
     "train": ("training.config_path", "training.test_path"),
     "explore": ("md.structures", "md.template_path", "md.plugin_path"),
     "select": (),
-    "label": ("dft.input_path", "dft.incar_path", "dft.resource_path"),
+    "label": ("dft.input_path", "dft.resource_path"),
     "diagnose": (),
     "merge": (),
     "retrain": ("training.config_path", "training.test_path"),
@@ -197,7 +198,7 @@ class ExecutionTarget:
     executor: str
     host: str | None = None
     work_root: str | None = None
-    command: str = "NepTrain"
+    command: str = "neptrain"
     setup_script: str | None = None
     partition: str | None = None
     qos: str | None = None
@@ -217,7 +218,7 @@ class ExecutionTarget:
             raise ExecutionError(
                 f"execution target {name}.executor must be process or slurm"
             )
-        command = str(value.get("command", "NepTrain"))
+        command = str(value.get("command", "neptrain"))
         command_tokens = shlex.split(command)
         if not command_tokens or "=" in command_tokens[0]:
             raise ExecutionError(
@@ -322,7 +323,7 @@ class ExecutionTarget:
 @dataclass(frozen=True)
 class StageTask:
     task_id: str
-    campaign_id: str
+    workflow_id: str
     generation: int
     stage: str
     target: str
@@ -365,11 +366,11 @@ class ExecutionStatus:
 
     @property
     def terminal(self) -> bool:
-        return self.state in {"completed", "failed"}
+        return self.state in {"completed", "failed", "cancelled"}
 
 
 class StageExecutor(Protocol):
-    """Small execution seam used by the campaign controller."""
+    """Small execution seam used by the workflow controller."""
 
     def launch(self, task: StageTask) -> ExecutionHandle: ...
 
@@ -377,12 +378,14 @@ class StageExecutor(Protocol):
 
     def collect(self, handle: ExecutionHandle) -> Path: ...
 
+    def cancel(self, handle: ExecutionHandle) -> ExecutionStatus: ...
+
 
 def build_stage_task(
     tasks_dir: Path,
     *,
-    campaign_root: Path,
-    campaign_id: str,
+    workflow_root: Path,
+    workflow_id: str,
     generation: int,
     stage: str,
     attempt: int,
@@ -398,7 +401,7 @@ def build_stage_task(
         raise ExecutionError(f"unsupported stage task: {stage}")
 
     identity = {
-        "campaign_id": campaign_id,
+        "workflow_id": workflow_id,
         "generation": generation,
         "stage": stage,
         "attempt": attempt,
@@ -416,7 +419,7 @@ def build_stage_task(
         existing = json.loads(descriptor.read_text(encoding="utf-8"))
         if existing.get("identity") != identity:
             raise ExecutionError(f"task id collision at {bundle}")
-        return StageTask(task_id, campaign_id, generation, stage, target.name, bundle)
+        return StageTask(task_id, workflow_id, generation, stage, target.name, bundle)
 
     temporary = tasks_dir / f".{task_id}.building"
     if temporary.exists():
@@ -443,7 +446,7 @@ def build_stage_task(
             continue
         if dotted in target.overrides:
             continue
-        source = _resolve_path(value, campaign_root)
+        source = _resolve_path(value, workflow_root)
         suffix = source.suffix if source.is_file() else ""
         destination = inputs / "config" / dotted.replace(".", "/")
         if suffix:
@@ -513,7 +516,7 @@ def build_stage_task(
         {"protocol": "neptrain.stage-task.v1", "files": records},
     )
     temporary.replace(bundle)
-    return StageTask(task_id, campaign_id, generation, stage, target.name, bundle)
+    return StageTask(task_id, workflow_id, generation, stage, target.name, bundle)
 
 
 def _verify_task_bundle(bundle: Path) -> dict[str, Any]:
@@ -613,7 +616,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             result = {
                 "protocol": "neptrain.stage-result.v1",
                 "task_id": descriptor["task_id"],
-                "campaign_id": descriptor["identity"]["campaign_id"],
+                "workflow_id": descriptor["identity"]["workflow_id"],
                 "generation": descriptor["identity"]["generation"],
                 "stage": descriptor["identity"]["stage"],
                 "plan_sha256": descriptor["identity"]["plan_sha256"],
@@ -725,22 +728,22 @@ exec "$@"
         if not self.remote:
             return str(task.bundle)
         root = str(self.target.work_root)
-        remote_bundle = f"{root.rstrip('/')}/{task.campaign_id}/tasks/{task.task_id}"
-        remote_archive = f"{root.rstrip('/')}/{task.campaign_id}/incoming/{task.task_id}.tar.gz"
+        remote_bundle = f"{root.rstrip('/')}/{task.workflow_id}/tasks/{task.task_id}"
+        remote_archive = f"{root.rstrip('/')}/{task.workflow_id}/incoming/{task.task_id}.tar.gz"
         setup = """set -eo pipefail
 root=$1
-campaign=$2
+workflow=$2
 task=$3
 case "$root" in
   '~/'*) root="$HOME/${root:2}" ;;
   /*) ;;
   *) exit 2 ;;
 esac
-mkdir -p "$root/$campaign/incoming" "$root/$campaign/tasks"
-if [ -f "$root/$campaign/tasks/$task/task.json" ]; then exit 0; fi
+mkdir -p "$root/$workflow/incoming" "$root/$workflow/tasks"
+if [ -f "$root/$workflow/tasks/$task/task.json" ]; then exit 0; fi
 """
         completed = self.runner(
-            ["ssh", str(self.target.host), "bash", "-s", "--", root, task.campaign_id, task.task_id],
+            ["ssh", str(self.target.host), "bash", "-s", "--", root, task.workflow_id, task.task_id],
             input=setup,
             capture_output=True,
             text=True,
@@ -771,20 +774,20 @@ if [ -f "$root/$campaign/tasks/$task/task.json" ]; then exit 0; fi
                 raise ExecutionError((upload.stderr or upload.stdout).strip())
             extract = """set -eo pipefail
 root=$1
-campaign=$2
+workflow=$2
 task=$3
 expected=$4
 case "$root" in
   '~/'*) root="$HOME/${root:2}" ;;
 esac
-archive="$root/$campaign/incoming/$task.tar.gz"
+archive="$root/$workflow/incoming/$task.tar.gz"
 actual=$(sha256sum "$archive" | cut -d' ' -f1)
 [ "$actual" = "$expected" ]
-temporary="$root/$campaign/tasks/.$task.extracting"
+temporary="$root/$workflow/tasks/.$task.extracting"
 rm -rf "$temporary"
 mkdir -p "$temporary"
 tar -xzf "$archive" -C "$temporary" --strip-components=1
-mv "$temporary" "$root/$campaign/tasks/$task"
+mv "$temporary" "$root/$workflow/tasks/$task"
 rm -f "$archive"
 """
             completed = self.runner(
@@ -795,7 +798,7 @@ rm -f "$archive"
                     "-s",
                     "--",
                     root,
-                    task.campaign_id,
+                    task.workflow_id,
                     task.task_id,
                     digest,
                 ],
@@ -869,6 +872,57 @@ def _pid_matches_bundle(pid: int, bundle: str) -> bool:
         check=False,
     )
     return completed.returncode == 0 and bundle in completed.stdout
+
+
+def _wait_for_process_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                return True
+        except ChildProcessError:
+            pass
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return True
+        if completed.stdout.strip().startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _local_execution_status(path: Path) -> ExecutionStatus | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    state = value.get("state")
+    if state == "COMPLETED":
+        return ExecutionStatus("completed")
+    if state == "FAILED":
+        return ExecutionStatus(
+            "failed", str(value.get("error", "worker failed"))
+        )
+    return None
+
+
+def _wait_for_local_execution_status(
+    path: Path, timeout: float = 0.25
+) -> ExecutionStatus | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        status = _local_execution_status(path)
+        if status is not None or time.monotonic() >= deadline:
+            return status
+        time.sleep(0.02)
 
 
 class ProcessExecutor:
@@ -969,13 +1023,9 @@ cat worker.pid
     def inspect(self, handle: ExecutionHandle) -> ExecutionStatus:
         if self.target.host is None:
             path = Path(handle.local_bundle) / "execution.json"
-            if path.is_file():
-                value = json.loads(path.read_text(encoding="utf-8"))
-                state = value.get("state")
-                if state == "COMPLETED":
-                    return ExecutionStatus("completed")
-                if state == "FAILED":
-                    return ExecutionStatus("failed", str(value.get("error", "worker failed")))
+            file_status = _local_execution_status(path)
+            if file_status is not None:
+                return file_status
             try:
                 pid = int(handle.execution_id)
                 owned_child = True
@@ -985,24 +1035,25 @@ cat worker.pid
                     owned_child = False
                     waited = 0
                 if waited == pid:
-                    if path.is_file():
-                        value = json.loads(path.read_text(encoding="utf-8"))
-                        if value.get("state") == "COMPLETED":
-                            return ExecutionStatus("completed")
-                        if value.get("state") == "FAILED":
-                            return ExecutionStatus(
-                                "failed", str(value.get("error", "worker failed"))
-                            )
+                    file_status = _wait_for_local_execution_status(path)
+                    if file_status is not None:
+                        return file_status
                     return ExecutionStatus("failed", "worker exited without a result")
                 os.kill(pid, 0)
                 if owned_child:
                     return ExecutionStatus("running")
                 if not _pid_matches_bundle(pid, handle.local_bundle):
+                    file_status = _wait_for_local_execution_status(path)
+                    if file_status is not None:
+                        return file_status
                     return ExecutionStatus(
                         "failed", "worker pid no longer belongs to this task"
                     )
                 return ExecutionStatus("running")
             except (OSError, ValueError):
+                file_status = _wait_for_local_execution_status(path)
+                if file_status is not None:
+                    return file_status
                 return ExecutionStatus("failed", "worker exited without a result")
         script = """set -eo pipefail
 bundle=$1
@@ -1033,6 +1084,90 @@ fi
 
     def collect(self, handle: ExecutionHandle) -> Path:
         return self.transport.collect(handle)
+
+    def cancel(self, handle: ExecutionHandle) -> ExecutionStatus:
+        status = self.inspect(handle)
+        if status.terminal:
+            return status
+        try:
+            pid = int(handle.execution_id)
+        except ValueError as error:
+            raise ExecutionError(
+                f"process execution has an invalid pid: {handle.execution_id}"
+            ) from error
+        if self.target.host is None:
+            if not _pid_matches_bundle(pid, handle.local_bundle):
+                raise ExecutionError(
+                    "refusing to cancel a process that no longer belongs to "
+                    "this workflow task"
+                )
+            try:
+                process_group = os.getpgid(pid)
+                if process_group != pid:
+                    raise ExecutionError(
+                        "refusing to cancel a process outside its own process group"
+                    )
+                os.killpg(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                return ExecutionStatus("failed", "process already exited")
+            if not _wait_for_process_exit(pid, 3.0):
+                if not _pid_matches_bundle(pid, handle.local_bundle):
+                    raise ExecutionError(
+                        "process identity changed while waiting for cancellation"
+                    )
+                os.killpg(process_group, signal.SIGKILL)
+                if not _wait_for_process_exit(pid, 2.0):
+                    raise ExecutionError(
+                        f"process group {pid} did not exit after SIGKILL"
+                    )
+            return ExecutionStatus("cancelled", f"sent SIGTERM to process group {pid}")
+        bundle = str(handle.remote_bundle)
+        script = """set -eo pipefail
+bundle=$1
+pid=$2
+kill -0 "$pid" 2>/dev/null || exit 3
+ps -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
+pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+[ "$pgid" = "$pid" ]
+kill -TERM -- "-$pgid"
+for _ in $(seq 1 30); do
+  kill -0 "$pid" 2>/dev/null || exit 0
+  sleep 0.1
+done
+ps -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
+kill -KILL -- "-$pgid"
+for _ in $(seq 1 20); do
+  kill -0 "$pid" 2>/dev/null || exit 0
+  sleep 0.1
+done
+exit 4
+"""
+        completed = self.transport.runner(
+            [
+                "ssh",
+                str(self.target.host),
+                "bash",
+                "-s",
+                "--",
+                bundle,
+                str(pid),
+            ],
+            input=script,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode == 3:
+            return ExecutionStatus("failed", "remote process already exited")
+        if completed.returncode == 4:
+            raise ExecutionError(
+                f"remote process group {pid} did not exit after SIGKILL"
+            )
+        if completed.returncode != 0:
+            raise ExecutionError((completed.stderr or completed.stdout).strip())
+        return ExecutionStatus(
+            "cancelled", f"sent SIGTERM to remote process group {pid}"
+        )
 
 
 class SlurmExecutor:
@@ -1102,7 +1237,7 @@ cat "$bundle/execution.json"
 
     def launch(self, task: StageTask) -> ExecutionHandle:
         if os.environ.get("SLURM_JOB_ID") and self.target.host is None:
-            raise ExecutionError("campaign controller must run on the Slurm login node")
+            raise ExecutionError("workflow controller must run on the Slurm login node")
         _prepare_setup(self.target, task)
         script = task.bundle / "job.sbatch"
         bundle = self.transport.deploy(task)
@@ -1235,6 +1370,44 @@ cat "$bundle/execution.json"
 
     def collect(self, handle: ExecutionHandle) -> Path:
         return self.transport.collect(handle)
+
+    def cancel(self, handle: ExecutionHandle) -> ExecutionStatus:
+        status = self.inspect(handle)
+        if status.terminal:
+            return status
+        if not handle.execution_id.isdigit():
+            raise ExecutionError(
+                f"Slurm execution has an invalid job id: {handle.execution_id}"
+            )
+        bundle = handle.remote_bundle or handle.local_bundle
+        args = ["scancel", handle.execution_id]
+        completed = self.transport.run(
+            [bundle, *args] if self.target.host else args,
+            cwd=Path(bundle) if not self.target.host else None,
+        )
+        if completed.returncode != 0:
+            refreshed = self.inspect(handle)
+            if refreshed.terminal:
+                return refreshed
+            raise ExecutionError((completed.stderr or completed.stdout).strip())
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            refreshed = self.inspect(handle)
+            if refreshed.state == "completed":
+                return refreshed
+            if refreshed.state == "failed":
+                if "CANCELLED" in refreshed.detail.upper():
+                    return ExecutionStatus(
+                        "cancelled",
+                        f"Slurm job {handle.execution_id} is cancelled",
+                    )
+                return refreshed
+            time.sleep(0.2)
+        return ExecutionStatus(
+            "cancelling",
+            f"Slurm accepted cancellation for job {handle.execution_id}; "
+            "terminal state is not confirmed yet",
+        )
 
 
 def executor_for(

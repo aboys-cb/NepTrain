@@ -1,4 +1,4 @@
-"""High-level preparation and Slurm submission for iteration campaigns."""
+"""High-level preparation and control for persistent iteration workflows."""
 
 from __future__ import annotations
 
@@ -15,24 +15,24 @@ import subprocess
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
-from .campaign_workspace import CampaignWorkspace
+from .workflow_workspace import WorkflowWorkspace
 
 
-class CampaignError(RuntimeError):
-    """Raised when campaign preparation or submission is inconsistent."""
+class WorkflowError(RuntimeError):
+    """Raised when workflow preparation or submission is inconsistent."""
 
 
-class _SubmissionRejected(CampaignError):
+class _SubmissionRejected(WorkflowError):
     """Raised when Slurm definitively rejected a submission."""
 
 
-class _SubmissionUncertain(CampaignError):
+class _SubmissionUncertain(WorkflowError):
     """Raised when Slurm may have accepted a submission without returning its id."""
 
 
 @dataclass(frozen=True)
-class CampaignPreparation:
-    campaign_id: str
+class WorkflowPreparation:
+    workflow_id: str
     output_dir: Path
     config_file: Path
     initial_training: Path
@@ -42,15 +42,15 @@ class CampaignPreparation:
 
 
 @dataclass(frozen=True)
-class CampaignSubmission:
-    campaign_id: str
+class WorkflowSubmission:
+    workflow_id: str
     job_ids: tuple[str, ...]
     manifest: Path
 
 
 @dataclass(frozen=True)
-class CampaignRetry:
-    campaign_id: str
+class WorkflowRetry:
+    workflow_id: str
     retry_number: int
     from_generation: int
     from_stage: str
@@ -59,8 +59,8 @@ class CampaignRetry:
 
 
 @dataclass(frozen=True)
-class CampaignResume:
-    campaign_id: str
+class WorkflowResume:
+    workflow_id: str
     action: str
     job_ids: tuple[str, ...]
     manifest: Path
@@ -69,8 +69,8 @@ class CampaignResume:
 
 
 @dataclass(frozen=True)
-class CampaignStatus:
-    campaign_id: str
+class WorkflowStatus:
+    workflow_id: str
     state: str
     completed_generations: int
     total_generations: int
@@ -112,13 +112,13 @@ _LEDGER_UNSET = object()
 
 
 @contextmanager
-def _campaign_lock(output_dir: Path):
-    """Serialize scheduler side effects and manifest updates per campaign."""
+def _workflow_lock(output_dir: Path):
+    """Serialize scheduler side effects and manifest updates per workflow."""
 
     try:
-        lock_path = CampaignWorkspace.locate(output_dir).manifest_lock
+        lock_path = WorkflowWorkspace.locate(output_dir).manifest_lock
     except FileNotFoundError:
-        lock_path = output_dir / ".campaign-manifest.lock"
+        lock_path = output_dir / ".workflow-manifest.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -158,7 +158,7 @@ def _path_record(role: str, path: Path) -> dict[str, Any]:
             "sha256": _canonical_hash(entries),
             "file_count": len(entries),
         }
-    raise CampaignError(f"campaign dependency does not exist: {path}")
+    raise WorkflowError(f"workflow dependency does not exist: {path}")
 
 
 def _record_matches(record: Mapping[str, Any]) -> bool:
@@ -204,22 +204,14 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
         if md.get(key):
             md[key] = _absolute_path(md[key], base_dir)
     dft = resolved.get("dft", {})
-    for key in ("input_path", "incar_path", "resource_path"):
-        if dft.get(key) and dft[key] != "auto":
+    for key in ("input_path", "resource_path"):
+        if dft.get(key):
             dft[key] = _absolute_path(dft[key], base_dir)
     evaluation = resolved.get("evaluation", {})
     if evaluation.get("validation_path"):
         evaluation["validation_path"] = _absolute_path(
             evaluation["validation_path"], base_dir
         )
-    campaign = resolved.get("campaign", {})
-    slurm = campaign.get("slurm", {})
-    for resource in ("training", "cpu", "dft"):
-        profile = slurm.get(resource, {})
-        if profile.get("setup_script"):
-            profile["setup_script"] = _absolute_path(
-                profile["setup_script"], base_dir
-            )
     for profile in resolved.get("execution", {}).get("targets", {}).values():
         if profile.get("setup_script"):
             profile["setup_script"] = _absolute_path(
@@ -228,14 +220,14 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
     return resolved
 
 
-def _slurm_profile(campaign: Mapping[str, Any], name: str) -> dict[str, Any]:
-    profiles = campaign.get("slurm", {})
+def _slurm_profile(workflow: Mapping[str, Any], name: str) -> dict[str, Any]:
+    profiles = workflow.get("slurm", {})
     selected = profiles.get(name)
     if name == "dft" and not selected:
         selected = profiles.get("cpu", {})
     profile = dict(selected or {})
     if not profile.get("partition"):
-        raise CampaignError(f"campaign.slurm.{name}.partition is required")
+        raise WorkflowError(f"workflow.slurm.{name}.partition is required")
     profile.setdefault("time", "01:00:00")
     if name == "training":
         profile.setdefault("gpus_per_node", 1)
@@ -277,8 +269,8 @@ def _resource_command(
     config_file: Path,
     plan_file: Path,
     initial_training: Path,
-    campaign_dir: Path,
-    campaign_id: str,
+    workflow_dir: Path,
+    workflow_id: str,
     resource: str,
 ) -> str:
     tokens = [
@@ -289,15 +281,15 @@ def _resource_command(
         str(plan_file),
         "--initial-training",
         str(initial_training),
-        "--campaign-dir",
-        str(campaign_dir),
-        "--campaign-id",
-        campaign_id,
+        "--workflow-dir",
+        str(workflow_dir),
+        "--workflow-id",
+        workflow_id,
         "--resource",
         resource,
     ]
     if not shlex.split(command):
-        raise CampaignError("campaign.command cannot be empty")
+        raise WorkflowError("workflow.command cannot be empty")
     return shlex.join(tokens)
 
 
@@ -320,7 +312,9 @@ def _render_script(
     return "\n".join(lines)
 
 
-def _plans(settings: Mapping[str, Any]) -> tuple[Any, ...]:
+def _plans(
+    settings: Mapping[str, Any], md: Mapping[str, Any]
+) -> tuple[Any, ...]:
     from .iteration import progressive_plans
 
     plans = progressive_plans(
@@ -329,9 +323,9 @@ def _plans(settings: Mapping[str, Any]) -> tuple[Any, ...]:
         initial_candidates=int(settings.get("initial_candidates", 24)),
         initial_budget=int(settings.get("dft_budget", 8)),
         minimum_budget=int(settings.get("minimum_dft_budget", 4)),
-        initial_steps=int(settings.get("initial_steps", 100)),
-        temperatures=tuple(float(value) for value in settings.get("temperatures", [300])),
-        pressure=float(settings.get("pressure", 0.0)),
+        initial_steps=int(md["initial_steps"]),
+        temperatures=tuple(float(value) for value in md["temperatures"]),
+        pressure=float(md.get("pressure", 0.0)),
         min_distance=float(settings.get("min_distance", 0.0)),
         frame_stride=int(settings.get("frame_stride", 2)),
     )
@@ -343,7 +337,6 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     training = config.get("training", {})
     md = config.get("md", {})
     dft = config.get("dft", {})
-    campaign = config.get("campaign", {})
     evaluation = config.get("evaluation", {})
     for role, value in (
         ("training_config", training.get("config_path")),
@@ -351,15 +344,9 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
         ("md_structures", md.get("structures")),
         ("md_template", md.get("template_path")),
         ("md_plugin", md.get("plugin_path")),
-        ("dft_input", dft.get("input_path") or dft.get("incar_path")),
+        ("dft_input", dft.get("input_path")),
         ("dft_resources", dft.get("resource_path")),
         ("evaluation_validation", evaluation.get("validation_path")),
-        (
-            "training_setup",
-            campaign.get("slurm", {}).get("training", {}).get("setup_script"),
-        ),
-        ("cpu_setup", campaign.get("slurm", {}).get("cpu", {}).get("setup_script")),
-        ("dft_setup", campaign.get("slurm", {}).get("dft", {}).get("setup_script")),
     ):
         if value and value != "auto":
             paths.append((role, Path(value)))
@@ -370,11 +357,11 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [_path_record(role, path) for role, path in paths]
 
 
-def _preparation_from_manifest(path: Path) -> CampaignPreparation:
+def _preparation_from_manifest(path: Path) -> WorkflowPreparation:
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    workspace = CampaignWorkspace.locate(path)
-    return CampaignPreparation(
-        campaign_id=manifest["campaign_id"],
+    workspace = WorkflowWorkspace.locate(path)
+    return WorkflowPreparation(
+        workflow_id=manifest["workflow_id"],
         output_dir=workspace.root,
         config_file=Path(manifest["config"]["path"]),
         initial_training=Path(manifest["initial_training"]["path"]),
@@ -384,12 +371,12 @@ def _preparation_from_manifest(path: Path) -> CampaignPreparation:
     )
 
 
-def _write_campaign_scripts(
+def _write_workflow_scripts(
     *,
     output: Path,
     config_file: Path,
     initial_training: Path,
-    campaign_id: str,
+    workflow_id: str,
     plans: Sequence[Any],
     plan_paths: Sequence[Path],
     command: str,
@@ -397,13 +384,13 @@ def _write_campaign_scripts(
     cpu_profile: Mapping[str, Any],
     dft_profile: Mapping[str, Any],
 ) -> list[Path]:
-    """Write one contiguous campaign segment, including its train bootstrap."""
+    """Write one contiguous workflow segment, including its train bootstrap."""
 
     if not plans or len(plans) != len(plan_paths):
-        raise CampaignError("campaign script segment must contain matching plans")
-    workspace = CampaignWorkspace.locate(output)
+        raise WorkflowError("workflow script segment must contain matching plans")
+    workspace = WorkflowWorkspace.locate(output)
     script_paths: list[Path] = []
-    campaign_dir = workspace.controller_root
+    workflow_dir = workspace.controller_root
     logs = workspace.logs_dir
     logs.mkdir(parents=True, exist_ok=True)
 
@@ -416,8 +403,8 @@ def _write_campaign_scripts(
         config_file=config_file,
         plan_file=plan_paths[0],
         initial_training=initial_training,
-        campaign_dir=campaign_dir,
-        campaign_id=campaign_id,
+        workflow_dir=workflow_dir,
+        workflow_id=workflow_id,
         resource="training",
     )
     _write_text(
@@ -452,8 +439,8 @@ def _write_campaign_scripts(
                 config_file=config_file,
                 plan_file=plan_path,
                 initial_training=initial_training,
-                campaign_dir=campaign_dir,
-                campaign_id=campaign_id,
+                workflow_dir=workflow_dir,
+                workflow_id=workflow_id,
                 resource=resource,
             )
             _write_text(
@@ -475,8 +462,8 @@ def _write_campaign_scripts(
                 config_file=config_file,
                 plan_file=plan_path,
                 initial_training=initial_training,
-                campaign_dir=campaign_dir,
-                campaign_id=campaign_id,
+                workflow_dir=workflow_dir,
+                workflow_id=workflow_id,
                 resource="cpu",
             )
         ]
@@ -487,8 +474,8 @@ def _write_campaign_scripts(
                     config_file=config_file,
                     plan_file=plan_paths[index + 1],
                     initial_training=initial_training,
-                    campaign_dir=campaign_dir,
-                    campaign_id=campaign_id,
+                    workflow_dir=workflow_dir,
+                    workflow_id=workflow_id,
                     resource="training",
                 )
             )
@@ -507,28 +494,28 @@ def _write_campaign_scripts(
 
 
 def _coerce_preparation(
-    preparation: CampaignPreparation | str | Path,
-) -> CampaignPreparation:
-    if isinstance(preparation, CampaignPreparation):
+    preparation: WorkflowPreparation | str | Path,
+) -> WorkflowPreparation:
+    if isinstance(preparation, WorkflowPreparation):
         return preparation
     path = Path(preparation).expanduser().resolve()
     try:
-        manifest = CampaignWorkspace.locate(path).manifest
+        manifest = WorkflowWorkspace.locate(path).manifest
     except FileNotFoundError:
         manifest = path if path.is_file() else path / ".neptrain" / "manifest.json"
     if not manifest.is_file():
-        raise CampaignError(f"prepared campaign manifest does not exist: {manifest}")
+        raise WorkflowError(f"prepared workflow manifest does not exist: {manifest}")
     return _preparation_from_manifest(manifest)
 
 
-def prepare_campaign(
+def prepare_workflow(
     config_path: str | Path,
     initial_training: str | Path,
     output_dir: str | Path,
     *,
-    campaign_id: str | None = None,
-) -> CampaignPreparation:
-    """Prepare immutable plans for the persistent campaign controller."""
+    workflow_id: str | None = None,
+) -> WorkflowPreparation:
+    """Prepare immutable plans for the persistent workflow controller."""
 
     from .config import ConfigError, load_config, save_config
 
@@ -536,21 +523,33 @@ def prepare_campaign(
     initial = Path(initial_training).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
     if not initial.is_file():
-        raise CampaignError(f"initial training set does not exist: {initial}")
+        raise WorkflowError(f"initial training set does not exist: {initial}")
     try:
         config, _ = load_config(source_config)
     except ConfigError as error:
-        raise CampaignError(f"invalid project configuration: {error}") from error
+        raise WorkflowError(f"invalid project configuration: {error}") from error
     config = _resolved_config(config, source_config.parent)
-    settings = config.get("campaign", {})
-    selected_id = campaign_id or str(settings.get("id", output.name))
+    labeling_target_name = config["execution"]["routes"]["labeling"]
+    labeling_target = config["execution"]["targets"][labeling_target_name]
+    target_overrides = labeling_target.get("overrides", {})
+    dft_backend = target_overrides.get("dft.backend", config["dft"]["backend"])
+    dft_resource = target_overrides.get(
+        "dft.resource_path", config["dft"].get("resource_path")
+    )
+    if dft_backend in {"vasp", "abacus"} and not dft_resource:
+        raise WorkflowError(
+            f"{dft_backend} workflows require dft.resource_path or the "
+            "labeling target override dft.resource_path"
+        )
+    settings = config.get("workflow", {})
+    selected_id = workflow_id or str(settings.get("id", output.name))
     if not selected_id.strip():
-        raise CampaignError("campaign id cannot be empty")
-    plans = _plans(settings)
-    command = str(settings.get("command", "NepTrain"))
+        raise WorkflowError("workflow id cannot be empty")
+    plans = _plans(settings, config["md"])
+    command = "neptrain"
     source_dependencies = _dependencies(config)
     spec = {
-        "campaign_id": selected_id,
+        "workflow_id": selected_id,
         "config": config,
         "initial_training": str(initial),
         "initial_training_sha256": _sha256(initial),
@@ -559,21 +558,21 @@ def prepare_campaign(
         "dependencies": source_dependencies,
     }
     spec_sha256 = _canonical_hash(spec)
-    if (output / "campaign-manifest.json").is_file():
-        workspace = CampaignWorkspace.locate(output)
+    if (output / "workflow-manifest.json").is_file():
+        workspace = WorkflowWorkspace.locate(output)
     elif (output / ".neptrain" / "layout.json").is_file():
-        workspace = CampaignWorkspace.locate(output)
+        workspace = WorkflowWorkspace.locate(output)
     else:
         try:
-            workspace = CampaignWorkspace.create(output)
+            workspace = WorkflowWorkspace.create(output)
         except ValueError as error:
-            raise CampaignError(str(error)) from error
+            raise WorkflowError(str(error)) from error
     manifest_path = workspace.manifest
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if existing.get("spec_sha256") != spec_sha256:
-            raise CampaignError(
-                "campaign preparation changed; choose a new output directory or "
+            raise WorkflowError(
+                "workflow preparation changed; choose a new output directory or "
                 "restore the original inputs"
             )
         for record in [
@@ -584,8 +583,8 @@ def prepare_campaign(
             *existing.get("dependencies", []),
         ]:
             if not _record_matches(record):
-                raise CampaignError(
-                    f"prepared campaign artifact drifted: {record['path']}"
+                raise WorkflowError(
+                    f"prepared workflow artifact drifted: {record['path']}"
                 )
         return _preparation_from_manifest(manifest_path)
 
@@ -602,10 +601,10 @@ def prepare_campaign(
     script_paths: list[Path] = []
 
     manifest = {
-        "version": 3 if workspace.version == 2 else 1,
+        "version": 3,
         "layout_version": workspace.version,
         "orchestration": "controller-v1",
-        "campaign_id": selected_id,
+        "workflow_id": selected_id,
         "spec_sha256": spec_sha256,
         "config": {"path": str(resolved_config), "sha256": _sha256(resolved_config)},
         "initial_training": {
@@ -625,38 +624,38 @@ def prepare_campaign(
     return _preparation_from_manifest(manifest_path)
 
 
-def extend_campaign(
-    preparation: CampaignPreparation | str | Path,
+def extend_workflow(
+    preparation: WorkflowPreparation | str | Path,
     total_generations: int,
-) -> CampaignPreparation:
-    """Append immutable generations to a completed, accepted campaign."""
+) -> WorkflowPreparation:
+    """Append immutable generations to a completed, accepted workflow."""
 
     from .config import load_config, save_config
 
     preparation = _coerce_preparation(preparation)
-    with _campaign_lock(preparation.output_dir):
+    with _workflow_lock(preparation.output_dir):
         manifest = _validated_manifest(preparation)
-        progress = _campaign_progress(preparation, manifest)
+        progress = _workflow_progress(preparation, manifest)
         if progress.state != "complete":
-            raise CampaignError(
-                "campaign can only be extended after all prepared generations "
+            raise WorkflowError(
+                "workflow can only be extended after all prepared generations "
                 "completed and passed evaluation"
             )
         current_total = len(preparation.plans)
         if total_generations <= current_total:
-            raise CampaignError(
+            raise WorkflowError(
                 f"extension target must exceed current total {current_total}"
             )
 
         portable_config, _ = load_config(preparation.config_file)
-        portable_config.setdefault("campaign", {})["generations"] = int(
+        portable_config.setdefault("workflow", {})["generations"] = int(
             total_generations
         )
         config = _resolved_config(
             portable_config, preparation.config_file.parent
         )
-        settings = dict(config.get("campaign", {}))
-        all_plans = _plans(settings)
+        settings = dict(config.get("workflow", {}))
+        all_plans = _plans(settings, config["md"])
         existing_values = [
             json.loads(path.read_text(encoding="utf-8"))
             for path in preparation.plans
@@ -664,11 +663,11 @@ def extend_campaign(
         if [
             _canonical_hash(asdict(plan)) for plan in all_plans[:current_total]
         ] != [_canonical_hash(value) for value in existing_values]:
-            raise CampaignError("campaign extension changed an existing generation plan")
+            raise WorkflowError("workflow extension changed an existing generation plan")
 
         new_plans = all_plans[current_total:]
         new_plan_paths: list[Path] = []
-        workspace = CampaignWorkspace.locate(preparation.output_dir)
+        workspace = WorkflowWorkspace.locate(preparation.output_dir)
         for plan in new_plans:
             path = workspace.plans_dir / f"generation-{plan.generation}.json"
             _write_json(path, asdict(plan))
@@ -680,14 +679,14 @@ def extend_campaign(
             training_profile = _slurm_profile(settings, "training")
             cpu_profile = _slurm_profile(settings, "cpu")
             dft_profile = _slurm_profile(settings, "dft")
-            new_scripts = _write_campaign_scripts(
+            new_scripts = _write_workflow_scripts(
                 output=preparation.output_dir,
                 config_file=preparation.config_file,
                 initial_training=preparation.initial_training,
-                campaign_id=preparation.campaign_id,
+                workflow_id=preparation.workflow_id,
                 plans=new_plans,
                 plan_paths=new_plan_paths,
-                command=str(settings.get("command", "NepTrain")),
+                command=str(settings.get("command", "neptrain")),
                 training_profile=training_profile,
                 cpu_profile=cpu_profile,
                 dft_profile=dft_profile,
@@ -731,22 +730,22 @@ def _submit(args: Sequence[str], cwd: Path) -> str:
     return job_id
 
 
-def _submission_token(campaign_id: str, script: Path) -> str:
-    campaign = hashlib.sha256(campaign_id.encode()).hexdigest()[:8]
+def _submission_token(workflow_id: str, script: Path) -> str:
+    workflow = hashlib.sha256(workflow_id.encode()).hexdigest()[:8]
     stage = "".join(character for character in script.stem if character.isalnum())[:24]
-    return f"nt-{campaign}-{stage}-{uuid.uuid4().hex[:12]}"
+    return f"nt-{workflow}-{stage}-{uuid.uuid4().hex[:12]}"
 
 
 def _resolve_submission(record: Mapping[str, Any], cwd: Path) -> str | None:
     """Find a write-ahead submission intent in Slurm by its unique job name."""
 
     if os.environ.get("SLURM_JOB_ID"):
-        raise CampaignError(
-            "campaign submission reconciliation must run on the Slurm login node"
+        raise WorkflowError(
+            "workflow submission reconciliation must run on the Slurm login node"
         )
     token = str(record.get("submission_token", ""))
     if not token:
-        raise CampaignError("pending campaign job is missing its submission token")
+        raise WorkflowError("pending workflow job is missing its submission token")
     submitted_at = datetime.fromisoformat(str(record["submitted_at"]))
     accounting_start = (submitted_at - timedelta(days=1)).date().isoformat()
     commands = [
@@ -770,7 +769,7 @@ def _resolve_submission(record: Mapping[str, Any], cwd: Path) -> str | None:
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
-            raise CampaignError(
+            raise WorkflowError(
                 f"cannot reconcile Slurm submission {token}: {detail}"
             )
         for line in completed.stdout.splitlines():
@@ -778,7 +777,7 @@ def _resolve_submission(record: Mapping[str, Any], cwd: Path) -> str | None:
             if len(columns) >= 2 and columns[0].isdigit() and columns[1] == token:
                 job_ids.add(columns[0])
     if len(job_ids) > 1:
-        raise CampaignError(
+        raise WorkflowError(
             f"submission token {token} matched multiple Slurm jobs: {sorted(job_ids)}"
         )
     return next(iter(job_ids), None)
@@ -795,19 +794,19 @@ def _reconcile_submission_records(
 ) -> str | None:
     expected = [str(path) for path in scripts]
     if [record.get("script") for record in records] != expected[: len(records)]:
-        raise CampaignError("campaign job history is not a valid script prefix")
+        raise WorkflowError("workflow job history is not a valid script prefix")
     starts = {0, *(chain_starts or set())}
     dependency = None
     for index, record in enumerate(records):
         if index in starts:
             dependency = None
         if record.get("dependency") != dependency:
-            raise CampaignError("campaign job history has an invalid dependency chain")
+            raise WorkflowError("workflow job history has an invalid dependency chain")
         job_id = record.get("job_id")
         if job_id is None:
             job_id = resolver(record, output)
             if job_id is None:
-                raise CampaignError(
+                raise WorkflowError(
                     "submission outcome is still uncertain; Slurm has no job for "
                     f"token {record.get('submission_token')}. Retry after accounting updates."
                 )
@@ -816,7 +815,7 @@ def _reconcile_submission_records(
             record["reconciled_at"] = datetime.now(timezone.utc).isoformat()
             persist()
         if not str(job_id).isdigit():
-            raise CampaignError(f"invalid Slurm job id in campaign history: {job_id}")
+            raise WorkflowError(f"invalid Slurm job id in workflow history: {job_id}")
         dependency = str(job_id)
     return dependency
 
@@ -825,7 +824,7 @@ def _submit_missing_records(
     records: list[dict[str, Any]],
     scripts: Sequence[Path],
     *,
-    campaign_id: str,
+    workflow_id: str,
     output: Path,
     runner: SubmitRunner,
     resolver: SubmissionResolver,
@@ -844,7 +843,7 @@ def _submit_missing_records(
     for index, script in enumerate(scripts[len(records) :], start=len(records)):
         if index in starts:
             dependency = None
-        token = _submission_token(campaign_id, script)
+        token = _submission_token(workflow_id, script)
         record = {
             "script": str(script),
             "dependency": dependency,
@@ -890,14 +889,14 @@ def _submission_chain_starts(
             try:
                 index = names.index(bootstrap)
             except ValueError as error:
-                raise CampaignError(
-                    f"campaign extension is missing scheduler bootstrap {bootstrap}"
+                raise WorkflowError(
+                    f"workflow extension is missing scheduler bootstrap {bootstrap}"
                 ) from error
         starts.add(int(index))
     return starts
 
 
-def _validated_manifest(preparation: CampaignPreparation) -> dict[str, Any]:
+def _validated_manifest(preparation: WorkflowPreparation) -> dict[str, Any]:
     manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
     for record in [
         manifest["config"],
@@ -907,40 +906,40 @@ def _validated_manifest(preparation: CampaignPreparation) -> dict[str, Any]:
         *manifest.get("dependencies", []),
     ]:
         if not _record_matches(record):
-            raise CampaignError(
-                f"prepared campaign artifact drifted: {record['path']}"
+            raise WorkflowError(
+                f"prepared workflow artifact drifted: {record['path']}"
             )
     return manifest
 
 
-def submit_campaign(
-    preparation: CampaignPreparation | str | Path,
+def submit_workflow(
+    preparation: WorkflowPreparation | str | Path,
     *,
     runner: SubmitRunner = _submit,
-) -> CampaignSubmission:
+) -> WorkflowSubmission:
     """Submit the prepared scripts as one strict afterok dependency chain."""
 
     preparation = _coerce_preparation(preparation)
     manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
     if manifest.get("orchestration") == "controller-v1":
-        raise CampaignError(
-            "controller campaigns do not submit a Slurm dependency chain; "
+        raise WorkflowError(
+            "controller workflows do not submit a Slurm dependency chain; "
             "start the persistent controller instead"
         )
-    with _campaign_lock(preparation.output_dir):
-        return _submit_campaign_locked(
+    with _workflow_lock(preparation.output_dir):
+        return _submit_workflow_locked(
             preparation,
             runner=runner,
             submission_resolver=_resolve_submission,
         )
 
 
-def _submit_campaign_locked(
-    preparation: CampaignPreparation,
+def _submit_workflow_locked(
+    preparation: WorkflowPreparation,
     *,
     runner: SubmitRunner,
     submission_resolver: SubmissionResolver,
-) -> CampaignSubmission:
+) -> WorkflowSubmission:
     manifest = _validated_manifest(preparation)
     jobs = list(manifest.get("jobs", []))
 
@@ -951,15 +950,15 @@ def _submit_campaign_locked(
     _submit_missing_records(
         jobs,
         preparation.scripts,
-        campaign_id=preparation.campaign_id,
+        workflow_id=preparation.workflow_id,
         output=preparation.output_dir,
         runner=runner,
         resolver=submission_resolver,
         persist=persist,
         chain_starts=_submission_chain_starts(manifest, preparation.scripts),
     )
-    return CampaignSubmission(
-        campaign_id=preparation.campaign_id,
+    return WorkflowSubmission(
+        workflow_id=preparation.workflow_id,
         job_ids=tuple(record["job_id"] for record in jobs),
         manifest=preparation.manifest,
     )
@@ -971,7 +970,7 @@ def _normalise_job_state(value: str) -> str:
 
 def _job_state(job_id: str, cwd: Path) -> str:
     if os.environ.get("SLURM_JOB_ID"):
-        raise CampaignError(
+        raise WorkflowError(
             "NepTrain resume must execute on the Slurm login node, not inside a batch job"
         )
     completed = subprocess.run(
@@ -991,7 +990,7 @@ def _job_state(job_id: str, cwd: Path) -> str:
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
-        raise CampaignError(f"cannot query Slurm job {job_id}: {detail}")
+        raise WorkflowError(f"cannot query Slurm job {job_id}: {detail}")
     fallback = None
     for line in completed.stdout.splitlines():
         columns = line.strip().split("|")
@@ -1002,12 +1001,12 @@ def _job_state(job_id: str, cwd: Path) -> str:
             return _normalise_job_state(columns[1])
     if fallback:
         return _normalise_job_state(fallback)
-    raise CampaignError(f"Slurm has no accounting record for job {job_id}")
+    raise WorkflowError(f"Slurm has no accounting record for job {job_id}")
 
 
 def _cancel(job_id: str, cwd: Path) -> None:
     if os.environ.get("SLURM_JOB_ID"):
-        raise CampaignError(
+        raise WorkflowError(
             "NepTrain resume must execute on the Slurm login node, not inside a batch job"
         )
     completed = subprocess.run(
@@ -1019,11 +1018,11 @@ def _cancel(job_id: str, cwd: Path) -> None:
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
-        raise CampaignError(f"cannot cancel stale Slurm job {job_id}: {detail}")
+        raise WorkflowError(f"cannot cancel stale Slurm job {job_id}: {detail}")
 
 
 @dataclass(frozen=True)
-class _CampaignProgress:
+class _WorkflowProgress:
     state: str
     completed_generations: int
     generation: int | None
@@ -1031,34 +1030,34 @@ class _CampaignProgress:
     reason: str
 
 
-def _read_campaign_ledger(
-    preparation: CampaignPreparation,
+def _read_workflow_ledger(
+    preparation: WorkflowPreparation,
 ) -> Mapping[str, Any] | None:
-    ledger_path = CampaignWorkspace.locate(preparation.output_dir).ledger
+    ledger_path = WorkflowWorkspace.locate(preparation.output_dir).ledger
     if not ledger_path.exists():
         return None
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    if ledger.get("campaign_id") != preparation.campaign_id:
-        raise CampaignError("campaign_id does not match the existing ledger")
+    if ledger.get("workflow_id") != preparation.workflow_id:
+        raise WorkflowError("workflow_id does not match the existing ledger")
     if not isinstance(ledger.get("generations", {}), Mapping):
-        raise CampaignError("campaign generations must be a mapping")
+        raise WorkflowError("workflow generations must be a mapping")
     return ledger
 
 
-def _campaign_progress(
-    preparation: CampaignPreparation,
+def _workflow_progress(
+    preparation: WorkflowPreparation,
     manifest: Mapping[str, Any],
     *,
     ledger: Mapping[str, Any] | None | object = _LEDGER_UNSET,
-) -> _CampaignProgress:
+) -> _WorkflowProgress:
     plans = [
         json.loads(Path(record["path"]).read_text(encoding="utf-8"))
         for record in manifest["plans"]
     ]
     if ledger is _LEDGER_UNSET:
-        ledger = _read_campaign_ledger(preparation)
+        ledger = _read_workflow_ledger(preparation)
     if ledger is None:
-        return _CampaignProgress(
+        return _WorkflowProgress(
             "prepared", 0, int(plans[0]["generation"]), "train", "ledger not started"
         )
     assert isinstance(ledger, Mapping)
@@ -1067,7 +1066,7 @@ def _campaign_progress(
         generation = int(plan["generation"])
         record = generations.get(str(generation))
         if record is None:
-            return _CampaignProgress(
+            return _WorkflowProgress(
                 "incomplete",
                 generation - 1,
                 generation,
@@ -1075,7 +1074,7 @@ def _campaign_progress(
                 f"generation {generation} has not started",
             )
         if record.get("plan_sha256") != _canonical_hash(plan):
-            raise CampaignError(
+            raise WorkflowError(
                 f"generation {generation} plan changed after it entered the ledger"
             )
         stages = record.get("stages", {})
@@ -1085,18 +1084,18 @@ def _campaign_progress(
             if stage not in stages:
                 missing_seen = True
             elif missing_seen:
-                raise CampaignError(
+                raise WorkflowError(
                     "generation stage ledger is not a contiguous prefix"
                 )
             else:
                 completed.append(stage)
         if len(completed) < len(_STAGES):
             if record.get("complete"):
-                raise CampaignError(
+                raise WorkflowError(
                     "generation is marked complete before all stages finished"
                 )
             stage = _STAGES[len(completed)]
-            return _CampaignProgress(
+            return _WorkflowProgress(
                 "incomplete",
                 generation - 1,
                 generation,
@@ -1104,11 +1103,11 @@ def _campaign_progress(
                 f"generation {generation} is waiting for stage {stage}",
             )
         if not record.get("complete"):
-            raise CampaignError(
+            raise WorkflowError(
                 f"generation {generation} has all stages but is not marked complete"
             )
         if record.get("accepted") is False:
-            return _CampaignProgress(
+            return _WorkflowProgress(
                 "rejected",
                 generation - 1,
                 generation,
@@ -1116,10 +1115,10 @@ def _campaign_progress(
                 f"generation {generation} failed its evaluation acceptance gate",
             )
         if record.get("accepted") is not True:
-            raise CampaignError(
+            raise WorkflowError(
                 f"generation {generation} completion is missing accepted=true/false"
             )
-    return _CampaignProgress(
+    return _WorkflowProgress(
         "complete",
         len(plans),
         None,
@@ -1135,15 +1134,15 @@ def _generation_science(
 
     stages = {} if record is None else record.get("stages", {})
     if not isinstance(stages, Mapping):
-        raise CampaignError("generation stages must be a mapping")
+        raise WorkflowError("generation stages must be a mapping")
 
     def metrics(stage: str) -> Mapping[str, Any]:
         stage_record = stages.get(stage, {})
         if not isinstance(stage_record, Mapping):
-            raise CampaignError(f"generation stage {stage} must be a mapping")
+            raise WorkflowError(f"generation stage {stage} must be a mapping")
         value = stage_record.get("metrics", {})
         if not isinstance(value, Mapping):
-            raise CampaignError(f"generation stage {stage} metrics must be a mapping")
+            raise WorkflowError(f"generation stage {stage} metrics must be a mapping")
         return value
 
     train = metrics("train")
@@ -1227,7 +1226,7 @@ def _generation_science(
 
 
 def _scientific_progress(
-    preparation: CampaignPreparation,
+    preparation: WorkflowPreparation,
     manifest: Mapping[str, Any],
     *,
     ledger: Mapping[str, Any] | None | object = _LEDGER_UNSET,
@@ -1238,7 +1237,7 @@ def _scientific_progress(
     ]
     generations: Mapping[str, Any] = {}
     if ledger is _LEDGER_UNSET:
-        ledger = _read_campaign_ledger(preparation)
+        ledger = _read_workflow_ledger(preparation)
     if ledger is not None:
         assert isinstance(ledger, Mapping)
         generations = ledger.get("generations", {})
@@ -1248,22 +1247,22 @@ def _scientific_progress(
     )
 
 
-def _campaign_breakpoint(
-    preparation: CampaignPreparation, manifest: Mapping[str, Any]
+def _workflow_breakpoint(
+    preparation: WorkflowPreparation, manifest: Mapping[str, Any]
 ) -> tuple[int, str]:
-    progress = _campaign_progress(preparation, manifest)
+    progress = _workflow_progress(preparation, manifest)
     if progress.state in {"prepared", "incomplete"}:
         assert progress.generation is not None and progress.stage is not None
         return progress.generation, progress.stage
     if progress.state == "rejected":
-        raise CampaignError(
+        raise WorkflowError(
             f"{progress.reason}; retry cannot bypass the acceptance gate"
         )
-    raise CampaignError("campaign is already complete; nothing to retry")
+    raise WorkflowError("workflow is already complete; nothing to retry")
 
 
 def _retry_script_index(
-    preparation: CampaignPreparation, generation: int, stage: str
+    preparation: WorkflowPreparation, generation: int, stage: str
 ) -> int:
     if stage == "train":
         bootstrap = f"generation-{generation}-bootstrap.sbatch"
@@ -1284,8 +1283,8 @@ def _retry_script_index(
     for index, script in enumerate(preparation.scripts):
         if script.name == filename:
             return index
-    raise CampaignError(
-        f"prepared campaign has no job script for generation {generation} stage {stage}"
+    raise WorkflowError(
+        f"prepared workflow has no job script for generation {generation} stage {stage}"
     )
 
 
@@ -1297,10 +1296,10 @@ def _job_records(manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _retry_result(
-    preparation: CampaignPreparation, retry: Mapping[str, Any]
-) -> CampaignRetry:
-    return CampaignRetry(
-        campaign_id=preparation.campaign_id,
+    preparation: WorkflowPreparation, retry: Mapping[str, Any]
+) -> WorkflowRetry:
+    return WorkflowRetry(
+        workflow_id=preparation.workflow_id,
         retry_number=int(retry["retry"]),
         from_generation=int(retry["from_generation"]),
         from_stage=str(retry["from_stage"]),
@@ -1310,7 +1309,7 @@ def _retry_result(
 
 
 def _status_job_records(
-    preparation: CampaignPreparation, manifest: Mapping[str, Any]
+    preparation: WorkflowPreparation, manifest: Mapping[str, Any]
 ) -> tuple[dict[str, Any], ...]:
     records: list[tuple[str, Mapping[str, Any]]] = [
         ("initial", record) for record in manifest.get("jobs", [])
@@ -1332,7 +1331,7 @@ def _status_job_records(
         if job_id is None:
             try:
                 job_id = _resolve_submission(record, preparation.output_dir)
-            except CampaignError as error:
+            except WorkflowError as error:
                 state = "UNKNOWN"
                 detail = str(error)
             else:
@@ -1344,7 +1343,7 @@ def _status_job_records(
                 state = _normalise_job_state(
                     _job_state(str(job_id), preparation.output_dir)
                 )
-            except CampaignError as error:
+            except WorkflowError as error:
                 detail = str(error)
         statuses.append(
             {
@@ -1373,18 +1372,18 @@ def _status_job_records(
     return tuple(statuses)
 
 
-def campaign_status(output_dir: str | Path) -> CampaignStatus:
-    """Return a read-only ledger and Slurm summary for one prepared campaign."""
+def workflow_status(output_dir: str | Path) -> WorkflowStatus:
+    """Return a read-only ledger and Slurm summary for one prepared workflow."""
 
     preparation = _coerce_preparation(output_dir)
     manifest = _validated_manifest(preparation)
-    ledger = _read_campaign_ledger(preparation)
-    progress = _campaign_progress(preparation, manifest, ledger=ledger)
+    ledger = _read_workflow_ledger(preparation)
+    progress = _workflow_progress(preparation, manifest, ledger=ledger)
     generations = _scientific_progress(preparation, manifest, ledger=ledger)
     if manifest.get("orchestration") == "controller-v1":
         from .controller import controller_running
 
-        workspace = CampaignWorkspace.locate(preparation.output_dir)
+        workspace = WorkflowWorkspace.locate(preparation.output_dir)
         controller = (
             json.loads(workspace.controller_file.read_text(encoding="utf-8"))
             if workspace.controller_file.is_file()
@@ -1396,15 +1395,22 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
         jobs = []
         for item in controller.get("history", []):
             handle = item.get("handle") or {}
+            if item.get("completed_at"):
+                execution_state = "COMPLETED"
+            elif item.get("cancelled_at"):
+                execution_state = "CANCELLED"
+            else:
+                execution_state = "FAILED"
             jobs.append(
                 {
                     "attempt": f"attempt-{item.get('attempt', 1)}",
                     "script": f"{item.get('target', '-')}/{item.get('stage', '-')}",
                     "job_id": handle.get("execution_id"),
                     "dependency": None,
-                    "state": "COMPLETED" if item.get("completed_at") else "FAILED",
+                    "state": execution_state,
                     "current": False,
-                    "detail": item.get("failure"),
+                    "detail": item.get("failure")
+                    or (item.get("cancellation") or {}).get("detail"),
                 }
             )
         if current:
@@ -1429,7 +1435,7 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
         elif progress.state == "rejected" or controller_state == "rejected":
             state = "rejected"
             reason = str(controller.get("reason", progress.reason))
-            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+            next_action = f"neptrain workflow resume {shlex.quote(str(preparation.output_dir))}"
         elif active:
             state = "degraded" if controller_state == "degraded" else "running"
             reason = str(
@@ -1437,25 +1443,25 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
                 or controller.get("reason")
                 or "persistent controller is active"
             )
-            next_action = f"NepTrain status {shlex.quote(str(preparation.output_dir))}"
+            next_action = f"neptrain workflow status {shlex.quote(str(preparation.output_dir))}"
         elif controller_state == "failed":
             state = "failed"
             reason = str(controller.get("reason", "controller failed"))
-            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+            next_action = f"neptrain workflow resume {shlex.quote(str(preparation.output_dir))}"
         elif controller_state == "stopped":
             state = "paused"
             reason = str(controller.get("reason", "controller is stopped"))
-            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+            next_action = f"neptrain workflow resume {shlex.quote(str(preparation.output_dir))}"
         elif controller_state in {"running", "launching", "degraded"}:
             state = "paused"
             reason = "controller process is not running; remote work is preserved"
-            next_action = f"NepTrain resume {shlex.quote(str(preparation.output_dir))}"
+            next_action = f"neptrain workflow resume {shlex.quote(str(preparation.output_dir))}"
         else:
             state = "prepared"
-            reason = "campaign is prepared and controller has not started"
-            next_action = f"NepTrain run {shlex.quote(str(preparation.output_dir))}"
-        return CampaignStatus(
-            campaign_id=preparation.campaign_id,
+            reason = "workflow is prepared and controller has not started"
+            next_action = f"neptrain workflow run {shlex.quote(str(preparation.output_dir))}"
+        return WorkflowStatus(
+            workflow_id=preparation.workflow_id,
             state=state,
             completed_generations=progress.completed_generations,
             total_generations=len(preparation.plans),
@@ -1551,8 +1557,8 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
             f"NepTrain resume {shlex.quote(str(output))}"
         )
 
-    return CampaignStatus(
-        campaign_id=preparation.campaign_id,
+    return WorkflowStatus(
+        workflow_id=preparation.workflow_id,
         state=state,
         completed_generations=progress.completed_generations,
         total_generations=len(preparation.plans),
@@ -1565,12 +1571,12 @@ def campaign_status(output_dir: str | Path) -> CampaignStatus:
     )
 
 
-def resume_campaign(
+def resume_workflow(
     output_dir: str | Path,
     *,
     foreground: bool = False,
     poll_interval: float | None = None,
-) -> CampaignResume:
+) -> WorkflowResume:
     """Take the only safe continuation without exposing scheduler failure modes."""
 
     output = Path(output_dir).expanduser().resolve()
@@ -1583,16 +1589,16 @@ def resume_campaign(
             start_controller,
         )
 
-        status = campaign_status(output)
+        status = workflow_status(output)
         if status.state == "complete":
-            return CampaignResume(
-                preparation.campaign_id,
+            return WorkflowResume(
+                preparation.workflow_id,
                 "complete",
                 (),
                 preparation.manifest,
             )
         if controller_running(output):
-            raise CampaignError("campaign controller is already running")
+            raise WorkflowError("workflow controller is already running")
         controller = PersistentController(output)
         action = "resume"
         if status.state == "failed":
@@ -1608,63 +1614,63 @@ def resume_campaign(
                 poll_interval=poll_interval,
             )
         except Exception as error:
-            raise CampaignError(str(error)) from error
-        return CampaignResume(
-            preparation.campaign_id,
+            raise WorkflowError(str(error)) from error
+        return WorkflowResume(
+            preparation.workflow_id,
             action,
             (),
             preparation.manifest,
             controller_pid=None if foreground else controller_result,
             controller_exit_code=controller_result if foreground else None,
         )
-    status = campaign_status(output)
+    status = workflow_status(output)
     if status.state in {"prepared", "paused"}:
-        submission = submit_campaign(output)
-        return CampaignResume(
-            submission.campaign_id,
+        submission = submit_workflow(output)
+        return WorkflowResume(
+            submission.workflow_id,
             "submit",
             submission.job_ids,
             submission.manifest,
         )
     if status.state in {"failed", "blocked"}:
-        retry = retry_failed_campaign(output)
-        return CampaignResume(
-            retry.campaign_id,
+        retry = retry_failed_workflow(output)
+        return WorkflowResume(
+            retry.workflow_id,
             "retry",
             retry.job_ids,
             retry.manifest,
         )
     if status.state == "rejected":
-        retry = retry_failed_campaign(output, recover_rejected=True)
-        return CampaignResume(
-            retry.campaign_id,
+        retry = retry_failed_workflow(output, recover_rejected=True)
+        return WorkflowResume(
+            retry.workflow_id,
             "recover_rejected",
             retry.job_ids,
             retry.manifest,
         )
     if status.state == "complete":
-        return CampaignResume(
-            preparation.campaign_id,
+        return WorkflowResume(
+            preparation.workflow_id,
             "complete",
             (),
             preparation.manifest,
         )
     if status.state == "running":
-        raise CampaignError("campaign is already running")
-    raise CampaignError(
-        f"campaign cannot resume safely while state is {status.state}: {status.reason}"
+        raise WorkflowError("workflow is already running")
+    raise WorkflowError(
+        f"workflow cannot resume safely while state is {status.state}: {status.reason}"
     )
 
 
-def retry_failed_campaign(
+def retry_failed_workflow(
     output_dir: str | Path,
     *,
     recover_rejected: bool = False,
     runner: SubmitRunner = _submit,
     state_runner: JobStateRunner = _job_state,
     cancel_runner: CancelRunner = _cancel,
-) -> CampaignRetry:
-    """Resume a prepared campaign from its first unfinished ledger stage.
+) -> WorkflowRetry:
+    """Resume a prepared workflow from its first unfinished ledger stage.
 
     Scheduler history remains append-only. Pending jobs from the obsolete
     dependency tail are canceled before a fresh strict afterok chain is made.
@@ -1672,17 +1678,17 @@ def retry_failed_campaign(
 
     output = Path(output_dir).expanduser().resolve()
     try:
-        workspace = CampaignWorkspace.locate(output)
+        workspace = WorkflowWorkspace.locate(output)
     except FileNotFoundError as error:
-        raise CampaignError(
-            f"prepared campaign does not exist: {output}"
+        raise WorkflowError(
+            f"prepared workflow does not exist: {output}"
         ) from error
     if not workspace.manifest.is_file():
-        raise CampaignError(
-            f"prepared campaign manifest does not exist: {workspace.manifest}"
+        raise WorkflowError(
+            f"prepared workflow manifest does not exist: {workspace.manifest}"
         )
-    with _campaign_lock(output):
-        return _retry_failed_campaign_locked(
+    with _workflow_lock(output):
+        return _retry_failed_workflow_locked(
             output,
             runner=runner,
             state_runner=state_runner,
@@ -1692,7 +1698,7 @@ def retry_failed_campaign(
         )
 
 
-def _retry_failed_campaign_locked(
+def _retry_failed_workflow_locked(
     output: Path,
     *,
     runner: SubmitRunner,
@@ -1700,8 +1706,8 @@ def _retry_failed_campaign_locked(
     cancel_runner: CancelRunner,
     submission_resolver: SubmissionResolver,
     recover_rejected: bool = False,
-) -> CampaignRetry:
-    manifest_path = CampaignWorkspace.locate(output).manifest
+) -> WorkflowRetry:
+    manifest_path = WorkflowWorkspace.locate(output).manifest
     preparation = _preparation_from_manifest(manifest_path)
     manifest = _validated_manifest(preparation)
     original_jobs = list(manifest.get("jobs", []))
@@ -1719,10 +1725,10 @@ def _retry_failed_campaign_locked(
         chain_starts=_submission_chain_starts(manifest, preparation.scripts),
     )
     recovery_started = False
-    progress = _campaign_progress(preparation, manifest)
+    progress = _workflow_progress(preparation, manifest)
     if recover_rejected:
         if progress.state != "rejected" or progress.generation is None:
-            raise CampaignError(
+            raise WorkflowError(
                 "rejected recovery requires a completed rejected generation"
             )
         from .iteration import GenerationController, GenerationPlan
@@ -1732,17 +1738,17 @@ def _retry_failed_campaign_locked(
         )
         value["temperatures"] = tuple(value["temperatures"])
         controller = GenerationController(
-            CampaignWorkspace.locate(output).controller_root,
-            preparation.campaign_id,
+            WorkflowWorkspace.locate(output).controller_root,
+            preparation.workflow_id,
         )
         try:
             controller.reopen_rejected(
                 GenerationPlan(**value), from_stage="retrain"
             )
         except Exception as error:
-            raise CampaignError(f"cannot reopen rejected generation: {error}") from error
+            raise WorkflowError(f"cannot reopen rejected generation: {error}") from error
         recovery_started = True
-    generation, stage = _campaign_breakpoint(preparation, manifest)
+    generation, stage = _workflow_breakpoint(preparation, manifest)
     start = _retry_script_index(preparation, generation, stage)
     remaining = preparation.scripts[start:]
     target = str(remaining[0])
@@ -1775,15 +1781,15 @@ def _retry_failed_campaign_locked(
         if not failed:
             if len(retry_jobs) == len(remaining):
                 if states and all(state == "COMPLETED" for state in states):
-                    raise CampaignError(
-                        "retry jobs completed but the campaign ledger did not "
+                    raise WorkflowError(
+                        "retry jobs completed but the workflow ledger did not "
                         "advance; inspect the job logs"
                     )
                 return _retry_result(preparation, latest_retry)
             _submit_missing_records(
                 retry_jobs,
                 remaining,
-                campaign_id=preparation.campaign_id,
+                workflow_id=preparation.workflow_id,
                 output=output,
                 runner=runner,
                 resolver=submission_resolver,
@@ -1795,7 +1801,7 @@ def _retry_failed_campaign_locked(
     for record in _job_records(manifest):
         latest_by_script[str(record["script"])] = record
     if target not in latest_by_script:
-        raise CampaignError(
+        raise WorkflowError(
             "the unfinished stage has no submitted job history; use NepTrain run"
         )
     replaced = []
@@ -1821,20 +1827,20 @@ def _retry_failed_campaign_locked(
             if blocked_by_failed_dependency:
                 cancel_runner(job_id, output)
             elif state in _ACTIVE_JOB_STATES:
-                raise CampaignError(
+                raise WorkflowError(
                     f"job {job_id} for the unfinished stage is still {state}; "
                     "retry is not needed"
                 )
             if state == "COMPLETED":
                 if not recovery_started:
-                    raise CampaignError(
-                        f"job {job_id} completed but the campaign ledger did not "
+                    raise WorkflowError(
+                        f"job {job_id} completed but the workflow ledger did not "
                         "advance; inspect the job log"
                     )
         elif state == "PENDING":
             cancel_runner(job_id, output)
         elif state in _ACTIVE_JOB_STATES:
-            raise CampaignError(
+            raise WorkflowError(
                 f"downstream job {job_id} is already {state}; refusing concurrent recovery"
             )
 
@@ -1861,7 +1867,7 @@ def _retry_failed_campaign_locked(
     _submit_missing_records(
         retry_jobs,
         remaining,
-        campaign_id=preparation.campaign_id,
+        workflow_id=preparation.workflow_id,
         output=output,
         runner=runner,
         resolver=submission_resolver,
@@ -1871,16 +1877,16 @@ def _retry_failed_campaign_locked(
 
 
 __all__ = [
-    "CampaignError",
-    "CampaignPreparation",
-    "CampaignResume",
-    "CampaignRetry",
-    "CampaignStatus",
-    "CampaignSubmission",
-    "campaign_status",
-    "extend_campaign",
-    "prepare_campaign",
-    "resume_campaign",
-    "retry_failed_campaign",
-    "submit_campaign",
+    "WorkflowError",
+    "WorkflowPreparation",
+    "WorkflowResume",
+    "WorkflowRetry",
+    "WorkflowStatus",
+    "WorkflowSubmission",
+    "workflow_status",
+    "extend_workflow",
+    "prepare_workflow",
+    "resume_workflow",
+    "retry_failed_workflow",
+    "submit_workflow",
 ]

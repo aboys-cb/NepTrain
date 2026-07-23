@@ -1,140 +1,133 @@
-"""Versioned user configuration for the active-learning workflow."""
+"""Strict project configuration for manual steps and workflows."""
 
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
 from ruamel.yaml import YAML
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 class ConfigError(ValueError):
-    """Raised when a workflow configuration is incomplete or inconsistent."""
+    """Raised when a project configuration is incomplete or inconsistent."""
 
 
-def _copy_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
-    return deepcopy(dict(value))
+_FIELDS: dict[str, set[str]] = {
+    "training": {
+        "backend",
+        "initial_path",
+        "test_path",
+        "config_path",
+        "device",
+        "torch_backend",
+        "precision",
+        "use_compile",
+        "restart",
+        "restart_steps",
+        "finetune_lr_scale",
+        "finetune_lr",
+        "seed",
+    },
+    "md": {
+        "backend",
+        "inference_backend",
+        "structures",
+        "template_path",
+        "ensemble",
+        "temperatures",
+        "pressure",
+        "initial_steps",
+        "timestep",
+        "tdamp",
+        "pdamp",
+        "dump_interval",
+        "spin",
+        "spin_temperature",
+        "spin_alpha",
+        "spin_seed",
+        "midpoint_iter",
+        "lmp",
+        "mpiexec",
+        "mpi_ranks",
+        "plugin_path",
+        "pre_failure_frames",
+        "bad_tail_frames",
+        "health",
+    },
+    "dft": {
+        "backend",
+        "n_cpu",
+        "kpoints_use_gamma",
+        "input_path",
+        "resource_path",
+        "use_k_stype",
+        "kpoints",
+        "kspacing",
+        "teacher_profile",
+    },
+    "evaluation": {
+        "validation_path",
+        "inference_backend",
+        "max_rmse",
+    },
+    "workflow": {
+        "id",
+        "generations",
+        "seed",
+        "initial_candidates",
+        "dft_budget",
+        "minimum_dft_budget",
+        "frame_stride",
+        "min_distance",
+        "maturity",
+    },
+    "execution": {"poll_interval", "routes", "targets"},
+}
+_TARGET_FIELDS = {
+    "executor",
+    "host",
+    "work_root",
+    "command",
+    "setup_script",
+    "partition",
+    "qos",
+    "time",
+    "cpus_per_task",
+    "gpus_per_node",
+    "directives",
+    "overrides",
+    "environment",
+}
 
 
-def migrate_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Return schema-v3 configuration and a list of performed migrations."""
+def _mapping(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = config.get(name, {})
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"{name} must be a mapping")
+    return value
 
-    migrated = _copy_mapping(config)
-    changes: list[str] = []
-    schema_version = int(migrated.get("schema_version", 1))
-    if schema_version > CURRENT_SCHEMA_VERSION:
+
+def _reject_unknown(config: Mapping[str, Any]) -> None:
+    allowed_top = {"schema_version", *_FIELDS}
+    unknown_top = sorted(set(config) - allowed_top)
+    if unknown_top:
         raise ConfigError(
-            f"config schema {schema_version} is newer than supported schema "
-            f"{CURRENT_SCHEMA_VERSION}"
+            "unknown project fields: "
+            + ", ".join(unknown_top)
+            + "; schema v4 does not accept legacy fields"
         )
-
-    if "training" not in migrated and "nep" in migrated:
-        migrated["training"] = migrated.pop("nep")
-        changes.append("nep -> training")
-    if "md" not in migrated and "gpumd" in migrated:
-        migrated["md"] = migrated.pop("gpumd")
-        changes.append("gpumd -> md")
-    if "md_split_job" not in migrated and "gpumd_split_job" in migrated:
-        migrated["md_split_job"] = migrated.pop("gpumd_split_job")
-        changes.append("gpumd_split_job -> md_split_job")
-
-    training = migrated.setdefault("training", {})
-    md = migrated.setdefault("md", {})
-    training.setdefault("backend", "gpumd")
-    md.setdefault("backend", "gpumd")
-    training.setdefault("device", "cuda")
-    training.setdefault("torch_backend", "auto")
-    training.setdefault("finetune_lr_scale", 0.1)
-    md.setdefault("inference_backend", "auto")
-
-    campaign = migrated.setdefault("campaign", {})
-    if "execution" not in migrated:
-        legacy_slurm = campaign.pop("slurm", None)
-        if legacy_slurm:
-            command = str(campaign.get("command", "NepTrain"))
-
-            def target(profile_name: str, fallback: str | None = None) -> dict[str, Any]:
-                profile = dict(
-                    legacy_slurm.get(profile_name)
-                    or (legacy_slurm.get(fallback) if fallback else {})
-                    or {}
-                )
-                profile["executor"] = "slurm"
-                profile.setdefault("command", command)
-                return profile
-
-            migrated["execution"] = {
-                "poll_interval": 30,
-                "routes": {
-                    "training": "training",
-                    "sampling": "sampling",
-                    "labeling": "labeling",
-                    "analysis": "analysis",
-                },
-                "targets": {
-                    "training": target("training"),
-                    "sampling": target("cpu"),
-                    "labeling": target("dft", "cpu"),
-                    "analysis": target("cpu"),
-                },
-            }
-            changes.append("campaign.slurm -> execution targets/routes")
-        else:
-            migrated["execution"] = {
-                "poll_interval": 30,
-                "routes": {
-                    "training": "local",
-                    "sampling": "local",
-                    "labeling": "local",
-                    "analysis": "local",
-                },
-                "targets": {"local": {"executor": "process"}},
-            }
-            changes.append("default local execution target")
-
-    if "initial_path" not in training and migrated.get("init_train_xyz"):
-        training["initial_path"] = migrated["init_train_xyz"]
-        changes.append("init_train_xyz -> training.initial_path")
-
-    if "test_xyz_path" in training and "test_path" not in training:
-        training["test_path"] = training.pop("test_xyz_path")
-        changes.append("training.test_xyz_path -> training.test_path")
-    if "test" in training and "test_path" not in training:
-        training["test_path"] = training.pop("test")
-        changes.append("training.test -> training.test_path")
-    if "config_path" not in training and "nep_in_path" in training:
-        training["config_path"] = training.pop("nep_in_path")
-        changes.append("training.nep_in_path -> training.config_path")
-    if "restart" not in training and "nep_restart" in training:
-        training["restart"] = training.pop("nep_restart")
-        changes.append("training.nep_restart -> training.restart")
-    if "restart_steps" not in training and "nep_restart_step" in training:
-        training["restart_steps"] = training.pop("nep_restart_step")
-        changes.append("training.nep_restart_step -> training.restart_steps")
-    if "run_in_path" in md and "template_path" not in md:
-        md["template_path"] = md.pop("run_in_path")
-        changes.append("md.run_in_path -> md.template_path")
-    if "duration_ps_every_generation" not in md and "step_times" in md:
-        md["duration_ps_every_generation"] = md.pop("step_times")
-        changes.append("md.step_times -> md.duration_ps_every_generation")
-    if "temperatures" not in md and "temperature_every_step" in md:
-        md["temperatures"] = md.pop("temperature_every_step")
-        changes.append("md.temperature_every_step -> md.temperatures")
-    if "structures" not in md and "model_path" in md:
-        md["structures"] = md.pop("model_path")
-        changes.append("md.model_path -> md.structures")
-
-    current_job = migrated.get("current_job", "training")
-    current_job = {"nep": "training", "gpumd": "md", "vasp": "dft"}.get(
-        current_job, current_job
-    )
-    migrated["current_job"] = current_job
-    migrated["schema_version"] = CURRENT_SCHEMA_VERSION
-    return migrated, changes
+    for section, allowed in _FIELDS.items():
+        value = _mapping(config, section)
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ConfigError(
+                f"unknown {section} fields: "
+                + ", ".join(unknown)
+                + "; remove obsolete or misspelled fields"
+            )
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
@@ -142,42 +135,60 @@ def validate_config(config: Mapping[str, Any]) -> None:
     from .md_policy import TrajectoryHealthError, TrajectoryHealthPolicy
     from .scenario import ScenarioLadder, ScenarioMaturityError
 
-    training = config.get("training", {})
-    md = config.get("md", {})
-    dft = config.get("dft", {})
-    campaign = config.get("campaign", {})
-    evaluation = config.get("evaluation", {})
+    try:
+        schema = int(config.get("schema_version", 0))
+    except (TypeError, ValueError) as error:
+        raise ConfigError("schema_version must be 4") from error
+    if schema != CURRENT_SCHEMA_VERSION:
+        raise ConfigError(
+            f"unsupported schema_version {schema}; NepTrain requires "
+            f"schema_version {CURRENT_SCHEMA_VERSION} and does not run legacy projects"
+        )
+    _reject_unknown(config)
+
+    training = _mapping(config, "training")
+    md = _mapping(config, "md")
+    dft = _mapping(config, "dft")
+    workflow = _mapping(config, "workflow")
+    evaluation = _mapping(config, "evaluation")
+    execution = _mapping(config, "execution")
+
     if training.get("backend") not in {"gpumd", "torchnep"}:
         raise ConfigError("training.backend must be gpumd or torchnep")
+    if not training.get("initial_path"):
+        raise ConfigError("training.initial_path is required")
+    if not training.get("config_path"):
+        raise ConfigError("training.config_path is required")
     if float(training.get("finetune_lr_scale", 0.1)) <= 0:
         raise ConfigError("training.finetune_lr_scale must be positive")
-    if int(training.get("seed", campaign.get("seed", 20260723))) < 0:
+    if int(training.get("seed", workflow.get("seed", 20260723))) < 0:
         raise ConfigError("training.seed must be non-negative")
     if training.get("finetune_lr") is not None and float(
         training["finetune_lr"]
     ) <= 0:
         raise ConfigError("training.finetune_lr must be positive")
+
     if md.get("backend") not in {"gpumd", "lammps"}:
         raise ConfigError("md.backend must be gpumd or lammps")
     if md.get("inference_backend", "auto") not in {"auto", "cpu", "cuda"}:
         raise ConfigError("md.inference_backend must be auto, cpu, or cuda")
-    if dft.get("software", "vasp") not in {"vasp", "abacus", "toy"}:
-        raise ConfigError("dft.software must be vasp, abacus, or toy")
-    if dft.get("teacher_profile", "ordinary") not in {"ordinary", "spin"}:
-        raise ConfigError("dft.teacher_profile must be ordinary or spin")
-    if int(dft.get("n_cpu", dft.get("cpu_core", 1))) < 1:
-        raise ConfigError("dft.n_cpu/dft.cpu_core must be positive")
-    if dft.get("use_k_stype", "kspacing") not in {"kspacing", "kpoints"}:
-        raise ConfigError("dft.use_k_stype must be kspacing or kpoints")
-    if config.get("current_job") not in {"training", "md", "select", "dft", "pred"}:
-        raise ConfigError(
-            "current_job must be training, md, select, dft, or pred"
-        )
-    ranks = int(md.get("mpi_ranks", 1))
-    if ranks < 1:
+    if not md.get("structures"):
+        raise ConfigError("md.structures is required")
+    temperatures = md.get("temperatures")
+    if (
+        not isinstance(temperatures, list)
+        or not temperatures
+        or any(not isinstance(value, (int, float)) for value in temperatures)
+    ):
+        raise ConfigError("md.temperatures must be a non-empty numeric list")
+    if int(md.get("initial_steps", 0)) < 1:
+        raise ConfigError("md.initial_steps must be positive")
+    if int(md.get("mpi_ranks", 1)) < 1:
         raise ConfigError("md.mpi_ranks must be at least 1")
     if int(md.get("dump_interval", 100)) < 1:
         raise ConfigError("md.dump_interval must be positive")
+    if float(md.get("tdamp", 0.1)) <= 0 or float(md.get("pdamp", 1.0)) <= 0:
+        raise ConfigError("md.tdamp and md.pdamp must be positive")
     if int(md.get("pre_failure_frames", 2)) < 0:
         raise ConfigError("md.pre_failure_frames must be non-negative")
     if int(md.get("bad_tail_frames", 1)) < 1:
@@ -186,56 +197,97 @@ def validate_config(config: Mapping[str, Any]) -> None:
         TrajectoryHealthPolicy.from_mapping(md.get("health", {}))
     except TrajectoryHealthError as error:
         raise ConfigError(str(error)) from error
+
+    if dft.get("backend", "vasp") not in {"vasp", "abacus", "toy"}:
+        raise ConfigError("dft.backend must be vasp, abacus, or toy")
+    if dft.get("teacher_profile", "ordinary") not in {"ordinary", "spin"}:
+        raise ConfigError("dft.teacher_profile must be ordinary or spin")
+    if int(dft.get("n_cpu", 1)) < 1:
+        raise ConfigError("dft.n_cpu must be positive")
+    if dft.get("use_k_stype", "kspacing") not in {"kspacing", "kpoints"}:
+        raise ConfigError("dft.use_k_stype must be kspacing or kpoints")
+
     if md.get("spin", False):
         if md.get("backend") != "lammps":
             raise ConfigError("spin MD currently requires md.backend=lammps")
         if md.get("spin_temperature") is None:
             raise ConfigError("spin MD requires md.spin_temperature")
-        if dft.get("software", "vasp") not in {"abacus", "toy"}:
+        if dft.get("backend", "vasp") not in {"abacus", "toy"}:
             raise ConfigError(
-                "spin campaigns require dft.software=abacus or toy; "
-                "VASP production labeling is non-magnetic only"
+                "spin workflows require dft.backend=abacus or toy; "
+                "VASP labeling is non-magnetic only"
             )
-    if campaign:
-        if not (
-            evaluation.get("validation_path") or training.get("test_path")
-        ):
-            raise ConfigError(
-                "campaign requires evaluation.validation_path or training.test_path"
-            )
+
+    if workflow:
+        if not evaluation.get("validation_path"):
+            raise ConfigError("evaluation.validation_path is required for workflows")
         thresholds = dict(evaluation.get("max_rmse") or {})
-        required_thresholds = {"energy_rmse", "force_rmse"}
+        required = {"energy_rmse", "force_rmse"}
         if md.get("spin", False):
-            required_thresholds.add("mforce_rmse")
-        missing_thresholds = sorted(required_thresholds - set(thresholds))
-        if missing_thresholds:
+            required.add("mforce_rmse")
+        missing = sorted(required - set(thresholds))
+        if missing:
             raise ConfigError(
-                "campaign evaluation.max_rmse is missing "
-                + ", ".join(missing_thresholds)
+                "evaluation.max_rmse is missing " + ", ".join(missing)
             )
     try:
-        ScenarioLadder.from_campaign(campaign)
+        ScenarioLadder.from_workflow(
+            {**dict(workflow), "initial_steps": int(md.get("initial_steps", 0))}
+        )
     except ScenarioMaturityError as error:
         raise ConfigError(str(error)) from error
-    execution = config.get("execution", {})
+
     try:
         interval = float(execution.get("poll_interval", 30))
     except (TypeError, ValueError) as error:
         raise ConfigError("execution.poll_interval must be numeric") from error
     if interval < 0.2:
         raise ConfigError("execution.poll_interval must be at least 0.2 seconds")
-    targets = execution.get("targets", {})
-    routes = execution.get("routes", {})
+    targets = _mapping(execution, "targets")
+    routes = _mapping(execution, "routes")
     required_routes = {"training", "sampling", "labeling", "analysis"}
     missing_routes = sorted(required_routes - set(routes))
     if missing_routes:
         raise ConfigError(
             "execution.routes is missing " + ", ".join(missing_routes)
         )
+    unknown_routes = sorted(set(routes) - required_routes)
+    if unknown_routes:
+        raise ConfigError(
+            "execution.routes has unknown roles: " + ", ".join(unknown_routes)
+        )
+    for name, raw_target in targets.items():
+        if not isinstance(raw_target, Mapping):
+            raise ConfigError(f"execution.targets.{name} must be a mapping")
+        unknown = sorted(set(raw_target) - _TARGET_FIELDS)
+        if unknown:
+            raise ConfigError(
+                f"execution.targets.{name} has unknown fields: "
+                + ", ".join(unknown)
+            )
+        overrides = raw_target.get("overrides", {})
+        if not isinstance(overrides, Mapping):
+            raise ConfigError(
+                f"execution.targets.{name}.overrides must be a mapping"
+            )
+        invalid_overrides = []
+        for dotted in overrides:
+            parts = str(dotted).split(".")
+            if (
+                len(parts) != 2
+                or parts[0] not in _FIELDS
+                or parts[1] not in _FIELDS[parts[0]]
+            ):
+                invalid_overrides.append(str(dotted))
+        if invalid_overrides:
+            raise ConfigError(
+                f"execution.targets.{name} has unknown overrides: "
+                + ", ".join(sorted(invalid_overrides))
+            )
     try:
         parsed_targets = {
             str(name): ExecutionTarget.from_mapping(str(name), value)
-            for name, value in dict(targets).items()
+            for name, value in targets.items()
         }
     except (ExecutionError, TypeError, ValueError) as error:
         raise ConfigError(str(error)) from error
@@ -249,13 +301,16 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
 def load_config(path: str | Path) -> tuple[dict[str, Any], list[str]]:
     with Path(path).open("r", encoding="utf-8") as handle:
-        raw = YAML(typ="safe").load(handle) or {}
-    migrated, changes = migrate_config(raw)
-    validate_config(migrated)
-    return migrated, changes
+        config = YAML(typ="safe").load(handle) or {}
+    if not isinstance(config, Mapping):
+        raise ConfigError("project file must contain a YAML mapping")
+    value = dict(config)
+    validate_config(value)
+    return value, []
 
 
 def save_config(config: Mapping[str, Any], path: str | Path) -> None:
+    validate_config(config)
     yaml = YAML()
     yaml.indent(mapping=2, sequence=4, offset=2)
     with Path(path).open("w", encoding="utf-8") as handle:

@@ -1,4 +1,4 @@
-"""Deterministic per-scenario maturity scheduling for MD campaigns."""
+"""Deterministic per-scenario maturity scheduling for MD workflows."""
 
 from __future__ import annotations
 
@@ -78,33 +78,33 @@ class ScenarioLadder:
         self.steps = {name: value for name, value in zip(_TARGET_LEVELS, ordered)}
 
     @classmethod
-    def from_campaign(
-        cls, campaign: Mapping[str, Any]
+    def from_workflow(
+        cls, workflow: Mapping[str, Any]
     ) -> ScenarioLadder | None:
-        """Build the optional ladder from user campaign settings.
+        """Build the optional ladder from user workflow settings.
 
-        A campaign enables the ladder by default. ``enabled: false`` is the
+        A workflow enables the ladder by default. ``enabled: false`` is the
         explicit legacy escape hatch.
         """
 
-        if not isinstance(campaign, Mapping):
-            raise ScenarioMaturityError("campaign must be a mapping")
-        if not campaign:
+        if not isinstance(workflow, Mapping):
+            raise ScenarioMaturityError("workflow must be a mapping")
+        if not workflow:
             return None
-        settings = campaign.get("maturity", {})
+        settings = workflow.get("maturity", {})
         if settings is None:
             settings = {}
         if not isinstance(settings, Mapping):
-            raise ScenarioMaturityError("campaign.maturity must be a mapping")
+            raise ScenarioMaturityError("workflow.maturity must be a mapping")
         enabled = settings.get("enabled", True)
         if not isinstance(enabled, bool):
-            raise ScenarioMaturityError("campaign.maturity.enabled must be boolean")
+            raise ScenarioMaturityError("workflow.maturity.enabled must be boolean")
         if enabled is False:
             return None
-        initial = int(campaign.get("initial_steps", 100))
+        initial = int(workflow.get("initial_steps", 100))
         configured = settings.get("levels", {})
         if not isinstance(configured, Mapping):
-            raise ScenarioMaturityError("campaign.maturity.levels must be a mapping")
+            raise ScenarioMaturityError("workflow.maturity.levels must be a mapping")
         defaults = {
             "smoke_passed": initial,
             "short_stable": initial * 4,
@@ -114,7 +114,7 @@ class ScenarioLadder:
         unknown = sorted(set(configured) - set(defaults))
         if unknown:
             raise ScenarioMaturityError(
-                f"unknown campaign.maturity.levels: {', '.join(unknown)}"
+                f"unknown workflow.maturity.levels: {', '.join(unknown)}"
             )
         return cls(
             {
@@ -140,7 +140,7 @@ class ScenarioLadder:
         if copied.get("version") != 1:
             raise ScenarioMaturityError("unsupported scenario maturity history version")
         if copied.get("levels") != self.steps:
-            raise ScenarioMaturityError("scenario maturity levels changed after campaign start")
+            raise ScenarioMaturityError("scenario maturity levels changed after workflow start")
         scenarios = copied.get("scenarios")
         if not isinstance(scenarios, dict):
             raise ScenarioMaturityError("scenario maturity history is malformed")

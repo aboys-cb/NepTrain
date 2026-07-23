@@ -9,16 +9,16 @@ from types import SimpleNamespace
 import pytest
 
 from NepTrain.cli.cli import run_project_command, run_status_command
-from NepTrain.core.campaign import (
-    CampaignError,
-    CampaignResume,
-    campaign_status,
-    extend_campaign,
-    prepare_campaign,
-    resume_campaign,
-    submit_campaign,
+from NepTrain.core.workflow import (
+    WorkflowError,
+    WorkflowResume,
+    workflow_status,
+    extend_workflow,
+    prepare_workflow,
+    resume_workflow,
+    submit_workflow,
 )
-from NepTrain.core.campaign_workspace import CampaignWorkspace
+from NepTrain.core.workflow_workspace import WorkflowWorkspace
 
 
 def _write(path: Path, text: str = "fixture\n") -> Path:
@@ -38,46 +38,56 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
     config = _write(
         tmp_path / "job.yaml",
         """
-schema_version: 2
+schema_version: 4
 training:
   backend: torchnep
+  initial_path: ./initial.xyz
   config_path: ./nep.in
   device: cuda
 md:
   backend: lammps
   structures: ./structure.xyz
   inference_backend: cpu
+  temperatures: [300, 500]
+  initial_steps: 10
   spin: false
 dft:
-  software: toy
+  backend: toy
 evaluation:
   validation_path: ./validation.xyz
   max_rmse:
     energy_rmse: 1.0
     force_rmse: 1.0
-campaign:
+workflow:
   id: controller-smoke
   generations: 3
   seed: 17
   initial_candidates: 12
   dft_budget: 6
   minimum_dft_budget: 2
-  initial_steps: 10
-  temperatures: [300, 500]
   frame_stride: 3
-  command: NepTrain
-  slurm:
+execution:
+  poll_interval: 0.2
+  routes:
+    training: training
+    sampling: cpu
+    labeling: dft
+    analysis: cpu
+  targets:
     training:
+      executor: slurm
       partition: 16V100
       qos: flood-1o2gpu
       gpus_per_node: 1
       setup_script: ./gpu-env.sh
     cpu:
+      executor: slurm
       partition: DSPRHBM
       qos: rush-cpu
       cpus_per_task: 4
       setup_script: ./cpu-env.sh
     dft:
+      executor: slurm
       partition: 16V100
       qos: flood-1o2gpu
       gpus_per_node: 1
@@ -93,12 +103,12 @@ def _hash(value) -> str:
     ).hexdigest()
 
 
-def test_campaign_prepares_controller_plans_and_readable_workspace(tmp_path: Path):
+def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Path):
     config, initial = _inputs(tmp_path)
-    result = prepare_campaign(config, initial, tmp_path / "campaign")
-    workspace = CampaignWorkspace.locate(result.output_dir)
+    result = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(result.output_dir)
 
-    assert result.campaign_id == "controller-smoke"
+    assert result.workflow_id == "controller-smoke"
     assert result.scripts == ()
     assert len(result.plans) == 3
     assert all(path.parent == workspace.plans_dir for path in result.plans)
@@ -109,8 +119,8 @@ def test_campaign_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert manifest["scripts"] == []
 
     project_text = result.config_file.read_text()
-    assert "schema_version: 3" in project_text
-    assert "campaign.slurm" not in project_text
+    assert "schema_version: 4" in project_text
+    assert "workflow.slurm" not in project_text
     assert "execution:" in project_text
     assert "inputs/training/nep.in" in project_text
     assert "inputs/md/structures.xyz" in project_text
@@ -129,7 +139,7 @@ def test_prepare_only_cli_does_not_start_controller(tmp_path: Path, capsys):
             project=str(config),
             initial_training=str(tmp_path / "initial.xyz"),
             output=str(output),
-            campaign_id=None,
+            workflow_id=None,
             prepare_only=True,
             foreground=False,
             poll_interval=None,
@@ -143,17 +153,17 @@ def test_prepare_only_cli_does_not_start_controller(tmp_path: Path, capsys):
 
 def test_status_reports_prepared_controller_without_mutation(tmp_path: Path):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     before = preparation.manifest.read_bytes()
 
-    status = campaign_status(preparation.output_dir)
+    status = workflow_status(preparation.output_dir)
 
     assert status.state == "prepared"
     assert status.completed_generations == 0
     assert status.generation == 1
     assert status.stage == "train"
     assert status.jobs == ()
-    assert status.next_action.startswith("NepTrain run ")
+    assert status.next_action.startswith("neptrain workflow run ")
     assert [item["state"] for item in status.generations] == [
         "not_started",
         "not_started",
@@ -164,13 +174,13 @@ def test_status_reports_prepared_controller_without_mutation(tmp_path: Path):
 
 def test_status_uses_controller_task_instead_of_scheduler_chain(tmp_path: Path):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
-    workspace = CampaignWorkspace.locate(preparation.output_dir)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
     workspace.controller_file.write_text(
         json.dumps(
             {
                 "protocol": "neptrain.controller.v1",
-                "campaign_id": preparation.campaign_id,
+                "workflow_id": preparation.workflow_id,
                 "state": "launching",
                 "current": {
                     "task_id": "abc",
@@ -189,7 +199,7 @@ def test_status_uses_controller_task_instead_of_scheduler_chain(tmp_path: Path):
         encoding="utf-8",
     )
 
-    status = campaign_status(preparation.output_dir)
+    status = workflow_status(preparation.output_dir)
 
     assert status.state == "paused"
     assert "not running" in status.reason
@@ -200,7 +210,7 @@ def test_status_uses_controller_task_instead_of_scheduler_chain(tmp_path: Path):
 
 def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     run_status_command(
         SimpleNamespace(project=str(preparation.output_dir), json=False, jobs=False)
     )
@@ -211,9 +221,9 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     assert "Executor: 0/0 stages completed" in output
 
 
-def test_completed_campaign_extends_plans_without_job_scripts(tmp_path: Path):
+def test_completed_workflow_extends_plans_without_job_scripts(tmp_path: Path):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     original = [path.read_bytes() for path in preparation.plans]
     generations = {}
     for path in preparation.plans:
@@ -226,13 +236,13 @@ def test_completed_campaign_extends_plans_without_job_scripts(tmp_path: Path):
             "complete": True,
             "accepted": True,
         }
-    workspace = CampaignWorkspace.locate(preparation.output_dir)
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
     workspace.ledger.write_text(
-        json.dumps({"version": 1, "campaign_id": preparation.campaign_id, "generations": generations}),
+        json.dumps({"version": 1, "workflow_id": preparation.workflow_id, "generations": generations}),
         encoding="utf-8",
     )
 
-    extended = extend_campaign(preparation.output_dir, 5)
+    extended = extend_workflow(preparation.output_dir, 5)
 
     assert len(extended.plans) == 5
     assert extended.scripts == ()
@@ -244,43 +254,43 @@ def test_completed_campaign_extends_plans_without_job_scripts(tmp_path: Path):
 
 def test_extension_requires_completed_accepted_prefix(tmp_path: Path):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
-    with pytest.raises(CampaignError, match="only be extended"):
-        extend_campaign(preparation, 4)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    with pytest.raises(WorkflowError, match="only be extended"):
+        extend_workflow(preparation, 4)
 
 
-def test_campaign_rejects_prepared_input_drift(tmp_path: Path):
+def test_workflow_rejects_prepared_input_drift(tmp_path: Path):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     preparation.config_file.write_text("changed: true\n", encoding="utf-8")
-    with pytest.raises(CampaignError, match="artifact drifted"):
-        campaign_status(preparation.output_dir)
+    with pytest.raises(WorkflowError, match="artifact drifted"):
+        workflow_status(preparation.output_dir)
 
 
-def test_controller_campaign_rejects_legacy_dependency_submission(tmp_path: Path):
+def test_controller_workflow_rejects_legacy_dependency_submission(tmp_path: Path):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
-    with pytest.raises(CampaignError, match="do not submit a Slurm dependency"):
-        submit_campaign(preparation)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    with pytest.raises(WorkflowError, match="do not submit a Slurm dependency"):
+        submit_workflow(preparation)
 
 
 def test_run_on_existing_project_uses_resume_interface(tmp_path: Path, monkeypatch, capsys):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
-    expected = CampaignResume(
-        preparation.campaign_id,
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    expected = WorkflowResume(
+        preparation.workflow_id,
         "resume",
         ("123",),
         preparation.manifest,
     )
-    monkeypatch.setattr("NepTrain.core.campaign.resume_campaign", lambda _path: expected)
+    monkeypatch.setattr("NepTrain.core.workflow.resume_workflow", lambda _path: expected)
 
     run_project_command(
         SimpleNamespace(
             project=str(preparation.output_dir),
             initial_training=None,
             output=None,
-            campaign_id=None,
+            workflow_id=None,
             prepare_only=False,
             foreground=False,
             poll_interval=None,
@@ -296,9 +306,9 @@ def test_run_existing_project_forwards_foreground_controller_options(
     tmp_path: Path, monkeypatch, capsys
 ):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
-    expected = CampaignResume(
-        preparation.campaign_id,
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    expected = WorkflowResume(
+        preparation.workflow_id,
         "resume",
         (),
         preparation.manifest,
@@ -310,14 +320,14 @@ def test_run_existing_project_forwards_foreground_controller_options(
         calls.append((Path(path), options))
         return expected
 
-    monkeypatch.setattr("NepTrain.core.campaign.resume_campaign", fake_resume)
+    monkeypatch.setattr("NepTrain.core.workflow.resume_workflow", fake_resume)
 
     run_project_command(
         SimpleNamespace(
             project=str(preparation.output_dir),
             initial_training=None,
             output=None,
-            campaign_id=None,
+            workflow_id=None,
             prepare_only=False,
             foreground=True,
             poll_interval=0.5,
@@ -332,17 +342,17 @@ def test_run_existing_project_forwards_foreground_controller_options(
     assert "job_ids" not in payload
 
 
-def test_resume_completed_campaign_is_an_idempotent_noop(
+def test_resume_completed_workflow_is_an_idempotent_noop(
     tmp_path: Path, monkeypatch
 ):
     config, initial = _inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     monkeypatch.setattr(
-        "NepTrain.core.campaign.campaign_status",
+        "NepTrain.core.workflow.workflow_status",
         lambda _path: SimpleNamespace(state="complete"),
     )
 
-    result = resume_campaign(preparation.output_dir)
+    result = resume_workflow(preparation.output_dir)
 
     assert result.action == "complete"
     assert result.job_ids == ()

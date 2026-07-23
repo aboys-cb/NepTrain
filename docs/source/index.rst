@@ -1,20 +1,12 @@
-.. NepTrainKit documentation master file, created by
-   sphinx-quickstart on Wed Dec  4 19:50:15 2024.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
+NepTrain 文档
+=============
 
-NepTrain documentation
-=========================
-Welcome to NepTrain – an advanced automation toolkit for training neuroevolution potential (NEP). Simplify your workflows with seamless integration of GPUMD, VASP, and NEP, offering features like perturbation, active learning, single-point energy calculations, and efficient potential training.
-
+NepTrain 同时提供可组合的训练、MD、DFT、采样命令和可恢复的主动学习 workflow。
+手动步骤与自动流程使用相同的科学 Adapter 和执行 target。
 
 .. toctree::
    :maxdepth: 2
-   :caption: Documentation:
+   :caption: 使用文档
 
-   install    <install/index>
-   command    <command/index>
-   example    <example/index>
-
-
-
+   安装 <install/index>
+   命令行 <command/index>

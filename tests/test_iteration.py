@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -30,7 +29,6 @@ from NepTrain.core.dft.toy import ToyTeacher
 from NepTrain.core.dft import LabelResult
 from ase.io import read as ase_read
 from ase.io import write as ase_write
-from NepTrain.cli import cli
 
 
 def test_progression_grows_exploration_and_reduces_dft_budget():
@@ -81,7 +79,7 @@ def test_zero_min_distance_allows_duplicate_smoke_candidates():
     assert result.selected_ids == ("candidate-a",)
 
 
-def test_two_generation_toy_campaign_is_deterministic_and_resumable(tmp_path: Path):
+def test_two_generation_toy_workflow_is_deterministic_and_resumable(tmp_path: Path):
     report = run_toy_iteration_smoke(
         tmp_path / "iteration",
         profile="spin",
@@ -104,7 +102,7 @@ def test_two_generation_toy_campaign_is_deterministic_and_resumable(tmp_path: Pa
     assert report.deterministic_selection
     assert report.resume_reused_artifacts
     ledger = json.loads(
-        (tmp_path / "iteration/campaign/campaign-ledger.json").read_text(
+        (tmp_path / "iteration/workflow/workflow-ledger.json").read_text(
             encoding="utf-8"
         )
     )
@@ -143,18 +141,18 @@ def test_controller_rejects_completed_artifact_drift(tmp_path: Path):
         initial_training=root / "initial-train.xyz",
         validation=root / "validation.xyz",
     )
-    controller = GenerationController(root / "campaign", "toy-spin-17")
-    summary = controller.run_campaign(plan, adapter)[0]
+    controller = GenerationController(root / "workflow", "toy-spin-17")
+    summary = controller.run_workflow(plan, adapter)[0]
     summary.artifacts["selection_result"].write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(IterationError, match="artifact drifted"):
-        GenerationController(root / "campaign", "toy-spin-17").run_campaign(plan, adapter)
+        GenerationController(root / "workflow", "toy-spin-17").run_workflow(plan, adapter)
 
 
 def test_ledger_records_plan_and_stage_artifact_hashes(tmp_path: Path):
     run_toy_iteration_smoke(tmp_path / "iteration", generations=1)
     ledger = json.loads(
-        (tmp_path / "iteration/campaign/campaign-ledger.json").read_text(encoding="utf-8")
+        (tmp_path / "iteration/workflow/workflow-ledger.json").read_text(encoding="utf-8")
     )
 
     generation = ledger["generations"]["1"]
@@ -188,7 +186,7 @@ def test_rejected_generation_stops_before_next_plan(tmp_path: Path):
     plans = progressive_plans(2)
     summaries = GenerationController(
         tmp_path / "rejected", "rejected"
-    ).run_campaign(plans, RejectingAdapter())
+    ).run_workflow(plans, RejectingAdapter())
 
     assert len(summaries) == 1
     assert summaries[0].accepted is False
@@ -221,7 +219,7 @@ def test_rejected_generation_can_reopen_from_retrain_with_history(tmp_path: Path
 
     recovered = controller.run_generation(plan, adapter)
     assert recovered.accepted is True
-    ledger = json.loads((root / "campaign-ledger.json").read_text())
+    ledger = json.loads((root / "workflow-ledger.json").read_text())
     generation = ledger["generations"]["1"]
     assert generation["recovery_attempts"][0]["from_stage"] == "retrain"
     assert generation["recovery_attempts"][0]["stages"]["evaluate"][
@@ -240,11 +238,11 @@ def test_controller_rejects_plan_change_after_generation_started(tmp_path: Path)
 
     controller = GenerationController(tmp_path / "plan-drift", "plan-drift")
     original = GenerationPlan(1, 1, 4, 2, 100, (300.0,))
-    controller.run_campaign((original,), AcceptingAdapter())
+    controller.run_workflow((original,), AcceptingAdapter())
     changed = GenerationPlan(1, 1, 4, 2, 200, (300.0,))
 
     with pytest.raises(IterationError, match="plan changed"):
-        controller.run_campaign((changed,), AcceptingAdapter())
+        controller.run_workflow((changed,), AcceptingAdapter())
 
 
 def test_controller_runs_one_resource_stage_at_a_time(tmp_path: Path):
@@ -282,26 +280,6 @@ def test_controller_rejects_out_of_order_resource_stage(tmp_path: Path):
 
     with pytest.raises(IterationError, match="expects stage train, not explore"):
         controller.run_stage(plan, object(), "explore")
-
-
-def test_training_resource_stops_cleanly_at_cpu_boundary(tmp_path: Path, monkeypatch):
-    class Adapter:
-        def run_stage(self, stage, context):
-            artifact = context.generation_dir / f"{stage}.json"
-            artifact.write_text("{}\n", encoding="utf-8")
-            return StageOutcome({f"{stage}_artifact": artifact})
-
-    plan = progressive_plans(1)[0]
-    controller = GenerationController(tmp_path / "resource", "resource")
-    monkeypatch.setattr(
-        cli,
-        "_iteration_execution",
-        lambda args: (plan, Adapter(), controller),
-    )
-
-    cli.run_iteration_resource_command(SimpleNamespace(resource="training"))
-
-    assert controller.next_stage(plan) == "explore"
 
 
 def test_stale_controller_cannot_repeat_a_completed_stage(tmp_path: Path):
@@ -433,7 +411,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
                 "mforce_rmse": 0.5,
             },
         },
-        "campaign": {
+        "workflow": {
             "initial_steps": 40,
             "maturity": {
                 "levels": {
@@ -456,7 +434,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     )
     plan = GenerationPlan(1, 19, 6, 3, 40, (300.0, 500.0), frame_stride=1)
     summary = GenerationController(
-        tmp_path / "campaign", "real-contract-toy-labels"
+        tmp_path / "workflow", "real-contract-toy-labels"
     ).run_generation(plan, adapter)
 
     assert summary.accepted
@@ -514,7 +492,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     )
     with pytest.raises(WorkflowIterationError, match="overlaps"):
         GenerationController(
-            tmp_path / "overlap-campaign", "overlap"
+            tmp_path / "overlap-workflow", "overlap"
         ).run_generation(plan, overlap_adapter)
 
     unsafe_config = {
@@ -542,7 +520,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
         },
     }
     fallback_summary = GenerationController(
-        tmp_path / "fallback-campaign", "fallback"
+        tmp_path / "fallback-workflow", "fallback"
     ).run_generation(
         plan,
         WorkflowIterationAdapter(
@@ -710,11 +688,11 @@ def test_workflow_label_routes_production_dft_through_label_interface(
     adapter = WorkflowIterationAdapter(
         {
             "training": {"backend": "gpumd", "config_path": str(config_file)},
-            "md": {"backend": "lammps", "spin": False},
-            "dft": {
-                "software": backend,
-                "cpu_core": 4,
-                "incar_path": str(input_file),
+                "md": {"backend": "lammps", "spin": False},
+                "dft": {
+                    "backend": backend,
+                    "n_cpu": 4,
+                    "input_path": str(input_file),
                 "resource_path": str(resource_dir),
                 "kpoints_use_gamma": True,
                 "use_k_stype": "kpoints",

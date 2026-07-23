@@ -10,7 +10,7 @@ import subprocess
 
 from ase.io import write as ase_write
 
-from NepTrain import utils, Config
+from NepTrain import utils
 from .plot import *
 
 
@@ -22,7 +22,7 @@ class RunInput:
 
     def __init__(self,nep_txt_path):
         self.nep_txt_path=nep_txt_path
-        self.command=Config.get('environ','gpumd_path')
+        self.command = os.environ.get("NEPTRAIN_GPUMD_COMMAND", "gpumd")
         self.time_step=1
         self.dump_thermo=False
         self.dump_exyz=False

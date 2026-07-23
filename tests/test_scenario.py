@@ -140,7 +140,7 @@ def test_failed_md_attempt_does_not_promote_after_validation_passes():
 
 def test_maturity_config_rejects_typos_instead_of_silently_using_defaults():
     with pytest.raises(ScenarioMaturityError, match="short_stabel"):
-        ScenarioLadder.from_campaign(
+        ScenarioLadder.from_workflow(
             {
                 "initial_steps": 10,
                 "maturity": {"levels": {"short_stabel": 40}},

@@ -78,9 +78,6 @@ def merge_yaml(yaml_a, yaml_b):
     return result
 
 
-def get_config_path():
-    return os.path.join(os.path.expanduser('~'),".NepTrain")
-
 def verify_path(path):
     if not os.path.exists(os.path.expanduser(path)):
 
@@ -249,4 +246,3 @@ def is_diff_path(path,path1):
 def split_list(lst, n):
     k, m = divmod(len(lst), n)
     return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
-

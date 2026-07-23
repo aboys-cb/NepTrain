@@ -1,4 +1,4 @@
-"""Persistent, scheduler-independent controller for NepTrain campaigns."""
+"""Persistent, scheduler-independent controller for NepTrain workflows."""
 
 from __future__ import annotations
 
@@ -13,10 +13,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Mapping
 
-from .campaign_workspace import CampaignWorkspace
+from .workflow_workspace import WorkflowWorkspace
 from .config import ConfigError, load_config
 from .execution import (
     ExecutionError,
@@ -31,7 +32,7 @@ from .iteration import GenerationController, GenerationPlan, IterationError, Sta
 
 
 class ControllerError(RuntimeError):
-    """Raised when a campaign controller cannot safely make progress."""
+    """Raised when a workflow controller cannot safely make progress."""
 
 
 _RESOURCE_FOR_STAGE = {
@@ -45,6 +46,7 @@ _RESOURCE_FOR_STAGE = {
     "evaluate": "analysis",
 }
 _STOP = False
+_STOP_EVENT = threading.Event()
 
 
 def _now() -> str:
@@ -119,7 +121,7 @@ def _process_matches(pid: int, project: Path) -> bool:
 
 
 def controller_running(project: str | Path) -> bool:
-    workspace = CampaignWorkspace.locate(project)
+    workspace = WorkflowWorkspace.locate(project)
     workspace.controller_lock.parent.mkdir(parents=True, exist_ok=True)
     with workspace.controller_lock.open("a+", encoding="utf-8") as handle:
         try:
@@ -148,7 +150,7 @@ class ControllerTick:
 
 
 class PersistentController:
-    """Advance one campaign through portable stage tasks.
+    """Advance one workflow through portable stage tasks.
 
     The ledger remains the scientific source of truth.  This module owns only
     execution intent and remote handles, so restarting it cannot repeat an
@@ -161,15 +163,15 @@ class PersistentController:
         *,
         executor_factory: ExecutorFactory = executor_for,
     ):
-        self.workspace = CampaignWorkspace.locate(project)
+        self.workspace = WorkflowWorkspace.locate(project)
         if self.workspace.version != 2:
             raise ControllerError(
-                "persistent controllers require campaign layout v2; migrate the project first"
+                "persistent controllers require workflow layout v2; migrate the project first"
             )
         self.manifest = _read_json(self.workspace.manifest)
         if self.manifest.get("orchestration") != "controller-v1":
             raise ControllerError(
-                "campaign was prepared for the legacy Slurm dependency chain"
+                "workflow was prepared for the legacy Slurm dependency chain"
             )
         for record in [
             self.manifest["config"],
@@ -179,9 +181,9 @@ class PersistentController:
         ]:
             if not _record_matches(record):
                 raise ControllerError(
-                    f"prepared campaign artifact drifted: {record['path']}"
+                    f"prepared workflow artifact drifted: {record['path']}"
                 )
-        self.campaign_id = str(self.manifest["campaign_id"])
+        self.workflow_id = str(self.manifest["workflow_id"])
         try:
             self.config, _ = load_config(self.workspace.project_file)
         except ConfigError as error:
@@ -189,7 +191,7 @@ class PersistentController:
         self.plans = tuple(_plan(Path(item["path"])) for item in self.manifest["plans"])
         self.initial_training = Path(self.manifest["initial_training"]["path"])
         self.generation_controller = GenerationController(
-            self.workspace.root, self.campaign_id
+            self.workspace.root, self.workflow_id
         )
         self.executor_factory = executor_factory
         self.targets, self.routes = self._execution_config(
@@ -199,14 +201,14 @@ class PersistentController:
             self.workspace.controller_file,
             {
                 "protocol": "neptrain.controller.v1",
-                "campaign_id": self.campaign_id,
+                "workflow_id": self.workflow_id,
                 "state": "idle",
                 "history": [],
                 "current": None,
             },
         )
-        if self.state.get("campaign_id") != self.campaign_id:
-            raise ControllerError("controller state belongs to a different campaign")
+        if self.state.get("workflow_id") != self.workflow_id:
+            raise ControllerError("controller state belongs to a different workflow")
 
     @staticmethod
     def _execution_config(
@@ -248,7 +250,7 @@ class PersistentController:
     def _ledger(self) -> dict[str, Any]:
         return _read_json(
             self.workspace.ledger,
-            {"version": 1, "campaign_id": self.campaign_id, "generations": {}},
+            {"version": 1, "workflow_id": self.workflow_id, "generations": {}},
         )
 
     def _next(self) -> tuple[GenerationPlan, str, Any] | None:
@@ -296,7 +298,7 @@ class PersistentController:
         current = self.state["current"]
         expected = {
             "task_id": current["task_id"],
-            "campaign_id": self.campaign_id,
+            "workflow_id": self.workflow_id,
             "generation": plan.generation,
             "stage": stage,
             "plan_sha256": plan.sha256,
@@ -335,7 +337,7 @@ class PersistentController:
 
                 task = StageTask(
                     str(current["task_id"]),
-                    self.campaign_id,
+                    self.workflow_id,
                     int(current["generation"]),
                     str(current["stage"]),
                     str(current["target"]),
@@ -426,8 +428,8 @@ class PersistentController:
         attempt = self._attempt(plan.generation, stage)
         task = build_stage_task(
             self.workspace.tasks_dir,
-            campaign_root=self.workspace.root,
-            campaign_id=self.campaign_id,
+            workflow_root=self.workspace.root,
+            workflow_id=self.workflow_id,
             generation=plan.generation,
             stage=stage,
             attempt=attempt,
@@ -456,10 +458,10 @@ class PersistentController:
     def retry(self, *, recover_rejected: bool = False) -> None:
         state = str(self.state.get("state", "idle"))
         if state == "complete":
-            raise ControllerError("campaign is already complete")
+            raise ControllerError("workflow is already complete")
         if state == "rejected":
             if not recover_rejected:
-                raise ControllerError("campaign is rejected; explicit recovery is required")
+                raise ControllerError("workflow is rejected; explicit recovery is required")
             ledger = self._ledger()
             rejected = [
                 plan
@@ -487,14 +489,16 @@ class PersistentController:
 def _signal_stop(_signum, _frame) -> None:
     global _STOP
     _STOP = True
+    _STOP_EVENT.set()
 
 
 def run_controller(project: str | Path, *, poll_interval: float | None = None) -> int:
-    """Hold the campaign controller lock and supervise until a terminal state."""
+    """Hold the workflow controller lock and supervise until a terminal state."""
 
     global _STOP
     _STOP = False
-    workspace = CampaignWorkspace.locate(project)
+    _STOP_EVENT.clear()
+    workspace = WorkflowWorkspace.locate(project)
     interval = poll_interval
     if interval is None:
         config, _ = load_config(workspace.project_file)
@@ -507,12 +511,13 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise ControllerError("campaign controller is already running") from error
+            raise ControllerError("workflow controller is already running") from error
         workspace.controller_pid.write_text(f"{os.getpid()}\n", encoding="utf-8")
         controller = PersistentController(workspace.root)
         controller.state["pid"] = os.getpid()
         controller.state["started_at"] = _now()
         controller.state["state"] = "running"
+        controller.state.pop("reason", None)
         controller._save()
         try:
             while not _STOP:
@@ -536,7 +541,7 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                     tick = ControllerTick("degraded", detail=str(error))
                 if tick.state in {"complete", "rejected", "failed"}:
                     return 0 if tick.state == "complete" else 2
-                time.sleep(interval)
+                _STOP_EVENT.wait(interval)
             controller.state["state"] = "stopped"
             controller.state["reason"] = "controller stopped by user"
             controller._save()
@@ -560,9 +565,9 @@ def start_controller(
     foreground: bool = False,
     poll_interval: float | None = None,
 ) -> int:
-    workspace = CampaignWorkspace.locate(project)
+    workspace = WorkflowWorkspace.locate(project)
     if controller_running(workspace.root):
-        raise ControllerError("campaign controller is already running")
+        raise ControllerError("workflow controller is already running")
     if foreground:
         return run_controller(workspace.root, poll_interval=poll_interval)
     command = [*_controller_command(), "controller", str(workspace.root)]
@@ -605,15 +610,15 @@ def start_controller(
 
 
 def stop_controller(project: str | Path) -> None:
-    workspace = CampaignWorkspace.locate(project)
+    workspace = WorkflowWorkspace.locate(project)
     if not controller_running(workspace.root):
-        raise ControllerError("campaign controller is not running")
+        raise ControllerError("workflow controller is not running")
     try:
         pid = int(workspace.controller_pid.read_text(encoding="utf-8").strip())
     except (FileNotFoundError, ValueError) as error:
         raise ControllerError("running controller has no valid pid record") from error
     if not _process_matches(pid, workspace.root):
-        raise ControllerError("refusing to signal a pid that is not this campaign controller")
+        raise ControllerError("refusing to signal a pid that is not this workflow controller")
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
@@ -621,6 +626,116 @@ def stop_controller(project: str | Path) -> None:
             return
         time.sleep(0.05)
     raise ControllerError("controller did not stop within 5 seconds")
+
+
+def stop_workflow(
+    project: str | Path,
+    *,
+    cancel_jobs: bool = False,
+    executor_factory: ExecutorFactory = executor_for,
+) -> dict[str, Any]:
+    """Stop the controller and optionally cancel its current execution.
+
+    Cancellation is intentionally explicit. A successfully cancelled task is
+    archived and removed from ``current`` so a later resume creates a new,
+    traceable attempt instead of inspecting the cancelled handle again.
+    """
+
+    workspace = WorkflowWorkspace.locate(project)
+    was_running = controller_running(workspace.root)
+    if was_running:
+        stop_controller(workspace.root)
+    elif not cancel_jobs:
+        raise ControllerError("workflow controller is not running")
+
+    result: dict[str, Any] = {
+        "project": str(workspace.root),
+        "controller": "stopped" if was_running else "already_stopped",
+        "current_execution": None,
+    }
+    if not cancel_jobs:
+        return result
+
+    with workspace.controller_lock.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:  # pragma: no cover - race protection
+            raise ControllerError(
+                "workflow controller restarted before jobs could be cancelled"
+            ) from error
+        controller = PersistentController(
+            workspace.root, executor_factory=executor_factory
+        )
+        current = controller.state.get("current")
+        if current is None:
+            controller.state["state"] = "stopped"
+            controller.state["reason"] = (
+                "controller stopped by user; no current execution to cancel"
+            )
+            controller._save()
+            result["current_execution"] = {"action": "none"}
+            return result
+        handle_value = current.get("handle")
+        if handle_value is None:
+            raise ControllerError(
+                "current task has no execution handle; cancellation cannot "
+                "safely determine whether submission completed"
+            )
+        target_name = str(current["target"])
+        target = controller.targets[target_name]
+        handle = ExecutionHandle.from_mapping(handle_value)
+        executor = controller.executor_factory(target)
+        try:
+            status = executor.cancel(handle)
+        except ExecutionError as error:
+            raise ControllerError(
+                f"failed to cancel {target_name} execution "
+                f"{handle.execution_id}: {error}"
+            ) from error
+
+        record = {
+            "target": target_name,
+            "executor": handle.executor,
+            "execution_id": handle.execution_id,
+            "action": status.state,
+            "detail": status.detail,
+        }
+        result["current_execution"] = record
+        if status.state == "completed":
+            controller.state["state"] = "stopped"
+            controller.state["reason"] = (
+                "controller stopped by user; current execution completed "
+                "before cancellation and remains available for collection"
+            )
+            controller._save()
+            return result
+        if status.state == "cancelling":
+            current["cancellation_requested_at"] = _now()
+            current["cancellation"] = record
+            controller.state["state"] = "stopped"
+            controller.state["reason"] = (
+                "controller stopped; current execution cancellation was "
+                "accepted but is not terminal yet"
+            )
+            controller._save()
+            return result
+        if status.state not in {"cancelled", "failed"}:
+            raise ControllerError(
+                f"execution cancellation returned unsafe state {status.state}"
+            )
+        archived = dict(current)
+        archived["cancelled_at"] = _now()
+        archived["cancellation"] = record
+        controller.state.setdefault("history", []).append(archived)
+        controller.state["current"] = None
+        controller.state["state"] = "stopped"
+        controller.state["reason"] = (
+            "controller stopped and current execution cancelled by user"
+            if status.state == "cancelled"
+            else "controller stopped; current execution had already failed"
+        )
+        controller._save()
+        return result
 
 
 __all__ = [
@@ -631,4 +746,5 @@ __all__ = [
     "run_controller",
     "start_controller",
     "stop_controller",
+    "stop_workflow",
 ]

@@ -26,7 +26,7 @@ STAGES = (
 
 
 class IterationError(RuntimeError):
-    """Raised when a campaign plan, ledger, or artifact is inconsistent."""
+    """Raised when a workflow plan, ledger, or artifact is inconsistent."""
 
 
 def _canonical_hash(value: Any) -> str:
@@ -78,7 +78,7 @@ def progressive_plans(
     min_distance: float = 0.0,
     frame_stride: int = 2,
 ) -> tuple[GenerationPlan, ...]:
-    """Build the conservative auto progression used by the Toy campaign.
+    """Build the conservative auto progression used by the Toy workflow.
 
     Cheap exploration grows each generation while the expensive DFT budget
     contracts. Step count grows before a new temperature stratum is opened.
@@ -227,7 +227,7 @@ class StageContext:
         """Directory owned by the current stage.
 
         Legacy and direct controller users keep writing to ``generation_dir``;
-        campaign layout v2 gives each stage a focused subdirectory.
+        workflow layout v2 gives each stage a focused subdirectory.
         """
 
         return self.stage_dir or self.generation_dir
@@ -259,14 +259,14 @@ class StageSummary:
 class GenerationController:
     """Execute the fixed generation sequence with an atomic, hash-checked ledger."""
 
-    def __init__(self, root: str | Path, campaign_id: str):
+    def __init__(self, root: str | Path, workflow_id: str):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.workspace = None
         try:
-            from .campaign_workspace import CampaignWorkspace
+            from .workflow_workspace import WorkflowWorkspace
 
-            workspace = CampaignWorkspace.locate(self.root)
+            workspace = WorkflowWorkspace.locate(self.root)
         except FileNotFoundError:
             workspace = None
         if workspace is not None and workspace.version == 2:
@@ -274,11 +274,11 @@ class GenerationController:
             self.ledger_path = workspace.ledger
             self.lock_path = workspace.ledger_lock
         else:
-            self.ledger_path = self.root / "campaign-ledger.json"
-            self.lock_path = self.root / ".campaign-ledger.lock"
+            self.ledger_path = self.root / "workflow-ledger.json"
+            self.lock_path = self.root / ".workflow-ledger.lock"
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self.campaign_id = campaign_id
+        self.workflow_id = workflow_id
         with self._lock():
             self._ledger = self._load()
 
@@ -293,12 +293,12 @@ class GenerationController:
 
     def _load(self) -> dict[str, Any]:
         if not self.ledger_path.exists():
-            ledger = {"version": 1, "campaign_id": self.campaign_id, "generations": {}}
+            ledger = {"version": 1, "workflow_id": self.workflow_id, "generations": {}}
             self._write(ledger)
             return ledger
         ledger = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-        if ledger.get("campaign_id") != self.campaign_id:
-            raise IterationError("campaign_id does not match the existing ledger")
+        if ledger.get("workflow_id") != self.workflow_id:
+            raise IterationError("workflow_id does not match the existing ledger")
         return ledger
 
     def _write(self, ledger: Mapping[str, Any]) -> None:
@@ -402,7 +402,7 @@ class GenerationController:
     ) -> tuple[str, StageContext]:
         """Describe the next stage without executing or mutating it.
 
-        Persistent campaign controllers use this method to build an immutable
+        Persistent workflow controllers use this method to build an immutable
         task for another machine.  The returned paths remain protected by the
         ledger hashes and are checked again when the result is committed.
         """
@@ -517,7 +517,7 @@ class GenerationController:
         """Run exactly one ledger-authorized stage.
 
         This is the resource-boundary API: training and MD may be submitted as
-        separate Slurm jobs while sharing one deterministic campaign ledger.
+        separate Slurm jobs while sharing one deterministic workflow ledger.
         """
 
         with self._lock():
@@ -662,13 +662,13 @@ class GenerationController:
             self.run_stage(plan, adapter)
         return self._summary(plan)
 
-    def run_campaign(
+    def run_workflow(
         self, plans: Sequence[GenerationPlan], adapter: IterationAdapter
     ) -> tuple[GenerationSummary, ...]:
         expected = list(range(1, len(plans) + 1))
         observed = [plan.generation for plan in plans]
         if observed != expected:
-            raise IterationError("campaign plans must be contiguous and start at generation 1")
+            raise IterationError("workflow plans must be contiguous and start at generation 1")
         summaries = []
         for plan in plans:
             summary = self.run_generation(plan, adapter)

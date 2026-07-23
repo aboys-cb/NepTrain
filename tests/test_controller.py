@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -10,13 +11,14 @@ import time
 
 import pytest
 
-from NepTrain.core.campaign import campaign_status, prepare_campaign
+from NepTrain.core.workflow import workflow_status, prepare_workflow
 from NepTrain.core.controller import (
     ControllerError,
     PersistentController,
     controller_running,
     start_controller,
     stop_controller,
+    stop_workflow,
 )
 from NepTrain.core.execution import (
     ExecutionError,
@@ -66,8 +68,8 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
     target = ExecutionTarget("local", "process")
     task = build_stage_task(
         tmp_path / "tasks",
-        campaign_root=tmp_path,
-        campaign_id="demo",
+        workflow_root=tmp_path,
+        workflow_id="demo",
         generation=1,
         stage="explore",
         attempt=1,
@@ -78,7 +80,7 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
             "evaluation": {"validation_path": str(validation), "max_rmse": {"energy_rmse": 1, "force_rmse": 1}},
             "md": {"backend": "lammps", "spin": False},
             "dft": {"software": "toy"},
-            "campaign": {},
+            "workflow": {},
             "execution": {},
         },
         initial_training=initial,
@@ -129,8 +131,8 @@ def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
     }
     task = build_stage_task(
         tmp_path / "tasks",
-        campaign_root=tmp_path,
-        campaign_id="filtered",
+        workflow_root=tmp_path,
+        workflow_id="filtered",
         generation=1,
         stage="explore",
         attempt=1,
@@ -220,7 +222,7 @@ class ImmediateExecutor:
                 {
                     "protocol": "neptrain.stage-result.v1",
                     "task_id": task.task_id,
-                    "campaign_id": task.campaign_id,
+                    "workflow_id": task.workflow_id,
                     "generation": task.generation,
                     "stage": task.stage,
                     "plan_sha256": descriptor["identity"]["plan_sha256"],
@@ -253,7 +255,7 @@ def _controller_inputs(tmp_path: Path):
     config = _write(
         tmp_path / "project.yaml",
         """
-schema_version: 3
+schema_version: 4
 training:
   backend: gpumd
   initial_path: ./initial.xyz
@@ -261,22 +263,22 @@ training:
 md:
   backend: lammps
   structures: ./structures.xyz
+  temperatures: [300]
+  initial_steps: 2
   spin: false
 dft:
-  software: toy
+  backend: toy
 evaluation:
   validation_path: ./validation.xyz
   max_rmse:
     energy_rmse: 1
     force_rmse: 1
-campaign:
+workflow:
   id: controller-test
   generations: 1
   initial_candidates: 4
   dft_budget: 2
   minimum_dft_budget: 1
-  initial_steps: 2
-  temperatures: [300]
 execution:
   poll_interval: 0.2
   routes:
@@ -296,7 +298,7 @@ execution:
 
 def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     config, initial = _controller_inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     launches = []
 
     def factory(target):
@@ -343,7 +345,7 @@ class SameSchedulerIdExecutor(ImmediateExecutor):
 
 def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
     config, initial = _controller_inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     launches = []
     controller = PersistentController(
         preparation.output_dir,
@@ -374,7 +376,7 @@ def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
         "cpu",
     ]
 
-    status = campaign_status(preparation.output_dir)
+    status = workflow_status(preparation.output_dir)
     assert len(status.jobs) == 8
     assert {job["job_id"] for job in status.jobs} == {"12345"}
     assert [job["script"] for job in status.jobs] == [
@@ -389,9 +391,9 @@ def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
     ]
 
 
-def test_controller_refuses_drifted_campaign_inputs(tmp_path):
+def test_controller_refuses_drifted_workflow_inputs(tmp_path):
     config, initial = _controller_inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     (preparation.output_dir / "inputs/md/structures.xyz").write_text(
         "changed\n", encoding="utf-8"
     )
@@ -436,11 +438,52 @@ bundle = pathlib.Path(sys.argv[-1])
     assert executor.collect(handle) == bundle
 
 
+def test_process_executor_cancels_its_own_process_group(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    script = _write(
+        tmp_path / "slow_worker.py",
+        """
+import time
+time.sleep(30)
+""",
+    )
+    task = StageTask("abc", "demo", 1, "train", "local", bundle)
+    executor = ProcessExecutor(
+        ExecutionTarget(
+            "local",
+            "process",
+            command=f"{sys.executable} {script}",
+        )
+    )
+    handle = executor.launch(task)
+
+    status = executor.cancel(handle)
+
+    assert status.state == "cancelled"
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        completed = subprocess.run(
+            ["ps", "-p", handle.execution_id, "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            break
+        if completed.stdout.strip().startswith("Z"):
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("cancelled process group is still running")
+
+
 class SlurmRunner:
     def __init__(self):
         self.submissions = 0
         self.known = False
         self.state = "RUNNING"
+        self.cancelled = []
 
     def __call__(self, args, **_kwargs):
         args = list(args)
@@ -460,6 +503,10 @@ class SlurmRunner:
             return subprocess.CompletedProcess(
                 args, 0, f"{self.state}|0:0|\n", ""
             )
+        if args[0] == "scancel":
+            self.cancelled.append(args[1])
+            self.state = "CANCELLED"
+            return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError(args)
 
 
@@ -540,6 +587,180 @@ def test_slurm_executor_recovers_completed_worker_before_resubmitting(tmp_path):
     assert executor.inspect(handle).state == "completed"
 
 
+def test_slurm_executor_cancels_the_exact_current_job(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    runner = SlurmRunner()
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="cpu"), runner=runner
+    )
+    handle = ExecutionHandle("abc", "slurm", "slurm", "123", str(bundle))
+
+    status = executor.cancel(handle)
+
+    assert status.state == "cancelled"
+    assert runner.cancelled == ["123"]
+
+
+def test_remote_slurm_cancel_runs_on_the_target_host(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    calls = []
+    state = {"cancelled": False}
+
+    def runner(args, **_kwargs):
+        args = list(args)
+        calls.append(args)
+        if args[:6] == ["ssh", "remote", "bash", "-s", "--", "/remote/task"]:
+            command = args[6:]
+            if not command:
+                return subprocess.CompletedProcess(args, 3, "", "")
+            if command[0] == "squeue":
+                output = "" if state["cancelled"] else "RUNNING\n"
+                return subprocess.CompletedProcess(args, 0, output, "")
+            if command[0] == "sacct":
+                output = (
+                    "CANCELLED|0:0|\n"
+                    if state["cancelled"]
+                    else "RUNNING|0:0|\n"
+                )
+                return subprocess.CompletedProcess(args, 0, output, "")
+            if command[0] == "scancel":
+                state["cancelled"] = True
+                return subprocess.CompletedProcess(args, 0, "", "")
+        raise AssertionError(args)
+
+    executor = SlurmExecutor(
+        ExecutionTarget(
+            "remote",
+            "slurm",
+            host="remote",
+            work_root="/remote/root",
+            partition="cpu",
+        ),
+        runner=runner,
+    )
+    handle = ExecutionHandle(
+        "abc",
+        "remote",
+        "slurm",
+        "321",
+        str(bundle),
+        remote_bundle="/remote/task",
+    )
+
+    status = executor.cancel(handle)
+
+    assert status.state == "cancelled"
+    assert any(call[-2:] == ["scancel", "321"] for call in calls)
+
+
+class CancellableExecutor:
+    def __init__(self, target, cancellations):
+        self.target = target
+        self.cancellations = cancellations
+
+    def cancel(self, handle):
+        self.cancellations.append((handle.target, handle.execution_id))
+        return ExecutionStatus("cancelled", "test cancellation accepted")
+
+
+def test_stop_workflow_cancels_and_archives_current_execution(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    controller.state["state"] = "stopped"
+    controller.state["current"] = {
+        "task_id": "task-1",
+        "generation": 1,
+        "stage": "train",
+        "resource": "training",
+        "target": "gpu",
+        "attempt": 1,
+        "bundle": str(preparation.output_dir / ".neptrain/tasks/task-1"),
+        "handle": {
+            "task_id": "task-1",
+            "target": "gpu",
+            "executor": "slurm",
+            "execution_id": "123",
+            "local_bundle": str(
+                preparation.output_dir / ".neptrain/tasks/task-1"
+            ),
+        },
+    }
+    controller._save()
+    cancellations = []
+
+    result = stop_workflow(
+        preparation.output_dir,
+        cancel_jobs=True,
+        executor_factory=lambda target: CancellableExecutor(
+            target, cancellations
+        ),
+    )
+
+    assert result["controller"] == "already_stopped"
+    assert result["current_execution"]["action"] == "cancelled"
+    assert cancellations == [("gpu", "123")]
+    state = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert state["current"] is None
+    assert state["history"][-1]["cancellation"]["execution_id"] == "123"
+    assert state["state"] == "stopped"
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "paused"
+    assert status.jobs[-1]["state"] == "CANCELLED"
+
+
+def test_stop_workflow_preserves_current_until_cancellation_is_terminal(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    controller.state["state"] = "stopped"
+    controller.state["current"] = {
+        "task_id": "task-1",
+        "generation": 1,
+        "stage": "train",
+        "resource": "training",
+        "target": "gpu",
+        "attempt": 1,
+        "bundle": str(preparation.output_dir / ".neptrain/tasks/task-1"),
+        "handle": {
+            "task_id": "task-1",
+            "target": "gpu",
+            "executor": "slurm",
+            "execution_id": "123",
+            "local_bundle": str(
+                preparation.output_dir / ".neptrain/tasks/task-1"
+            ),
+        },
+    }
+    controller._save()
+
+    class PendingCancellation:
+        def cancel(self, _handle):
+            return ExecutionStatus(
+                "cancelling", "scheduler accepted cancellation"
+            )
+
+    result = stop_workflow(
+        preparation.output_dir,
+        cancel_jobs=True,
+        executor_factory=lambda _target: PendingCancellation(),
+    )
+
+    assert result["current_execution"]["action"] == "cancelling"
+    state = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert state["current"]["handle"]["execution_id"] == "123"
+    assert state["current"]["cancellation_requested_at"]
+    assert state["history"] == []
+
+
 class FailingExecutor:
     def __init__(self, target, task_ids):
         self.target = target
@@ -564,7 +785,7 @@ class FailingExecutor:
 
 def test_controller_retry_creates_a_new_traceable_attempt(tmp_path):
     config, initial = _controller_inputs(tmp_path)
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     task_ids = []
     controller = PersistentController(
         preparation.output_dir,
@@ -585,7 +806,7 @@ def test_controller_retry_creates_a_new_traceable_attempt(tmp_path):
     assert state["history"][0]["failure"] == "intentional failure"
 
 
-def test_detached_controller_completes_a_real_multi_process_campaign(tmp_path):
+def test_detached_controller_completes_a_real_multi_process_workflow(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     worker = _write(
         tmp_path / "portable_dummy_worker.py",
@@ -622,7 +843,7 @@ for name in names:
 result = {
     'protocol': 'neptrain.stage-result.v1',
     'task_id': task['task_id'],
-    'campaign_id': task['identity']['campaign_id'],
+    'workflow_id': task['identity']['workflow_id'],
     'generation': task['identity']['generation'],
     'stage': stage,
     'plan_sha256': task['identity']['plan_sha256'],
@@ -643,13 +864,13 @@ result = {
         ),
         encoding="utf-8",
     )
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
 
     pid = start_controller(preparation.output_dir, poll_interval=0.2)
     assert pid > 0
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
-        status = campaign_status(preparation.output_dir)
+        status = workflow_status(preparation.output_dir)
         if status.state == "complete":
             break
         if status.state in {"failed", "rejected"}:
@@ -705,7 +926,7 @@ for name in names:
 (bundle / 'result.json').write_text(json.dumps({
     'protocol': 'neptrain.stage-result.v1',
     'task_id': task['task_id'],
-    'campaign_id': task['identity']['campaign_id'],
+    'workflow_id': task['identity']['workflow_id'],
     'generation': task['identity']['generation'],
     'stage': stage,
     'plan_sha256': task['identity']['plan_sha256'],
@@ -725,9 +946,10 @@ for name in names:
         ),
         encoding="utf-8",
     )
-    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
 
-    start_controller(preparation.output_dir, poll_interval=0.2)
+    # A long scheduler poll must not make an explicit stop wait for that poll.
+    start_controller(preparation.output_dir, poll_interval=30)
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         state_path = preparation.output_dir / ".neptrain/controller.json"
@@ -747,9 +969,13 @@ for name in names:
     assert not controller_running(preparation.output_dir)
 
     start_controller(preparation.output_dir, poll_interval=0.2)
+    restarted = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert "reason" not in restarted
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        status = campaign_status(preparation.output_dir)
+        status = workflow_status(preparation.output_dir)
         if status.state == "complete":
             break
         if status.state in {"failed", "rejected"}:

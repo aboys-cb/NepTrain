@@ -6,7 +6,6 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 
 import numpy as np
@@ -41,17 +40,6 @@ class SmokeReport:
     selected_energy_span_fraction: float
     recovery_match: bool | None
     passed: bool
-
-
-@dataclass(frozen=True)
-class WorkflowSmokeReport:
-    config_file: str
-    training_backend: str
-    md_backend: str
-    teacher_profile: str
-    training_steps: int
-    md_steps: int
-    completed: bool
 
 
 def _assert_safe_output(path: Path) -> Path:
@@ -268,119 +256,8 @@ def run_smoke(
     return report
 
 
-def _absolute_from(base: Path, value: str | None) -> str | None:
-    if value is None:
-        return None
-    path = Path(value).expanduser()
-    return str(path if path.is_absolute() else (base / path).resolve())
-
-
-def _smoke_training_config(source: Path, destination: Path, backend: str, steps: int) -> None:
-    text = source.read_text(encoding="utf-8")
-    key = "epoch" if backend == "torchnep" else "generation"
-    pattern = re.compile(rf"(?m)^\s*{key}\s+\S+.*$")
-    replacement = f"{key} {steps}"
-    text = pattern.sub(replacement, text, count=1) if pattern.search(text) else text.rstrip() + f"\n{replacement}\n"
-    destination.write_text(text, encoding="utf-8")
-
-
-def run_backend_workflow_smoke(
-    config_path: str | Path,
-    output_dir: str | Path,
-    *,
-    profile: str,
-    training_steps: int = 2,
-    md_steps: int = 2,
-    dft_budget: int = 8,
-) -> WorkflowSmokeReport:
-    """Run the production workflow with only the DFT Adapter replaced by ToyTeacher."""
-
-    from .config import load_config, save_config
-    from .train.run import NepTrainWorker
-    from NepTrain import utils
-
-    if profile not in {"ordinary", "spin"}:
-        raise SmokeError("backend workflow smoke profile must be ordinary or spin")
-    if training_steps < 1 or md_steps < 1:
-        raise SmokeError("training_steps and md_steps must be at least 1")
-
-    source_config = Path(config_path).expanduser().resolve()
-    source_root = source_config.parent
-    config, _ = load_config(source_config)
-    smoke_root = _assert_safe_output(Path(output_dir)) / "backend-workflow"
-    if smoke_root.exists():
-        shutil.rmtree(smoke_root)
-    smoke_root.mkdir(parents=True)
-
-    for key in ("init_train_xyz", "init_nep_txt"):
-        if key in config:
-            config[key] = _absolute_from(source_root, config[key])
-    for section, key in (
-        ("training", "config_path"),
-        ("training", "test_path"),
-        ("md", "structures"),
-        ("md", "template_path"),
-    ):
-        if key in config.get(section, {}):
-            config[section][key] = _absolute_from(source_root, config[section][key])
-
-    initial_frames = ase_read(config["init_train_xyz"], index=":", format="extxyz")
-    initial_frames = initial_frames if isinstance(initial_frames, list) else [initial_frames]
-    _, spin_count = validate_spin_dataset(initial_frames, require_mforce=True)
-    if (profile == "spin") != (spin_count > 0):
-        raise SmokeError("smoke profile does not match init_train_xyz spin mode")
-    if profile == "spin" and not config["md"].get("spin", False):
-        raise SmokeError("spin backend smoke requires md.spin=true")
-
-    training_source = Path(config["training"]["config_path"])
-    training_config = smoke_root / "nep.in"
-    _smoke_training_config(
-        training_source,
-        training_config,
-        config["training"]["backend"],
-        training_steps,
-    )
-    config["training"]["config_path"] = str(training_config)
-    config["training"]["restart"] = False
-    config["dft"]["software"] = "toy"
-    config["dft"]["teacher_profile"] = profile
-    config["dft"]["incar_path"] = None
-    config["dft"]["cpu_core"] = 1
-    config["dft_job"] = 1
-    config["select"]["max_selected"] = dft_budget
-    config["md"]["dump_interval"] = 1
-    config["md"]["temperatures"] = list(config["md"]["temperatures"][:1])
-    timestep = float(config["md"].get("timestep", 0.001))
-    config["md"]["duration_ps_every_generation"] = [md_steps * timestep]
-    config["work_path"] = str(smoke_root / "runs")
-    config["current_job"] = "training"
-    config["generation"] = 1
-    smoke_config = smoke_root / "job.smoke.yaml"
-    save_config(config, smoke_config)
-
-    # Keep restart.yaml and every runtime artifact inside the ignored smoke root.
-    with utils.cd(smoke_root):
-        NepTrainWorker().start(smoke_config)
-
-    report = WorkflowSmokeReport(
-        config_file=str(smoke_config),
-        training_backend=config["training"]["backend"],
-        md_backend=config["md"]["backend"],
-        teacher_profile=profile,
-        training_steps=training_steps,
-        md_steps=md_steps,
-        completed=True,
-    )
-    (smoke_root / "workflow-smoke-report.json").write_text(
-        json.dumps(asdict(report), indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    return report
-
-
 __all__ = [
     "SmokeError",
     "SmokeReport",
-    "WorkflowSmokeReport",
-    "run_backend_workflow_smoke",
     "run_smoke",
 ]

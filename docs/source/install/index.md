@@ -1,57 +1,24 @@
-# Installation Guide
+# 安装
 
+NepTrain 要求 Python 3.10 或更高版本：
 
-
-
-This guide explains how to install **NepTrain** using `pip`.
-
-## Prerequisites
-
-Before installing NepTrain, make sure you have the following:
-
-- **Python**: NepTrain requires Python 3.8 or higher.  
-
-## Installation Steps
-
-1. Open a terminal or command prompt.
-2. Run the following command to install NepTrain via `pip`:
-   ```bash
-   pip install neptrain
-   ```
----
-
-## Configuration File
-
-The program's configuration file is located at `~/.NepTrain`. If the file does not exist, you can execute `NepTrain -h`, and the program will create it. 
-:::{important}
-You must modify the `potcar_path` to match the path of your pseudopotential files.  
-If the executable programs are included in your system's environment variables, you do not need to modify their paths.
-::: 
-
-The default configuration is as follows:
-
-```text
-[environ]
-# Pseudopotential file path
-potcar_path = ~/POT_GGA_PAW_PBE_54
-# VASP execution path
-vasp_path = vasp_std
-
-# mpirun execution path
-mpirun_path = mpirun
-# NEP execution path
-nep_path = nep
-
-# GPUMD execution path
-gpumd_path = gpumd
-
-[potcar]
-# You can set the pseudopotential file version yourself
-# If not set, the pseudopotential file version recommended by the VASP official website will be used
-# e.g., Ag=Ag_sv
-H = H
+```bash
+pip install NepTrain
 ```
 
+TorchNEP：
 
- 
- 
+```bash
+pip install torch
+pip install 'NepTrain[torchnep]'
+```
+
+LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和
+`LAMMPS_PLUGIN_PATH` 写入 execution target 的 `setup_script`，然后运行：
+
+```bash
+neptrain doctor --project project.yaml
+```
+
+NepTrain 不再读取 `~/.NepTrain` 中的旧环境配置。所有可复现执行环境都应进入
+schema-v4 `project.yaml` 的 target 或对应环境脚本。

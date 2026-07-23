@@ -1,4 +1,4 @@
-"""Two-generation Toy Teacher campaign for testing real loop control."""
+"""Two-generation Toy Teacher workflow for testing real loop control."""
 
 from __future__ import annotations
 
@@ -455,14 +455,14 @@ def run_toy_iteration_smoke(
     )
 
     initial, validation = _prepare_inputs(root, profile, seed)
-    campaign = root / "campaign"
+    workflow = root / "workflow"
     adapter = ToyIterationAdapter(
         profile=profile, initial_training=initial, validation=validation
     )
-    controller = GenerationController(campaign, f"toy-{profile}-{seed}")
-    summaries = controller.run_campaign(plans, adapter)
+    controller = GenerationController(workflow, f"toy-{profile}-{seed}")
+    summaries = controller.run_workflow(plans, adapter)
     calls_after_first_run = len(adapter.stage_calls)
-    resumed = controller.run_campaign(plans, adapter)
+    resumed = controller.run_workflow(plans, adapter)
     resume_reused = len(adapter.stage_calls) == calls_after_first_run
 
     replay_root = root / "replay"
@@ -474,8 +474,8 @@ def run_toy_iteration_smoke(
         validation=replay_validation,
     )
     replay = GenerationController(
-        replay_root / "campaign", f"toy-{profile}-{seed}"
-    ).run_campaign(plans, replay_adapter)
+        replay_root / "workflow", f"toy-{profile}-{seed}"
+    ).run_workflow(plans, replay_adapter)
     deterministic = _selected_ids(summaries) == _selected_ids(replay)
 
     selected_counts = tuple(

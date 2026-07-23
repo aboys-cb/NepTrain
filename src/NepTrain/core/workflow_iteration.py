@@ -146,8 +146,13 @@ class WorkflowIterationAdapter:
         self.base_dir = Path(base_dir).expanduser().resolve()
         self.initial_training = self._path(initial_training)
         self.runtime = runtime or WorkflowRuntime()
-        self.scenario_ladder = ScenarioLadder.from_campaign(
-            self.config.get("campaign", {})
+        self.scenario_ladder = ScenarioLadder.from_workflow(
+            {
+                **dict(self.config.get("workflow", {})),
+                "initial_steps": int(
+                    self.config.get("md", {}).get("initial_steps", 100)
+                ),
+            }
         )
         if not self.initial_training.is_file():
             raise WorkflowIterationError(
@@ -252,7 +257,7 @@ class WorkflowIterationAdapter:
             seed=int(
                 options.get(
                     "seed",
-                    self.config.get("campaign", {}).get("seed", 20260723),
+                    self.config.get("workflow", {}).get("seed", 20260723),
                 )
             ),
         )
@@ -759,7 +764,7 @@ class WorkflowIterationAdapter:
         selected = [candidates[index] for index in result.selected_indices]
         if not selected:
             raise WorkflowIterationError(
-                "FPS selected no structures; lower iteration.min_distance"
+                "FPS selected no structures; lower workflow.min_distance"
             )
         selected_path = context.work_dir / "selected-input.xyz"
         ase_write(selected_path, selected, format="extxyz")
@@ -780,7 +785,7 @@ class WorkflowIterationAdapter:
 
     def _label(self, context: StageContext) -> StageOutcome:
         options = self.config.get("dft", {})
-        backend = str(options.get("software", "toy"))
+        backend = str(options.get("backend", "toy"))
         use_k_stype = str(options.get("use_k_stype", "kspacing"))
         output = context.work_dir / "selected-labels.xyz"
         result = self.runtime.label(
@@ -789,10 +794,10 @@ class WorkflowIterationAdapter:
                 output_file=output,
                 work_dir=context.work_dir / "teacher",
                 input_file=self._optional_path(
-                    options.get("input_path", options.get("incar_path"))
+                    options.get("input_path")
                 ),
                 resource_dir=self._optional_path(options.get("resource_path")),
-                n_cpu=int(options.get("n_cpu", options.get("cpu_core", 1))),
+                n_cpu=int(options.get("n_cpu", 1)),
                 use_gamma=bool(options.get("use_gamma", options.get("kpoints_use_gamma", False))),
                 kpoint_mode=use_k_stype,
                 kspacing=float(options["kspacing"])

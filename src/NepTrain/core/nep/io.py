@@ -11,10 +11,15 @@ import subprocess
 
 from rich.progress import Progress
 
-from watchdog.events import FileSystemEventHandler
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:  # pragma: no cover - optional progress dependency
+    FileSystemEventHandler = object
+    Observer = None
 
 
-from NepTrain import utils, Config, observer
+from NepTrain import utils
 from .utils import read_symbols_from_file
 
 
@@ -64,7 +69,7 @@ class RunInput:
         self.restart=False
         if self.nep_in_path is not None and os.path.exists(self.nep_in_path):
             self.read_run(self.nep_in_path)
-        self.command=Config.get('environ','nep_path')
+        self.command = os.environ.get("NEPTRAIN_NEP_COMMAND", "nep")
 
     def read_run(self,file_name):
         with open(file_name,'r',encoding="utf8") as f:
@@ -119,7 +124,8 @@ class RunInput:
             if utils.is_diff_path(self.test_xyz_path, os.path.join(directory, "test.xyz")):
 
                 shutil.copy(self.test_xyz_path, os.path.join(directory, "test.xyz"))
-        if show_progress and observer is not None:
+        observer = Observer() if show_progress and Observer is not None else None
+        if observer is not None:
 
             handler=NepFileMoniter(os.path.join(directory,"loss.out"),self.run_in["generation"])
             watch=observer.schedule(handler, os.path.abspath(directory) , recursive=False)

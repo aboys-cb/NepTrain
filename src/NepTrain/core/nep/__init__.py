@@ -7,8 +7,6 @@ from importlib import import_module
 
 _EXPORTS = {
     "RunInput": ("NepTrain.core.nep.io", "RunInput"),
-    "run_nep": ("NepTrain.core.nep.run", "run_nep"),
-    "plot_nep_result": ("NepTrain.core.nep.plot", "plot_nep_result"),
     "Nep3Calculator": ("NepTrain.core.nep.calculator", "Nep3Calculator"),
 }
 

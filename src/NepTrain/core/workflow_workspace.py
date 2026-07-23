@@ -1,4 +1,4 @@
-"""User-facing filesystem interface for a NepTrain campaign."""
+"""User-facing filesystem interface for a NepTrain workflow."""
 
 from __future__ import annotations
 
@@ -40,24 +40,23 @@ def _copy_file(source: Path, target: Path) -> None:
 
 
 @dataclass(frozen=True)
-class CampaignWorkspace:
-    """Own every durable path in one campaign directory.
+class WorkflowWorkspace:
+    """Own every durable path in one workflow directory.
 
     Layout v2 keeps the machine state below ``.neptrain`` and exposes only
     inputs, generation evidence, logs, and accepted results at the project
-    root.  ``locate`` can still open a v1 campaign so completed campaigns are
-    not stranded, but newly created workspaces always use v2.
+    root. Legacy layouts are rejected instead of being silently migrated.
     """
 
     root: Path
     version: int = _LAYOUT_VERSION
 
     @classmethod
-    def create(cls, root: str | Path) -> "CampaignWorkspace":
+    def create(cls, root: str | Path) -> "WorkflowWorkspace":
         workspace = cls(Path(root).expanduser().resolve())
         if workspace.root.exists() and any(workspace.root.iterdir()):
             raise ValueError(
-                f"campaign output directory is not empty: {workspace.root}"
+                f"workflow output directory is not empty: {workspace.root}"
             )
         workspace.root.mkdir(parents=True, exist_ok=True)
         for directory in (
@@ -74,48 +73,47 @@ class CampaignWorkspace:
         _write_json(
             workspace.layout_file,
             {
-                "layout": "neptrain.campaign",
+                "layout": "neptrain.workflow",
                 "version": _LAYOUT_VERSION,
                 "user_directories": ["inputs", "results", "generations", "logs"],
                 "internal_directory": ".neptrain",
             },
         )
         (workspace.root / "README.md").write_text(
-            "# NepTrain campaign\n\n"
+            "# NepTrain workflow\n\n"
             "- `project.yaml`：本次运行采用的完整配置快照。\n"
-            "- `inputs/`：进入 campaign 的输入快照。\n"
+            "- `inputs/`：进入 workflow 的输入快照。\n"
             "- `results/`：最新通过验收的模型、训练集和指标。\n"
             "- `generations/`：按代组织的采样、标注、训练和评价证据。\n"
             "- `logs/`：Controller 与执行后端日志。\n"
             "- `.neptrain/`：账本、计划、可移植任务和执行状态，通常无需编辑。\n"
-            "\n常用命令：`NepTrain status .`、`NepTrain resume .`、`NepTrain stop .`。\n",
+            "\n常用命令：`neptrain workflow status .`、"
+            "`neptrain workflow resume .`、`neptrain workflow stop .`。\n"
+            "流程作废并需要取消当前计算任务时使用："
+            "`neptrain workflow stop . --cancel-jobs`。\n",
             encoding="utf-8",
         )
         return workspace
 
     @classmethod
-    def locate(cls, path: str | Path) -> "CampaignWorkspace":
+    def locate(cls, path: str | Path) -> "WorkflowWorkspace":
         candidate = Path(path).expanduser().resolve()
         if candidate.is_file():
             if candidate.name == "manifest.json" and candidate.parent.name == ".neptrain":
                 candidate = candidate.parent.parent
-            elif candidate.name == "campaign-manifest.json":
-                return cls(candidate.parent, version=1)
         layout = candidate / ".neptrain" / "layout.json"
         if layout.is_file():
             value = json.loads(layout.read_text(encoding="utf-8"))
-            if value.get("layout") != "neptrain.campaign" or int(
+            if value.get("layout") != "neptrain.workflow" or int(
                 value.get("version", 0)
             ) != _LAYOUT_VERSION:
-                raise ValueError(f"unsupported campaign layout: {layout}")
+                raise ValueError(f"unsupported workflow layout: {layout}")
             return cls(candidate)
-        if (candidate / "campaign-manifest.json").is_file():
-            return cls(candidate, version=1)
-        raise FileNotFoundError(f"NepTrain campaign does not exist: {candidate}")
+        raise FileNotFoundError(f"NepTrain workflow does not exist: {candidate}")
 
     @property
     def internal_dir(self) -> Path:
-        return self.root / ".neptrain" if self.version == 2 else self.root
+        return self.root / ".neptrain"
 
     @property
     def layout_file(self) -> Path:
@@ -123,15 +121,11 @@ class CampaignWorkspace:
 
     @property
     def manifest(self) -> Path:
-        return (
-            self.internal_dir / "manifest.json"
-            if self.version == 2
-            else self.root / "campaign-manifest.json"
-        )
+        return self.internal_dir / "manifest.json"
 
     @property
     def project_file(self) -> Path:
-        return self.root / ("project.yaml" if self.version == 2 else "job.resolved.yaml")
+        return self.root / "project.yaml"
 
     @property
     def inputs_dir(self) -> Path:
@@ -143,7 +137,7 @@ class CampaignWorkspace:
 
     @property
     def generations_dir(self) -> Path:
-        return self.root / "generations" if self.version == 2 else self.root / "state"
+        return self.root / "generations"
 
     @property
     def logs_dir(self) -> Path:
@@ -151,43 +145,31 @@ class CampaignWorkspace:
 
     @property
     def plans_dir(self) -> Path:
-        return self.internal_dir / "plans" if self.version == 2 else self.root / "plans"
+        return self.internal_dir / "plans"
 
     @property
     def jobs_dir(self) -> Path:
-        return self.internal_dir / "jobs" if self.version == 2 else self.root / "jobs"
+        return self.internal_dir / "jobs"
 
     @property
     def tasks_dir(self) -> Path:
-        return self.internal_dir / "tasks" if self.version == 2 else self.root / "tasks"
+        return self.internal_dir / "tasks"
 
     @property
     def locks_dir(self) -> Path:
-        return self.internal_dir / "locks" if self.version == 2 else self.root
+        return self.internal_dir / "locks"
 
     @property
     def manifest_lock(self) -> Path:
-        return (
-            self.locks_dir / "manifest.lock"
-            if self.version == 2
-            else self.root / ".campaign-manifest.lock"
-        )
+        return self.locks_dir / "manifest.lock"
 
     @property
     def ledger(self) -> Path:
-        return (
-            self.internal_dir / "ledger.json"
-            if self.version == 2
-            else self.root / "state" / "campaign-ledger.json"
-        )
+        return self.internal_dir / "ledger.json"
 
     @property
     def ledger_lock(self) -> Path:
-        return (
-            self.locks_dir / "ledger.lock"
-            if self.version == 2
-            else self.root / "state" / ".campaign-ledger.lock"
-        )
+        return self.locks_dir / "ledger.lock"
 
     @property
     def controller_file(self) -> Path:
@@ -207,20 +189,16 @@ class CampaignWorkspace:
 
     @property
     def controller_root(self) -> Path:
-        return self.root if self.version == 2 else self.root / "state"
+        return self.root
 
     def generation_dir(self, generation: int) -> Path:
-        if self.version == 2:
-            return self.generations_dir / f"{generation:04d}"
-        return self.generations_dir / f"Generation-{generation}"
+        return self.generations_dir / f"{generation:04d}"
 
     def stage_dir(self, generation: int, stage: str) -> Path:
-        if self.version != 2:
-            return self.generation_dir(generation)
         try:
             relative = _STAGE_DIRECTORIES[stage]
         except KeyError as error:
-            raise ValueError(f"unknown campaign stage: {stage}") from error
+            raise ValueError(f"unknown workflow stage: {stage}") from error
         return self.generation_dir(generation) / relative
 
     def snapshot_inputs(
@@ -228,8 +206,6 @@ class CampaignWorkspace:
     ) -> tuple[dict[str, Any], Path]:
         """Create the portable user input view used by all generated jobs."""
 
-        if self.version != 2:
-            return json.loads(json.dumps(config)), initial_training
         snapshot = json.loads(json.dumps(config))
         initial_snapshot = self.inputs_dir / "initial-train.xyz"
         _copy_file(initial_training, initial_snapshot)
@@ -250,21 +226,7 @@ class CampaignWorkspace:
         copy_path("md", "structures", "md/structures")
         copy_path("md", "template_path", "md/template")
         copy_path("dft", "input_path", "dft/input")
-        copy_path("dft", "incar_path", "dft/input")
         copy_path("evaluation", "validation_path", "validation/validation")
-        for resource in ("training", "cpu", "dft"):
-            profile = snapshot.get("campaign", {}).get("slurm", {}).get(
-                resource, {}
-            )
-            value = profile.get("setup_script")
-            if value in {None, ""}:
-                continue
-            source = Path(value)
-            if not source.is_file():
-                continue
-            target = self.inputs_dir / "platform" / f"{resource}.sh"
-            _copy_file(source, target)
-            profile["setup_script"] = str(target.relative_to(self.root))
         for name, profile in snapshot.get("execution", {}).get(
             "targets", {}
         ).items():
@@ -287,8 +249,6 @@ class CampaignWorkspace:
     ) -> None:
         """Publish a stable human-facing summary and latest accepted results."""
 
-        if self.version != 2:
-            return
         stages = generation_record.get("stages", {})
         summary = {
             "generation": generation,
@@ -316,7 +276,7 @@ class CampaignWorkspace:
             missing = [name for name in required if name not in artifacts]
             if missing:
                 raise ValueError(
-                    "accepted campaign generation is missing publishable artifacts: "
+                    "accepted workflow generation is missing publishable artifacts: "
                     + ", ".join(missing)
                 )
         _write_json(self.generation_dir(generation) / "summary.json", summary)
@@ -327,7 +287,7 @@ class CampaignWorkspace:
         _write_json(self.results_dir / "summary.json", summary)
         evaluation = summary["metrics"].get("evaluate", {})
         lines = [
-            f"# NepTrain campaign 结果\n",
+            f"# NepTrain workflow 结果\n",
             f"- 最新验收代：{generation}",
             f"- Energy RMSE：{evaluation.get('energy_rmse', 'n/a')}",
             f"- Force RMSE：{evaluation.get('force_rmse', 'n/a')}",
@@ -343,4 +303,4 @@ class CampaignWorkspace:
         )
 
 
-__all__ = ["CampaignWorkspace"]
+__all__ = ["WorkflowWorkspace"]

@@ -8,8 +8,7 @@ from pathlib import Path
 from ase import Atoms
 from ase.io import write as ase_write
 
-from NepTrain import Config, module_path, utils
-from NepTrain.core.utils import check_env
+from NepTrain import utils
 
 from .native import NativeVaspRequest, run_native_vasp
 
@@ -25,20 +24,20 @@ atoms_index = 1
 )
 def calculate_vasp(atoms: Atoms, args):
     global atoms_index
-    resource_dir = Path(
-        getattr(args, "resource_dir", None)
-        or Config.get("environ", "potcar_path")
-    ).expanduser().resolve()
+    if not getattr(args, "resource_dir", None):
+        raise FileNotFoundError(
+            "VASP labeling requires dft.resource_path or --resources"
+        )
+    resource_dir = Path(args.resource_dir).expanduser().resolve()
     input_file = (
         Path(args.incar)
         if args.incar is not None and os.path.exists(args.incar)
-        else Path(module_path) / "core/dft/vasp/INCAR"
+        else Path(__file__).with_name("INCAR")
     )
-    command = (
-        f"{Config.get('environ', 'mpirun_path')} -n {args.n_cpu} "
-        f"{Config.get('environ', 'vasp_path')}"
+    command = os.environ.get(
+        "NEPTRAIN_VASP_COMMAND",
+        f"mpirun -n {args.n_cpu} vasp_std",
     )
-    command = os.environ.get("NEPTRAIN_VASP_COMMAND", command)
     result = run_native_vasp(
         atoms,
         NativeVaspRequest(
@@ -60,11 +59,16 @@ def calculate_vasp(atoms: Atoms, args):
 def run_vasp(args):
     global atoms_index
     atoms_index = 1
-    check_env(
-        potcar_path=getattr(args, "resource_dir", None),
-        require_potcar=True,
-        commands=("vasp_path", "mpirun_path"),
-    )
+    raw_resource = getattr(args, "resource_dir", None)
+    if not raw_resource:
+        raise FileNotFoundError(
+            "VASP labeling requires dft.resource_path or --resources"
+        )
+    resource = Path(raw_resource).expanduser()
+    if not resource.is_dir():
+        raise FileNotFoundError(
+            f"VASP pseudopotential root does not exist: {resource}"
+        )
     result = calculate_vasp(args.model_path, args)
     output = Path(args.out_file_path)
     output.parent.mkdir(parents=True, exist_ok=True)

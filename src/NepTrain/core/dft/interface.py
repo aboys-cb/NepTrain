@@ -129,7 +129,7 @@ def label(request: LabelRequest, backend: str) -> LabelResult:
     if not spec.supports_spin and _source_contains_spin(request.source):
         raise LabelingError(
             f"{backend} production labeling currently supports non-magnetic "
-            "structures only; spin DFT is reserved for a later validated Adapter"
+            "structures only; use the ABACUS Adapter for spin labeling"
         )
     result = spec.label(request)
     if not result.frames:

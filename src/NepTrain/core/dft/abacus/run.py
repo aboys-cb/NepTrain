@@ -6,7 +6,7 @@ from pathlib import Path
 from ase import Atoms
 from ase.io import write as ase_write
 
-from NepTrain import Config, module_path, utils
+from NepTrain import utils
 
 from .io import StructureVar, read_input_file
 from .native import NativeAbacusRequest, run_native_abacus
@@ -27,12 +27,11 @@ def calculate_abacus(atoms: Atoms, args):
     if args.incar is not None and os.path.exists(args.incar):
         input_dict = read_input_file(args.incar)
     else:
-        input_dict = read_input_file(os.path.join(module_path, "core/dft/abacus/INPUT"))
-    command = (
-        f"{Config.get('environ', 'mpirun_path')} -n {args.n_cpu} "
-        f"{Config.get('environ', 'abacus_path', fallback='abacus')}"
+        input_dict = read_input_file(Path(__file__).with_name("INPUT"))
+    command = os.environ.get(
+        "NEPTRAIN_ABACUS_COMMAND",
+        f"mpirun -n {args.n_cpu} abacus",
     )
-    command = os.environ.get("NEPTRAIN_ABACUS_COMMAND", command)
     result = run_native_abacus(
         atoms,
         NativeAbacusRequest(
