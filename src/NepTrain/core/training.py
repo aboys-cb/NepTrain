@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import random
 import shutil
 
 from ase.io import read as ase_read
+import numpy as np
 
 from .spin import validate_spin_dataset
 
@@ -28,6 +30,7 @@ class TrainingRequest:
     torch_backend: str = "auto"
     precision: str = "float32"
     use_compile: bool = False
+    seed: int = 20260723
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,12 @@ def _train_torchnep(request: TrainingRequest) -> TrainingResult:
         raise TrainingError(
             "TorchNEP backend requested but torchnep is not installed"
         ) from error
+    import torch
+
+    random.seed(request.seed)
+    np.random.seed(request.seed % (2**32))
+    torch.manual_seed(request.seed)
+    torch.cuda.manual_seed_all(request.seed)
 
     request.output_dir.mkdir(parents=True, exist_ok=True)
     train_nep(

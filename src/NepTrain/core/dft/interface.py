@@ -88,7 +88,7 @@ def _label_toy(request: LabelRequest) -> LabelResult:
 
 _ADAPTERS: dict[str, _AdapterSpec] = {
     "vasp": _AdapterSpec(_label_vasp, supports_spin=False),
-    "abacus": _AdapterSpec(_label_abacus, supports_spin=False),
+    "abacus": _AdapterSpec(_label_abacus, supports_spin=True),
     "toy": _AdapterSpec(_label_toy, supports_spin=True),
 }
 

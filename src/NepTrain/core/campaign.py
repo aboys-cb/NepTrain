@@ -1585,7 +1585,12 @@ def resume_campaign(
 
         status = campaign_status(output)
         if status.state == "complete":
-            raise CampaignError("campaign is already complete")
+            return CampaignResume(
+                preparation.campaign_id,
+                "complete",
+                (),
+                preparation.manifest,
+            )
         if controller_running(output):
             raise CampaignError("campaign controller is already running")
         controller = PersistentController(output)
@@ -1638,7 +1643,12 @@ def resume_campaign(
             retry.manifest,
         )
     if status.state == "complete":
-        raise CampaignError("campaign is already complete")
+        return CampaignResume(
+            preparation.campaign_id,
+            "complete",
+            (),
+            preparation.manifest,
+        )
     if status.state == "running":
         raise CampaignError("campaign is already running")
     raise CampaignError(

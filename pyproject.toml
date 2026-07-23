@@ -94,6 +94,9 @@ archs = ["auto64"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "real_abacus_spin: opt-in ABACUS DeltaSpin calculation on a real compute node",
+]
 filterwarnings = [
   "ignore:Setting the shape on a NumPy array has been deprecated.*:DeprecationWarning:ase\\..*"
 ]

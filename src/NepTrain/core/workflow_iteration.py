@@ -249,6 +249,12 @@ class WorkflowIterationAdapter:
             torch_backend=str(options.get("torch_backend", "auto")),
             precision=str(options.get("precision", "float32")),
             use_compile=bool(options.get("use_compile", False)),
+            seed=int(
+                options.get(
+                    "seed",
+                    self.config.get("campaign", {}).get("seed", 20260723),
+                )
+            ),
         )
         result = self.runtime.train(request, backend)
         return result, len(_read_frames(training_input)), config_file

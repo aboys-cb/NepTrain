@@ -13,7 +13,7 @@ from ase import Atoms
 from ase.io import read, write
 
 from NepTrain.core.dft import LabelRequest, label
-from NepTrain.core.dft.abacus.io import StructureVar
+from NepTrain.core.dft.abacus.io import StructureVar, read_input_file
 from NepTrain.core.dft.abacus.native import NativeAbacusError, parse_running_scf
 from NepTrain.core.dft.interface import LabelingError
 
@@ -26,6 +26,7 @@ suffix ABACUS
 calculation scf
 basis_type lcao
 ecutwfc 20
+smearing_method gau
 """,
         encoding="utf-8",
     )
@@ -97,12 +98,28 @@ def _spin_log() -> str:
  1.0 0.0 0.0
  0.0 2.0 0.0
  0.0 0.0 3.0
+ Total Magnetism (uB)
+ Fe 1.0 0.0 0.0
+    0.0 0.0 3.0
+ Al 0.0 2.0 0.0
  Magnetic force (eV/uB)
- Fe1 0.1 0.2 0.3
- Fe2 0.4 0.5 0.6
- Al1 0.7 0.8 0.9
+ Fe 0.1 0.2 0.3
+    0.4 0.5 0.6
+ Al 0.7 0.8 0.9
  !FINAL_ETOT_IS -12.5 eV
 """
+
+
+def test_abacus_input_header_can_include_a_description(tmp_path: Path):
+    path = tmp_path / "INPUT"
+    path.write_text(
+        "INPUT_PARAMETERS RUNNING ABACUS-DFT\n"
+        "suffix FeNi\n"
+        "nspin 4 # non-collinear\n",
+        encoding="utf-8",
+    )
+
+    assert read_input_file(path) == {"suffix": "FeNi", "nspin": "4"}
 
 
 def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
@@ -130,9 +147,10 @@ def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
     assert "Al.UPF" in (case / "STRU").read_text(encoding="utf-8")
     assert "1 1 1 0 0 0" in (case / "KPT").read_text(encoding="utf-8")
     assert str(resources.resolve()) in (case / "INPUT").read_text(encoding="utf-8")
+    assert "smearing_method gaussian" in (case / "INPUT").read_text(encoding="utf-8")
     manifest = (case / "abacus-result.json").read_text(encoding="utf-8")
     assert '"status": "completed"' in manifest
-    assert '"parser_version": "neptrain-abacus-running-scf-v1"' in manifest
+    assert '"parser_version": "neptrain-abacus-running-scf-v2"' in manifest
     input_manifest = json.loads((case / "abacus-input.json").read_text())
     resource_record = input_manifest["resources"]["Al"]
     assert resource_record["pseudopotential_sha256"] == hashlib.sha256(
@@ -143,7 +161,9 @@ def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
     ).hexdigest()
 
 
-def test_abacus_production_adapter_rejects_spin_until_validated(tmp_path: Path):
+def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
+    tmp_path: Path, monkeypatch
+):
     source = tmp_path / "selected.xyz"
     atoms = Atoms(
         "FeAlFe",
@@ -153,16 +173,88 @@ def test_abacus_production_adapter_rejects_spin_until_validated(tmp_path: Path):
     )
     spin = np.asarray([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]])
     atoms.set_array("spin", spin)
+    atoms.set_array("mforce", np.full((3, 3), 99.0))
     write(source, atoms, format="extxyz")
-    with pytest.raises(LabelingError, match="non-magnetic"):
-        label(
-            LabelRequest(
-                source=source,
-                output_file=tmp_path / "spin-labeled.xyz",
-                work_dir=tmp_path / "work",
-            ),
-            "abacus",
-        )
+    resources = tmp_path / "resources"
+    _resource_files(resources, elements=("Fe", "Al"))
+    arguments = _arguments(tmp_path, source, resources)
+    monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", _fake_command(tmp_path, _spin_log()))
+
+    result = label(
+        LabelRequest(
+            source=source,
+            output_file=tmp_path / "spin-labeled.xyz",
+            work_dir=tmp_path / "work",
+            input_file=Path(arguments.incar),
+            resource_dir=resources,
+            use_gamma=True,
+            kpoint_mode="kpoints",
+        ),
+        "abacus",
+    )
+
+    assert len(result.frames) == 1
+    frame = result.frames[0]
+    np.testing.assert_allclose(frame.arrays["spin"], spin)
+    np.testing.assert_allclose(
+        frame.arrays["mforce"],
+        [[0.1, 0.2, 0.3], [0.7, 0.8, 0.9], [0.4, 0.5, 0.6]],
+    )
+    assert frame.info["spin_constraint_rms_uB"] == pytest.approx(0.0)
+    reread = read(result.output_file)
+    np.testing.assert_allclose(reread.arrays["spin"], spin)
+    np.testing.assert_allclose(reread.arrays["mforce"], frame.arrays["mforce"])
+
+    case = tmp_path / "work" / "000001-AlFe2" / "attempt-0001"
+    rendered_input = (case / "INPUT").read_text(encoding="utf-8")
+    for setting in (
+        "nspin 4",
+        "noncolin 1",
+        "sc_mag_switch 1",
+        "symmetry 0",
+    ):
+        assert setting in rendered_input
+    assert "sc_direction_only" not in rendered_input
+    structure = (case / "STRU").read_text(encoding="utf-8")
+    assert "mag 1 0 0 sc 1 1 1" in structure
+    assert "mag 0 0 3 sc 1 1 1" in structure
+    assert "mag 0 2 0 sc 1 1 1" in structure
+
+
+def test_native_abacus_spin_reports_vector_rms_per_atom(tmp_path: Path, monkeypatch):
+    source = tmp_path / "selected.xyz"
+    atoms = Atoms(
+        "FeAlFe",
+        positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]],
+        cell=[6, 6, 6],
+        pbc=True,
+    )
+    atoms.set_array(
+        "spin",
+        np.asarray([[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]),
+    )
+    write(source, atoms, format="extxyz")
+    resources = tmp_path / "resources"
+    _resource_files(resources, elements=("Fe", "Al"))
+    arguments = _arguments(tmp_path, source, resources)
+    monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", _fake_command(tmp_path, _spin_log()))
+
+    result = label(
+        LabelRequest(
+            source=source,
+            output_file=tmp_path / "spin-labeled.xyz",
+            work_dir=tmp_path / "work",
+            input_file=Path(arguments.incar),
+            resource_dir=resources,
+            use_gamma=True,
+            kpoint_mode="kpoints",
+        ),
+        "abacus",
+    )
+
+    assert result.frames[0].info["spin_constraint_rms_uB"] == pytest.approx(
+        1.0 / np.sqrt(3.0)
+    )
 
 
 def test_abacus_parser_keeps_mforce_available_for_future_spin_adapter(tmp_path: Path):
@@ -172,23 +264,79 @@ def test_abacus_parser_keeps_mforce_available_for_future_spin_adapter(tmp_path: 
     parsed = parse_running_scf(log, expected_atoms=3)
 
     np.testing.assert_allclose(
+        parsed.magnetization,
+        [[1.0, 0.0, 0.0], [0.0, 0.0, 3.0], [0.0, 2.0, 0.0]],
+    )
+    np.testing.assert_allclose(
         parsed.mforce,
         [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
     )
 
 
-def test_native_abacus_internal_entry_also_rejects_spin(tmp_path: Path, monkeypatch):
+def test_native_abacus_spin_requires_magnetic_force(tmp_path: Path, monkeypatch):
     source = tmp_path / "selected.xyz"
-    atoms = Atoms("Al", positions=[[0, 0, 0]], cell=[4, 4, 4], pbc=True)
+    atoms = Atoms(
+        "FeAlFe",
+        positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]],
+        cell=[6, 6, 6],
+        pbc=True,
+    )
+    atoms.set_array(
+        "spin",
+        np.asarray([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]),
+    )
+    write(source, atoms, format="extxyz")
+    resources = tmp_path / "resources"
+    _resource_files(resources, elements=("Fe", "Al"))
+    log_without_mforce = _spin_log().split(" Magnetic force (eV/uB)", 1)[0]
+    log_without_mforce += "\n !FINAL_ETOT_IS -12.5 eV\n"
+    monkeypatch.setenv(
+        "NEPTRAIN_ABACUS_COMMAND", _fake_command(tmp_path, log_without_mforce)
+    )
+
+    module = importlib.import_module("NepTrain.core.dft.abacus.run")
+    with pytest.raises(NativeAbacusError, match="mandatory magnetic force"):
+        module.run_abacus(_arguments(tmp_path, source, resources))
+
+
+def test_vasp_production_adapter_still_rejects_spin(tmp_path: Path):
+    source = tmp_path / "selected.xyz"
+    atoms = Atoms("Fe", positions=[[0, 0, 0]], cell=[4, 4, 4], pbc=True)
+    atoms.set_array("spin", np.asarray([[1.0, 0.0, 0.0]]))
+    write(source, atoms, format="extxyz")
+
+    with pytest.raises(LabelingError, match="non-magnetic"):
+        label(
+            LabelRequest(
+                source=source,
+                output_file=tmp_path / "spin-labeled.xyz",
+                work_dir=tmp_path / "work",
+            ),
+            "vasp",
+        )
+
+
+def test_abacus_rejects_direction_only_for_variable_magnitude_spin(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "selected.xyz"
+    atoms = Atoms("Fe", positions=[[0, 0, 0]], cell=[4, 4, 4], pbc=True)
     atoms.set_array("spin", np.asarray([[1.0, 0.0, 0.0]]))
     write(source, atoms, format="extxyz")
     resources = tmp_path / "resources"
-    _resource_files(resources)
-    monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", _fake_command(tmp_path, _ordinary_log()))
+    _resource_files(resources, elements=("Fe",))
+    arguments = _arguments(tmp_path, source, resources)
+    Path(arguments.incar).write_text(
+        "INPUT_PARAMETERS\nbasis_type lcao\nsc_direction_only 1\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "launched"
+    monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", f"touch {shlex.quote(str(marker))}")
 
     module = importlib.import_module("NepTrain.core.dft.abacus.run")
-    with pytest.raises(NativeAbacusError, match="non-magnetic"):
-        module.run_abacus(_arguments(tmp_path, source, resources))
+    with pytest.raises(NativeAbacusError, match="direction-only"):
+        module.run_abacus(arguments)
+    assert not marker.exists()
 
 
 def test_native_abacus_rejects_unconverged_result(tmp_path: Path, monkeypatch):

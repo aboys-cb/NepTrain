@@ -487,6 +487,40 @@ def test_slurm_executor_is_idempotent_without_afterok(tmp_path):
     assert executor.inspect(first).state == "completed"
 
 
+def test_slurm_executor_recognizes_site_annotated_cancelled_state(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    task = StageTask("abc", "demo", 1, "label", "slurm", bundle)
+    runner = SlurmRunner()
+    runner.known = True
+    runner.state = "CANCELLED by 1478400058"
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="gpu"), runner=runner
+    )
+    handle = ExecutionHandle("abc", "slurm", "slurm", "123", str(bundle))
+
+    status = executor.inspect(handle)
+
+    assert status.state == "failed"
+    assert status.detail == "Slurm CANCELLED exit=0:0"
+
+
+def test_slurm_terminal_state_overrides_stale_running_worker_file(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    (bundle / "execution.json").write_text(
+        json.dumps({"state": "RUNNING"}), encoding="utf-8"
+    )
+    runner = SlurmRunner()
+    runner.state = "CANCELLED by 1478400058"
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="gpu"), runner=runner
+    )
+    handle = ExecutionHandle("abc", "slurm", "slurm", "123", str(bundle))
+
+    assert executor.inspect(handle).state == "failed"
+
+
 def test_slurm_executor_recovers_completed_worker_before_resubmitting(tmp_path):
     bundle = tmp_path / "task"
     bundle.mkdir()

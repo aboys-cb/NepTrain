@@ -18,6 +18,7 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
     finetune = tmp_path / "previous.pt"
     finetune.write_bytes(b"previous")
     captured = {}
+    seeds = []
 
     def fake_train_nep(**kwargs):
         captured.update(kwargs)
@@ -28,6 +29,16 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
         (output / "checkpoint.pt").write_bytes(b"checkpoint")
 
     monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(train_nep=fake_train_nep))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(
+            manual_seed=lambda value: seeds.append(("cpu", value)),
+            cuda=types.SimpleNamespace(
+                manual_seed_all=lambda value: seeds.append(("cuda", value))
+            ),
+        ),
+    )
     monkeypatch.setitem(
         sys.modules,
         "nep_adapters",
@@ -52,6 +63,7 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
     assert result.checkpoint == output / "checkpoint.pt"
     assert captured["finetune_from"] == str(finetune)
     assert captured["resume_from"] is None
+    assert seeds == [("cpu", 20260723), ("cuda", 20260723)]
 
 
 def test_training_rejects_model_that_nepadapters_cannot_load(tmp_path: Path, monkeypatch):
@@ -69,6 +81,14 @@ def test_training_rejects_model_that_nepadapters_cannot_load(tmp_path: Path, mon
         raise RuntimeError("unsupported descriptor")
 
     monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(train_nep=fake_train_nep))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(
+            manual_seed=lambda _value: None,
+            cuda=types.SimpleNamespace(manual_seed_all=lambda _value: None),
+        ),
+    )
     monkeypatch.setitem(
         sys.modules,
         "nep_adapters",

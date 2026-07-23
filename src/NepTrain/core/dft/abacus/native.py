@@ -17,10 +17,11 @@ from ase.constraints import FixAtoms, FixCartesian
 from ase.data import atomic_masses, atomic_numbers
 from ase.units import Bohr
 
+from ...spin import prepare_spin_for_dft
 from .io import StructureVar
 
 
-PARSER_VERSION = "neptrain-abacus-running-scf-v1"
+PARSER_VERSION = "neptrain-abacus-running-scf-v2"
 KBAR_ANGSTROM3_TO_EV = 0.0006241509125883258
 _FLOAT_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?")
 
@@ -46,6 +47,7 @@ class ParsedAbacusResult:
     energy: float
     forces: np.ndarray
     stress_kbar: np.ndarray
+    magnetization: np.ndarray | None
     mforce: np.ndarray | None
     scf_iterations: int | None
 
@@ -55,22 +57,21 @@ def run_native_abacus(
 ) -> Atoms:
     """Run one fresh ABACUS attempt and return a normalized labeled frame."""
 
-    if "spin" in atoms.arrays:
-        raise NativeAbacusError(
-            "ABACUS production labeling currently supports non-magnetic "
-            "structures only"
-        )
+    input_frame = atoms.copy()
+    spin_frame = prepare_spin_for_dft(input_frame)
     parameters = dict(request.input_parameters)
+    if spin_frame:
+        _configure_spin_parameters(parameters)
     basis_type = str(parameters.get("basis_type", "pw")).strip().lower()
     pp_files, orb_files = StructureVar.completion_abacus(
-        atoms=atoms, require_orbitals=basis_type == "lcao"
+        atoms=input_frame, require_orbitals=basis_type == "lcao"
     )
     case_dir = _new_attempt_directory(
-        request.work_dir, case_index, atoms.get_chemical_formula()
+        request.work_dir, case_index, input_frame.get_chemical_formula()
     )
     ordered_indices = _render_case(
         case_dir,
-        atoms,
+        input_frame,
         parameters,
         resource_dir=request.resource_dir,
         pp_files=pp_files,
@@ -108,7 +109,15 @@ def run_native_abacus(
     log_path: Path | None = None
     try:
         log_path = _running_scf_log(case_dir, parameters)
-        parsed = parse_running_scf(log_path, expected_atoms=len(atoms))
+        parsed = parse_running_scf(log_path, expected_atoms=len(input_frame))
+        if spin_frame and parsed.magnetization is None:
+            raise NativeAbacusError(
+                f"ABACUS spin result is missing Total Magnetism: {log_path}"
+            )
+        if spin_frame and parsed.mforce is None:
+            raise NativeAbacusError(
+                f"ABACUS spin result is missing mandatory magnetic force: {log_path}"
+            )
     except NativeAbacusError:
         _write_result_manifest(
             case_dir,
@@ -119,7 +128,7 @@ def run_native_abacus(
         )
         raise
     forces = _restore_atom_order(parsed.forces, ordered_indices)
-    frame = atoms.copy()
+    frame = input_frame.copy()
     frame.arrays.pop("initial_magmoms", None)
     frame.calc = SinglePointCalculator(
         frame,
@@ -131,6 +140,20 @@ def run_native_abacus(
     )
     frame.info.setdefault("Config_type", "NepTrain scf ")
     frame.info["Weight"] = 1.0
+    if spin_frame:
+        magnetization = _restore_atom_order(
+            parsed.magnetization, ordered_indices
+        )
+        mforce = _restore_atom_order(parsed.mforce, ordered_indices)
+        target_spin = np.asarray(input_frame.arrays["spin"], dtype=np.float64)
+        frame.set_array("spin", magnetization)
+        frame.set_array("mforce", mforce)
+        frame.info["spin_constraint_rms_uB"] = float(
+            np.sqrt(
+                np.sum(np.square(magnetization - target_spin))
+                / len(target_spin)
+            )
+        )
     _write_result_manifest(
         case_dir,
         command=request.command,
@@ -164,13 +187,34 @@ def parse_running_scf(path: Path, *, expected_atoms: int) -> ParsedAbacusResult:
     stress = _last_matrix_table(lines, "TOTAL-STRESS", rows=3)
     if stress is None:
         raise NativeAbacusError(f"ABACUS stress table is missing or incomplete: {path}")
+    magnetization = _last_vector_table(lines, "Total Magnetism (uB)", expected_atoms)
     mforce = _last_magnetic_force_table(lines, expected_atoms)
     return ParsedAbacusResult(
         energy=energy,
         forces=forces,
         stress_kbar=stress,
+        magnetization=magnetization,
         mforce=mforce,
         scf_iterations=iterations,
+    )
+
+
+def _configure_spin_parameters(parameters: dict[str, str]) -> None:
+    """Select ABACUS full-vector DeltaSpin for canonical spin:R:3 input."""
+
+    direction_only = str(parameters.pop("sc_direction_only", "0")).strip().lower()
+    if direction_only not in {"", "0", "false", "f", "no", "off"}:
+        raise NativeAbacusError(
+            "ABACUS direction-only spin constraints are incompatible with "
+            "variable-magnitude spin labels"
+        )
+    parameters.update(
+        {
+            "nspin": "4",
+            "noncolin": "1",
+            "sc_mag_switch": "1",
+            "symmetry": "0",
+        }
     )
 
 
@@ -187,6 +231,8 @@ def _render_case(
     kspacing: float | None,
     ka: tuple[int, int, int],
 ) -> tuple[int, ...]:
+    if str(parameters.get("smearing_method", "")).strip().lower() == "gau":
+        parameters["smearing_method"] = "gaussian"
     parameters["pseudo_dir"] = str(resource_dir)
     if str(parameters.get("basis_type", "pw")).strip().lower() == "lcao":
         parameters["orbital_dir"] = str(resource_dir)
@@ -253,12 +299,19 @@ def _write_stru(
     rows.extend(_format_vector(vector) for vector in np.asarray(atoms.cell))
     mobility = _constraint_mobility(atoms)
     positions = np.asarray(atoms.positions)
+    spin = (
+        np.asarray(atoms.arrays["spin"], dtype=np.float64)
+        if "spin" in atoms.arrays
+        else None
+    )
     rows.extend(["", "ATOMIC_POSITIONS", "Cartesian"])
     for element in species:
         indices = [index for index in ordered_indices if symbols[index] == element]
         rows.extend(["", element, "0.0", str(len(indices))])
         for index in indices:
             row = f"{_format_vector(positions[index])} m {_format_int_vector(mobility[index])}"
+            if spin is not None:
+                row += f" mag {_format_vector(spin[index])} sc 1 1 1"
             rows.append(row)
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return ordered_indices
@@ -393,12 +446,7 @@ def _last_vector_table(
                 if rows:
                     break
                 continue
-            parts = stripped.split()
-            if len(parts) < 4:
-                if rows:
-                    break
-                continue
-            values = _floats(" ".join(parts[1:]))
+            values = _floats(stripped)
             if len(values) < 3:
                 if rows:
                     break
@@ -437,13 +485,19 @@ def _last_magnetic_force_table(
                     break
                 continue
             parts = stripped.split()
-            values = _floats(" ".join(parts[1:]))
+            values = _floats(stripped)
             if len(values) >= 3:
                 rows.append(values[-3:])
-            elif len(values) == 1:
-                rows.append([0.0, 0.0, values[0]])
-            elif rows:
-                break
+            else:
+                scalar_values = (
+                    _floats(" ".join(parts[1:]))
+                    if len(parts) > 1
+                    else values
+                )
+                if len(scalar_values) == 1:
+                    rows.append([0.0, 0.0, scalar_values[0]])
+                elif rows:
+                    break
             if len(rows) == expected_rows:
                 return np.asarray(rows, dtype=float)
     return None
@@ -488,6 +542,7 @@ def _write_result_manifest(
         payload["result"] = {
             "energy_eV": parsed.energy,
             "atom_count": len(parsed.forces),
+            "has_magnetization": parsed.magnetization is not None,
             "has_mforce": parsed.mforce is not None,
             "scf_iterations": parsed.scf_iterations,
         }

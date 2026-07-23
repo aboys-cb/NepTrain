@@ -15,6 +15,7 @@ from NepTrain.core.campaign import (
     campaign_status,
     extend_campaign,
     prepare_campaign,
+    resume_campaign,
     submit_campaign,
 )
 from NepTrain.core.campaign_workspace import CampaignWorkspace
@@ -329,3 +330,20 @@ def test_run_existing_project_forwards_foreground_controller_options(
     ]
     assert payload["controller_exit_code"] == 0
     assert "job_ids" not in payload
+
+
+def test_resume_completed_campaign_is_an_idempotent_noop(
+    tmp_path: Path, monkeypatch
+):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_campaign(config, initial, tmp_path / "campaign")
+    monkeypatch.setattr(
+        "NepTrain.core.campaign.campaign_status",
+        lambda _path: SimpleNamespace(state="complete"),
+    )
+
+    result = resume_campaign(preparation.output_dir)
+
+    assert result.action == "complete"
+    assert result.job_ids == ()
+    assert result.controller_pid is None

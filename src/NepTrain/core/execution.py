@@ -49,6 +49,14 @@ _ACTIVE = {
     "STAGE_OUT",
     "SUSPENDED",
 }
+
+
+def _slurm_state(value: str) -> str:
+    """Normalize states such as ``COMPLETED+`` and ``CANCELLED by <uid>``."""
+
+    return re.split(r"[+\s]", value.strip(), maxsplit=1)[0].upper()
+
+
 _STAGE_CONFIG_PATH_FIELDS = {
     "train": ("training.config_path", "training.test_path"),
     "explore": ("md.structures", "md.template_path", "md.plugin_path"),
@@ -970,9 +978,11 @@ cat worker.pid
                     return ExecutionStatus("failed", str(value.get("error", "worker failed")))
             try:
                 pid = int(handle.execution_id)
+                owned_child = True
                 try:
                     waited, _ = os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
+                    owned_child = False
                     waited = 0
                 if waited == pid:
                     if path.is_file():
@@ -985,6 +995,8 @@ cat worker.pid
                             )
                     return ExecutionStatus("failed", "worker exited without a result")
                 os.kill(pid, 0)
+                if owned_child:
+                    return ExecutionStatus("running")
                 if not _pid_matches_bundle(pid, handle.local_bundle):
                     return ExecutionStatus(
                         "failed", "worker pid no longer belongs to this task"
@@ -1184,7 +1196,7 @@ cat "$bundle/execution.json"
     def inspect(self, handle: ExecutionHandle) -> ExecutionStatus:
         bundle = handle.remote_bundle or handle.local_bundle
         worker_status = self._worker_status(bundle)
-        if worker_status is not None:
+        if worker_status is not None and worker_status.terminal:
             return worker_status
         squeue = ["squeue", "--noheader", "--jobs", handle.execution_id, "--format", "%T"]
         completed = self.transport.run(
@@ -1192,7 +1204,7 @@ cat "$bundle/execution.json"
             cwd=Path(bundle) if not self.target.host else None,
         )
         if completed.returncode == 0 and completed.stdout.strip():
-            state = completed.stdout.strip().splitlines()[0].split("+", 1)[0].upper()
+            state = _slurm_state(completed.stdout.strip().splitlines()[0])
             if state in _ACTIVE:
                 return ExecutionStatus("running", state)
         sacct = [
@@ -1213,7 +1225,7 @@ cat "$bundle/execution.json"
         rows = [line.split("|") for line in completed.stdout.splitlines() if line.strip()]
         if not rows:
             return ExecutionStatus("unknown", "Slurm has no accounting record yet")
-        state = rows[0][0].split("+", 1)[0].upper()
+        state = _slurm_state(rows[0][0])
         exit_code = rows[0][1] if len(rows[0]) > 1 else ""
         if state in _TERMINAL_SUCCESS and exit_code.startswith("0:0"):
             return ExecutionStatus("completed", state)

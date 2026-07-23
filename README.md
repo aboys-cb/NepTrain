@@ -12,10 +12,9 @@ NepTrain 用于组织 NEP 主动学习循环。训练和分子动力学是两个
 
 LAMMPS 只是 MD frontend；模型识别、能力检查和计算实现统一由 NEPAdapters 提供。
 
-当前生产保证先收敛在**非磁、固定几何的单点标注**：VASP 和 ABACUS 接受普通
-结构并返回 energy、force、virial。spin/mforce 数据结构、Toy Teacher 与 DynSpin
-工具仍保留用于后续打磨，但生产 VASP/ABACUS Adapter 会明确拒绝 spin 结构，避免
-把尚未真实验收的磁性 DFT 路径误当成可用功能。
+当前生产路径支持固定几何单点标注：VASP 和 ABACUS 接受普通结构并返回
+energy、force、virial；ABACUS 还支持全矢量 DeltaSpin 标注并返回 spin、mforce。
+VASP Adapter 仍明确拒绝 spin 结构。
 
 ## 安装
 
@@ -61,6 +60,7 @@ training:
   device: cuda
   config_path: ./nep.in
   finetune_lr_scale: 0.1   # 只作用于增量 retrain；初始训练不变
+  seed: 20260723            # 固定 TorchNEP 初始化和数据顺序
 
 md:
   backend: lammps          # gpumd 或 lammps
@@ -136,7 +136,7 @@ NepTrain md spin.xyz \
 
 默认提供 `dynspin/glsd/nvt` 和 `dynspin/glsd/npt` 模板，磁矩方向与模长都会演化。高级用法可通过 `--template custom.in` 提供完整 LAMMPS 输入；NepTrain 只替换模板中实际出现的 `{{ variable }}`。
 
-## 预留的 spin 数据契约
+## spin 数据契约
 
 训练和 DFT 标注使用 extxyz：
 
@@ -146,8 +146,10 @@ Properties=species:S:1:pos:R:3:spin:R:3:mforce:R:3
 
 - `spin` 是完整物理磁矩向量，模长为 `|spin|`。
 - `mforce` 是参考磁力 `-dE/dspin`。
-- 当前只有 Toy Teacher 使用这套完整标签契约；生产 VASP/ABACUS 暂不接受 spin。
-- 后续磁性 DFT Adapter 启用后，结构包含 `spin` 时必须同时得到 `mforce`，否则失败。
+- ABACUS DeltaSpin 和 Toy Teacher 使用这套完整标签契约；VASP 暂不接受 spin。
+- ABACUS 将输入 `spin` 写入 STRU 的全矢量 `mag ... sc 1 1 1`，并从最终
+  `Total Magnetism` 与 `Magnetic force (eV/uB)` 表收集标签。
+- 结构包含 `spin` 时必须同时得到 `mforce`，否则标注失败。
 - MD 轨迹中的模型磁力也统一写为 `mforce`，进入 DFT 标注后必须由参考计算结果替换。
 
 默认 DynSpin dump 的含义由 compute 顺序确定：
@@ -317,10 +319,41 @@ VASP 使用 ASE 自带的输入与结果解析能力；`resource_path` 直接指
 当成单点标签。ABACUS Adapter 原生生成
 `INPUT/STRU/KPT`、执行 `abacus` 并解析 `OUT.*/running_scf.log`，不需要额外
 安装 ASE 插件。ABACUS 的 `resource_path` 放 `.UPF`；`basis_type lcao` 时还
-必须放 `.orb`，文件扩展名大小写均可。Sai 的 `env-dft.sh` 加载实际 module，例如
+必须放 `.orb`，文件扩展名大小写均可。spin 输入会自动启用 `nspin=4`、
+`noncolin=1`、`sc_mag_switch=1` 和完整模长约束；INPUT 仍负责给出
+`sc_thr`、`nsc` 等收敛参数。Sai 的 `env-dft.sh` 加载实际 module，例如
 `module load abacus/LTSv3.10.1-sm70-auto` 或
 `module load vasp/6.6.0-nvhpc25.7-ompi5.0.10`。module 和赝势是两个独立
 依赖，缺任意一项都会在 label 阶段明确失败。
+
+Sai 的 `abacus/LTSv3.10.1-sm70-auto` 可用于普通 ABACUS 标注，但该发布版会
+拒绝 `sc_mag_switch`；spin 标注必须通过 `NEPTRAIN_ABACUS_COMMAND` 指向已启用
+DeltaSpin 的 ABACUS 构建。当前验证分支的 subspace fast mode 只覆盖
+`nspin=2`，全矢量 `nspin=4` 仍使用完整对角化。
+
+### ABACUS spin 真实验收
+
+快速单元测试负责输入生成、输出格式和失败边界；生产验收使用固定 Fe2 用例，
+通过完整 CLI 启动真实 ABACUS，并检查 energy、force、virial、spin、mforce
+以及结果 manifest。赝势、轨道文件、编译目录和计算输出不进入 Git。
+
+变更 ABACUS 二进制或 spin Adapter 后，依次执行：
+
+1. 在目标节点按固定 commit 编译 ABACUS，使用 C++17 和与运行节点兼容的
+   MPI、ELPA、BLAS 指令集。
+2. 运行 `pytest -q`。
+3. 在 Sai V100 计算节点设置以下变量并运行真实测试：
+
+```bash
+export NEPTRAIN_RUN_REAL_ABACUS_SPIN=1
+export NEPTRAIN_ABACUS_SOURCE_COMMIT=de434f18e0c5f86e5f185db4958daab71b113666
+export NEPTRAIN_ABACUS_COMMAND="mpirun -n 4 /path/to/abacus"
+export NEPTRAIN_ABACUS_SPIN_RESOURCES=/path/to/Fe/resources
+pytest -q -m real_abacus_spin tests/integration/test_abacus_spin_real.py
+```
+
+测试只有在真实计算完成、SCF 收敛、mforce 存在、参考数值在容差内且 extxyz
+可重新读取时才通过。普通本地 `pytest` 会跳过这项远程测试。
 
 K 点选择不会再靠参数覆盖顺序碰运气：`use_k_stype: kspacing` 使用配置中的
 `kspacing`，或在配置未给值时读取 `INCAR/INPUT` 模板；`use_k_stype: kpoints`
@@ -442,7 +475,7 @@ append-only 历史。依赖文件漂移时会拒绝启动。每代的
 }
 ```
 
-真实 Adapter 会用 TorchNEP/GPUMD 训练、LAMMPS/GPUMD 探索、NEPAdapters 描述符做分层 FPS，并根据 `dft.software` 调用 VASP、ABACUS 或 Toy Teacher。MD source 数按候选预算裁剪，已在训练集中的结构不会送入标注。VASP/ABACUS 缺少收敛结果时失败，并且当前会在启动 DFT 前拒绝 spin 结构。
+真实 Adapter 会用 TorchNEP/GPUMD 训练、LAMMPS/GPUMD 探索、NEPAdapters 描述符做分层 FPS，并根据 `dft.software` 调用 VASP、ABACUS 或 Toy Teacher。MD source 数按候选预算裁剪，已在训练集中的结构不会送入标注。VASP/ABACUS 缺少收敛结果时失败；spin 结构只能进入 ABACUS DeltaSpin 或 Toy Teacher。
 
 ## 开发闭环 smoke
 

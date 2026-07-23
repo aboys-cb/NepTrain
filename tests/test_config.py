@@ -61,7 +61,7 @@ md: {backend: lammps, spin: true, spin_temperature: null}
         load_config(path)
 
 
-def test_spin_campaign_rejects_unvalidated_production_dft(tmp_path: Path):
+def test_spin_campaign_accepts_abacus_deltaspin(tmp_path: Path):
     path = tmp_path / "job.yaml"
     path.write_text(
         """
@@ -73,7 +73,23 @@ dft: {software: abacus}
 """,
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="non-magnetic only"):
+    config, _ = load_config(path)
+    assert config["dft"]["software"] == "abacus"
+
+
+def test_spin_campaign_still_rejects_vasp(tmp_path: Path):
+    path = tmp_path / "job.yaml"
+    path.write_text(
+        """
+schema_version: 2
+current_job: md
+training: {backend: torchnep}
+md: {backend: lammps, spin: true, spin_temperature: auto}
+dft: {software: vasp}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="VASP production labeling"):
         load_config(path)
 
 

@@ -151,6 +151,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ConfigError("training.backend must be gpumd or torchnep")
     if float(training.get("finetune_lr_scale", 0.1)) <= 0:
         raise ConfigError("training.finetune_lr_scale must be positive")
+    if int(training.get("seed", campaign.get("seed", 20260723))) < 0:
+        raise ConfigError("training.seed must be non-negative")
     if training.get("finetune_lr") is not None and float(
         training["finetune_lr"]
     ) <= 0:
@@ -189,10 +191,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError("spin MD currently requires md.backend=lammps")
         if md.get("spin_temperature") is None:
             raise ConfigError("spin MD requires md.spin_temperature")
-        if dft.get("software", "vasp") != "toy":
+        if dft.get("software", "vasp") not in {"abacus", "toy"}:
             raise ConfigError(
-                "spin campaigns currently require dft.software=toy; "
-                "VASP/ABACUS production labeling is non-magnetic only"
+                "spin campaigns require dft.software=abacus or toy; "
+                "VASP production labeling is non-magnetic only"
             )
     if campaign:
         if not (

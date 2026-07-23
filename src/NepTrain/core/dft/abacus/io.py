@@ -22,7 +22,7 @@ def read_input_file(file_name: str) -> dict:
         #     input_key[group[0].strip()] = group[1].strip()
         for line in f:
             line = line.strip()
-            if not line or line == "INPUT_PARAMETERS":
+            if not line or line.split(maxsplit=1)[0].upper() == "INPUT_PARAMETERS":
                 continue
             m = re.match(pattern, line)
             if m:
