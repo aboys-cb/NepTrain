@@ -17,16 +17,47 @@ def _project(**overrides):
         "md": {
             "backend": "lammps",
             "structures": "./structures",
-            "temperatures": [300],
-            "initial_steps": 100,
             "spin": False,
+        },
+        "sampling": {
+            "mode": "auto",
+            "conditions": {
+                "temperature_path": [300],
+                "production_temperatures": [300],
+                "pressure": 0.0,
+                "spin_temperature": None,
+            },
+            "progression": {
+                "md_runs_per_iteration": 1,
+                "steps": {
+                    "smoke_passed": 100,
+                    "short_stable": 400,
+                    "long_stable": 1600,
+                    "production_ready": 6400,
+                },
+            },
+            "candidate_pool": {
+                "target": 20,
+                "growth": 1.0,
+                "frame_stride": 2,
+                "pre_failure_frames": 2,
+                "bad_tail_frames": 1,
+                "health": {},
+            },
+            "selection": {
+                "method": "fps",
+                "dft_budget": 8,
+                "minimum_dft_budget": 4,
+                "budget_decay": 0.75,
+                "min_novelty": 0.0,
+            },
         },
         "dft": {"backend": "toy"},
         "evaluation": {
             "validation_path": "./validation.xyz",
             "max_rmse": {"energy_rmse": 1, "force_rmse": 1},
         },
-        "workflow": {"generations": 1},
+        "workflow": {"max_iterations": 1},
         "execution": {
             "routes": {
                 "training": "local",
@@ -52,7 +83,7 @@ def _write(tmp_path: Path, value: dict) -> Path:
 def test_schema_v4_loads_without_migration(tmp_path):
     config, changes = load_config(_write(tmp_path, _project()))
     assert config["schema_version"] == 4
-    assert config["md"]["temperatures"] == [300]
+    assert config["sampling"]["conditions"]["temperature_path"] == [300]
     assert changes == []
 
 
@@ -72,31 +103,44 @@ def test_unknown_legacy_fields_are_rejected(tmp_path):
 
 
 def test_unknown_section_fields_are_rejected(tmp_path):
-    with pytest.raises(ConfigError, match="md.*temperatrues"):
+    with pytest.raises(ConfigError, match="sampling.conditions.*temperatrues"):
+        value = _project()
+        value["sampling"]["conditions"]["temperatrues"] = [500]
         load_config(
-            _write(tmp_path, _project(md={"temperatrues": [500]}))
+            _write(tmp_path, value)
         )
 
 
 def test_temperature_steps_and_pressure_have_one_md_source(tmp_path):
+    value = _project()
+    value["sampling"]["conditions"].update(
+        temperature_path=[400, 800],
+        production_temperatures=[400, 800],
+        pressure=5.0,
+    )
+    value["sampling"]["progression"]["steps"] = {
+        "smoke_passed": 2000,
+        "short_stable": 8000,
+        "long_stable": 32000,
+        "production_ready": 128000,
+    }
     config, _ = load_config(
-        _write(
-            tmp_path,
-            _project(
-                md={
-                    "temperatures": [400, 800],
-                    "initial_steps": 2000,
-                    "pressure": 5.0,
-                }
-            ),
-        )
+        _write(tmp_path, value)
     )
-    assert config["md"]["temperatures"] == [400, 800]
-    assert config["md"]["initial_steps"] == 2000
-    assert config["md"]["pressure"] == 5.0
-    assert not {"temperatures", "initial_steps", "pressure"} & set(
-        config["workflow"]
+    assert config["sampling"]["conditions"]["temperature_path"] == [400, 800]
+    assert config["sampling"]["conditions"]["pressure"] == 5.0
+    assert config["sampling"]["progression"]["steps"]["smoke_passed"] == 2000
+    assert not {"temperatures", "initial_steps", "pressure"} & set(config["md"])
+
+
+def test_temperature_path_and_production_targets_are_validated(tmp_path):
+    value = _project()
+    value["sampling"]["conditions"].update(
+        temperature_path=[300, 700, 500],
+        production_temperatures=[300, 900],
     )
+    with pytest.raises(ConfigError, match="strictly|subset"):
+        load_config(_write(tmp_path, value))
 
 
 def test_torchnep_finetune_learning_rate_must_be_positive(tmp_path):
@@ -112,36 +156,29 @@ def test_spin_md_requires_spin_temperature(tmp_path):
 
 
 def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
+    value = _project(
+        md={"spin": True},
+        dft={"backend": "abacus"},
+        evaluation={
+            "max_rmse": {
+                "energy_rmse": 1,
+                "force_rmse": 1,
+                "mforce_rmse": 1,
+            }
+        },
+    )
+    value["sampling"]["conditions"]["spin_temperature"] = 300
     config, _ = load_config(
-        _write(
-            tmp_path,
-            _project(
-                md={"spin": True, "spin_temperature": 300},
-                dft={"backend": "abacus"},
-                evaluation={
-                    "max_rmse": {
-                        "energy_rmse": 1,
-                        "force_rmse": 1,
-                        "mforce_rmse": 1,
-                    }
-                },
-            ),
-        )
+        _write(tmp_path, value)
     )
     assert config["dft"]["backend"] == "abacus"
 
 
 def test_spin_workflow_rejects_vasp(tmp_path):
+    value = _project(md={"spin": True}, dft={"backend": "vasp"})
+    value["sampling"]["conditions"]["spin_temperature"] = 300
     with pytest.raises(ConfigError, match="VASP labeling"):
-        load_config(
-            _write(
-                tmp_path,
-                _project(
-                    md={"spin": True, "spin_temperature": 300},
-                    dft={"backend": "vasp"},
-                ),
-            )
-        )
+        load_config(_write(tmp_path, value))
 
 
 @pytest.mark.parametrize(
@@ -154,5 +191,10 @@ def test_spin_workflow_rejects_vasp(tmp_path):
     ],
 )
 def test_failure_window_config_is_validated(tmp_path, settings, message):
+    value = _project()
+    if "dump_interval" in settings:
+        value["md"].update(settings)
+    else:
+        value["sampling"]["candidate_pool"].update(settings)
     with pytest.raises(ConfigError, match=message):
-        load_config(_write(tmp_path, _project(md=settings)))
+        load_config(_write(tmp_path, value))

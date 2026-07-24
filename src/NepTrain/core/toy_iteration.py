@@ -118,7 +118,14 @@ class ToyIterationAdapter:
                 "short_stable": 400,
                 "long_stable": 1600,
                 "production_ready": 6400,
-            }
+            },
+            temperature_path=(300.0, 500.0, 700.0),
+            replicas={
+                "smoke_passed": 1,
+                "short_stable": 1,
+                "long_stable": 1,
+                "production_ready": 1,
+            },
         )
         self.stage_calls: list[tuple[int, str]] = []
 
@@ -169,11 +176,11 @@ class ToyIterationAdapter:
             )
         attempts = self.scenario_ladder.schedule(
             [base_identifier],
-            context.plan.temperatures,
             pressure=context.plan.pressure,
             generation=context.generation,
             seed=context.plan.seed,
             limit=len(context.plan.temperatures),
+            model_id=_sha256(context.artifacts["model"]),
             history=history,
         )
         by_temperature = {attempt.temperature: attempt for attempt in attempts}
@@ -182,7 +189,7 @@ class ToyIterationAdapter:
             context.plan.seed,
             context.plan.candidate_count,
             generation=context.generation,
-            temperatures=context.plan.temperatures,
+            temperatures=tuple(by_temperature),
             pressure=context.plan.pressure,
         )
         for frame in candidates:
@@ -198,7 +205,14 @@ class ToyIterationAdapter:
         scenario_plan = context.generation_dir / "scenario-plan.json"
         _write_json(
             scenario_plan,
-            {"version": 1, "attempts": self.scenario_ladder.serialize(attempts)},
+            {
+                "version": 2,
+                "structure_ids": [base_identifier],
+                "attempts": self.scenario_ladder.serialize(attempts),
+                "completed": {
+                    attempt.attempt_id: True for attempt in attempts
+                },
+            },
         )
         return StageOutcome(
             artifacts={"candidates": output, "scenario_plan": scenario_plan},
@@ -392,12 +406,20 @@ class ToyIterationAdapter:
         )
         maturity = self.scenario_ladder.record(
             scenario_plan["attempts"],
-            accepted=accepted,
+            completed=scenario_plan["completed"],
+            diagnostic_accepted={
+                attempt["attempt_id"]: bool(accepted)
+                for attempt in scenario_plan["attempts"]
+            },
             history=previous,
             diagnostic=json.loads(
                 context.artifacts["acquisition_signals"].read_text(encoding="utf-8")
             ),
             validation=signals,
+            validation_accepted=bool(accepted),
+            model_improved=True,
+            novelty_converged=True,
+            final_model_id=_sha256(context.artifacts["retrained_model"]),
         )
         signals["scenario_counts_by_maturity"] = maturity["counts_by_maturity"]
         output = context.generation_dir / "signals.json"
@@ -450,7 +472,7 @@ def run_toy_iteration_smoke(
         generations,
         seed=seed,
         initial_budget=dft_budget,
-        initial_candidates=24,
+        candidate_target=24,
         initial_steps=100,
     )
 

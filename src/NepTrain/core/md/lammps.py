@@ -283,7 +283,6 @@ def run_lammps(
     lmp_command: str,
     mpiexec: str,
     mpi_ranks: int,
-    plugin_path: str | None,
     spin: bool,
     pre_failure_frames: int = 2,
     bad_tail_frames: int = 1,
@@ -303,18 +302,6 @@ def run_lammps(
     pair_style = "nep/gpu/kk" if selected == "cuda" else "nep/cpu"
     atom_style = "spin/kk" if spin and selected == "cuda" else "spin" if spin else "atomic"
     fix_suffix = "/kk" if selected == "cuda" else ""
-    plugin_command = ""
-    if plugin_path:
-        plugin = Path(plugin_path).expanduser().resolve()
-        if plugin.is_dir():
-            plugin_name = (
-                "nepadaptersgpuplugin.so" if selected == "cuda" else "nepadapterscpuplugin.so"
-            )
-            plugin = plugin / plugin_name
-        if not plugin.is_file():
-            raise LammpsError(f"NEPAdapters LAMMPS plugin does not exist: {plugin}")
-        plugin_command = f"plugin load {plugin}"
-
     output_dir.mkdir(parents=True, exist_ok=True)
     local_model = output_dir / "nep.txt"
     if model_file.resolve() != local_model.resolve():
@@ -332,7 +319,6 @@ def run_lammps(
         pair_style=pair_style,
         elements=" ".join(info.elements),
         fix_suffix=fix_suffix,
-        plugin_command=plugin_command,
         trajectory_file=dump_file.name,
     )
     rendered_input = render_template(template, template_variables)

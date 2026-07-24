@@ -2,18 +2,17 @@ clear
 units metal
 atom_style {{ atom_style }}
 boundary p p p
-{{ plugin_command }}
 read_data {{ structure_file }}
 
 pair_style {{ pair_style }}
 pair_coeff * * {{ model_file }} {{ elements }}
 
-timestep {{ timestep }}
-velocity all create {{ temperature }} 12345 mom yes rot yes dist gaussian
-fix integrator all npt{{ fix_suffix }} temp {{ temperature }} {{ temperature }} {{ tdamp }} iso {{ pressure }} {{ pressure }} {{ pdamp }}
+timestep 0.001
+velocity all create {{ temperature }} {{ seed }} mom yes rot yes dist gaussian
+fix integrator all npt{{ fix_suffix }} temp {{ temperature }} {{ temperature }} 0.1 iso {{ pressure }} {{ pressure }} 1.0
 
-thermo {{ dump_interval }}
+thermo 100
 thermo_style custom step temp pe ke etotal press
-dump trajectory all custom {{ dump_interval }} {{ trajectory_file }} id type x y z fx fy fz
+dump trajectory all custom 100 {{ trajectory_file }} id type x y z fx fy fz
 dump_modify trajectory sort id format float %.17g
 run {{ steps }}

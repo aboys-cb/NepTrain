@@ -14,8 +14,19 @@ def test_init_project_writes_a_valid_narrow_schema_v4(tmp_path):
     assert config["schema_version"] == 4
     assert config["training"]["backend"] == "torchnep"
     assert config["md"]["backend"] == "lammps"
-    assert config["md"]["temperatures"] == [300]
-    assert config["md"]["initial_steps"] == 10000
+    assert config["sampling"]["conditions"]["temperature_path"] == [300]
+    assert config["sampling"]["conditions"]["production_temperatures"] == [300]
+    assert config["sampling"]["progression"]["replicas"]["production_ready"] == 3
+    assert (
+        config["sampling"]["progression"]["steps"]["smoke_passed"]
+        == 10000
+    )
+    assert "plugin_path" not in config["md"]
+    template = (tmp_path / "lammps-nvt.in").read_text(encoding="utf-8")
+    assert "{{ temperature }}" in template
+    assert "{{ steps }}" in template
+    assert "{{ tdamp }}" not in template
+    assert "{{ plugin_command }}" not in template
     assert "current_job" not in config
     assert "duration_ps_every_generation" not in config["md"]
     assert (tmp_path / "lammps-nvt.in").is_file()

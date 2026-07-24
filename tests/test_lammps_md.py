@@ -126,7 +126,6 @@ def test_failed_lammps_run_recovers_complete_frames_and_quarantines_tail(
         lmp_command="lmp",
         mpiexec="mpirun",
         mpi_ranks=1,
-        plugin_path=None,
         spin=False,
         pre_failure_frames=2,
         bad_tail_frames=1,
@@ -169,6 +168,8 @@ def test_write_spin_data_uses_direction_then_magnitude(tmp_path: Path):
 def test_default_spin_template_matches_documented_compute_order():
     template = files("NepTrain.core.md").joinpath("templates/spin-nvt.in").read_text()
     assert "property/atom sp spx spy spz fmx fmy fmz fx fy fz" in template
+    assert "velocity all create {{ temperature }} {{ seed }}" in template
+    assert "stemp {{ spin_temperature }} seed {{ seed }}" in template
     rendered = render_template(
         "run {{ steps }}\nvariable x equal {{ temperature }}\n",
         {"steps": 10, "temperature": 300},

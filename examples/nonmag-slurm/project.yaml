@@ -1,0 +1,120 @@
+schema_version: 4
+
+training:
+  backend: torchnep
+  initial_path: ./train.xyz
+  config_path: ./nep.in
+  device: cuda
+  torch_backend: auto
+  precision: float32
+  use_compile: false
+  finetune_lr_scale: 0.1
+  seed: 20260723
+
+md:
+  backend: lammps
+  structures: ./structures
+  template_path: ./lammps.in
+  inference_backend: auto
+  spin: false
+  lmp: lmp
+  mpiexec: mpirun
+  mpi_ranks: 4
+
+sampling:
+  mode: auto
+
+  conditions:
+    temperature_path:
+      - 300
+      - 500
+      - 700
+    production_temperatures:
+      - 300
+      - 700
+    pressure: 0.0
+    spin_temperature:
+
+  progression:
+    md_runs_per_iteration: 4
+    steps:
+      smoke_passed: 10000
+      short_stable: 40000
+      long_stable: 160000
+      production_ready: 640000
+    replicas:
+      smoke_passed: 1
+      short_stable: 1
+      long_stable: 2
+      production_ready: 3
+
+  candidate_pool:
+    target: 200
+    growth: 1.0
+    frame_stride: 2
+    pre_failure_frames: 2
+    bad_tail_frames: 1
+    health:
+      min_distance_ratio: 0.5
+      min_volume_ratio: 0.5
+      max_volume_ratio: 2.0
+      max_force: 100.0
+      max_mforce: 100.0
+      max_spin_magnitude: 20.0
+
+  selection:
+    method: fps
+    dft_budget: 20
+    minimum_dft_budget: 8
+    budget_decay: 0.75
+    min_novelty: 0.0
+
+dft:
+  backend: vasp
+  n_cpu: 32
+  input_path: ./INCAR
+  resource_path: /shared/potpaw_PBE
+  kpoints_use_gamma: true
+  use_k_stype: kspacing
+  kspacing: 0.2
+
+evaluation:
+  validation_path: ./validation.xyz
+  inference_backend: auto
+  max_rmse:
+    energy_rmse: 0.05
+    force_rmse: 0.20
+
+workflow:
+  id: fe-workflow
+  max_iterations: 12
+  seed: 20260721
+
+execution:
+  poll_interval: 30
+  routes:
+    training: gpu
+    sampling: cpu
+    labeling: dft
+    analysis: cpu
+  targets:
+    gpu:
+      executor: slurm
+      partition: gpu
+      time: 24:00:00
+      gpus_per_node: 1
+      setup_script: ./env-training.sh
+    cpu:
+      executor: slurm
+      partition: cpu
+      time: 04:00:00
+      cpus_per_task: 4
+      setup_script: ./env-cpu.sh
+    dft:
+      executor: slurm
+      partition: cpu
+      time: 24:00:00
+      cpus_per_task: 32
+      setup_script: ./env-dft.sh
+      environment:
+        NEPTRAIN_VASP_COMMAND: srun vasp_std

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -54,6 +55,39 @@ def _rmse(reference: np.ndarray, prediction: np.ndarray) -> float:
             f"prediction shape {prediction.shape} does not match labels {reference.shape}"
         )
     return float(np.sqrt(np.mean(np.square(prediction - reference))))
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _within_thresholds(
+    metrics: Mapping[str, float], thresholds: Mapping[str, Any]
+) -> bool:
+    return bool(metrics) and all(
+        name in metrics
+        and np.isfinite(float(metrics[name]))
+        and float(metrics[name]) <= float(limit)
+        for name, limit in thresholds.items()
+    )
+
+
+def _threshold_score(
+    metrics: Mapping[str, float], thresholds: Mapping[str, Any]
+) -> float:
+    missing = sorted(name for name in thresholds if name not in metrics)
+    if missing:
+        raise WorkflowIterationError(
+            "model evaluation is missing metrics: " + ", ".join(missing)
+        )
+    return max(
+        (
+            float(metrics[name]) / float(limit)
+            for name, limit in thresholds.items()
+            if name in metrics
+        ),
+        default=float("inf"),
+    )
 
 
 def _nep_prediction_metrics(
@@ -146,13 +180,8 @@ class WorkflowIterationAdapter:
         self.base_dir = Path(base_dir).expanduser().resolve()
         self.initial_training = self._path(initial_training)
         self.runtime = runtime or WorkflowRuntime()
-        self.scenario_ladder = ScenarioLadder.from_workflow(
-            {
-                **dict(self.config.get("workflow", {})),
-                "initial_steps": int(
-                    self.config.get("md", {}).get("initial_steps", 100)
-                ),
-            }
+        self.scenario_ladder = ScenarioLadder.from_sampling(
+            self.config.get("sampling", {})
         )
         if not self.initial_training.is_file():
             raise WorkflowIterationError(
@@ -429,17 +458,15 @@ class WorkflowIterationAdapter:
 
     def _explore(self, context: StageContext) -> StageOutcome:
         options = self.config.get("md", {})
+        sampling = self.config.get("sampling", {})
+        conditions = sampling.get("conditions", {})
+        progression = sampling.get("progression", {})
+        candidate_pool = sampling.get("candidate_pool", {})
         structures = _read_frames(self._path(options.get("structures")))
         backend = str(options.get("backend", "lammps"))
         structure_by_id = {structure_id(atoms): atoms for atoms in structures}
         ordered_structure_ids = sorted(structure_by_id)
-        expected_frames = max(
-            1, context.plan.steps // int(options.get("dump_interval", 100))
-        )
-        target_sources = max(
-            min(len(context.plan.temperatures), context.plan.candidate_count),
-            int(np.ceil(context.plan.candidate_count / expected_frames)),
-        )
+        target_sources = int(progression.get("md_runs_per_iteration", 1))
         scenario_history = None
         if "scenario_maturity" in context.previous_artifacts:
             scenario_history = json.loads(
@@ -447,45 +474,28 @@ class WorkflowIterationAdapter:
                     encoding="utf-8"
                 )
             )
-        scenario_attempts = ()
-        if self.scenario_ladder is not None:
-            scenario_attempts = self.scenario_ladder.schedule(
-                ordered_structure_ids,
-                context.plan.temperatures,
-                pressure=context.plan.pressure,
-                generation=context.generation,
-                seed=context.plan.seed,
-                limit=min(
-                    len(ordered_structure_ids) * len(context.plan.temperatures),
-                    target_sources,
-                ),
-                history=scenario_history,
+        scenario_attempts = self.scenario_ladder.schedule(
+            ordered_structure_ids,
+            pressure=context.plan.pressure,
+            generation=context.generation,
+            seed=context.plan.seed,
+            limit=min(target_sources, context.plan.dft_budget),
+            model_id=_file_sha256(context.artifacts["model"]),
+            history=scenario_history,
+        )
+        run_specs = [
+            (
+                attempt.structure_id,
+                attempt.temperature,
+                attempt.steps,
+                attempt.scenario_id,
+                attempt.attempt_id,
+                attempt.target_level,
+                attempt.replica,
+                attempt.seed,
             )
-            run_specs = [
-                (
-                    attempt.structure_id,
-                    attempt.temperature,
-                    attempt.steps,
-                    attempt.scenario_id,
-                    attempt.target_level,
-                )
-                for attempt in scenario_attempts
-            ]
-        else:
-            rng = np.random.default_rng(context.plan.seed)
-            structure_order = rng.permutation(len(ordered_structure_ids))
-            run_specs = [
-                (
-                    ordered_structure_ids[int(structure_index)],
-                    temperature,
-                    context.plan.steps,
-                    None,
-                    None,
-                )
-                for structure_index in structure_order
-                for temperature in context.plan.temperatures
-            ]
-            run_specs = run_specs[: min(len(run_specs), target_sources)]
+            for attempt in scenario_attempts
+        ]
         groups: list[tuple[str, list[Atoms]]] = []
         backend_details: set[str] = set()
         source_metadata: dict[str, dict[str, Any]] = {}
@@ -495,16 +505,20 @@ class WorkflowIterationAdapter:
             temperature,
             steps,
             scenario_identifier,
+            scenario_attempt_identifier,
             target_level,
+            replica,
+            md_seed,
         ) in run_specs:
             atoms = structure_by_id[structure_identifier]
             source = (
                 f"g{context.generation}-s{structure_identifier[:8]}-"
-                f"T{temperature:g}-P{context.plan.pressure:g}"
+                f"T{temperature:g}-P{context.plan.pressure:g}-"
+                f"r{replica}-{scenario_attempt_identifier[:8]}"
             )
             run_dir = context.work_dir / "md" / source
             trajectory = run_dir / "trajectory.xyz"
-            spin_temperature = options.get("spin_temperature")
+            spin_temperature = conditions.get("spin_temperature")
             if spin_temperature in {None, "auto"}:
                 spin_temperature = temperature
             request = MdRequest(
@@ -514,19 +528,12 @@ class WorkflowIterationAdapter:
                 output_file=trajectory,
                 temperature=float(temperature),
                 steps=int(steps),
-                timestep=float(options.get("timestep", 0.001)),
-                ensemble=str(options.get("ensemble", "nvt")),
+                seed=md_seed,
                 pressure=context.plan.pressure,
-                tdamp=float(options.get("tdamp", 0.1)),
-                pdamp=float(options.get("pdamp", 1.0)),
-                dump_interval=int(options.get("dump_interval", 100)),
                 spin=bool(options.get("spin", False)),
                 spin_temperature=float(spin_temperature)
                 if spin_temperature is not None
                 else None,
-                spin_alpha=float(options.get("spin_alpha", 0.01)),
-                spin_seed=int(options.get("spin_seed", context.plan.seed)),
-                midpoint_iter=int(options.get("midpoint_iter", 3)),
                 template_path=self._path(options["template_path"])
                 if options.get("template_path")
                 else None,
@@ -534,11 +541,11 @@ class WorkflowIterationAdapter:
                 lmp_command=str(options.get("lmp", "lmp")),
                 mpiexec=str(options.get("mpiexec", "mpirun")),
                 mpi_ranks=int(options.get("mpi_ranks", 1)),
-                plugin_path=options.get("plugin_path"),
-                pre_failure_frames=int(options.get("pre_failure_frames", 2)),
-                bad_tail_frames=int(options.get("bad_tail_frames", 1)),
-                health=dict(options.get("health") or {}),
-                extra_variables=dict(options.get("variables", {})),
+                pre_failure_frames=int(
+                    candidate_pool.get("pre_failure_frames", 2)
+                ),
+                bad_tail_frames=int(candidate_pool.get("bad_tail_frames", 1)),
+                health=dict(candidate_pool.get("health") or {}),
             )
             try:
                 result = self.runtime.md(request, backend)
@@ -549,6 +556,8 @@ class WorkflowIterationAdapter:
                     {
                         "source_id": source,
                         "scenario_id": scenario_identifier,
+                        "scenario_attempt_id": scenario_attempt_identifier,
+                        "seed": md_seed,
                         "completed": False,
                         "usable_frames": 0,
                         "window_counts": {},
@@ -582,12 +591,26 @@ class WorkflowIterationAdapter:
                     int(frame.info.get("lammps_step", 0)),
                 )
             )
+            stride = int(candidate_pool.get("frame_stride", 1))
+            stable_index = 0
+            thinned_frames = []
+            for frame in usable_frames:
+                if frame.info.get("md_window") == "pre_failure":
+                    thinned_frames.append(frame)
+                    continue
+                if stable_index % stride == 0:
+                    thinned_frames.append(frame)
+                stable_index += 1
+            usable_frames = thinned_frames
             if usable_frames:
                 groups.append((source, usable_frames))
             source_metadata[source] = {
                 "structure_id": structure_identifier,
                 "scenario_id": scenario_identifier,
+                "scenario_attempt_id": scenario_attempt_identifier,
                 "maturity_target": target_level,
+                "replica": replica,
+                "seed": md_seed,
                 "md_steps": int(steps),
                 "temperature": float(temperature),
                 "completed": bool(result.completed),
@@ -603,6 +626,8 @@ class WorkflowIterationAdapter:
                 {
                     "source_id": source,
                     "scenario_id": scenario_identifier,
+                    "scenario_attempt_id": scenario_attempt_identifier,
+                    "seed": md_seed,
                     "completed": bool(result.completed),
                     "usable_frames": len(usable_frames),
                     "window_counts": window_counts,
@@ -616,7 +641,11 @@ class WorkflowIterationAdapter:
                 }
             )
 
-        candidates = self._balanced_cap(groups, context.plan.candidate_count)
+        candidates = [
+            (source, frame_index, frame)
+            for source, frames in groups
+            for frame_index, frame in enumerate(frames)
+        ]
         if not candidates:
             failed = sum(not item["completed"] for item in attempt_results)
             raise WorkflowIterationError(
@@ -624,7 +653,6 @@ class WorkflowIterationAdapter:
                 f"across {len(attempt_results)} attempts ({failed} failed)"
             )
         output_frames = []
-        dump_interval = int(options.get("dump_interval", 100))
         for source, frame_index, frame in candidates:
             copied = frame.copy()
             metadata = source_metadata[source]
@@ -633,11 +661,10 @@ class WorkflowIterationAdapter:
                 source_id=source,
                 temperature=metadata["temperature"],
                 pressure=context.plan.pressure,
-                frame_step=int(
-                    frame.info.get("lammps_step", (frame_index + 1) * dump_interval)
-                ),
+                frame_step=int(frame.info.get("lammps_step", frame_index)),
                 scenario_structure_id=metadata["structure_id"],
                 md_steps=metadata["md_steps"],
+                md_seed=metadata["seed"],
                 md_completed=metadata["completed"],
             )
             if metadata["failure_code"] is not None:
@@ -645,7 +672,9 @@ class WorkflowIterationAdapter:
             if metadata["scenario_id"] is not None:
                 copied.info.update(
                     scenario_id=metadata["scenario_id"],
+                    scenario_attempt_id=metadata["scenario_attempt_id"],
                     maturity_target=metadata["maturity_target"],
+                    scenario_replica=metadata["replica"],
                 )
             output_frames.append(copied)
         output = context.work_dir / "candidates.xyz"
@@ -657,20 +686,21 @@ class WorkflowIterationAdapter:
                 {"version": 1, "attempts": attempt_results},
             ),
         }
-        if self.scenario_ladder is not None:
-            scenario_plan = _write_json(
-                context.work_dir / "scenario-plan.json",
-                {
-                    "version": 1,
-                    "attempts": self.scenario_ladder.serialize(scenario_attempts),
-                    "completed": {
-                        str(item["scenario_id"]): bool(item["completed"])
-                        for item in attempt_results
-                        if item["scenario_id"] is not None
-                    },
+        scenario_plan = _write_json(
+            context.work_dir / "scenario-plan.json",
+            {
+                "version": 2,
+                "model_id": _file_sha256(context.artifacts["model"]),
+                "structure_ids": ordered_structure_ids,
+                "attempts": self.scenario_ladder.serialize(scenario_attempts),
+                "completed": {
+                    str(item["scenario_attempt_id"]): bool(item["completed"])
+                    for item in attempt_results
+                    if item.get("scenario_attempt_id") is not None
                 },
-            )
-            artifacts["scenario_plan"] = scenario_plan
+            },
+        )
+        artifacts["scenario_plan"] = scenario_plan
         return StageOutcome(
             artifacts=artifacts,
             metrics={
@@ -701,26 +731,45 @@ class WorkflowIterationAdapter:
                 "steps": context.plan.steps,
                 "scenario_steps": sorted({int(spec[2]) for spec in run_specs}),
                 "scenario_targets": sorted(
-                    {str(spec[4]) for spec in run_specs if spec[4] is not None}
+                    {str(spec[5]) for spec in run_specs if spec[5] is not None}
                 ),
             },
         )
 
     def _select(self, context: StageContext) -> StageOutcome:
         all_candidates = _read_frames(context.artifacts["candidates"])
-        source_counts: dict[str, int] = {}
-        candidates = []
-        for frame in all_candidates:
-            source = str(frame.info["source_id"])
-            source_index = source_counts.get(source, 0)
-            source_counts[source] = source_index + 1
-            if (
-                frame.info.get("md_window") == "pre_failure"
-                or source_index % context.plan.frame_stride == 0
-            ):
-                candidates.append(frame)
-        if not candidates:
-            raise WorkflowIterationError("temporal thinning removed every MD candidate")
+        sampling = self.config.get("sampling", {})
+        selection = sampling.get("selection", {})
+        if "md_attempts" in context.artifacts:
+            attempts = json.loads(
+                context.artifacts["md_attempts"].read_text(encoding="utf-8")
+            )["attempts"]
+            scheduled_count = len(attempts)
+            failed_count = sum(
+                not bool(item["completed"]) for item in attempts
+            )
+        else:
+            scheduled_count = len(
+                {
+                    str(frame.info.get("scenario_attempt_id"))
+                    if frame.info.get("scenario_attempt_id") is not None
+                    else str(frame.info.get("source_id"))
+                    for frame in all_candidates
+                }
+            )
+            failed_count = int(
+                any(not bool(frame.info.get("md_completed", True)) for frame in all_candidates)
+            )
+        minimum_budget = int(selection.get("minimum_dft_budget", 1))
+        effective_budget = (
+            context.plan.dft_budget
+            if failed_count
+            else min(
+                context.plan.dft_budget,
+                max(scheduled_count, minimum_budget),
+            )
+        )
+        candidates = list(all_candidates)
         training = _read_frames(context.artifacts["training_input"])
         known_ids = {structure_id(frame) for frame in training}
         candidates = [
@@ -742,6 +791,17 @@ class WorkflowIterationAdapter:
                 unique_candidates[identifier] = frame
         duplicate_candidate_count = len(candidates) - len(unique_candidates)
         candidates = list(unique_candidates.values())
+        grouped: dict[str, list[Atoms]] = {}
+        for frame in candidates:
+            grouped.setdefault(str(frame.info["source_id"]), []).append(frame)
+        capped = self._balanced_cap(
+            sorted(grouped.items()), context.plan.candidate_count
+        )
+        candidates = [frame for _, _, frame in capped]
+        if not candidates:
+            raise WorkflowIterationError(
+                "sampling.candidate_pool.target removed every MD candidate"
+            )
         candidate_ids = [structure_id(frame) for frame in candidates]
         strata = []
         for frame in candidates:
@@ -749,22 +809,34 @@ class WorkflowIterationAdapter:
                 f"T={float(frame.info['temperature']):g}|"
                 f"P={float(frame.info['pressure']):g}"
             )
+            if "scenario_attempt_id" in frame.info:
+                base = (
+                    f"A={str(frame.info['scenario_attempt_id'])[:8]}|{base}"
+                )
             if "scenario_id" in frame.info:
                 base = f"S={str(frame.info['scenario_id'])[:8]}|{base}"
             if "md_window" in frame.info:
                 base = f"W={frame.info['md_window']}|{base}"
             strata.append(base)
+        audit_plan = replace(
+            context.plan,
+            dft_budget=effective_budget,
+            # Every frontier point needs at least a small DFT audit. Novelty is
+            # recorded as evidence and decides convergence, not whether the
+            # audit is allowed to happen.
+            min_novelty=0.0,
+        )
         result = stratified_farthest_point_sampling(
             self.runtime.descriptors(context.artifacts["model"], candidates),
             self.runtime.descriptors(context.artifacts["model"], training),
             candidate_ids,
             strata,
-            context.plan,
+            audit_plan,
         )
         selected = [candidates[index] for index in result.selected_indices]
         if not selected:
             raise WorkflowIterationError(
-                "FPS selected no structures; lower workflow.min_distance"
+                "FPS selected no structures; lower sampling.selection.min_novelty"
             )
         selected_path = context.work_dir / "selected-input.xyz"
         ase_write(selected_path, selected, format="extxyz")
@@ -779,6 +851,14 @@ class WorkflowIterationAdapter:
                 "duplicate_candidate_count": duplicate_candidate_count,
                 "selected_count": len(selected),
                 "remaining_novelty": result.remaining_novelty,
+                "configured_dft_budget": context.plan.dft_budget,
+                "effective_dft_budget": effective_budget,
+                "failed_md_attempt_count": failed_count,
+                "novelty_threshold": context.plan.min_novelty,
+                "novel_selected_count": sum(
+                    value > context.plan.min_novelty
+                    for value in result.selected_novelty
+                ),
                 "counts_by_stratum": dict(result.counts_by_stratum),
             },
         )
@@ -818,6 +898,7 @@ class WorkflowIterationAdapter:
         options = self.config.get("evaluation", {})
         frames = _read_frames(context.artifacts["labeled"])
         _, spin_count = validate_spin_dataset(frames, require_mforce=True)
+        thresholds = dict(options.get("max_rmse", {}))
         raw_metrics = self.runtime.predict(
             context.artifacts["model"],
             frames,
@@ -827,9 +908,34 @@ class WorkflowIterationAdapter:
             f"current_model_{name}": float(value)
             for name, value in raw_metrics.items()
         }
+        grouped: dict[str, list[Atoms]] = {}
+        for frame in frames:
+            attempt_id = frame.info.get("scenario_attempt_id")
+            if attempt_id is not None:
+                grouped.setdefault(str(attempt_id), []).append(frame)
+        attempt_metrics = {}
+        attempt_accepted = {}
+        for attempt_id, attempt_frames in sorted(grouped.items()):
+            values = {
+                name: float(value)
+                for name, value in self.runtime.predict(
+                    context.artifacts["model"],
+                    attempt_frames,
+                    str(options.get("inference_backend", "auto")),
+                ).items()
+            }
+            attempt_metrics[attempt_id] = values
+            attempt_accepted[attempt_id] = _within_thresholds(
+                values, thresholds
+            )
         signals = {
             **metrics,
             "diagnostic_only": True,
+            "diagnostic_accepted": _within_thresholds(
+                raw_metrics, thresholds
+            ),
+            "attempt_accepted": attempt_accepted,
+            "attempt_metrics": attempt_metrics,
             "evaluated_count": len(frames),
             "spin_frame_count": spin_count,
         }
@@ -867,6 +973,55 @@ class WorkflowIterationAdapter:
 
     def _retrain(self, context: StageContext) -> StageOutcome:
         training_input = context.artifacts["training_set"]
+        diagnostic = json.loads(
+            context.artifacts["acquisition_signals"].read_text(encoding="utf-8")
+        )
+        attempts = json.loads(
+            context.artifacts["md_attempts"].read_text(encoding="utf-8")
+        )["attempts"]
+        failed_md = any(not bool(item["completed"]) for item in attempts)
+        previous_signals = (
+            json.loads(
+                context.previous_artifacts["signals"].read_text(
+                    encoding="utf-8"
+                )
+            )
+            if "signals" in context.previous_artifacts
+            else {}
+        )
+        continue_training = bool(
+            previous_signals.get("production_ready") is True
+            and previous_signals.get("validation_accepted") is False
+        )
+        retrain_required = bool(
+            failed_md
+            or not diagnostic.get("diagnostic_accepted", False)
+            or continue_training
+        )
+        if not retrain_required:
+            decision = {
+                "retrained": False,
+                "reason": "current model passed trajectory DFT diagnostics",
+            }
+            artifacts = {
+                "retrained_model": context.artifacts["model"],
+                "retraining_decision": _write_json(
+                    context.work_dir / "retraining-decision.json", decision
+                ),
+            }
+            if "checkpoint" in context.artifacts:
+                artifacts["retrained_checkpoint"] = context.artifacts[
+                    "checkpoint"
+                ]
+            return StageOutcome(
+                artifacts=artifacts,
+                metrics={
+                    "backend": "reuse",
+                    "training_count": len(_read_frames(training_input)),
+                    **decision,
+                },
+            )
+
         output_name = self._attempt_output_name(
             context.work_dir, "retraining"
         )
@@ -886,9 +1041,28 @@ class WorkflowIterationAdapter:
         )
         if config_file != original_config:
             artifacts["retraining_config"] = config_file
+        decision = {
+            "retrained": True,
+            "reason": (
+                "MD recovery required"
+                if failed_md
+                else (
+                    "trajectory DFT diagnostics exceeded thresholds"
+                    if not diagnostic.get("diagnostic_accepted", False)
+                    else "continued checkpoint training for global validation"
+                )
+            ),
+        }
+        artifacts["retraining_decision"] = _write_json(
+            context.work_dir / "retraining-decision.json", decision
+        )
         return StageOutcome(
             artifacts=artifacts,
-            metrics={"backend": result.backend, "training_count": frame_count},
+            metrics={
+                "backend": result.backend,
+                "training_count": frame_count,
+                **decision,
+            },
         )
 
     def _evaluate(self, context: StageContext) -> StageOutcome:
@@ -913,21 +1087,61 @@ class WorkflowIterationAdapter:
         )
         finite = all(np.isfinite(float(value)) for value in metrics.values())
         thresholds = dict(options.get("max_rmse", {}))
-        within_thresholds = all(
-            name in metrics and float(metrics[name]) <= float(limit)
-            for name, limit in thresholds.items()
+        validation_accepted = _within_thresholds(metrics, thresholds)
+        validation_score = _threshold_score(metrics, thresholds)
+        previous_signals = (
+            json.loads(
+                context.previous_artifacts["signals"].read_text(
+                    encoding="utf-8"
+                )
+            )
+            if "signals" in context.previous_artifacts
+            else {}
         )
+        previous_validation_score = previous_signals.get("validation_score")
         training_before = _read_frames(context.artifacts["training_input"])
         training_after = _read_frames(context.artifacts["training_set"])
         added_count = len(training_after) - len(training_before)
-        accepted = bool(frames and added_count > 0 and finite and within_thresholds)
+        accepted = bool(frames and finite)
+        retraining = json.loads(
+            context.artifacts["retraining_decision"].read_text(encoding="utf-8")
+        )
+        diagnostic = json.loads(
+            context.artifacts["acquisition_signals"].read_text(encoding="utf-8")
+        )
+        selection = json.loads(
+            context.artifacts["selection_result"].read_text(encoding="utf-8")
+        )
+        novelty_threshold = float(context.plan.min_novelty)
+        remaining_novelty = float(selection.get("remaining_novelty", 0.0))
+        novelty_converged = bool(
+            novelty_threshold <= 0.0
+            or remaining_novelty <= novelty_threshold
+        )
+        validation_improved = bool(
+            retraining["retrained"]
+            and (
+                previous_validation_score is None
+                or validation_score
+                < float(previous_validation_score) * 0.99
+            )
+        )
         signals = {
             **metrics,
             "accepted": accepted,
+            "validation_accepted": validation_accepted,
+            "validation_score": validation_score,
+            "previous_validation_score": previous_validation_score,
+            "validation_improved": validation_improved,
             "evaluated_count": len(frames),
             "spin_frame_count": spin_count,
             "added_training_count": added_count,
-            "model_trained_on_current_labels": True,
+            "model_trained_on_current_labels": bool(
+                retraining["retrained"]
+            ),
+            "remaining_novelty": remaining_novelty,
+            "novelty_threshold": novelty_threshold,
+            "novelty_converged": novelty_converged,
             "validation_path": str(self.validation),
         }
         artifacts = {}
@@ -936,36 +1150,63 @@ class WorkflowIterationAdapter:
             attempt += 1
         recovering = (context.work_dir / "signals.json").exists()
         suffix = f"-attempt-{attempt}" if recovering else ""
-        if self.scenario_ladder is not None:
-            scenario_plan = json.loads(
-                context.artifacts["scenario_plan"].read_text(encoding="utf-8")
-            )
-            previous = None
-            if "scenario_maturity" in context.previous_artifacts:
-                previous = json.loads(
-                    context.previous_artifacts["scenario_maturity"].read_text(
-                        encoding="utf-8"
-                    )
+        scenario_plan = json.loads(
+            context.artifacts["scenario_plan"].read_text(encoding="utf-8")
+        )
+        previous = None
+        if "scenario_maturity" in context.previous_artifacts:
+            previous = json.loads(
+                context.previous_artifacts["scenario_maturity"].read_text(
+                    encoding="utf-8"
                 )
-            history = self.scenario_ladder.record(
-                scenario_plan["attempts"],
-                accepted=accepted,
-                completed=scenario_plan["completed"],
-                history=previous,
-                diagnostic=json.loads(
-                    context.artifacts["acquisition_signals"].read_text(
-                        encoding="utf-8"
-                    )
-                ),
-                validation=signals,
             )
-            maturity_path = _write_json(
-                context.work_dir / f"scenario-maturity{suffix}.json", history
+        attempt_accepted = {
+            str(attempt["attempt_id"]): bool(
+                diagnostic.get("attempt_accepted", {}).get(
+                    str(attempt["attempt_id"]), False
+                )
             )
-            artifacts["scenario_maturity"] = maturity_path
-            signals["scenario_counts_by_maturity"] = history[
-                "counts_by_maturity"
-            ]
+            for attempt in scenario_plan["attempts"]
+        }
+        final_model_id = _file_sha256(context.artifacts["retrained_model"])
+        history = self.scenario_ladder.record(
+            scenario_plan["attempts"],
+            completed=scenario_plan["completed"],
+            diagnostic_accepted=attempt_accepted,
+            history=previous,
+            diagnostic=diagnostic,
+            validation=metrics,
+            validation_accepted=validation_accepted,
+            model_improved=validation_improved,
+            novelty_converged=novelty_converged,
+            final_model_id=final_model_id,
+        )
+        production_ready = self.scenario_ladder.production_ready(
+            scenario_plan["structure_ids"],
+            pressure=context.plan.pressure,
+            model_id=final_model_id,
+            history=history,
+        )
+        workflow_converged = bool(
+            validation_accepted and production_ready and novelty_converged
+        )
+        workflow_stalled = bool(
+            not workflow_converged
+            and int(history.get("no_progress_rounds", 0)) >= 2
+        )
+        history["workflow_converged"] = workflow_converged
+        history["workflow_stalled"] = workflow_stalled
+        maturity_path = _write_json(
+            context.work_dir / f"scenario-maturity{suffix}.json", history
+        )
+        artifacts["scenario_maturity"] = maturity_path
+        signals.update(
+            scenario_counts_by_maturity=history["counts_by_maturity"],
+            production_ready=production_ready,
+            workflow_converged=workflow_converged,
+            workflow_stalled=workflow_stalled,
+            no_progress_rounds=int(history.get("no_progress_rounds", 0)),
+        )
         output = _write_json(context.work_dir / f"signals{suffix}.json", signals)
         artifacts["signals"] = output
         return StageOutcome(artifacts=artifacts, metrics=signals)

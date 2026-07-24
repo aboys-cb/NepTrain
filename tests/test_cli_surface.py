@@ -39,3 +39,19 @@ def test_workflow_stop_exposes_explicit_job_cancellation():
     completed = _help("workflow", "stop", "--help")
     assert completed.returncode == 0
     assert "--cancel-jobs" in completed.stdout
+
+
+def test_md_cli_keeps_template_owned_parameters_out_of_the_interface():
+    completed = _help("md", "--help")
+    assert completed.returncode == 0
+    for removed in (
+        "--plugin-path",
+        "--timestep",
+        "--tdamp",
+        "--pdamp",
+        "--dump-interval",
+        "--spin-alpha",
+        "--spin-seed",
+        "--midpoint-iter",
+    ):
+        assert removed not in completed.stdout

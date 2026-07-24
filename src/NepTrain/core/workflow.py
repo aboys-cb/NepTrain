@@ -200,7 +200,7 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
         if training.get(key):
             training[key] = _absolute_path(training[key], base_dir)
     md = resolved.get("md", {})
-    for key in ("structures", "template_path", "plugin_path"):
+    for key in ("structures", "template_path"):
         if md.get(key):
             md[key] = _absolute_path(md[key], base_dir)
     dft = resolved.get("dft", {})
@@ -313,21 +313,30 @@ def _render_script(
 
 
 def _plans(
-    settings: Mapping[str, Any], md: Mapping[str, Any]
+    settings: Mapping[str, Any], sampling: Mapping[str, Any]
 ) -> tuple[Any, ...]:
     from .iteration import progressive_plans
 
+    conditions = sampling["conditions"]
+    progression = sampling["progression"]
+    candidate_pool = sampling["candidate_pool"]
+    selection = sampling["selection"]
+    steps = progression["steps"]
     plans = progressive_plans(
-        int(settings.get("generations", 1)),
+        int(settings.get("max_iterations", 1)),
         seed=int(settings.get("seed", 20260721)),
-        initial_candidates=int(settings.get("initial_candidates", 24)),
-        initial_budget=int(settings.get("dft_budget", 8)),
-        minimum_budget=int(settings.get("minimum_dft_budget", 4)),
-        initial_steps=int(md["initial_steps"]),
-        temperatures=tuple(float(value) for value in md["temperatures"]),
-        pressure=float(md.get("pressure", 0.0)),
-        min_distance=float(settings.get("min_distance", 0.0)),
-        frame_stride=int(settings.get("frame_stride", 2)),
+        candidate_target=int(candidate_pool["target"]),
+        candidate_growth=float(candidate_pool.get("growth", 1.0)),
+        initial_budget=int(selection["dft_budget"]),
+        minimum_budget=int(selection["minimum_dft_budget"]),
+        budget_decay=float(selection.get("budget_decay", 0.75)),
+        initial_steps=int(steps["smoke_passed"]),
+        temperatures=tuple(
+            float(value) for value in conditions["temperature_path"]
+        ),
+        pressure=float(conditions.get("pressure", 0.0)),
+        min_novelty=float(selection.get("min_novelty", 0.0)),
+        frame_stride=int(candidate_pool.get("frame_stride", 2)),
     )
     return plans
 
@@ -343,7 +352,6 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
         ("training_test", training.get("test_path")),
         ("md_structures", md.get("structures")),
         ("md_template", md.get("template_path")),
-        ("md_plugin", md.get("plugin_path")),
         ("dft_input", dft.get("input_path")),
         ("dft_resources", dft.get("resource_path")),
         ("evaluation_validation", evaluation.get("validation_path")),
@@ -545,7 +553,7 @@ def prepare_workflow(
     selected_id = workflow_id or str(settings.get("id", output.name))
     if not selected_id.strip():
         raise WorkflowError("workflow id cannot be empty")
-    plans = _plans(settings, config["md"])
+    plans = _plans(settings, config["sampling"])
     command = "neptrain"
     source_dependencies = _dependencies(config)
     spec = {
@@ -648,14 +656,14 @@ def extend_workflow(
             )
 
         portable_config, _ = load_config(preparation.config_file)
-        portable_config.setdefault("workflow", {})["generations"] = int(
+        portable_config.setdefault("workflow", {})["max_iterations"] = int(
             total_generations
         )
         config = _resolved_config(
             portable_config, preparation.config_file.parent
         )
         settings = dict(config.get("workflow", {}))
-        all_plans = _plans(settings, config["md"])
+        all_plans = _plans(settings, config["sampling"])
         existing_values = [
             json.loads(path.read_text(encoding="utf-8"))
             for path in preparation.plans
@@ -708,6 +716,18 @@ def extend_workflow(
         save_config(portable_config, preparation.config_file)
         manifest["config"]["sha256"] = _sha256(preparation.config_file)
         _write_json(preparation.manifest, manifest)
+        if (
+            manifest.get("orchestration") == "controller-v1"
+            and workspace.controller_file.is_file()
+        ):
+            controller_state = json.loads(
+                workspace.controller_file.read_text(encoding="utf-8")
+            )
+            if controller_state.get("state") == "budget_exhausted":
+                controller_state["state"] = "idle"
+                controller_state["current"] = None
+                controller_state.pop("reason", None)
+                _write_json(workspace.controller_file, controller_state)
         return _preparation_from_manifest(preparation.manifest)
 
 
@@ -1430,8 +1450,22 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         state = progress.state
         reason = progress.reason
         next_action = None
-        if progress.state == "complete":
+        if controller_state == "complete":
             state = "complete"
+            reason = str(
+                controller.get("reason", "workflow trust envelope converged")
+            )
+        elif controller_state == "budget_exhausted":
+            state = "budget_exhausted"
+            reason = str(controller.get("reason", "iteration budget exhausted"))
+            next_action = (
+                f"neptrain workflow extend "
+                f"{shlex.quote(str(preparation.output_dir))} "
+                f"{len(preparation.plans) + 1}"
+            )
+        elif controller_state == "stalled":
+            state = "stalled"
+            reason = str(controller.get("reason", "workflow made no progress"))
         elif progress.state == "rejected" or controller_state == "rejected":
             state = "rejected"
             reason = str(controller.get("reason", progress.reason))
@@ -1456,6 +1490,9 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             state = "paused"
             reason = "controller process is not running; remote work is preserved"
             next_action = f"neptrain workflow resume {shlex.quote(str(preparation.output_dir))}"
+        elif progress.state == "complete":
+            state = "complete"
+            reason = progress.reason
         else:
             state = "prepared"
             reason = "workflow is prepared and controller has not started"

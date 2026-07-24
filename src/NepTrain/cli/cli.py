@@ -133,10 +133,10 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
     print(f"State: {status.state}")
     print(
         f"Progress: {status.completed_generations}/{status.total_generations} "
-        "generations"
+        "iterations"
     )
     if status.generation is not None:
-        print(f"Ledger: generation {status.generation}, stage {status.stage}")
+        print(f"Ledger: iteration {status.generation}, stage {status.stage}")
     else:
         print("Ledger: complete")
     print(f"Reason: {status.reason}")
@@ -300,14 +300,14 @@ def run_extend_command(args):
     from NepTrain.core.workflow import WorkflowError, extend_workflow
 
     try:
-        preparation = extend_workflow(args.project, args.generations)
+        preparation = extend_workflow(args.project, args.iterations)
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     print(
         json.dumps(
             {
                 "workflow_id": preparation.workflow_id,
-                "total_generations": len(preparation.plans),
+                "total_iterations": len(preparation.plans),
                 "project": str(preparation.output_dir),
             },
             indent=2,
@@ -453,26 +453,12 @@ def run_doctor(args):
         if not executable:
             failures.append("lammps")
         else:
-            environment = os.environ.copy()
-            if args.plugin_path:
-                environment["LAMMPS_PLUGIN_PATH"] = str(Path(args.plugin_path).expanduser())
             probe_command = shlex.split(args.lmp)
-            probe_input = None
-            if args.plugin_path:
-                plugin = Path(args.plugin_path).expanduser().resolve()
-                if plugin.is_dir():
-                    name = "nepadaptersgpuplugin.so" if selected_inference == "cuda" else "nepadapterscpuplugin.so"
-                    plugin = plugin / name
-                probe_input = f"plugin load {plugin}\ninfo styles pair\n"
-                probe_command.extend(["-log", "none"])
-            else:
-                probe_command.append("-h")
+            probe_command.append("-h")
             completed = subprocess.run(
                 probe_command,
-                input=probe_input,
                 capture_output=True,
                 text=True,
-                env=environment,
             )
             help_text = completed.stdout + completed.stderr
             pair = "nep/gpu/kk" if selected_inference == "cuda" else "nep/cpu"
@@ -498,13 +484,11 @@ def run_doctor(args):
                     spin_temperature=300 if spin else None,
                     steps=1,
                     timestep=0.0001,
-                    dump_interval=1,
                     spin=spin,
                     inference_backend=selected_inference,
                     lmp_command=args.lmp,
                     mpiexec=args.mpiexec,
                     mpi_ranks=args.mpi_ranks,
-                    plugin_path=args.plugin_path,
                 ),
                 "lammps",
             )
@@ -565,7 +549,6 @@ def build_doctor(subparsers):
     parser.add_argument("--lmp", default="lmp")
     parser.add_argument("--mpiexec", default="mpirun")
     parser.add_argument("--mpi-ranks", type=int, default=1)
-    parser.add_argument("--plugin-path", default=None)
     parser.add_argument(
         "--project",
         default=None,
@@ -716,34 +699,28 @@ def run_manual_md_command(args):
 
     project, base = _manual_project(args.project)
     settings = project.get("md", {})
+    sampling = project.get("sampling", {})
+    conditions = sampling.get("conditions", {})
+    progression = sampling.get("progression", {})
+    candidate_pool = sampling.get("candidate_pool", {})
+    progression_steps = progression.get("steps", {})
     target = target_from_project(args.project, args.target, route="sampling")
     operation = prepare_md(
         args.input,
         backend=args.backend or settings.get("backend", "lammps"),
         model_file=args.model,
-        temperatures=args.temperature or settings.get("temperatures", [300.0]),
+        temperatures=args.temperature
+        or conditions.get("temperature_path", [300.0]),
         output=args.output,
         workdir=args.workdir,
         target=target,
         steps=args.steps
         if args.steps is not None
-        else int(settings.get("initial_steps", 10000)),
+        else int(progression_steps.get("smoke_passed", 10000)),
         pressure=args.pressure
         if args.pressure is not None
-        else float(settings.get("pressure", 0.0)),
-        timestep=args.timestep
-        if args.timestep is not None
-        else float(settings.get("timestep", 0.001)),
-        tdamp=args.tdamp
-        if args.tdamp is not None
-        else float(settings.get("tdamp", 0.1)),
-        pdamp=args.pdamp
-        if args.pdamp is not None
-        else float(settings.get("pdamp", 1.0)),
-        ensemble=args.ensemble or settings.get("ensemble", "nvt"),
-        dump_interval=args.dump_interval
-        if args.dump_interval is not None
-        else int(settings.get("dump_interval", 100)),
+        else float(conditions.get("pressure", 0.0)),
+        ensemble=args.ensemble or "nvt",
         template_path=args.template
         or _project_path(base, settings.get("template_path")),
         spin=args.spin
@@ -751,16 +728,7 @@ def run_manual_md_command(args):
         else bool(settings.get("spin", False)),
         spin_temperature=args.spin_temperature
         if args.spin_temperature is not None
-        else settings.get("spin_temperature"),
-        spin_alpha=args.spin_alpha
-        if args.spin_alpha is not None
-        else float(settings.get("spin_alpha", 0.01)),
-        spin_seed=args.spin_seed
-        if args.spin_seed is not None
-        else int(settings.get("spin_seed", 12345)),
-        midpoint_iter=args.midpoint_iter
-        if args.midpoint_iter is not None
-        else int(settings.get("midpoint_iter", 3)),
+        else conditions.get("spin_temperature"),
         inference_backend=args.inference_backend
         or settings.get("inference_backend", "auto"),
         lmp=args.lmp or settings.get("lmp", "lmp"),
@@ -768,19 +736,17 @@ def run_manual_md_command(args):
         mpi_ranks=args.mpi_ranks
         if args.mpi_ranks is not None
         else int(settings.get("mpi_ranks", 1)),
-        plugin_path=args.plugin_path
-        or _project_path(base, settings.get("plugin_path")),
         pre_failure_frames=(
             args.pre_failure_frames
             if args.pre_failure_frames is not None
-            else int(settings.get("pre_failure_frames", 2))
+            else int(candidate_pool.get("pre_failure_frames", 2))
         ),
         bad_tail_frames=(
             args.bad_tail_frames
             if args.bad_tail_frames is not None
-            else int(settings.get("bad_tail_frames", 1))
+            else int(candidate_pool.get("bad_tail_frames", 1))
         ),
-        health=dict(settings.get("health") or {}),
+        health=dict(candidate_pool.get("health") or {}),
         max_concurrent=args.max_concurrent,
         force=args.force,
     )
@@ -933,24 +899,16 @@ def build_manual_md(subparsers):
     parser.add_argument("--temperature", type=float, nargs="+")
     parser.add_argument("--pressure", type=float)
     parser.add_argument("--steps", type=int)
-    parser.add_argument("--timestep", type=float)
-    parser.add_argument("--tdamp", type=float)
-    parser.add_argument("--pdamp", type=float)
     parser.add_argument("--ensemble", choices=["nvt", "npt"])
-    parser.add_argument("--dump-interval", type=int)
     parser.add_argument("--template")
     parser.add_argument(
         "--spin", action=argparse.BooleanOptionalAction, default=None
     )
     parser.add_argument("--spin-temperature", type=float)
-    parser.add_argument("--spin-alpha", type=float)
-    parser.add_argument("--spin-seed", type=int)
-    parser.add_argument("--midpoint-iter", type=int)
     parser.add_argument("--inference-backend", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--lmp")
     parser.add_argument("--mpiexec")
     parser.add_argument("--mpi-ranks", type=int)
-    parser.add_argument("--plugin-path")
     parser.add_argument("--pre-failure-frames", type=int)
     parser.add_argument("--bad-tail-frames", type=int)
     parser.add_argument("--max-concurrent", type=int, default=20)
@@ -1043,11 +1001,11 @@ def build_workflow_commands(subparsers):
     resume.add_argument("project")
 
     extend = actions.add_parser(
-        "extend", help="Append generations after the accepted workflow prefix."
+        "extend", help="Increase the maximum model-iteration budget."
     )
     extend.set_defaults(func=run_extend_command)
     extend.add_argument("project")
-    extend.add_argument("generations", type=int)
+    extend.add_argument("iterations", type=int)
 
     stop = actions.add_parser(
         "stop", help="Stop the controller without cancelling compute jobs."

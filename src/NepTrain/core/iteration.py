@@ -47,7 +47,7 @@ class GenerationPlan:
     steps: int
     temperatures: tuple[float, ...]
     pressure: float = 0.0
-    min_distance: float = 0.0
+    min_novelty: float = 0.0
     frame_stride: int = 2
 
     def __post_init__(self) -> None:
@@ -57,8 +57,8 @@ class GenerationPlan:
             raise ValueError("seed, candidate_count, and dft_budget must be positive")
         if self.steps < 1 or not self.temperatures or self.frame_stride < 1:
             raise ValueError("steps and temperatures must be non-empty")
-        if self.min_distance < 0:
-            raise ValueError("min_distance must be non-negative")
+        if self.min_novelty < 0:
+            raise ValueError("min_novelty must be non-negative")
 
     @property
     def sha256(self) -> str:
@@ -69,41 +69,50 @@ def progressive_plans(
     generations: int,
     *,
     seed: int = 20260721,
-    initial_candidates: int = 24,
+    candidate_target: int = 24,
+    candidate_growth: float = 1.0,
     initial_budget: int = 8,
     minimum_budget: int = 4,
+    budget_decay: float = 0.75,
     initial_steps: int = 100,
     temperatures: Sequence[float] = (300.0, 500.0, 700.0),
     pressure: float = 0.0,
-    min_distance: float = 0.0,
+    min_novelty: float = 0.0,
     frame_stride: int = 2,
 ) -> tuple[GenerationPlan, ...]:
-    """Build the conservative auto progression used by the Toy workflow.
+    """Build visible per-generation budgets for the auto sampling policy.
 
-    Cheap exploration grows each generation while the expensive DFT budget
-    contracts. Step count grows before a new temperature stratum is opened.
+    All requested thermodynamic conditions are available from the first
+    generation. Scenario maturity decides which condition runs next and how
+    many MD steps it receives.
     """
 
-    if generations < 1 or not temperatures:
-        raise ValueError("generations and temperatures must be positive")
+    if (
+        generations < 1
+        or not temperatures
+        or candidate_target < 1
+        or candidate_growth <= 0
+        or not 0 < budget_decay <= 1
+    ):
+        raise ValueError("invalid automatic sampling progression")
     plans = []
     for offset in range(generations):
         generation = offset + 1
-        step_level = (offset + 1) // 2
-        temperature_count = min(len(temperatures), 1 + offset // 2)
         plans.append(
             GenerationPlan(
                 generation=generation,
                 seed=seed + offset,
-                candidate_count=initial_candidates * generation,
+                candidate_count=int(
+                    np.ceil(candidate_target * (candidate_growth**offset))
+                ),
                 dft_budget=max(
                     minimum_budget,
-                    int(np.ceil(initial_budget * (0.75**offset))),
+                    int(np.ceil(initial_budget * (budget_decay**offset))),
                 ),
-                steps=initial_steps * (4**step_level),
-                temperatures=tuple(float(value) for value in temperatures[:temperature_count]),
+                steps=initial_steps,
+                temperatures=tuple(float(value) for value in temperatures),
                 pressure=float(pressure),
-                min_distance=float(min_distance),
+                min_novelty=float(min_novelty),
                 frame_stride=int(frame_stride),
             )
         )
@@ -171,12 +180,12 @@ def stratified_farthest_point_sampling(
     counts = {group: 0 for group in sorted(set(groups))}
     available = np.ones(len(points), dtype=bool)
     while len(selected) < budget:
-        distance_gate = (
+        novelty_gate = (
             np.ones(len(points), dtype=bool)
-            if plan.min_distance == 0.0
-            else distances > plan.min_distance
+            if plan.min_novelty == 0.0
+            else distances > plan.min_novelty
         )
-        eligible = np.flatnonzero(available & distance_gate)
+        eligible = np.flatnonzero(available & novelty_gate)
         if not len(eligible):
             break
         active_groups = {groups[index] for index in eligible}

@@ -60,7 +60,7 @@ def _slurm_state(value: str) -> str:
 
 _STAGE_CONFIG_PATH_FIELDS = {
     "train": ("training.config_path", "training.test_path"),
-    "explore": ("md.structures", "md.template_path", "md.plugin_path"),
+    "explore": ("md.structures", "md.template_path"),
     "select": (),
     "label": ("dft.input_path", "dft.resource_path"),
     "diagnose": (),
@@ -71,17 +71,26 @@ _STAGE_CONFIG_PATH_FIELDS = {
 _STAGE_ARTIFACTS = {
     "train": (),
     "explore": ("model",),
-    "select": ("candidates", "training_input", "model"),
+    "select": ("candidates", "training_input", "model", "md_attempts"),
     "label": ("selected_input",),
     "diagnose": ("labeled", "model"),
     "merge": ("training_input", "labeled"),
-    "retrain": ("training_set", "checkpoint"),
+    "retrain": (
+        "training_set",
+        "model",
+        "checkpoint",
+        "acquisition_signals",
+        "md_attempts",
+    ),
     "evaluate": (
         "training_input",
         "training_set",
         "retrained_model",
+        "retraining_decision",
         "scenario_plan",
         "acquisition_signals",
+        "selection_result",
+        "md_attempts",
     ),
 }
 _STAGE_PREVIOUS_ARTIFACTS = {
@@ -91,8 +100,8 @@ _STAGE_PREVIOUS_ARTIFACTS = {
     "label": (),
     "diagnose": (),
     "merge": (),
-    "retrain": (),
-    "evaluate": ("scenario_maturity",),
+    "retrain": ("signals", "scenario_maturity"),
+    "evaluate": ("signals", "scenario_maturity"),
 }
 
 

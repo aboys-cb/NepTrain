@@ -263,11 +263,36 @@ class PersistentController:
                     self.state["reason"] = f"generation {plan.generation} failed evaluation"
                     self._save()
                     return None
+                evaluate = (
+                    record.get("stages", {})
+                    .get("evaluate", {})
+                    .get("metrics", {})
+                )
+                if evaluate.get("workflow_converged") is True:
+                    self.state["state"] = "complete"
+                    self.state["reason"] = (
+                        f"workflow converged after iteration {plan.generation}"
+                    )
+                    self.state["current"] = None
+                    self._save()
+                    return None
+                if evaluate.get("workflow_stalled") is True:
+                    self.state["state"] = "stalled"
+                    self.state["reason"] = (
+                        "validation is still outside target and repeated "
+                        "production probes found no useful model update"
+                    )
+                    self.state["current"] = None
+                    self._save()
+                    return None
                 continue
             stage, context = self.generation_controller.stage_context(plan)
             return plan, stage, context
-        self.state["state"] = "complete"
-        self.state["reason"] = "all prepared generations passed evaluation"
+        self.state["state"] = "budget_exhausted"
+        self.state["reason"] = (
+            "maximum iterations reached before the production trust envelope "
+            "and validation targets both converged"
+        )
         self.state["current"] = None
         self._save()
         return None
@@ -539,7 +564,13 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                     controller.state["state"] = "degraded"
                     controller._save()
                     tick = ControllerTick("degraded", detail=str(error))
-                if tick.state in {"complete", "rejected", "failed"}:
+                if tick.state in {
+                    "complete",
+                    "rejected",
+                    "failed",
+                    "stalled",
+                    "budget_exhausted",
+                }:
                     return 0 if tick.state == "complete" else 2
                 _STOP_EVENT.wait(interval)
             controller.state["state"] = "stopped"

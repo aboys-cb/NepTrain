@@ -3,146 +3,319 @@ import pytest
 from NepTrain.core.scenario import ScenarioLadder, ScenarioMaturityError
 
 
-def _ladder() -> ScenarioLadder:
+def _ladder(
+    *,
+    path=(300.0, 500.0, 700.0),
+    production=(300.0, 700.0),
+    replicas=None,
+) -> ScenarioLadder:
     return ScenarioLadder(
         {
             "smoke_passed": 10,
             "short_stable": 40,
             "long_stable": 160,
             "production_ready": 640,
-        }
+        },
+        temperature_path=path,
+        production_temperatures=production,
+        replicas=replicas
+        or {
+            "smoke_passed": 1,
+            "short_stable": 1,
+            "long_stable": 1,
+            "production_ready": 1,
+        },
     )
 
 
-def test_scenario_ladder_promotes_one_level_at_a_time():
+def _record(
+    ladder,
+    attempts,
+    *,
+    history=None,
+    accepted=True,
+    completed=True,
+    validation_accepted=False,
+    model_improved=False,
+    final_model_id="model-1",
+):
+    return ladder.record(
+        attempts,
+        completed={
+            attempt.attempt_id: bool(completed) for attempt in attempts
+        },
+        diagnostic_accepted={
+            attempt.attempt_id: bool(accepted) for attempt in attempts
+        },
+        history=history,
+        validation_accepted=validation_accepted,
+        model_improved=model_improved,
+        novelty_converged=True,
+        final_model_id=final_model_id,
+    )
+
+
+def test_temperature_path_unlocks_in_order_and_duration_runs_in_parallel():
+    ladder = _ladder()
+    first = ladder.schedule(
+        ["structure-a", "structure-b"],
+        pressure=0.0,
+        generation=1,
+        seed=1,
+        limit=4,
+        model_id="model-1",
+    )
+
+    assert len(first) == 2
+    assert {attempt.temperature for attempt in first} == {300.0}
+    assert {attempt.target_level for attempt in first} == {"smoke_passed"}
+
+    history = _record(ladder, first)
+    second = ladder.schedule(
+        ["structure-a", "structure-b"],
+        pressure=0.0,
+        generation=2,
+        seed=2,
+        limit=4,
+        model_id="model-1",
+        history=history,
+    )
+
+    assert {(attempt.temperature, attempt.target_level) for attempt in second} == {
+        (500.0, "smoke_passed"),
+        (300.0, "short_stable"),
+    }
+
+
+def test_intermediate_temperature_stops_after_smoke():
     ladder = _ladder()
     first = ladder.schedule(
         ["structure-a"],
-        [300.0],
         pressure=0.0,
         generation=1,
         seed=1,
         limit=1,
+        model_id="model-1",
     )
-
-    assert first[0].previous_level == "untested"
-    assert first[0].target_level == "smoke_passed"
-    assert first[0].steps == 10
-
-    history = ladder.record(first, accepted=True)
+    history = _record(ladder, first)
     second = ladder.schedule(
         ["structure-a"],
-        [300.0],
         pressure=0.0,
         generation=2,
         seed=2,
-        limit=1,
+        limit=2,
+        model_id="model-1",
+        history=history,
+    )
+    temperature_probe = tuple(
+        attempt for attempt in second if attempt.temperature == 500.0
+    )
+    history = _record(ladder, temperature_probe, history=history)
+    third = ladder.schedule(
+        ["structure-a"],
+        pressure=0.0,
+        generation=3,
+        seed=3,
+        limit=3,
+        model_id="model-1",
         history=history,
     )
 
-    assert second[0].previous_level == "smoke_passed"
-    assert second[0].target_level == "short_stable"
-    assert second[0].steps == 40
+    assert any(
+        attempt.temperature == 700.0
+        and attempt.target_level == "smoke_passed"
+        for attempt in third
+    )
+    assert not any(
+        attempt.temperature == 500.0
+        and attempt.target_level != "smoke_passed"
+        for attempt in third
+    )
 
 
-def test_new_scenario_is_prioritized_without_skipping_smoke():
-    ladder = _ladder()
+def test_long_and_production_levels_require_multiple_replicas():
+    ladder = _ladder(
+        path=(300.0,),
+        production=(300.0,),
+        replicas={
+            "smoke_passed": 1,
+            "short_stable": 1,
+            "long_stable": 2,
+            "production_ready": 3,
+        },
+    )
+    history = None
+    for generation, expected_target, expected_count in (
+        (1, "smoke_passed", 1),
+        (2, "short_stable", 1),
+        (3, "long_stable", 2),
+        (4, "production_ready", 3),
+    ):
+        attempts = ladder.schedule(
+            ["structure-a"],
+            pressure=0.0,
+            generation=generation,
+            seed=generation,
+            limit=3,
+            model_id="model-1",
+            history=history,
+        )
+        assert len(attempts) == expected_count
+        assert {attempt.target_level for attempt in attempts} == {
+            expected_target
+        }
+        assert len({attempt.seed for attempt in attempts}) == expected_count
+        history = _record(
+            ladder,
+            attempts,
+            history=history,
+            validation_accepted=generation == 4,
+        )
+
+    record = next(iter(history["scenarios"].values()))
+    assert record["maturity"] == "production_ready"
+    assert record["verified_model_id"] == "model-1"
+
+
+def test_failed_attempt_does_not_promote_and_is_retried_at_same_frontier():
+    ladder = _ladder(path=(300.0, 500.0), production=(500.0,))
     first = ladder.schedule(
         ["structure-a"],
-        [300.0],
         pressure=0.0,
         generation=1,
         seed=1,
         limit=1,
+        model_id="model-1",
     )
-    history = ladder.record(first, accepted=True)
-    attempts = ladder.schedule(
+    history = _record(
+        ladder, first, accepted=False, completed=False, model_improved=True
+    )
+    retry = ladder.schedule(
         ["structure-a"],
-        [300.0, 500.0],
         pressure=0.0,
         generation=2,
         seed=2,
         limit=1,
+        model_id="model-2",
         history=history,
     )
 
-    assert attempts[0].temperature == 500.0
-    assert attempts[0].target_level == "smoke_passed"
-    assert attempts[0].steps == 10
+    record = next(iter(history["scenarios"].values()))
+    assert record["maturity"] == "untested"
+    assert retry[0].temperature == 300.0
+    assert retry[0].target_level == "smoke_passed"
 
 
-def test_schedule_balances_temperature_and_structure_evidence():
-    ladder = _ladder()
+def test_history_records_each_attempts_own_diagnostic_metrics():
+    ladder = _ladder(path=(300.0,), production=(300.0,))
     attempts = ladder.schedule(
         ["structure-a", "structure-b"],
-        [300.0, 500.0],
-        pressure=0.0,
-        generation=1,
-        seed=7,
-        limit=2,
-    )
-
-    assert {attempt.temperature for attempt in attempts} == {300.0, 500.0}
-    assert {attempt.structure_id for attempt in attempts} == {
-        "structure-a",
-        "structure-b",
-    }
-
-
-def test_rejected_attempt_records_evidence_without_promotion():
-    ladder = _ladder()
-    attempt = ladder.schedule(
-        ["structure-a"],
-        [300.0],
         pressure=0.0,
         generation=1,
         seed=1,
-        limit=1,
-    )
-    history = ladder.record(
-        attempt,
-        accepted=False,
-        diagnostic={"current_model_force_rmse": 0.3},
-        validation={"force_rmse": 0.4},
-    )
-    record = next(iter(history["scenarios"].values()))
-
-    assert record["maturity"] == "untested"
-    assert record["evidence"][0]["accepted"] is False
-    assert record["evidence"][0]["diagnostic"]["current_model_force_rmse"] == 0.3
-
-
-def test_failed_md_attempt_does_not_promote_after_validation_passes():
-    ladder = _ladder()
-    attempts = ladder.schedule(
-        ["structure-a", "structure-b"],
-        [300.0],
-        pressure=0.0,
-        generation=1,
-        seed=4,
         limit=2,
+        model_id="model-1",
     )
-    completed = {
-        attempts[0].scenario_id: True,
-        attempts[1].scenario_id: False,
+    force_rmse = {
+        attempts[0].attempt_id: 0.2,
+        attempts[1].attempt_id: 0.8,
     }
 
-    history = ladder.record(attempts, accepted=True, completed=completed)
-    records = history["scenarios"]
+    history = ladder.record(
+        attempts,
+        completed={attempt.attempt_id: True for attempt in attempts},
+        diagnostic_accepted={
+            attempt.attempt_id: True for attempt in attempts
+        },
+        diagnostic={
+            "current_model_force_rmse": 99.0,
+            "attempt_metrics": {
+                attempt_id: {"force_rmse": value}
+                for attempt_id, value in force_rmse.items()
+            },
+        },
+        validation_accepted=True,
+        model_improved=False,
+        novelty_converged=True,
+        final_model_id="model-1",
+    )
 
-    assert records[attempts[0].scenario_id]["maturity"] == "smoke_passed"
-    assert records[attempts[1].scenario_id]["maturity"] == "untested"
-    failed_evidence = records[attempts[1].scenario_id]["evidence"][0]
-    assert failed_evidence["accepted"] is False
-    assert failed_evidence["md_completed"] is False
-    assert failed_evidence["validation_accepted"] is True
+    for attempt in attempts:
+        evidence = history["scenarios"][attempt.scenario_id]["evidence"][0]
+        assert evidence["diagnostic"]["force_rmse"] == force_rmse[
+            attempt.attempt_id
+        ]
+
+
+def test_production_readiness_is_rechecked_after_model_changes():
+    ladder = _ladder(path=(300.0,), production=(300.0,))
+    history = None
+    for generation in range(1, 5):
+        attempts = ladder.schedule(
+            ["structure-a"],
+            pressure=0.0,
+            generation=generation,
+            seed=generation,
+            limit=1,
+            model_id="model-1",
+            history=history,
+        )
+        history = _record(ladder, attempts, history=history)
+
+    assert ladder.production_ready(
+        ["structure-a"],
+        pressure=0.0,
+        model_id="model-1",
+        history=history,
+    )
+    assert not ladder.production_ready(
+        ["structure-a"],
+        pressure=0.0,
+        model_id="model-2",
+        history=history,
+    )
+    recheck = ladder.schedule(
+        ["structure-a"],
+        pressure=0.0,
+        generation=5,
+        seed=5,
+        limit=1,
+        model_id="model-2",
+        history=history,
+    )
+    assert recheck[0].target_level == "production_ready"
+    history = _record(
+        ladder,
+        recheck,
+        history=history,
+        accepted=False,
+        final_model_id="model-2",
+    )
+    assert history["counts_by_maturity"] == {"long_stable": 1}
+    assert next(iter(history["scenarios"].values()))["maturity"] == (
+        "production_ready"
+    )
 
 
 def test_maturity_config_rejects_typos_instead_of_silently_using_defaults():
     with pytest.raises(ScenarioMaturityError, match="short_stabel"):
-        ScenarioLadder.from_workflow(
+        ScenarioLadder.from_sampling(
             {
-                "initial_steps": 10,
-                "maturity": {"levels": {"short_stabel": 40}},
+                "conditions": {"temperature_path": [300]},
+                "progression": {
+                    "steps": {
+                        "smoke_passed": 10,
+                        "short_stabel": 40,
+                        "long_stable": 160,
+                        "production_ready": 640,
+                    }
+                },
             }
         )
+
+
+def test_temperature_path_must_be_monotonic_and_targets_must_be_on_path():
+    with pytest.raises(ScenarioMaturityError, match="strictly"):
+        _ladder(path=(300.0, 700.0, 500.0))
+    with pytest.raises(ScenarioMaturityError, match="subset"):
+        _ladder(path=(300.0, 500.0), production=(700.0,))

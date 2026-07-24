@@ -36,26 +36,17 @@ _FIELDS: dict[str, set[str]] = {
         "inference_backend",
         "structures",
         "template_path",
-        "ensemble",
-        "temperatures",
-        "pressure",
-        "initial_steps",
-        "timestep",
-        "tdamp",
-        "pdamp",
-        "dump_interval",
         "spin",
-        "spin_temperature",
-        "spin_alpha",
-        "spin_seed",
-        "midpoint_iter",
         "lmp",
         "mpiexec",
         "mpi_ranks",
-        "plugin_path",
-        "pre_failure_frames",
-        "bad_tail_frames",
-        "health",
+    },
+    "sampling": {
+        "mode",
+        "conditions",
+        "progression",
+        "candidate_pool",
+        "selection",
     },
     "dft": {
         "backend",
@@ -75,16 +66,34 @@ _FIELDS: dict[str, set[str]] = {
     },
     "workflow": {
         "id",
-        "generations",
+        "max_iterations",
         "seed",
-        "initial_candidates",
-        "dft_budget",
-        "minimum_dft_budget",
-        "frame_stride",
-        "min_distance",
-        "maturity",
     },
     "execution": {"poll_interval", "routes", "targets"},
+}
+_SAMPLING_FIELDS = {
+    "conditions": {
+        "temperature_path",
+        "production_temperatures",
+        "pressure",
+        "spin_temperature",
+    },
+    "progression": {"md_runs_per_iteration", "steps", "replicas"},
+    "candidate_pool": {
+        "target",
+        "growth",
+        "frame_stride",
+        "pre_failure_frames",
+        "bad_tail_frames",
+        "health",
+    },
+    "selection": {
+        "method",
+        "dft_budget",
+        "minimum_dft_budget",
+        "budget_decay",
+        "min_novelty",
+    },
 }
 _TARGET_FIELDS = {
     "executor",
@@ -128,6 +137,16 @@ def _reject_unknown(config: Mapping[str, Any]) -> None:
                 + ", ".join(unknown)
                 + "; remove obsolete or misspelled fields"
             )
+    sampling = _mapping(config, "sampling")
+    for section, allowed in _SAMPLING_FIELDS.items():
+        value = _mapping(sampling, section)
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ConfigError(
+                f"unknown sampling.{section} fields: "
+                + ", ".join(unknown)
+                + "; remove obsolete or misspelled fields"
+            )
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
@@ -148,6 +167,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
     training = _mapping(config, "training")
     md = _mapping(config, "md")
+    sampling = _mapping(config, "sampling")
     dft = _mapping(config, "dft")
     workflow = _mapping(config, "workflow")
     evaluation = _mapping(config, "evaluation")
@@ -174,29 +194,114 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ConfigError("md.inference_backend must be auto, cpu, or cuda")
     if not md.get("structures"):
         raise ConfigError("md.structures is required")
-    temperatures = md.get("temperatures")
+    if int(md.get("mpi_ranks", 1)) < 1:
+        raise ConfigError("md.mpi_ranks must be at least 1")
+
+    if sampling.get("mode", "auto") != "auto":
+        raise ConfigError("sampling.mode currently must be auto")
+    conditions = _mapping(sampling, "conditions")
+    progression = _mapping(sampling, "progression")
+    candidate_pool = _mapping(sampling, "candidate_pool")
+    selection = _mapping(sampling, "selection")
+    temperatures = conditions.get("temperature_path")
     if (
         not isinstance(temperatures, list)
         or not temperatures
         or any(not isinstance(value, (int, float)) for value in temperatures)
     ):
-        raise ConfigError("md.temperatures must be a non-empty numeric list")
-    if int(md.get("initial_steps", 0)) < 1:
-        raise ConfigError("md.initial_steps must be positive")
-    if int(md.get("mpi_ranks", 1)) < 1:
-        raise ConfigError("md.mpi_ranks must be at least 1")
-    if int(md.get("dump_interval", 100)) < 1:
-        raise ConfigError("md.dump_interval must be positive")
-    if float(md.get("tdamp", 0.1)) <= 0 or float(md.get("pdamp", 1.0)) <= 0:
-        raise ConfigError("md.tdamp and md.pdamp must be positive")
-    if int(md.get("pre_failure_frames", 2)) < 0:
-        raise ConfigError("md.pre_failure_frames must be non-negative")
-    if int(md.get("bad_tail_frames", 1)) < 1:
-        raise ConfigError("md.bad_tail_frames must be at least 1")
+        raise ConfigError(
+            "sampling.conditions.temperature_path must be a non-empty numeric list"
+        )
+    production_temperatures = conditions.get("production_temperatures")
+    if production_temperatures is not None and (
+        not isinstance(production_temperatures, list)
+        or not production_temperatures
+        or any(
+            not isinstance(value, (int, float))
+            for value in production_temperatures
+        )
+    ):
+        raise ConfigError(
+            "sampling.conditions.production_temperatures must be a "
+            "non-empty numeric list when provided"
+        )
+    if not isinstance(conditions.get("pressure", 0.0), (int, float)):
+        raise ConfigError("sampling.conditions.pressure must be numeric")
+    steps = _mapping(progression, "steps")
+    expected_steps = {
+        "smoke_passed",
+        "short_stable",
+        "long_stable",
+        "production_ready",
+    }
+    if set(steps) != expected_steps:
+        raise ConfigError(
+            "sampling.progression.steps must define smoke_passed, "
+            "short_stable, long_stable, and production_ready"
+        )
+    ordered_steps = [
+        int(steps[name])
+        for name in (
+            "smoke_passed",
+            "short_stable",
+            "long_stable",
+            "production_ready",
+        )
+    ]
+    if any(value < 1 for value in ordered_steps) or any(
+        later <= earlier for earlier, later in zip(ordered_steps, ordered_steps[1:])
+    ):
+        raise ConfigError(
+            "sampling.progression.steps must be positive and strictly increasing"
+        )
+    replicas = progression.get("replicas")
+    if replicas is not None:
+        if not isinstance(replicas, Mapping) or set(replicas) != expected_steps:
+            raise ConfigError(
+                "sampling.progression.replicas must define smoke_passed, "
+                "short_stable, long_stable, and production_ready"
+            )
+        if any(int(value) < 1 for value in replicas.values()):
+            raise ConfigError(
+                "sampling.progression.replicas values must be positive"
+            )
+    if int(progression.get("md_runs_per_iteration", 1)) < 1:
+        raise ConfigError(
+            "sampling.progression.md_runs_per_iteration must be positive"
+        )
+    if int(candidate_pool.get("target", 0)) < 1:
+        raise ConfigError("sampling.candidate_pool.target must be positive")
+    if float(candidate_pool.get("growth", 1.0)) <= 0:
+        raise ConfigError("sampling.candidate_pool.growth must be positive")
+    if int(candidate_pool.get("frame_stride", 1)) < 1:
+        raise ConfigError("sampling.candidate_pool.frame_stride must be positive")
+    if int(candidate_pool.get("pre_failure_frames", 2)) < 0:
+        raise ConfigError(
+            "sampling.candidate_pool.pre_failure_frames must be non-negative"
+        )
+    if int(candidate_pool.get("bad_tail_frames", 1)) < 1:
+        raise ConfigError(
+            "sampling.candidate_pool.bad_tail_frames must be at least 1"
+        )
     try:
-        TrajectoryHealthPolicy.from_mapping(md.get("health", {}))
+        TrajectoryHealthPolicy.from_mapping(candidate_pool.get("health", {}))
     except TrajectoryHealthError as error:
         raise ConfigError(str(error)) from error
+    if selection.get("method", "fps") != "fps":
+        raise ConfigError("sampling.selection.method currently must be fps")
+    if int(selection.get("dft_budget", 0)) < 1:
+        raise ConfigError("sampling.selection.dft_budget must be positive")
+    if int(selection.get("minimum_dft_budget", 0)) < 1:
+        raise ConfigError(
+            "sampling.selection.minimum_dft_budget must be positive"
+        )
+    budget_decay = float(selection.get("budget_decay", 0.75))
+    if not 0 < budget_decay <= 1:
+        raise ConfigError(
+            "sampling.selection.budget_decay must be greater than 0 and at most 1"
+        )
+    if float(selection.get("min_novelty", 0.0)) < 0:
+        raise ConfigError("sampling.selection.min_novelty must be non-negative")
 
     if dft.get("backend", "vasp") not in {"vasp", "abacus", "toy"}:
         raise ConfigError("dft.backend must be vasp, abacus, or toy")
@@ -210,8 +315,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if md.get("spin", False):
         if md.get("backend") != "lammps":
             raise ConfigError("spin MD currently requires md.backend=lammps")
-        if md.get("spin_temperature") is None:
-            raise ConfigError("spin MD requires md.spin_temperature")
+        if conditions.get("spin_temperature") is None:
+            raise ConfigError(
+                "spin MD requires sampling.conditions.spin_temperature"
+            )
         if dft.get("backend", "vasp") not in {"abacus", "toy"}:
             raise ConfigError(
                 "spin workflows require dft.backend=abacus or toy; "
@@ -219,6 +326,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
             )
 
     if workflow:
+        if int(workflow.get("max_iterations", 0)) < 1:
+            raise ConfigError("workflow.max_iterations must be positive")
         if not evaluation.get("validation_path"):
             raise ConfigError("evaluation.validation_path is required for workflows")
         thresholds = dict(evaluation.get("max_rmse") or {})
@@ -230,10 +339,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError(
                 "evaluation.max_rmse is missing " + ", ".join(missing)
             )
+        if any(float(value) <= 0 for value in thresholds.values()):
+            raise ConfigError("evaluation.max_rmse values must be positive")
     try:
-        ScenarioLadder.from_workflow(
-            {**dict(workflow), "initial_steps": int(md.get("initial_steps", 0))}
-        )
+        ScenarioLadder.from_sampling(sampling)
     except ScenarioMaturityError as error:
         raise ConfigError(str(error)) from error
 

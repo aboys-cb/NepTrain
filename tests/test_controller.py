@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from NepTrain.core.workflow import workflow_status, prepare_workflow
+from NepTrain.core.workflow import extend_workflow, workflow_status, prepare_workflow
 from NepTrain.core.controller import (
     ControllerError,
     PersistentController,
@@ -51,7 +51,7 @@ def _plan() -> GenerationPlan:
         seed=7,
         candidate_count=4,
         dft_budget=2,
-        min_distance=0.0,
+        min_novelty=0.0,
         temperatures=(300.0,),
         pressure=0.0,
         steps=2,
@@ -216,7 +216,11 @@ class ImmediateExecutor:
                 "size": path.stat().st_size,
             }
         descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
-        metrics = {"accepted": True} if task.stage == "evaluate" else {}
+        metrics = (
+            {"accepted": True, "workflow_converged": True}
+            if task.stage == "evaluate"
+            else {}
+        )
         (task.bundle / "result.json").write_text(
             json.dumps(
                 {
@@ -263,9 +267,34 @@ training:
 md:
   backend: lammps
   structures: ./structures.xyz
-  temperatures: [300]
-  initial_steps: 2
   spin: false
+sampling:
+  mode: auto
+  conditions:
+    temperature_path: [300]
+    production_temperatures: [300]
+    pressure: 0
+    spin_temperature:
+  progression:
+    md_runs_per_iteration: 1
+    steps:
+      smoke_passed: 2
+      short_stable: 8
+      long_stable: 32
+      production_ready: 128
+  candidate_pool:
+    target: 4
+    growth: 1
+    frame_stride: 1
+    pre_failure_frames: 2
+    bad_tail_frames: 1
+    health: {}
+  selection:
+    method: fps
+    dft_budget: 2
+    minimum_dft_budget: 1
+    budget_decay: 0.75
+    min_novelty: 0
 dft:
   backend: toy
 evaluation:
@@ -275,10 +304,7 @@ evaluation:
     force_rmse: 1
 workflow:
   id: controller-test
-  generations: 1
-  initial_candidates: 4
-  dft_budget: 2
-  minimum_dft_budget: 1
+  max_iterations: 1
 execution:
   poll_interval: 0.2
   routes:
@@ -327,6 +353,71 @@ def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     manifest = json.loads(preparation.manifest.read_text())
     assert manifest["orchestration"] == "controller-v1"
     assert manifest["scripts"] == []
+
+
+class EvaluationStateExecutor(ImmediateExecutor):
+    def __init__(self, target, launches, evaluation_metrics):
+        super().__init__(target, launches)
+        self.evaluation_metrics = evaluation_metrics
+
+    def launch(self, task):
+        handle = super().launch(task)
+        if task.stage == "evaluate":
+            result_path = task.bundle / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["metrics"] = dict(self.evaluation_metrics)
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+        return handle
+
+
+@pytest.mark.parametrize(
+    ("metrics", "expected_state"),
+    [
+        (
+            {
+                "accepted": True,
+                "workflow_converged": False,
+                "workflow_stalled": False,
+            },
+            "budget_exhausted",
+        ),
+        (
+            {
+                "accepted": True,
+                "workflow_converged": False,
+                "workflow_stalled": True,
+            },
+            "stalled",
+        ),
+    ],
+)
+def test_controller_does_not_report_unconverged_work_as_complete(
+    tmp_path, metrics, expected_state
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    def factory(target):
+        return EvaluationStateExecutor(target, launches, metrics)
+
+    controller = PersistentController(
+        preparation.output_dir, executor_factory=factory
+    )
+    for _ in range(20):
+        tick = controller.tick()
+        if tick.state == expected_state:
+            break
+    else:
+        raise AssertionError(f"controller did not reach {expected_state}")
+
+    status = workflow_status(preparation.output_dir)
+    assert status.state == expected_state
+    assert status.state != "complete"
+    if expected_state == "budget_exhausted":
+        extend_workflow(preparation.output_dir, 2)
+        resumed = workflow_status(preparation.output_dir)
+        assert resumed.state == "prepared"
 
 
 class SameSchedulerIdExecutor(ImmediateExecutor):
@@ -848,7 +939,9 @@ result = {
     'stage': stage,
     'plan_sha256': task['identity']['plan_sha256'],
     'artifacts': artifacts,
-    'metrics': {'accepted': True} if stage == 'evaluate' else {},
+    'metrics': {
+        'accepted': True, 'workflow_converged': True
+    } if stage == 'evaluate' else {},
 }
 (bundle / 'result.json').write_text(json.dumps(result))
 (bundle / 'execution.json').write_text(json.dumps({
@@ -931,7 +1024,9 @@ for name in names:
     'stage': stage,
     'plan_sha256': task['identity']['plan_sha256'],
     'artifacts': artifacts,
-    'metrics': {'accepted': True} if stage == 'evaluate' else {},
+    'metrics': {
+        'accepted': True, 'workflow_converged': True
+    } if stage == 'evaluate' else {},
 }))
 (bundle / 'execution.json').write_text(json.dumps({
     'task_id': task['task_id'], 'state': 'COMPLETED', 'pid': os.getpid()

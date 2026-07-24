@@ -68,32 +68,55 @@ def _project(profile: str) -> dict:
             "inference_backend": "auto",
             "structures": "./structures",
             "template_path": "./lammps-nvt.in",
-            "ensemble": "nvt",
-            "temperatures": [300],
-            "pressure": 0.0,
-            "initial_steps": 10000,
-            "timestep": 0.001,
-            "tdamp": 0.1,
-            "pdamp": 1.0,
-            "dump_interval": 100,
             "spin": False,
-            "spin_temperature": None,
-            "spin_alpha": 0.01,
-            "spin_seed": 12345,
-            "midpoint_iter": 3,
             "lmp": "lmp",
             "mpiexec": "mpirun",
             "mpi_ranks": 1,
-            "plugin_path": None,
-            "pre_failure_frames": 2,
-            "bad_tail_frames": 1,
-            "health": {
-                "min_distance_ratio": 0.5,
-                "min_volume_ratio": 0.5,
-                "max_volume_ratio": 2.0,
-                "max_force": 100.0,
-                "max_mforce": 100.0,
-                "max_spin_magnitude": 20.0,
+        },
+        "sampling": {
+            "mode": "auto",
+            "conditions": {
+                "temperature_path": [300],
+                "production_temperatures": [300],
+                "pressure": 0.0,
+                "spin_temperature": None,
+            },
+            "progression": {
+                "md_runs_per_iteration": 4,
+                "steps": {
+                    "smoke_passed": 10000,
+                    "short_stable": 40000,
+                    "long_stable": 160000,
+                    "production_ready": 640000,
+                },
+                "replicas": {
+                    "smoke_passed": 1,
+                    "short_stable": 1,
+                    "long_stable": 2,
+                    "production_ready": 3,
+                },
+            },
+            "candidate_pool": {
+                "target": 200,
+                "growth": 1.0,
+                "frame_stride": 2,
+                "pre_failure_frames": 2,
+                "bad_tail_frames": 1,
+                "health": {
+                    "min_distance_ratio": 0.5,
+                    "min_volume_ratio": 0.5,
+                    "max_volume_ratio": 2.0,
+                    "max_force": 100.0,
+                    "max_mforce": 100.0,
+                    "max_spin_magnitude": 20.0,
+                },
+            },
+            "selection": {
+                "method": "fps",
+                "dft_budget": 20,
+                "minimum_dft_budget": 8,
+                "budget_decay": 0.75,
+                "min_novelty": 0.0,
             },
         },
         "dft": {
@@ -115,14 +138,8 @@ def _project(profile: str) -> dict:
         },
         "workflow": {
             "id": "workflow",
-            "generations": 3,
+            "max_iterations": 12,
             "seed": 20260721,
-            "initial_candidates": 200,
-            "dft_budget": 20,
-            "minimum_dft_budget": 8,
-            "frame_stride": 2,
-            "min_distance": 0.0,
-            "maturity": {"enabled": True},
         },
         "execution": {
             "poll_interval": 30,
@@ -161,6 +178,7 @@ def init_project(profile: str, destination: str | Path, *, force: bool = False) 
                 "#!/bin/bash\n"
                 "# Load LAMMPS/NEPAdapters and activate the NepTrain environment here.\n"
                 "# module load lammps/nep-release\n"
+                "# export LAMMPS_PLUGIN_PATH=/path/to/nepadapters/lib\n"
             ),
             "env-dft.sh": (
                 "#!/bin/bash\n"

@@ -27,24 +27,17 @@ class MdRequest:
     output_file: Path
     temperature: float
     steps: int
+    seed: int = 12345
     timestep: float = 0.001
     ensemble: str = "nvt"
     pressure: float = 0.0
-    tdamp: float = 0.1
-    pdamp: float = 1.0
-    dump_interval: int = 100
     spin: bool = False
     spin_temperature: float | None = None
-    spin_alpha: float = 0.01
-    spin_seed: int = 12345
-    midpoint_iter: int = 3
     template_path: Path | None = None
     inference_backend: str = "auto"
     lmp_command: str = "lmp"
     mpiexec: str = "mpirun"
     mpi_ranks: int = 1
-    plugin_path: str | None = None
-    extra_variables: Mapping[str, object] = field(default_factory=dict)
     pre_failure_frames: int = 2
     bad_tail_frames: int = 1
     health: Mapping[str, object] = field(default_factory=dict)
@@ -104,8 +97,8 @@ def _run_gpumd(request: MdRequest) -> MdResult:
 def run_md(request: MdRequest, backend: str) -> MdResult:
     if request.ensemble not in {"nvt", "npt"}:
         raise MdError("ensemble must be nvt or npt")
-    if request.steps <= 0 or request.timestep <= 0 or request.dump_interval <= 0:
-        raise MdError("steps, timestep, and dump_interval must be positive")
+    if request.steps <= 0 or request.timestep <= 0 or request.seed < 1:
+        raise MdError("steps, timestep, and seed must be positive")
     if request.mpi_ranks < 1:
         raise MdError("mpi_ranks must be at least 1")
     if request.pre_failure_frames < 0 or request.bad_tail_frames < 1:
@@ -127,14 +120,7 @@ def run_md(request: MdRequest, backend: str) -> MdResult:
         "spin_temperature": request.spin_temperature,
         "pressure": request.pressure,
         "steps": request.steps,
-        "timestep": request.timestep,
-        "tdamp": request.tdamp,
-        "pdamp": request.pdamp,
-        "dump_interval": request.dump_interval,
-        "spin_alpha": request.spin_alpha,
-        "spin_seed": request.spin_seed,
-        "midpoint_iter": request.midpoint_iter,
-        **dict(request.extra_variables),
+        "seed": request.seed,
     }
     try:
         result = run_lammps(
@@ -148,7 +134,6 @@ def run_md(request: MdRequest, backend: str) -> MdResult:
             lmp_command=request.lmp_command,
             mpiexec=request.mpiexec,
             mpi_ranks=request.mpi_ranks,
-            plugin_path=request.plugin_path,
             spin=request.spin,
             pre_failure_frames=request.pre_failure_frames,
             bad_tail_frames=request.bad_tail_frames,

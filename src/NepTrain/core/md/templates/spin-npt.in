@@ -2,19 +2,18 @@ clear
 units metal
 atom_style {{ atom_style }}
 boundary p p p
-{{ plugin_command }}
 read_data {{ structure_file }}
 
 pair_style {{ pair_style }}
 pair_coeff * * {{ model_file }} {{ elements }}
 
-timestep {{ timestep }}
-velocity all create {{ temperature }} 12345 mom yes rot yes dist gaussian
+timestep 0.001
+velocity all create {{ temperature }} {{ seed }} mom yes rot yes dist gaussian
 compute spin all property/atom sp spx spy spz fmx fmy fmz fx fy fz
-fix integrator all dynspin/glsd/npt{{ fix_suffix }} temp {{ temperature }} {{ temperature }} {{ tdamp }} iso {{ pressure }} {{ pressure }} {{ pdamp }} dynspin alpha {{ spin_alpha }} stemp {{ spin_temperature }} seed {{ spin_seed }} fm_units field lattice on midpoint_iter {{ midpoint_iter }}
+fix integrator all dynspin/glsd/npt{{ fix_suffix }} temp {{ temperature }} {{ temperature }} 0.1 iso {{ pressure }} {{ pressure }} 1.0 dynspin alpha 0.01 stemp {{ spin_temperature }} seed {{ seed }} fm_units field lattice on midpoint_iter 3
 
-thermo {{ dump_interval }}
+thermo 100
 thermo_style custom step temp pe ke etotal press
-dump trajectory all custom {{ dump_interval }} {{ trajectory_file }} id type x y z c_spin[1] c_spin[2] c_spin[3] c_spin[4] c_spin[5] c_spin[6] c_spin[7]
+dump trajectory all custom 100 {{ trajectory_file }} id type x y z c_spin[1] c_spin[2] c_spin[3] c_spin[4] c_spin[5] c_spin[6] c_spin[7]
 dump_modify trajectory sort id format float %.17g
 run {{ steps }}

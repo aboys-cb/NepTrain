@@ -165,7 +165,7 @@ neptrain workflow stop workflow --cancel-jobs
 
 ## schema v4
 
-温度、压强和 MD 步数只有 `md` 一个权威位置：
+温度、压强和 MD 步数只有 `sampling` 一个权威位置：
 
 ```yaml
 schema_version: 4
@@ -186,18 +186,49 @@ md:
   inference_backend: auto
   structures: ./structures
   template_path: ./lammps-nvt.in
-  ensemble: nvt
-  temperatures: [300, 500, 700]
-  pressure: 0.0
-  initial_steps: 10000
-  timestep: 0.001
-  tdamp: 0.1
-  pdamp: 1.0
-  dump_interval: 100
   spin: false
   mpi_ranks: 4
   lmp: lmp
   mpiexec: mpirun
+
+sampling:
+  mode: auto
+  conditions:
+    temperature_path: [300, 500, 700]
+    production_temperatures: [300, 700]
+    pressure: 0.0
+    spin_temperature:
+  progression:
+    md_runs_per_iteration: 4
+    steps:
+      smoke_passed: 10000
+      short_stable: 40000
+      long_stable: 160000
+      production_ready: 640000
+    replicas:
+      smoke_passed: 1
+      short_stable: 1
+      long_stable: 2
+      production_ready: 3
+  candidate_pool:
+    target: 200
+    growth: 1.0
+    frame_stride: 2
+    pre_failure_frames: 2
+    bad_tail_frames: 1
+    health:
+      min_distance_ratio: 0.5
+      min_volume_ratio: 0.5
+      max_volume_ratio: 2.0
+      max_force: 100.0
+      max_mforce: 100.0
+      max_spin_magnitude: 20.0
+  selection:
+    method: fps
+    dft_budget: 20
+    minimum_dft_budget: 8
+    budget_decay: 0.75
+    min_novelty: 0.0
 
 dft:
   backend: vasp
@@ -217,15 +248,8 @@ evaluation:
 
 workflow:
   id: fe-workflow
-  generations: 3
+  max_iterations: 12
   seed: 20260721
-  initial_candidates: 200
-  dft_budget: 20
-  minimum_dft_budget: 8
-  frame_stride: 2
-  min_distance: 0.0
-  maturity:
-    enabled: true
 
 execution:
   poll_interval: 30
@@ -258,6 +282,28 @@ execution:
       environment:
         NEPTRAIN_VASP_COMMAND: srun vasp_std
 ```
+
+`md` 只选择 MD Adapter、结构、LAMMPS 模板和运行命令。温度、压强、递进步数、
+候选池和 FPS 预算统一放在 `sampling`。`timestep`、`tdamp`、`pdamp`、
+`spin_alpha` 和 dump 频率直接写在用户的 LAMMPS 模板中。
+
+`temperature_path` 是严格有序的温度探路路径，只有前一个温度通过才解锁下一个。
+`production_temperatures` 才会继续跑 short、long 和 production；其余温度只做
+便宜的 smoke 探路。健康场景只使用小型 DFT 审计预算，失败场景才使用完整预算；
+新标签上的当前模型误差已经达标时直接复用模型，不做无收益重训。
+
+每个 replica 都会得到 NepTrain 派生的确定性 `{{ seed }}`；用户模板可把它同时
+用于 `velocity create` 和 DynSpin thermostat，保证重复运行可复现但 replica
+彼此独立。`min_novelty: 0` 表示只记录 FPS 新颖度而不把它作为收敛硬门槛。
+
+`workflow.max_iterations` 是最大迭代预算。生产温度、最长时长、replica、轨迹诊断和
+validation 全部通过后会提前完成；预算耗尽或连续无进展会分别报告
+`budget_exhausted` 或 `stalled`，不会误报为 `complete`。
+
+LAMMPS plugin 由 `execution.targets.*.setup_script` 加载，例如在
+`env-cpu.sh` 中执行 `module load lammps/nep-release` 或设置
+`LAMMPS_PLUGIN_PATH`；NepTrain 不接受 `plugin_path`，也不会重复执行
+`plugin load`。
 
 未知字段、拼写错误和旧字段会直接失败。CLI 覆盖值、输入快照、target、作业号和最终
 生效配置都会进入运行记录。
@@ -309,7 +355,6 @@ neptrain md spin.xyz \
   --spin \
   --temperature 300 \
   --spin-temperature 500 \
-  --spin-alpha 0.01 \
   --steps 100000 \
   -o spin-trajectory.xyz
 ```
