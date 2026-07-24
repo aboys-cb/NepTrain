@@ -30,7 +30,7 @@ class SmokeReport:
     seed: int
     candidates: int
     selected: int
-    dft_budget: int
+    max_selected: int
     deterministic_selection: bool
     label_roundtrip: bool
     derivative_force_max_error: float
@@ -146,13 +146,13 @@ def run_smoke(
     *,
     profile: str = "ordinary",
     seed: int = 20260721,
-    dft_budget: int = 8,
+    max_selected: int = 8,
     force: bool = False,
 ) -> SmokeReport:
     if profile not in {"ordinary", "spin", "recovery"}:
         raise SmokeError("smoke profile must be ordinary, spin, or recovery")
-    if dft_budget < 1:
-        raise SmokeError("dft_budget must be at least 1")
+    if max_selected < 1:
+        raise SmokeError("max_selected must be at least 1")
     teacher_profile = "spin" if profile in {"spin", "recovery"} else "ordinary"
     root = _assert_safe_output(Path(output_dir))
     if root.exists():
@@ -175,8 +175,12 @@ def run_smoke(
     feature_matrix = toy_features(all_frames, teacher_profile)
     seed_features = feature_matrix[:1]
     candidate_features = feature_matrix[1:]
-    selected = farthest_point_sampling(candidate_features, dft_budget, 0.0, seed_features)
-    repeated = farthest_point_sampling(candidate_features, dft_budget, 0.0, seed_features)
+    selected = farthest_point_sampling(
+        candidate_features, max_selected, 0.0, seed_features
+    )
+    repeated = farthest_point_sampling(
+        candidate_features, max_selected, 0.0, seed_features
+    )
     selected_frames = [candidates[index] for index in selected]
     selected_input = root / "selected-input.xyz"
     selected_output = root / "selected-labels.xyz"
@@ -237,7 +241,7 @@ def run_smoke(
         seed=seed,
         candidates=len(candidates),
         selected=len(selected),
-        dft_budget=dft_budget,
+        max_selected=max_selected,
         deterministic_selection=selected == repeated,
         label_roundtrip=label_roundtrip and missing_mforce_rejected,
         derivative_force_max_error=force_error,

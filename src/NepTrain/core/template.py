@@ -1,4 +1,4 @@
-"""Create one strict schema-v4 project without touching existing files."""
+"""Create one strict schema-v5 project without touching existing files."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _project(profile: str) -> dict:
             "analysis": "cpu",
         }
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "training": {
             "backend": "torchnep",
             "initial_path": "./train.xyz",
@@ -97,9 +97,6 @@ def _project(profile: str) -> dict:
                 },
             },
             "candidate_pool": {
-                "target": 200,
-                "growth": 1.0,
-                "frame_stride": 2,
                 "pre_failure_frames": 2,
                 "bad_tail_frames": 1,
                 "health": {
@@ -113,9 +110,7 @@ def _project(profile: str) -> dict:
             },
             "selection": {
                 "method": "fps",
-                "dft_budget": 20,
-                "minimum_dft_budget": 8,
-                "budget_decay": 0.75,
+                "max_selected": 100,
                 "min_novelty": 0.0,
             },
         },

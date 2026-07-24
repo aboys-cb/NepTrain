@@ -8,7 +8,7 @@ from NepTrain.core.config import ConfigError, load_config
 
 def _project(**overrides):
     value = {
-        "schema_version": 4,
+        "schema_version": 5,
         "training": {
             "backend": "torchnep",
             "initial_path": "./train.xyz",
@@ -37,18 +37,13 @@ def _project(**overrides):
                 },
             },
             "candidate_pool": {
-                "target": 20,
-                "growth": 1.0,
-                "frame_stride": 2,
                 "pre_failure_frames": 2,
                 "bad_tail_frames": 1,
                 "health": {},
             },
             "selection": {
                 "method": "fps",
-                "dft_budget": 8,
-                "minimum_dft_budget": 4,
-                "budget_decay": 0.75,
+                "max_selected": 100,
                 "min_novelty": 0.0,
             },
         },
@@ -80,14 +75,14 @@ def _write(tmp_path: Path, value: dict) -> Path:
     return path
 
 
-def test_schema_v4_loads_without_migration(tmp_path):
+def test_schema_v5_loads_without_migration(tmp_path):
     config, changes = load_config(_write(tmp_path, _project()))
-    assert config["schema_version"] == 4
+    assert config["schema_version"] == 5
     assert config["sampling"]["conditions"]["temperature_path"] == [300]
     assert changes == []
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 5])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 6])
 def test_legacy_and_future_schemas_are_rejected(tmp_path, version):
     value = _project()
     value["schema_version"] = version
@@ -109,6 +104,22 @@ def test_unknown_section_fields_are_rejected(tmp_path):
         load_config(
             _write(tmp_path, value)
         )
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("candidate_pool", "target"),
+        ("candidate_pool", "frame_stride"),
+        ("selection", "dft_budget"),
+        ("selection", "dft_batch_size"),
+    ],
+)
+def test_pre_fps_candidate_caps_are_rejected(tmp_path, section, field):
+    value = _project()
+    value["sampling"][section][field] = 20
+    with pytest.raises(ConfigError, match=field):
+        load_config(_write(tmp_path, value))
 
 
 def test_temperature_steps_and_pressure_have_one_md_source(tmp_path):

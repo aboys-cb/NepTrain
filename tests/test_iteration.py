@@ -24,11 +24,32 @@ from NepTrain.core.workflow_iteration import (
     WorkflowIterationAdapter,
     WorkflowIterationError,
     WorkflowRuntime,
+    _batched_descriptors,
 )
 from NepTrain.core.dft.toy import ToyTeacher
 from NepTrain.core.dft import LabelResult
+from NepTrain.core.candidate_pool import (
+    CandidatePoolError,
+    regular_batch_minimum,
+    validate_candidate_pool,
+    write_candidate_pool,
+)
 from ase.io import read as ase_read
 from ase.io import write as ase_write
+
+
+def test_descriptor_backend_receives_every_frame_in_bounded_batches(tmp_path):
+    frames = toy_candidate_frames("ordinary", 501, 4101)
+    calls = []
+
+    def describe(_model, batch):
+        calls.append(len(batch))
+        return np.zeros((len(batch), 3))
+
+    values = _batched_descriptors(describe, tmp_path / "nep.txt", frames)
+
+    assert calls == [4096, 5]
+    assert values.shape == (4101, 3)
 
 
 def _sampling(
@@ -36,8 +57,7 @@ def _sampling(
     *,
     steps=(100, 400, 1600, 6400),
     md_runs=4,
-    candidate_target=24,
-    frame_stride=1,
+    max_selected=8,
 ):
     return {
         "mode": "auto",
@@ -62,38 +82,59 @@ def _sampling(
             ),
         },
         "candidate_pool": {
-            "target": candidate_target,
-            "growth": 1.0,
-            "frame_stride": frame_stride,
             "pre_failure_frames": 2,
             "bad_tail_frames": 1,
             "health": {},
         },
         "selection": {
             "method": "fps",
-            "dft_budget": 8,
-            "minimum_dft_budget": 4,
-            "budget_decay": 0.75,
+            "max_selected": max_selected,
             "min_novelty": 0.0,
         },
     }
 
 
-def test_progression_grows_exploration_and_reduces_dft_budget():
-    plans = progressive_plans(
-        4,
-        initial_budget=12,
-        minimum_budget=4,
-        candidate_growth=2.0,
-    )
+def test_progression_keeps_the_user_selection_limit_constant():
+    plans = progressive_plans(4, max_selected=100)
 
     assert [plan.steps for plan in plans] == [100, 100, 100, 100]
-    assert [plan.dft_budget for plan in plans] == [12, 9, 7, 6]
+    assert [plan.max_selected for plan in plans] == [100, 100, 100, 100]
     assert [len(plan.temperatures) for plan in plans] == [3, 3, 3, 3]
-    assert all(
-        later.candidate_count > earlier.candidate_count
-        for earlier, later in zip(plans, plans[1:])
+
+
+def test_regular_label_floor_is_derived_from_the_user_maximum():
+    assert regular_batch_minimum(1) == 1
+    assert regular_batch_minimum(100) == 50
+    assert regular_batch_minimum(200) == 100
+
+
+def test_candidate_pool_rejects_a_different_sampling_model(tmp_path: Path):
+    first_model = tmp_path / "model-a.txt"
+    second_model = tmp_path / "model-b.txt"
+    first_model.write_text("a\n", encoding="utf-8")
+    second_model.write_text("b\n", encoding="utf-8")
+    candidates = toy_candidate_frames("ordinary", 811, 2)
+    candidates_path = tmp_path / "candidates.xyz"
+    manifest = tmp_path / "candidate-pool.json"
+    write_candidate_pool(
+        candidates_path,
+        manifest,
+        candidates,
+        generation=3,
+        model_path=first_model,
+        requested_md_runs=4,
+        available_md_runs=4,
+        scheduled_md_runs=4,
+        failed_md_runs=0,
     )
+
+    with pytest.raises(CandidatePoolError, match="another sampling model"):
+        validate_candidate_pool(
+            ase_read(candidates_path, index=":"),
+            manifest,
+            generation=3,
+            model_path=second_model,
+        )
 
 
 def test_stratified_fps_is_input_order_independent_and_balanced():
@@ -102,7 +143,7 @@ def test_stratified_fps_is_input_order_independent_and_balanced():
     )
     candidate_ids = ["a1", "a2", "a3", "b1", "b2", "b3"]
     strata = ["A", "A", "A", "B", "B", "B"]
-    plan = GenerationPlan(1, 1, 6, 4, 100, (300.0,))
+    plan = GenerationPlan(1, 1, 4, 100, (300.0,))
     first = stratified_farthest_point_sampling(
         points, np.asarray([[0.0, 0.0]]), candidate_ids, strata, plan
     )
@@ -120,7 +161,7 @@ def test_stratified_fps_is_input_order_independent_and_balanced():
 
 
 def test_zero_min_novelty_allows_duplicate_smoke_candidates():
-    plan = GenerationPlan(1, 1, 2, 1, 2, (10.0,), min_novelty=0.0)
+    plan = GenerationPlan(1, 1, 1, 2, (10.0,), min_novelty=0.0)
     result = stratified_farthest_point_sampling(
         np.asarray([[1.0, 1.0], [1.0, 1.0]]),
         np.asarray([[1.0, 1.0]]),
@@ -137,14 +178,14 @@ def test_two_generation_toy_workflow_is_deterministic_and_resumable(tmp_path: Pa
         tmp_path / "iteration",
         profile="spin",
         generations=2,
-        dft_budget=8,
+        max_selected=8,
     )
 
     assert report.passed
     assert report.generations_completed == 2
-    assert report.budgets == (8, 6)
+    assert report.max_selected == (8, 8)
     assert report.steps == (100, 100)
-    assert report.selected_counts == (8, 6)
+    assert report.selected_counts == (8, 8)
     assert report.training_counts[1] > report.training_counts[0]
     assert report.coverage_p95[1] < report.coverage_p95[0]
     assert report.scenario_steps == ((100,), (100, 400))
@@ -169,7 +210,7 @@ def test_toy_generations_keep_all_temperature_strata_visible(tmp_path: Path):
         tmp_path / "iteration-three",
         profile="spin",
         generations=3,
-        dft_budget=8,
+        max_selected=8,
     )
 
     assert report.passed
@@ -295,9 +336,9 @@ def test_controller_rejects_plan_change_after_generation_started(tmp_path: Path)
             return StageOutcome({f"{stage}_artifact": artifact}, metrics)
 
     controller = GenerationController(tmp_path / "plan-drift", "plan-drift")
-    original = GenerationPlan(1, 1, 4, 2, 100, (300.0,))
+    original = GenerationPlan(1, 1, 2, 100, (300.0,))
     controller.run_workflow((original,), AcceptingAdapter())
-    changed = GenerationPlan(1, 1, 4, 2, 200, (300.0,))
+    changed = GenerationPlan(1, 1, 2, 200, (300.0,))
 
     with pytest.raises(IterationError, match="plan changed"):
         controller.run_workflow((changed,), AcceptingAdapter())
@@ -460,8 +501,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
             (300.0, 500.0),
             steps=(40, 160, 640, 2560),
             md_runs=2,
-            candidate_target=6,
-            frame_stride=1,
+            max_selected=3,
         ),
         "dft": {"software": "toy", "teacher_profile": "spin"},
         "evaluation": {
@@ -485,7 +525,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     adapter = WorkflowIterationAdapter(
         config, initial_training=initial, runtime=runtime
     )
-    plan = GenerationPlan(1, 19, 6, 3, 40, (300.0, 500.0), frame_stride=1)
+    plan = GenerationPlan(1, 19, 3, 40, (300.0, 500.0))
     summary = GenerationController(
         tmp_path / "workflow", "real-contract-toy-labels"
     ).run_generation(plan, adapter)
@@ -497,7 +537,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert summary.metrics["explore"]["completed_source_count"] == 1
     assert summary.metrics["explore"]["failed_source_count"] == 0
     assert summary.metrics["select"]["selected_count"] == 3
-    assert summary.metrics["select"]["candidate_count_after_thinning"] == 4
+    assert summary.metrics["select"]["candidate_count_after_deduplication"] == 4
     assert summary.metrics["label"]["backend"] == "toy"
     assert summary.metrics["diagnose"]["current_model_mforce_rmse"] == 4.0
     assert summary.metrics["merge"]["added_count"] == 3
@@ -600,7 +640,7 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     config = {
         "training": {"backend": "torchnep", "config_path": str(config_file)},
         "md": {"backend": "lammps", "spin": True},
-        "sampling": _sampling((100.0,), candidate_target=3),
+        "sampling": _sampling((100.0,), max_selected=20),
         "dft": {"software": "toy", "teacher_profile": "spin"},
         "evaluation": {
             "validation_path": str(validation),
@@ -638,12 +678,25 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     )
     model = tmp_path / "nep.txt"
     model.write_text("fake\n", encoding="utf-8")
+    manifest = tmp_path / "candidate-pool.json"
+    write_candidate_pool(
+        candidates_path,
+        manifest,
+        ase_read(candidates_path, index=":"),
+        generation=1,
+        model_path=model,
+        requested_md_runs=4,
+        available_md_runs=2,
+        scheduled_md_runs=2,
+        failed_md_runs=1,
+    )
     context = StageContext(
         generation=1,
         generation_dir=tmp_path,
-        plan=GenerationPlan(1, 1, 3, 20, 10, (100.0,), frame_stride=1),
+        plan=GenerationPlan(1, 1, 20, 10, (100.0,)),
         artifacts={
             "candidates": candidates_path,
+            "candidate_pool_manifest": manifest,
             "training_input": initial,
             "model": model,
         },
@@ -653,50 +706,265 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     outcome = adapter._select(context)
     selected = ase_read(outcome.artifacts["selected_input"], index=":")
 
-    assert outcome.metrics["candidate_count_after_thinning"] == 2
+    assert outcome.metrics["candidate_count_after_deduplication"] == 2
     assert outcome.metrics["duplicate_candidate_count"] == 1
     assert outcome.metrics["selected_count"] == 2
-    assert outcome.metrics["configured_dft_budget"] == 20
-    assert outcome.metrics["effective_dft_budget"] == 4
+    assert outcome.metrics["configured_max_selected"] == 20
     assert "pre_failure" in {frame.info["md_window"] for frame in selected}
 
 
-def test_candidate_cap_spreads_each_source_over_full_trajectory():
-    def frames(source: str, count: int):
-        result = []
-        for step in range(count):
-            frame = toy_candidate_frames("ordinary", step + 100, 1)[0]
-            frame.info.update(source_id=source, lammps_step=step)
-            result.append(frame)
-        return result
-
-    first = frames("first", 10)
-    second = frames("second", 10)
-    selected = WorkflowIterationAdapter._balanced_cap(
-        [("first", first), ("second", second)], 6
+def test_workflow_selection_describes_every_unique_valid_dump_frame(
+    tmp_path: Path,
+):
+    initial = tmp_path / "initial.xyz"
+    candidates_path = tmp_path / "candidates.xyz"
+    model = tmp_path / "nep.txt"
+    initial_frame = ToyTeacher("ordinary").label(
+        toy_candidate_frames("ordinary", 401, 1)[0]
+    )
+    candidates = toy_candidate_frames("ordinary", 402, 20)
+    for index, frame in enumerate(candidates):
+        frame.info.update(
+            source_id=f"source-{index % 2}",
+            temperature=300.0,
+            pressure=0.0,
+            md_window="stable_prefix",
+        )
+    ase_write(initial, [initial_frame], format="extxyz")
+    ase_write(candidates_path, candidates, format="extxyz")
+    model.write_text("fake\n", encoding="utf-8")
+    manifest = tmp_path / "candidate-pool.json"
+    write_candidate_pool(
+        candidates_path,
+        manifest,
+        candidates,
+        generation=1,
+        model_path=model,
+        requested_md_runs=4,
+        available_md_runs=4,
+        scheduled_md_runs=4,
+        failed_md_runs=0,
     )
 
-    by_source = {
-        source: [frame.info["lammps_step"] for item_source, _, frame in selected if item_source == source]
-        for source in ("first", "second")
-    }
-    assert by_source == {"first": [0, 4, 9], "second": [0, 4, 9]}
+    descriptor_counts = []
+
+    def descriptors(_model, frames):
+        descriptor_counts.append(len(frames))
+        return toy_raw_features(frames, "ordinary")
+
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {"backend": "gpumd"},
+            "md": {"backend": "lammps", "spin": False},
+            "sampling": _sampling(max_selected=4),
+            "dft": {"backend": "toy"},
+            "evaluation": {
+                "validation_path": str(initial),
+                "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
+            },
+        },
+        initial_training=initial,
+        runtime=WorkflowRuntime(descriptors=descriptors),
+    )
+    outcome = adapter._select(
+        StageContext(
+            generation=1,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(1, 1, 4, 10, (300.0,)),
+            artifacts={
+                "candidates": candidates_path,
+                "candidate_pool_manifest": manifest,
+                "training_input": initial,
+                "model": model,
+            },
+            previous_artifacts={},
+        )
+    )
+
+    assert descriptor_counts == [20, 1]
+    assert outcome.metrics["candidate_count_before_deduplication"] == 20
+    assert outcome.metrics["candidate_count_after_deduplication"] == 20
+    assert outcome.metrics["selected_count"] == 4
 
 
-def test_candidate_cap_prioritizes_pre_failure_frames():
-    frames = toy_candidate_frames("ordinary", 301, 6)
-    for step, frame in enumerate(frames):
-        frame.info.update(
-            lammps_step=step,
-            md_window="pre_failure" if step >= 4 else "stable_prefix",
+def test_explore_accumulates_same_model_md_waves_to_the_derived_floor(
+    tmp_path: Path,
+):
+    initial = tmp_path / "initial.xyz"
+    validation = tmp_path / "validation.xyz"
+    structures = tmp_path / "structures.xyz"
+    config_file = tmp_path / "nep.in"
+    model = tmp_path / "nep.txt"
+    teacher = ToyTeacher("ordinary")
+    ase_write(
+        initial,
+        [teacher.label(toy_candidate_frames("ordinary", 901, 1)[0])],
+        format="extxyz",
+    )
+    ase_write(
+        validation,
+        [teacher.label(toy_candidate_frames("ordinary", 902, 1)[0])],
+        format="extxyz",
+    )
+    starts = toy_candidate_frames("ordinary", 903, 3)
+    ase_write(structures, starts, format="extxyz")
+    config_file.write_text("type 1 Fe\n", encoding="utf-8")
+    model.write_text("active model\n", encoding="utf-8")
+    md_calls = []
+
+    def one_frame_md(request, backend):
+        md_calls.append(request.seed)
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        frame = request.atoms.copy()
+        frame.info["lammps_step"] = request.steps
+        ase_write(request.output_file, [frame], format="extxyz")
+        return MdResult(
+            backend,
+            request.output_file,
+            request.output_dir,
+            "cpu",
+            "nep/cpu",
+            completed=True,
+            last_step=request.steps,
         )
 
-    selected = WorkflowIterationAdapter._balanced_cap([("failed", frames)], 2)
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {"backend": "gpumd", "config_path": str(config_file)},
+            "md": {
+                "backend": "lammps",
+                "structures": str(structures),
+                "spin": False,
+            },
+            "sampling": _sampling(
+                (300.0,), md_runs=1, max_selected=4
+            ),
+            "dft": {"backend": "toy"},
+            "evaluation": {
+                "validation_path": str(validation),
+                "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
+            },
+        },
+        initial_training=initial,
+        runtime=WorkflowRuntime(md=one_frame_md),
+    )
+    outcome = adapter._explore(
+        StageContext(
+            generation=1,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(1, 11, 4, 100, (300.0,)),
+            artifacts={"model": model, "training_input": initial},
+            previous_artifacts={},
+            stage_dir=tmp_path / "explore",
+        )
+    )
 
-    assert [frame.info["lammps_step"] for _, _, frame in selected] == [4, 5]
+    assert len(md_calls) == 2
+    assert outcome.metrics["unique_candidate_count"] == 2
+    assert outcome.metrics["regular_batch_minimum"] == 2
+    manifest = json.loads(
+        outcome.artifacts["candidate_pool_manifest"].read_text()
+    )
+    assert manifest["model_sha256"] == outcome.metrics["sampling_model_sha256"]
+    assert manifest["scheduled_md_runs"] == 2
+    assert manifest["available_md_runs"] == 3
 
 
-def test_retrain_is_skipped_when_current_model_passes_new_dft_diagnostics(
+def test_next_md_round_uses_the_newly_published_model(tmp_path: Path):
+    teacher = ToyTeacher("ordinary")
+    initial = tmp_path / "initial.xyz"
+    validation = tmp_path / "validation.xyz"
+    structures = tmp_path / "structures.xyz"
+    config_file = tmp_path / "nep.in"
+    ase_write(
+        initial,
+        [teacher.label(toy_candidate_frames("ordinary", 921, 1)[0])],
+        format="extxyz",
+    )
+    ase_write(
+        validation,
+        [teacher.label(toy_candidate_frames("ordinary", 922, 1)[0])],
+        format="extxyz",
+    )
+    ase_write(
+        structures,
+        toy_candidate_frames("ordinary", 923, 1),
+        format="extxyz",
+    )
+    config_file.write_text("type 1 Fe\n", encoding="utf-8")
+    training_calls = []
+    md_models = []
+
+    def versioned_train(request, backend):
+        version = len(training_calls) + 1
+        training_calls.append(version)
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model = request.output_dir / "nep.txt"
+        model.write_text(f"model-{version}\n", encoding="utf-8")
+        return TrainingResult(backend, model, None, None)
+
+    def model_recording_md(request, backend):
+        md_models.append(request.model_file.read_text(encoding="utf-8").strip())
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        frames = toy_candidate_frames(
+            "ordinary",
+            930 + len(md_models),
+            2,
+            temperatures=(request.temperature,),
+        )
+        ase_write(request.output_file, frames, format="extxyz")
+        return MdResult(
+            backend,
+            request.output_file,
+            request.output_dir,
+            "cpu",
+            "nep/cpu",
+            completed=True,
+            last_step=request.steps,
+        )
+
+    def always_needs_update(_model, _frames, _backend):
+        return {"energy_rmse": 2.0, "force_rmse": 2.0}
+
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {"backend": "gpumd", "config_path": str(config_file)},
+            "md": {
+                "backend": "lammps",
+                "structures": str(structures),
+                "spin": False,
+            },
+            "sampling": _sampling(
+                (300.0,), md_runs=1, max_selected=2
+            ),
+            "dft": {"backend": "toy"},
+            "evaluation": {
+                "validation_path": str(validation),
+                "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
+            },
+        },
+        initial_training=initial,
+        runtime=WorkflowRuntime(
+            train=versioned_train,
+            md=model_recording_md,
+            descriptors=lambda _model, frames: toy_raw_features(
+                frames, "ordinary"
+            ),
+            predict=always_needs_update,
+        ),
+    )
+    controller = GenerationController(tmp_path / "workflow", "model-handoff")
+    controller.run_generation(
+        GenerationPlan(1, 31, 2, 100, (300.0,)), adapter
+    )
+    controller.run_generation(
+        GenerationPlan(2, 32, 2, 100, (300.0,)), adapter
+    )
+
+    assert md_models == ["model-1", "model-2"]
+
+
+def test_retrain_updates_only_when_diagnostics_require_a_new_model(
     tmp_path: Path,
 ):
     initial_frames = [
@@ -719,8 +987,14 @@ def test_retrain_is_skipped_when_current_model_passes_new_dft_diagnostics(
     config_file = tmp_path / "nep.in"
     config_file.write_text("type 1 Fe\n", encoding="utf-8")
 
-    def unexpected_train(_request, _backend):
-        raise AssertionError("training should be skipped")
+    training_calls = []
+
+    def continuation_train(request, backend):
+        training_calls.append((request, backend))
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        trained_model = request.output_dir / "nep.txt"
+        trained_model.write_text("continued model\n", encoding="utf-8")
+        return TrainingResult(backend, trained_model, None, None)
 
     adapter = WorkflowIterationAdapter(
         {
@@ -740,7 +1014,7 @@ def test_retrain_is_skipped_when_current_model_passes_new_dft_diagnostics(
             },
         },
         initial_training=initial,
-        runtime=WorkflowRuntime(train=unexpected_train),
+        runtime=WorkflowRuntime(train=continuation_train),
     )
     model = tmp_path / "nep.txt"
     model.write_text("model\n", encoding="utf-8")
@@ -759,8 +1033,9 @@ def test_retrain_is_skipped_when_current_model_passes_new_dft_diagnostics(
         StageContext(
             generation=1,
             generation_dir=tmp_path,
-            plan=GenerationPlan(1, 1, 4, 2, 10, (300.0,)),
+            plan=GenerationPlan(1, 1, 2, 10, (300.0,)),
             artifacts={
+                "training_input": initial,
                 "training_set": initial,
                 "model": model,
                 "acquisition_signals": diagnostic,
@@ -774,46 +1049,81 @@ def test_retrain_is_skipped_when_current_model_passes_new_dft_diagnostics(
     assert outcome.metrics["retrained"] is False
     assert outcome.metrics["backend"] == "reuse"
     assert outcome.artifacts["retrained_model"] == model
-
-    training_calls = []
-
-    def continuation_train(request, backend):
-        training_calls.append((request, backend))
-        request.output_dir.mkdir(parents=True, exist_ok=True)
-        trained_model = request.output_dir / "nep.txt"
-        trained_model.write_text("continued model\n", encoding="utf-8")
-        return TrainingResult(backend, trained_model, None, None)
-
-    adapter.runtime = WorkflowRuntime(train=continuation_train)
-    previous_signals = tmp_path / "previous-signals.json"
-    previous_signals.write_text(
-        json.dumps(
-            {"production_ready": True, "validation_accepted": False}
-        ),
-        encoding="utf-8",
+    lineage = json.loads(outcome.artifacts["model_lineage"].read_text())
+    assert lineage["trained_on_current_labels"] is False
+    assert lineage["model_updated"] is False
+    assert lineage["parent_model_sha256"] == lineage["candidate_model_sha256"]
+    assert len(training_calls) == 0
+    reused = adapter._train(
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(2, 2, 2, 10, (300.0,)),
+            artifacts={},
+            previous_artifacts={
+                "training_set": initial,
+                "retrained_model": outcome.artifacts["retrained_model"],
+                "model_lineage": outcome.artifacts["model_lineage"],
+            },
+            stage_dir=tmp_path / "next-reuse",
+        )
     )
-    continuation_dir = tmp_path / "continuation"
-    continuation_dir.mkdir()
-    continued = adapter.run_stage(
+    assert reused.artifacts["model"] == model
+
+    diagnostic.write_text(
+        json.dumps({"diagnostic_accepted": False}), encoding="utf-8"
+    )
+    update_dir = tmp_path / "update"
+    update_dir.mkdir()
+    updated = adapter.run_stage(
         "retrain",
         StageContext(
             generation=2,
             generation_dir=tmp_path,
-            plan=GenerationPlan(2, 2, 4, 2, 10, (300.0,)),
+            plan=GenerationPlan(2, 2, 2, 10, (300.0,)),
             artifacts={
+                "training_input": initial,
                 "training_set": initial,
                 "model": model,
                 "acquisition_signals": diagnostic,
                 "md_attempts": attempts,
             },
-            previous_artifacts={"signals": previous_signals},
-            stage_dir=continuation_dir,
+            previous_artifacts={},
+            stage_dir=update_dir,
         ),
     )
 
-    assert continued.metrics["retrained"] is True
-    assert "global validation" in continued.metrics["reason"]
+    assert updated.metrics["retrained"] is True
+    assert updated.metrics["backend"] == "torchnep"
+    assert updated.artifacts["retrained_model"].read_text() == "continued model\n"
+    updated_lineage = json.loads(
+        updated.artifacts["model_lineage"].read_text()
+    )
+    assert updated_lineage["trained_on_current_labels"] is True
+    assert updated_lineage["model_updated"] is True
+    assert (
+        updated_lineage["parent_model_sha256"]
+        != updated_lineage["candidate_model_sha256"]
+    )
     assert len(training_calls) == 1
+    next_updated = adapter._train(
+        StageContext(
+            generation=3,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(3, 3, 2, 10, (300.0,)),
+            artifacts={},
+            previous_artifacts={
+                "training_set": initial,
+                "retrained_model": updated.artifacts["retrained_model"],
+                "model_lineage": updated.artifacts["model_lineage"],
+            },
+            stage_dir=tmp_path / "next-update",
+        )
+    )
+    assert (
+        next_updated.artifacts["model"]
+        == updated.artifacts["retrained_model"]
+    )
 
 
 @pytest.mark.parametrize("backend", ["vasp", "abacus"])
@@ -884,7 +1194,7 @@ def test_workflow_label_routes_production_dft_through_label_interface(
         StageContext(
             generation=1,
             generation_dir=generation_dir,
-            plan=GenerationPlan(1, 1, 2, 2, 10, (300.0,)),
+            plan=GenerationPlan(1, 1, 2, 10, (300.0,)),
             artifacts={"selected_input": selected_input},
             previous_artifacts={},
         )

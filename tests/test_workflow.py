@@ -38,7 +38,7 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
     config = _write(
         tmp_path / "job.yaml",
         """
-schema_version: 4
+schema_version: 5
 training:
   backend: torchnep
   initial_path: ./initial.xyz
@@ -64,17 +64,12 @@ sampling:
       long_stable: 160
       production_ready: 640
   candidate_pool:
-    target: 12
-    growth: 1
-    frame_stride: 3
     pre_failure_frames: 2
     bad_tail_frames: 1
     health: {}
   selection:
     method: fps
-    dft_budget: 6
-    minimum_dft_budget: 2
-    budget_decay: 0.75
+    max_selected: 100
     min_novelty: 0
 dft:
   backend: toy
@@ -140,7 +135,7 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert manifest["scripts"] == []
 
     project_text = result.config_file.read_text()
-    assert "schema_version: 4" in project_text
+    assert "schema_version: 5" in project_text
     assert "workflow.slurm" not in project_text
     assert "execution:" in project_text
     assert "inputs/training/nep.in" in project_text
@@ -148,7 +143,7 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert "inputs/validation/validation.xyz" in project_text
     plans = [json.loads(path.read_text()) for path in result.plans]
     assert [plan["steps"] for plan in plans] == [10, 10, 10]
-    assert [plan["dft_budget"] for plan in plans] == [6, 5, 4]
+    assert [plan["max_selected"] for plan in plans] == [100, 100, 100]
     assert [plan["temperatures"] for plan in plans] == [
         [300.0, 500.0],
         [300.0, 500.0],
@@ -242,7 +237,7 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     output = capsys.readouterr().out
     assert "State: prepared" in output
     assert "Ledger: iteration 1, stage train" in output
-    assert "G1 not started: plan 12 candidates, DFT budget 6" in output
+    assert "G1 not started: FPS selects up to 100" in output
     assert "Executor: 0/0 stages completed" in output
 
 

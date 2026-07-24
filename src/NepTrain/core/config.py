@@ -8,7 +8,7 @@ from typing import Any, Mapping
 from ruamel.yaml import YAML
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 class ConfigError(ValueError):
@@ -80,18 +80,13 @@ _SAMPLING_FIELDS = {
     },
     "progression": {"md_runs_per_iteration", "steps", "replicas"},
     "candidate_pool": {
-        "target",
-        "growth",
-        "frame_stride",
         "pre_failure_frames",
         "bad_tail_frames",
         "health",
     },
     "selection": {
         "method",
-        "dft_budget",
-        "minimum_dft_budget",
-        "budget_decay",
+        "max_selected",
         "min_novelty",
     },
 }
@@ -126,7 +121,7 @@ def _reject_unknown(config: Mapping[str, Any]) -> None:
         raise ConfigError(
             "unknown project fields: "
             + ", ".join(unknown_top)
-            + "; schema v4 does not accept legacy fields"
+            + f"; schema v{CURRENT_SCHEMA_VERSION} does not accept legacy fields"
         )
     for section, allowed in _FIELDS.items():
         value = _mapping(config, section)
@@ -157,7 +152,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
     try:
         schema = int(config.get("schema_version", 0))
     except (TypeError, ValueError) as error:
-        raise ConfigError("schema_version must be 4") from error
+        raise ConfigError(
+            f"schema_version must be {CURRENT_SCHEMA_VERSION}"
+        ) from error
     if schema != CURRENT_SCHEMA_VERSION:
         raise ConfigError(
             f"unsupported schema_version {schema}; NepTrain requires "
@@ -269,12 +266,6 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ConfigError(
             "sampling.progression.md_runs_per_iteration must be positive"
         )
-    if int(candidate_pool.get("target", 0)) < 1:
-        raise ConfigError("sampling.candidate_pool.target must be positive")
-    if float(candidate_pool.get("growth", 1.0)) <= 0:
-        raise ConfigError("sampling.candidate_pool.growth must be positive")
-    if int(candidate_pool.get("frame_stride", 1)) < 1:
-        raise ConfigError("sampling.candidate_pool.frame_stride must be positive")
     if int(candidate_pool.get("pre_failure_frames", 2)) < 0:
         raise ConfigError(
             "sampling.candidate_pool.pre_failure_frames must be non-negative"
@@ -289,17 +280,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ConfigError(str(error)) from error
     if selection.get("method", "fps") != "fps":
         raise ConfigError("sampling.selection.method currently must be fps")
-    if int(selection.get("dft_budget", 0)) < 1:
-        raise ConfigError("sampling.selection.dft_budget must be positive")
-    if int(selection.get("minimum_dft_budget", 0)) < 1:
-        raise ConfigError(
-            "sampling.selection.minimum_dft_budget must be positive"
-        )
-    budget_decay = float(selection.get("budget_decay", 0.75))
-    if not 0 < budget_decay <= 1:
-        raise ConfigError(
-            "sampling.selection.budget_decay must be greater than 0 and at most 1"
-        )
+    if int(selection.get("max_selected", 0)) < 1:
+        raise ConfigError("sampling.selection.max_selected must be positive")
     if float(selection.get("min_novelty", 0.0)) < 0:
         raise ConfigError("sampling.selection.min_novelty must be non-negative")
 

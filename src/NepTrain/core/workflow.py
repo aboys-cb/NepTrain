@@ -319,24 +319,18 @@ def _plans(
 
     conditions = sampling["conditions"]
     progression = sampling["progression"]
-    candidate_pool = sampling["candidate_pool"]
     selection = sampling["selection"]
     steps = progression["steps"]
     plans = progressive_plans(
         int(settings.get("max_iterations", 1)),
         seed=int(settings.get("seed", 20260721)),
-        candidate_target=int(candidate_pool["target"]),
-        candidate_growth=float(candidate_pool.get("growth", 1.0)),
-        initial_budget=int(selection["dft_budget"]),
-        minimum_budget=int(selection["minimum_dft_budget"]),
-        budget_decay=float(selection.get("budget_decay", 0.75)),
+        max_selected=int(selection["max_selected"]),
         initial_steps=int(steps["smoke_passed"]),
         temperatures=tuple(
             float(value) for value in conditions["temperature_path"]
         ),
         pressure=float(conditions.get("pressure", 0.0)),
         min_novelty=float(selection.get("min_novelty", 0.0)),
-        frame_stride=int(candidate_pool.get("frame_stride", 2)),
     )
     return plans
 
@@ -1196,12 +1190,10 @@ def _generation_science(
         "state": state,
         "completed_stages": tuple(stage for stage in _STAGES if stage in stages),
         "plan": {
-            "candidate_target": int(plan["candidate_count"]),
-            "dft_budget": int(plan["dft_budget"]),
+            "max_selected": int(plan["max_selected"]),
             "steps": int(plan["steps"]),
             "temperatures": tuple(float(value) for value in plan["temperatures"]),
             "pressure": float(plan.get("pressure", 0.0)),
-            "frame_stride": int(plan.get("frame_stride", 1)),
         },
         "sampling": {
             "candidate_count": explore.get("candidate_count"),
@@ -1211,14 +1203,19 @@ def _generation_science(
             "scheduled_source_count": explore.get("scheduled_source_count"),
             "completed_source_count": explore.get("completed_source_count"),
             "failed_source_count": explore.get("failed_source_count"),
-            "candidate_count_before_thinning": select.get(
-                "candidate_count_before_thinning"
+            "candidate_count_before_deduplication": select.get(
+                "candidate_count_before_deduplication"
             ),
-            "candidate_count_after_thinning": select.get(
-                "candidate_count_after_thinning"
+            "candidate_count_after_deduplication": select.get(
+                "candidate_count_after_deduplication"
             ),
             "duplicate_candidate_count": select.get("duplicate_candidate_count"),
             "selected_count": select.get("selected_count"),
+            "regular_batch_minimum": select.get("regular_batch_minimum"),
+            "batch_kind": select.get("batch_kind"),
+            "sampling_model_sha256": explore.get(
+                "sampling_model_sha256"
+            ),
             "counts_by_stratum": dict(select.get("counts_by_stratum", {})),
             "labeled_count": label.get("labeled_count"),
         },
@@ -1227,6 +1224,8 @@ def _generation_science(
             "merged_count": merge.get("training_count"),
             "after_count": retrain.get("training_count"),
             "added_count": evaluate.get("added_training_count", merge.get("added_count")),
+            "model_updated": retrain.get("model_updated"),
+            "active_model_sha256": evaluate.get("active_model_sha256"),
         },
         "quality": {
             "acquisition_rmse": acquisition_rmse,

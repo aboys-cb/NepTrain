@@ -30,7 +30,7 @@ LAMMPS、VASP 和 ABACUS 由用户或计算平台提供。使用 NEPAdapters LAM
 export LAMMPS_PLUGIN_PATH=/path/to/nepadapters/lib
 ```
 
-NepTrain 只接受 `schema_version: 4`。旧 `train/vasp/gpumd/nep` 命令和旧配置不再
+NepTrain 只接受 `schema_version: 5`。旧 `train/vasp/gpumd/nep` 命令和旧配置不再
 兼容，也不会被静默迁移。
 
 ## 独立运行一个步骤
@@ -96,7 +96,7 @@ neptrain dft candidates.xyz \
 ```
 
 提供 `--project` 后，未在命令行覆盖的 backend、输入模板、温度、压强、步数和
-运行参数会直接读取 schema-v4 项目；命令行只需要写本次确实要改的值。
+运行参数会直接读取 schema-v5 项目；命令行只需要写本次确实要改的值。
 
 本地 `process` target 前台执行。Slurm target 提交后立即返回：
 
@@ -114,7 +114,7 @@ neptrain task cancel runs/dft-...
 
 ## 自动 workflow
 
-创建一个严格的 schema-v4 项目：
+创建一个严格的 schema-v5 项目：
 
 ```bash
 neptrain workflow init --profile slurm --directory fe-project
@@ -163,12 +163,12 @@ neptrain workflow stop workflow --cancel-jobs
 取消记录会写入 workflow 历史；以后恢复时会为该阶段创建新的可追踪 attempt。
 独立手动任务使用 `neptrain task cancel` 明确取消。
 
-## schema v4
+## schema v5
 
 温度、压强和 MD 步数只有 `sampling` 一个权威位置：
 
 ```yaml
-schema_version: 4
+schema_version: 5
 
 training:
   backend: torchnep
@@ -211,9 +211,6 @@ sampling:
       long_stable: 2
       production_ready: 3
   candidate_pool:
-    target: 200
-    growth: 1.0
-    frame_stride: 2
     pre_failure_frames: 2
     bad_tail_frames: 1
     health:
@@ -225,9 +222,7 @@ sampling:
       max_spin_magnitude: 20.0
   selection:
     method: fps
-    dft_budget: 20
-    minimum_dft_budget: 8
-    budget_decay: 0.75
+    max_selected: 100
     min_novelty: 0.0
 
 dft:
@@ -284,19 +279,28 @@ execution:
 ```
 
 `md` 只选择 MD Adapter、结构、LAMMPS 模板和运行命令。温度、压强、递进步数、
-候选池和 FPS 预算统一放在 `sampling`。`timestep`、`tdamp`、`pdamp`、
+轨迹健康检查和 FPS 批量上限统一放在 `sampling`。`timestep`、`tdamp`、`pdamp`、
 `spin_alpha` 和 dump 频率直接写在用户的 LAMMPS 模板中。
 
 `temperature_path` 是严格有序的温度探路路径，只有前一个温度通过才解锁下一个。
 `production_temperatures` 才会继续跑 short、long 和 production；其余温度只做
-便宜的 smoke 探路。健康场景只使用小型 DFT 审计预算，失败场景才使用完整预算；
-新标签上的当前模型误差已经达标时直接复用模型，不做无收益重训。
+便宜的 smoke 探路。所有通过健康检查的 dump 帧都会参与全局 FPS；系统只会去除
+训练集已有结构和完全重复结构，不会在描述符计算前按 stride 或数量上限抽帧。
+`max_selected` 是一个采样轮最多选去 DFT 的结构数。系统自动把常规积累下限设为
+它的一半（默认 100 对应 50）；当前场景 frontier 耗尽或物理失败抢救时可以提前
+flush，不需要用户再维护一组批量阈值。
+
+模型版本之间是硬边界：每轮候选只允许来自该轮激活模型，候选文件和 manifest
+都会记录模型哈希。误差超阈值或 MD 发生物理失败时才更新模型；只有新模型完成
+evaluate 并写入 lineage，下一轮 MD 才会启动。若当前模型已通过新 DFT 诊断，则
+保持该模型继续做长时认证，避免无意义更新反复清零稳定性证据。因此不会把旧模型
+轨迹误当成新模型的采样证据。
 
 每个 replica 都会得到 NepTrain 派生的确定性 `{{ seed }}`；用户模板可把它同时
 用于 `velocity create` 和 DynSpin thermostat，保证重复运行可复现但 replica
 彼此独立。`min_novelty: 0` 表示只记录 FPS 新颖度而不把它作为收敛硬门槛。
 
-`workflow.max_iterations` 是最大迭代预算。生产温度、最长时长、replica、轨迹诊断和
+`workflow.max_iterations` 是最大采样轮预算。生产温度、最长时长、replica、轨迹诊断和
 validation 全部通过后会提前完成；预算耗尽或连续无进展会分别报告
 `budget_exhausted` 或 `stalled`，不会误报为 `complete`。
 

@@ -35,7 +35,7 @@ def run_smoke_command(args):
         args.output,
         profile=args.profile,
         seed=args.seed,
-        dft_budget=args.dft_budget,
+        max_selected=args.max_selected,
         force=args.force,
     )
     print(json.dumps(asdict(report), indent=2, sort_keys=True))
@@ -47,7 +47,7 @@ def run_smoke_command(args):
             profile="spin" if args.profile == "recovery" else args.profile,
             generations=args.iterations,
             seed=args.seed,
-            dft_budget=args.dft_budget,
+            max_selected=args.max_selected,
             force=args.force,
         )
         print(json.dumps(asdict(iteration), indent=2, sort_keys=True))
@@ -70,8 +70,8 @@ def _print_scientific_progress(generations):
         if generation["state"] == "not_started":
             temperatures = ", ".join(f"{value:g}" for value in plan["temperatures"])
             print(
-                f"  G{number} {state}: plan {plan['candidate_target']} candidates, "
-                f"DFT budget {plan['dft_budget']}, {plan['steps']} MD steps, "
+                f"  G{number} {state}: FPS selects up to "
+                f"{plan['max_selected']}, {plan['steps']} MD steps, "
                 f"T={temperatures} K"
             )
             continue
@@ -81,8 +81,10 @@ def _print_scientific_progress(generations):
         flow = []
         if sampling["candidate_count"] is not None:
             flow.append(f"MD {sampling['candidate_count']} candidates")
-        if sampling["candidate_count_after_thinning"] is not None:
-            flow.append(f"{sampling['candidate_count_after_thinning']} eligible")
+        if sampling["candidate_count_after_deduplication"] is not None:
+            flow.append(
+                f"{sampling['candidate_count_after_deduplication']} unique eligible"
+            )
         if sampling["selected_count"] is not None:
             flow.append(f"FPS {sampling['selected_count']}")
         if sampling["labeled_count"] is not None:
@@ -109,6 +111,21 @@ def _print_scientific_progress(generations):
             if duplicates is not None:
                 details.append(f"duplicates={duplicates}")
             print("    sampling: " + ", ".join(details))
+        batch_kind = sampling.get("batch_kind")
+        batch_floor = sampling.get("regular_batch_minimum")
+        if batch_kind:
+            print(
+                f"    batch: {batch_kind}, regular floor={batch_floor}, "
+                f"active model={str(sampling.get('sampling_model_sha256') or '-')[:12]}"
+            )
+        active_model = training.get("active_model_sha256")
+        if active_model:
+            action = (
+                "updated"
+                if training.get("model_updated")
+                else "reused for certification"
+            )
+            print(f"    model: {str(active_model)[:12]} ({action})")
         validation = generation["quality"]["validation_rmse"]
         if any(value is not None for value in validation.values()):
             print(
@@ -566,7 +583,7 @@ def build_smoke(subparsers):
     )
     parser.add_argument("--output", default="./outputs/smoke")
     parser.add_argument("--seed", type=int, default=20260721)
-    parser.add_argument("--dft-budget", type=int, default=8)
+    parser.add_argument("--max-selected", type=int, default=8)
     parser.add_argument(
         "--iterations",
         type=int,
@@ -598,7 +615,7 @@ def build_select(subparsers):
                                default="./nep.txt",
                                help="Provide a path to a nep.txt file to extract descriptors for the structure, default is ./nep.txt. If the file does not exist, use SOAP descriptors."
                                )
-    parser_select.add_argument("--max_selected", "-max", type=int,
+    parser_select.add_argument("--max-selected", "-max", type=int,
                                help="Maximum number of structures to select, default is 20.",
                                default=20)
     parser_select.add_argument("--min_distance","-d", type=float,
@@ -968,7 +985,7 @@ def build_workflow_commands(subparsers):
         "workflow", help="Prepare and control an automated active-learning workflow."
     )
     actions = parser.add_subparsers(dest="workflow_action", required=True)
-    init = actions.add_parser("init", help="Create a strict schema-v4 project.")
+    init = actions.add_parser("init", help="Create a strict schema-v5 project.")
     init.set_defaults(func=init_template)
     init.add_argument("--profile", choices=["local", "slurm"], default="slurm")
     init.add_argument("--directory", default=".")

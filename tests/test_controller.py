@@ -49,13 +49,11 @@ def _plan() -> GenerationPlan:
     return GenerationPlan(
         generation=1,
         seed=7,
-        candidate_count=4,
-        dft_budget=2,
+        max_selected=2,
         min_novelty=0.0,
         temperatures=(300.0,),
         pressure=0.0,
         steps=2,
-        frame_stride=1,
     )
 
 
@@ -259,7 +257,7 @@ def _controller_inputs(tmp_path: Path):
     config = _write(
         tmp_path / "project.yaml",
         """
-schema_version: 4
+schema_version: 5
 training:
   backend: gpumd
   initial_path: ./initial.xyz
@@ -283,17 +281,12 @@ sampling:
       long_stable: 32
       production_ready: 128
   candidate_pool:
-    target: 4
-    growth: 1
-    frame_stride: 1
     pre_failure_frames: 2
     bad_tail_frames: 1
     health: {}
   selection:
     method: fps
-    dft_budget: 2
-    minimum_dft_budget: 1
-    budget_decay: 0.75
+    max_selected: 2
     min_novelty: 0
 dft:
   backend: toy

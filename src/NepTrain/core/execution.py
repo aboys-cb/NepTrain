@@ -71,11 +71,18 @@ _STAGE_CONFIG_PATH_FIELDS = {
 _STAGE_ARTIFACTS = {
     "train": (),
     "explore": ("model",),
-    "select": ("candidates", "training_input", "model", "md_attempts"),
+    "select": (
+        "candidates",
+        "candidate_pool_manifest",
+        "training_input",
+        "model",
+        "md_attempts",
+    ),
     "label": ("selected_input",),
     "diagnose": ("labeled", "model"),
     "merge": ("training_input", "labeled"),
     "retrain": (
+        "training_input",
         "training_set",
         "model",
         "checkpoint",
@@ -87,6 +94,7 @@ _STAGE_ARTIFACTS = {
         "training_set",
         "retrained_model",
         "retraining_decision",
+        "model_lineage",
         "scenario_plan",
         "acquisition_signals",
         "selection_result",
@@ -94,7 +102,12 @@ _STAGE_ARTIFACTS = {
     ),
 }
 _STAGE_PREVIOUS_ARTIFACTS = {
-    "train": ("training_set", "retrained_model", "retrained_checkpoint"),
+    "train": (
+        "training_set",
+        "retrained_model",
+        "retrained_checkpoint",
+        "model_lineage",
+    ),
     "explore": ("scenario_maturity",),
     "select": (),
     "label": (),

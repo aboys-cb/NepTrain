@@ -6,12 +6,12 @@ from NepTrain.core.config import load_config
 from NepTrain.core.template import init_project
 
 
-def test_init_project_writes_a_valid_narrow_schema_v4(tmp_path):
+def test_init_project_writes_a_valid_narrow_schema_v5(tmp_path):
     project = init_project("local", tmp_path)
     config, changes = load_config(project)
 
     assert changes == []
-    assert config["schema_version"] == 4
+    assert config["schema_version"] == 5
     assert config["training"]["backend"] == "torchnep"
     assert config["md"]["backend"] == "lammps"
     assert config["sampling"]["conditions"]["temperature_path"] == [300]

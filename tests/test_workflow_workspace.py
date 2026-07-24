@@ -45,7 +45,7 @@ class _PublishingAdapter:
 def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: Path):
     workspace = WorkflowWorkspace.create(tmp_path / "al-nonmag")
     controller = GenerationController(workspace.root, "al-nonmag")
-    plan = GenerationPlan(1, 7, 4, 2, 10, (300.0,))
+    plan = GenerationPlan(1, 7, 2, 10, (300.0,))
 
     summary = controller.run_generation(plan, _PublishingAdapter())
 
@@ -64,7 +64,7 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
 def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):
     workspace = WorkflowWorkspace.create(tmp_path / "broken")
     controller = GenerationController(workspace.root, "broken")
-    plan = GenerationPlan(1, 7, 4, 2, 10, (300.0,))
+    plan = GenerationPlan(1, 7, 2, 10, (300.0,))
 
     with pytest.raises(IterationError, match="missing publishable artifacts"):
         controller.run_generation(plan, _PublishingAdapter(complete_artifacts=False))

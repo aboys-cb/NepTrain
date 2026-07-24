@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -14,6 +14,12 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .candidate_pool import (
+    CandidatePoolError,
+    regular_batch_minimum,
+    validate_candidate_pool,
+    write_candidate_pool,
+)
 from .dft import LabelRequest, LabelResult, label
 from .iteration import (
     StageContext,
@@ -37,6 +43,7 @@ MdRunner = Callable[[MdRequest, str], MdResult]
 LabelRunner = Callable[[LabelRequest, str], LabelResult]
 DescriptorRunner = Callable[[Path, Sequence[Atoms]], np.ndarray]
 PredictionRunner = Callable[[Path, Sequence[Atoms], str], Mapping[str, float]]
+_DESCRIPTOR_BATCH_SIZE = 4096
 
 
 def _nep_descriptors(model: Path, frames: Sequence[Atoms]) -> np.ndarray:
@@ -45,6 +52,34 @@ def _nep_descriptors(model: Path, frames: Sequence[Atoms]) -> np.ndarray:
         return np.asarray(calculator.get_structures_descriptors(frames), dtype=np.float64)
     finally:
         calculator.calculator.close()
+
+
+def _batched_descriptors(
+    runner: DescriptorRunner,
+    model: Path,
+    frames: Sequence[Atoms],
+) -> np.ndarray:
+    """Describe every frame while bounding one backend call's working set."""
+
+    chunks = []
+    width = None
+    for start in range(0, len(frames), _DESCRIPTOR_BATCH_SIZE):
+        stop = min(start + _DESCRIPTOR_BATCH_SIZE, len(frames))
+        values = np.asarray(runner(model, frames[start:stop]), dtype=np.float64)
+        if values.ndim != 2 or len(values) != stop - start:
+            raise WorkflowIterationError(
+                "descriptor backend must return one feature row per frame"
+            )
+        if width is None:
+            width = values.shape[1]
+        elif values.shape[1] != width:
+            raise WorkflowIterationError(
+                "descriptor feature width changed between batches"
+            )
+        chunks.append(values)
+    if not chunks:
+        raise WorkflowIterationError("descriptor input cannot be empty")
+    return np.vstack(chunks)
 
 
 def _rmse(reference: np.ndarray, prediction: np.ndarray) -> float:
@@ -345,9 +380,24 @@ class WorkflowIterationAdapter:
 
     def _train(self, context: StageContext) -> StageOutcome:
         if context.generation > 1:
+            lineage_path = context.previous_artifacts.get("model_lineage")
+            if lineage_path is None:
+                raise WorkflowIterationError(
+                    "the previous model generation has no training lineage"
+                )
+            lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+            previous_model = context.previous_artifacts["retrained_model"]
+            if (
+                lineage.get("generation") != context.generation - 1
+                or lineage.get("candidate_model_sha256")
+                != _file_sha256(previous_model)
+            ):
+                raise WorkflowIterationError(
+                    "the previous round did not publish a valid active model lineage"
+                )
             artifacts = {
                 "training_input": context.previous_artifacts["training_set"],
-                "model": context.previous_artifacts["retrained_model"],
+                "model": previous_model,
             }
             if "retrained_checkpoint" in context.previous_artifacts:
                 artifacts["checkpoint"] = context.previous_artifacts[
@@ -387,75 +437,6 @@ class WorkflowIterationAdapter:
             },
         )
 
-    @staticmethod
-    def _balanced_cap(
-        groups: Sequence[tuple[str, list[Atoms]]], limit: int
-    ) -> list[tuple[str, int, Atoms]]:
-        """Cap every source fairly while retaining its full time span.
-
-        ``groups`` may contain trajectories much longer than the candidate
-        budget. Taking their first frames would make a longer MD run pay its
-        full cost while FPS only sees the beginning. Allocate the budget in a
-        round-robin manner, keep pre-failure frames first, and spread the
-        remaining quota over each stable trajectory from start to finish.
-        """
-
-        if limit < 1:
-            return []
-        nonempty = [(source, frames) for source, frames in groups if frames]
-        quotas = [0] * len(nonempty)
-        remaining = min(limit, sum(len(frames) for _, frames in nonempty))
-        while remaining:
-            changed = False
-            for index, (_, frames) in enumerate(nonempty):
-                if quotas[index] >= len(frames):
-                    continue
-                quotas[index] += 1
-                remaining -= 1
-                changed = True
-                if not remaining:
-                    break
-            if not changed:
-                break
-
-        spread_groups: list[tuple[str, list[tuple[int, Atoms]]]] = []
-        for (source, frames), quota in zip(nonempty, quotas):
-            pre_failure = [
-                (index, frame)
-                for index, frame in enumerate(frames)
-                if frame.info.get("md_window") == "pre_failure"
-            ]
-            stable = [
-                (index, frame)
-                for index, frame in enumerate(frames)
-                if frame.info.get("md_window") != "pre_failure"
-            ]
-            if len(pre_failure) >= quota:
-                chosen = pre_failure[-quota:]
-            else:
-                chosen = list(pre_failure)
-                stable_quota = quota - len(chosen)
-                if stable_quota >= len(stable):
-                    chosen.extend(stable)
-                elif stable_quota == 1:
-                    chosen.append(stable[-1])
-                elif stable_quota > 1:
-                    indices = np.linspace(
-                        0, len(stable) - 1, stable_quota
-                    ).round().astype(int)
-                    chosen.extend(stable[int(index)] for index in indices)
-            spread_groups.append((source, chosen))
-
-        selected: list[tuple[str, int, Atoms]] = []
-        for position in range(
-            max((len(frames) for _, frames in spread_groups), default=0)
-        ):
-            for source, frames in spread_groups:
-                if position < len(frames):
-                    frame_index, frame = frames[position]
-                    selected.append((source, frame_index, frame))
-        return selected
-
     def _explore(self, context: StageContext) -> StageOutcome:
         options = self.config.get("md", {})
         sampling = self.config.get("sampling", {})
@@ -467,6 +448,7 @@ class WorkflowIterationAdapter:
         structure_by_id = {structure_id(atoms): atoms for atoms in structures}
         ordered_structure_ids = sorted(structure_by_id)
         target_sources = int(progression.get("md_runs_per_iteration", 1))
+        regular_minimum = regular_batch_minimum(context.plan.max_selected)
         scenario_history = None
         if "scenario_maturity" in context.previous_artifacts:
             scenario_history = json.loads(
@@ -474,12 +456,17 @@ class WorkflowIterationAdapter:
                     encoding="utf-8"
                 )
             )
-        scenario_attempts = self.scenario_ladder.schedule(
+        maximum_frontier = (
+            len(ordered_structure_ids)
+            * len(self.scenario_ladder.temperature_path)
+            * max(self.scenario_ladder.replicas.values())
+        )
+        available_attempts = self.scenario_ladder.schedule(
             ordered_structure_ids,
             pressure=context.plan.pressure,
             generation=context.generation,
             seed=context.plan.seed,
-            limit=min(target_sources, context.plan.dft_budget),
+            limit=max(target_sources, maximum_frontier),
             model_id=_file_sha256(context.artifacts["model"]),
             history=scenario_history,
         )
@@ -494,13 +481,16 @@ class WorkflowIterationAdapter:
                 attempt.replica,
                 attempt.seed,
             )
-            for attempt in scenario_attempts
+            for attempt in available_attempts
         ]
+        executed_attempts = []
+        executed_specs = []
         groups: list[tuple[str, list[Atoms]]] = []
         backend_details: set[str] = set()
         source_metadata: dict[str, dict[str, Any]] = {}
         attempt_results: list[dict[str, Any]] = []
-        for (
+        unique_candidate_ids: set[str] = set()
+        for attempt, (
             structure_identifier,
             temperature,
             steps,
@@ -509,7 +499,25 @@ class WorkflowIterationAdapter:
             target_level,
             replica,
             md_seed,
-        ) in run_specs:
+        ) in zip(available_attempts, run_specs):
+            if (
+                len(executed_attempts) >= target_sources
+                and len(unique_candidate_ids) >= regular_minimum
+            ):
+                break
+            executed_attempts.append(attempt)
+            executed_specs.append(
+                (
+                    structure_identifier,
+                    temperature,
+                    steps,
+                    scenario_identifier,
+                    scenario_attempt_identifier,
+                    target_level,
+                    replica,
+                    md_seed,
+                )
+            )
             atoms = structure_by_id[structure_identifier]
             source = (
                 f"g{context.generation}-s{structure_identifier[:8]}-"
@@ -591,19 +599,11 @@ class WorkflowIterationAdapter:
                     int(frame.info.get("lammps_step", 0)),
                 )
             )
-            stride = int(candidate_pool.get("frame_stride", 1))
-            stable_index = 0
-            thinned_frames = []
-            for frame in usable_frames:
-                if frame.info.get("md_window") == "pre_failure":
-                    thinned_frames.append(frame)
-                    continue
-                if stable_index % stride == 0:
-                    thinned_frames.append(frame)
-                stable_index += 1
-            usable_frames = thinned_frames
             if usable_frames:
                 groups.append((source, usable_frames))
+                unique_candidate_ids.update(
+                    structure_id(frame) for frame in usable_frames
+                )
             source_metadata[source] = {
                 "structure_id": structure_identifier,
                 "scenario_id": scenario_identifier,
@@ -678,9 +678,27 @@ class WorkflowIterationAdapter:
                 )
             output_frames.append(copied)
         output = context.work_dir / "candidates.xyz"
-        ase_write(output, output_frames, format="extxyz")
+        pool_manifest_path = context.work_dir / "candidate-pool.json"
+        failed_md_runs = sum(
+            not bool(item["completed"]) for item in attempt_results
+        )
+        try:
+            pool_manifest = write_candidate_pool(
+                output,
+                pool_manifest_path,
+                output_frames,
+                generation=context.generation,
+                model_path=context.artifacts["model"],
+                requested_md_runs=target_sources,
+                available_md_runs=len(available_attempts),
+                scheduled_md_runs=len(attempt_results),
+                failed_md_runs=failed_md_runs,
+            )
+        except CandidatePoolError as error:
+            raise WorkflowIterationError(str(error)) from error
         artifacts = {
             "candidates": output,
+            "candidate_pool_manifest": pool_manifest_path,
             "md_attempts": _write_json(
                 context.work_dir / "md-attempts.json",
                 {"version": 1, "attempts": attempt_results},
@@ -692,7 +710,7 @@ class WorkflowIterationAdapter:
                 "version": 2,
                 "model_id": _file_sha256(context.artifacts["model"]),
                 "structure_ids": ordered_structure_ids,
-                "attempts": self.scenario_ladder.serialize(scenario_attempts),
+                "attempts": self.scenario_ladder.serialize(executed_attempts),
                 "completed": {
                     str(item["scenario_attempt_id"]): bool(item["completed"])
                     for item in attempt_results
@@ -707,6 +725,9 @@ class WorkflowIterationAdapter:
                 "backend": backend,
                 "inference_backends": sorted(backend_details),
                 "candidate_count": len(output_frames),
+                "unique_candidate_count": len(unique_candidate_ids),
+                "regular_batch_minimum": regular_minimum,
+                "sampling_model_sha256": pool_manifest.model_sha256,
                 "source_count": len(groups),
                 "scheduled_source_count": len(attempt_results),
                 "completed_source_count": sum(
@@ -729,46 +750,41 @@ class WorkflowIterationAdapter:
                 "temperatures": list(context.plan.temperatures),
                 "pressure": context.plan.pressure,
                 "steps": context.plan.steps,
-                "scenario_steps": sorted({int(spec[2]) for spec in run_specs}),
+                "scenario_steps": sorted(
+                    {int(spec[2]) for spec in executed_specs}
+                ),
                 "scenario_targets": sorted(
-                    {str(spec[5]) for spec in run_specs if spec[5] is not None}
+                    {
+                        str(spec[5])
+                        for spec in executed_specs
+                        if spec[5] is not None
+                    }
                 ),
             },
         )
 
     def _select(self, context: StageContext) -> StageOutcome:
         all_candidates = _read_frames(context.artifacts["candidates"])
-        sampling = self.config.get("sampling", {})
-        selection = sampling.get("selection", {})
+        try:
+            pool_manifest = validate_candidate_pool(
+                all_candidates,
+                context.artifacts["candidate_pool_manifest"],
+                generation=context.generation,
+                model_path=context.artifacts["model"],
+            )
+        except CandidatePoolError as error:
+            raise WorkflowIterationError(str(error)) from error
         if "md_attempts" in context.artifacts:
             attempts = json.loads(
                 context.artifacts["md_attempts"].read_text(encoding="utf-8")
             )["attempts"]
-            scheduled_count = len(attempts)
             failed_count = sum(
                 not bool(item["completed"]) for item in attempts
             )
         else:
-            scheduled_count = len(
-                {
-                    str(frame.info.get("scenario_attempt_id"))
-                    if frame.info.get("scenario_attempt_id") is not None
-                    else str(frame.info.get("source_id"))
-                    for frame in all_candidates
-                }
-            )
             failed_count = int(
                 any(not bool(frame.info.get("md_completed", True)) for frame in all_candidates)
             )
-        minimum_budget = int(selection.get("minimum_dft_budget", 1))
-        effective_budget = (
-            context.plan.dft_budget
-            if failed_count
-            else min(
-                context.plan.dft_budget,
-                max(scheduled_count, minimum_budget),
-            )
-        )
         candidates = list(all_candidates)
         training = _read_frames(context.artifacts["training_input"])
         known_ids = {structure_id(frame) for frame in training}
@@ -791,17 +807,6 @@ class WorkflowIterationAdapter:
                 unique_candidates[identifier] = frame
         duplicate_candidate_count = len(candidates) - len(unique_candidates)
         candidates = list(unique_candidates.values())
-        grouped: dict[str, list[Atoms]] = {}
-        for frame in candidates:
-            grouped.setdefault(str(frame.info["source_id"]), []).append(frame)
-        capped = self._balanced_cap(
-            sorted(grouped.items()), context.plan.candidate_count
-        )
-        candidates = [frame for _, _, frame in capped]
-        if not candidates:
-            raise WorkflowIterationError(
-                "sampling.candidate_pool.target removed every MD candidate"
-            )
         candidate_ids = [structure_id(frame) for frame in candidates]
         strata = []
         for frame in candidates:
@@ -818,20 +823,20 @@ class WorkflowIterationAdapter:
             if "md_window" in frame.info:
                 base = f"W={frame.info['md_window']}|{base}"
             strata.append(base)
-        audit_plan = replace(
-            context.plan,
-            dft_budget=effective_budget,
-            # Every frontier point needs at least a small DFT audit. Novelty is
-            # recorded as evidence and decides convergence, not whether the
-            # audit is allowed to happen.
-            min_novelty=0.0,
-        )
         result = stratified_farthest_point_sampling(
-            self.runtime.descriptors(context.artifacts["model"], candidates),
-            self.runtime.descriptors(context.artifacts["model"], training),
+            _batched_descriptors(
+                self.runtime.descriptors,
+                context.artifacts["model"],
+                candidates,
+            ),
+            _batched_descriptors(
+                self.runtime.descriptors,
+                context.artifacts["model"],
+                training,
+            ),
             candidate_ids,
             strata,
-            audit_plan,
+            context.plan,
         )
         selected = [candidates[index] for index in result.selected_indices]
         if not selected:
@@ -840,19 +845,46 @@ class WorkflowIterationAdapter:
             )
         selected_path = context.work_dir / "selected-input.xyz"
         ase_write(selected_path, selected, format="extxyz")
+        regular_minimum = regular_batch_minimum(context.plan.max_selected)
+        emergency_minimum = min(8, context.plan.max_selected)
+        emergency = failed_count > 0
+        batch_kind = (
+            "regular"
+            if len(selected) >= regular_minimum
+            else (
+                "emergency"
+                if emergency and len(selected) >= emergency_minimum
+                else (
+                    "frontier_flush"
+                    if pool_manifest.frontier_exhausted
+                    else "novelty_flush"
+                )
+            )
+        )
         result_path = _write_json(
-            context.work_dir / "selection-result.json", asdict(result)
+            context.work_dir / "selection-result.json",
+            {
+                **asdict(result),
+                "generation": context.generation,
+                "sampling_model_sha256": pool_manifest.model_sha256,
+                "batch_ready": True,
+                "batch_kind": batch_kind,
+                "regular_minimum": regular_minimum,
+            },
         )
         return StageOutcome(
             artifacts={"selected_input": selected_path, "selection_result": result_path},
             metrics={
-                "candidate_count_before_thinning": len(all_candidates),
-                "candidate_count_after_thinning": len(candidates),
+                "candidate_count_before_deduplication": len(all_candidates),
+                "candidate_count_after_deduplication": len(candidates),
                 "duplicate_candidate_count": duplicate_candidate_count,
                 "selected_count": len(selected),
                 "remaining_novelty": result.remaining_novelty,
-                "configured_dft_budget": context.plan.dft_budget,
-                "effective_dft_budget": effective_budget,
+                "configured_max_selected": context.plan.max_selected,
+                "regular_batch_minimum": regular_minimum,
+                "batch_ready": True,
+                "batch_kind": batch_kind,
+                "sampling_model_sha256": pool_manifest.model_sha256,
                 "failed_md_attempt_count": failed_count,
                 "novelty_threshold": context.plan.min_novelty,
                 "novel_selected_count": sum(
@@ -998,15 +1030,38 @@ class WorkflowIterationAdapter:
             or not diagnostic.get("diagnostic_accepted", False)
             or continue_training
         )
+        parent_model_sha256 = _file_sha256(context.artifacts["model"])
+        training_count = len(_read_frames(training_input))
+        previous_training_count = len(
+            _read_frames(context.artifacts["training_input"])
+        )
+        added_count = training_count - previous_training_count
         if not retrain_required:
             decision = {
                 "retrained": False,
-                "reason": "current model passed trajectory DFT diagnostics",
+                "reason": (
+                    "current model passed new-label diagnostics; "
+                    "continue certification without changing the model"
+                ),
+            }
+            lineage = {
+                "version": 1,
+                "generation": context.generation,
+                "parent_model_sha256": parent_model_sha256,
+                "candidate_model_sha256": parent_model_sha256,
+                "model_updated": False,
+                "training_dataset_sha256": _file_sha256(training_input),
+                "training_count": training_count,
+                "pending_label_count": added_count,
+                "trained_on_current_labels": False,
             }
             artifacts = {
                 "retrained_model": context.artifacts["model"],
                 "retraining_decision": _write_json(
                     context.work_dir / "retraining-decision.json", decision
+                ),
+                "model_lineage": _write_json(
+                    context.work_dir / "model-lineage.json", lineage
                 ),
             }
             if "checkpoint" in context.artifacts:
@@ -1017,7 +1072,10 @@ class WorkflowIterationAdapter:
                 artifacts=artifacts,
                 metrics={
                     "backend": "reuse",
-                    "training_count": len(_read_frames(training_input)),
+                    "training_count": training_count,
+                    "parent_model_sha256": parent_model_sha256,
+                    "candidate_model_sha256": parent_model_sha256,
+                    "model_updated": False,
                     **decision,
                 },
             )
@@ -1049,18 +1107,37 @@ class WorkflowIterationAdapter:
                 else (
                     "trajectory DFT diagnostics exceeded thresholds"
                     if not diagnostic.get("diagnostic_accepted", False)
-                    else "continued checkpoint training for global validation"
+                    else "new labels require a new model generation"
                 )
             ),
         }
         artifacts["retraining_decision"] = _write_json(
             context.work_dir / "retraining-decision.json", decision
         )
+        lineage = {
+            "version": 1,
+            "generation": context.generation,
+            "parent_model_sha256": parent_model_sha256,
+            "candidate_model_sha256": _file_sha256(result.best_model),
+            "model_updated": (
+                _file_sha256(result.best_model) != parent_model_sha256
+            ),
+            "training_dataset_sha256": _file_sha256(training_input),
+            "training_count": frame_count,
+            "pending_label_count": 0,
+            "trained_on_current_labels": True,
+        }
+        artifacts["model_lineage"] = _write_json(
+            context.work_dir / "model-lineage.json", lineage
+        )
         return StageOutcome(
             artifacts=artifacts,
             metrics={
                 "backend": result.backend,
                 "training_count": frame_count,
+                "parent_model_sha256": lineage["parent_model_sha256"],
+                "candidate_model_sha256": lineage["candidate_model_sha256"],
+                "model_updated": lineage["model_updated"],
                 **decision,
             },
         )
@@ -1106,6 +1183,31 @@ class WorkflowIterationAdapter:
         retraining = json.loads(
             context.artifacts["retraining_decision"].read_text(encoding="utf-8")
         )
+        lineage = json.loads(
+            context.artifacts["model_lineage"].read_text(encoding="utf-8")
+        )
+        active_model_sha256 = _file_sha256(
+            context.artifacts["retrained_model"]
+        )
+        lineage_valid = bool(
+            lineage.get("candidate_model_sha256") == active_model_sha256
+            and (
+                (
+                    retraining.get("retrained") is True
+                    and lineage.get("trained_on_current_labels") is True
+                )
+                or (
+                    retraining.get("retrained") is False
+                    and lineage.get("model_updated") is False
+                    and lineage.get("parent_model_sha256")
+                    == active_model_sha256
+                )
+            )
+        )
+        if not lineage_valid:
+            raise WorkflowIterationError(
+                "evaluate received an inconsistent active model lineage"
+            )
         diagnostic = json.loads(
             context.artifacts["acquisition_signals"].read_text(encoding="utf-8")
         )
@@ -1139,6 +1241,9 @@ class WorkflowIterationAdapter:
             "model_trained_on_current_labels": bool(
                 retraining["retrained"]
             ),
+            "active_model_sha256": active_model_sha256,
+            "parent_model_sha256": lineage["parent_model_sha256"],
+            "model_updated": bool(lineage["model_updated"]),
             "remaining_novelty": remaining_novelty,
             "novelty_threshold": novelty_threshold,
             "novelty_converged": novelty_converged,

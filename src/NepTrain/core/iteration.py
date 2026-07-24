@@ -42,20 +42,18 @@ def _file_hash(path: Path) -> str:
 class GenerationPlan:
     generation: int
     seed: int
-    candidate_count: int
-    dft_budget: int
+    max_selected: int
     steps: int
     temperatures: tuple[float, ...]
     pressure: float = 0.0
     min_novelty: float = 0.0
-    frame_stride: int = 2
 
     def __post_init__(self) -> None:
         if self.generation < 1:
             raise ValueError("generation must be at least 1")
-        if self.seed < 0 or self.candidate_count < 1 or self.dft_budget < 1:
-            raise ValueError("seed, candidate_count, and dft_budget must be positive")
-        if self.steps < 1 or not self.temperatures or self.frame_stride < 1:
+        if self.seed < 0 or self.max_selected < 1:
+            raise ValueError("seed and max_selected must be positive")
+        if self.steps < 1 or not self.temperatures:
             raise ValueError("steps and temperatures must be non-empty")
         if self.min_novelty < 0:
             raise ValueError("min_novelty must be non-negative")
@@ -69,31 +67,21 @@ def progressive_plans(
     generations: int,
     *,
     seed: int = 20260721,
-    candidate_target: int = 24,
-    candidate_growth: float = 1.0,
-    initial_budget: int = 8,
-    minimum_budget: int = 4,
-    budget_decay: float = 0.75,
+    max_selected: int = 8,
     initial_steps: int = 100,
     temperatures: Sequence[float] = (300.0, 500.0, 700.0),
     pressure: float = 0.0,
     min_novelty: float = 0.0,
-    frame_stride: int = 2,
 ) -> tuple[GenerationPlan, ...]:
-    """Build visible per-generation budgets for the auto sampling policy.
+    """Build visible per-generation plans for the auto sampling policy.
 
     All requested thermodynamic conditions are available from the first
     generation. Scenario maturity decides which condition runs next and how
-    many MD steps it receives.
+    many MD steps it receives. Every valid dump frame remains eligible for
+    global FPS; ``max_selected`` is the only selection-size limit.
     """
 
-    if (
-        generations < 1
-        or not temperatures
-        or candidate_target < 1
-        or candidate_growth <= 0
-        or not 0 < budget_decay <= 1
-    ):
+    if generations < 1 or not temperatures or max_selected < 1:
         raise ValueError("invalid automatic sampling progression")
     plans = []
     for offset in range(generations):
@@ -102,18 +90,11 @@ def progressive_plans(
             GenerationPlan(
                 generation=generation,
                 seed=seed + offset,
-                candidate_count=int(
-                    np.ceil(candidate_target * (candidate_growth**offset))
-                ),
-                dft_budget=max(
-                    minimum_budget,
-                    int(np.ceil(initial_budget * (budget_decay**offset))),
-                ),
+                max_selected=int(max_selected),
                 steps=initial_steps,
                 temperatures=tuple(float(value) for value in temperatures),
                 pressure=float(pressure),
                 min_novelty=float(min_novelty),
-                frame_stride=int(frame_stride),
             )
         )
     return tuple(plans)
@@ -127,6 +108,42 @@ class SelectionResult:
     selected_novelty: tuple[float, ...]
     counts_by_stratum: Mapping[str, int]
     remaining_novelty: float
+
+
+def _nearest_reference_distances(
+    points: np.ndarray,
+    reference: np.ndarray,
+    *,
+    point_batch_size: int = 4096,
+    reference_batch_size: int = 512,
+) -> np.ndarray:
+    """Return exact nearest-reference distances with bounded peak memory."""
+
+    result = np.full(len(points), np.inf, dtype=np.float64)
+    for point_start in range(0, len(points), point_batch_size):
+        point_stop = min(point_start + point_batch_size, len(points))
+        point_chunk = points[point_start:point_stop]
+        point_norm = np.einsum("ij,ij->i", point_chunk, point_chunk)
+        chunk_min = np.full(len(point_chunk), np.inf, dtype=np.float64)
+        for reference_start in range(0, len(reference), reference_batch_size):
+            reference_stop = min(
+                reference_start + reference_batch_size, len(reference)
+            )
+            reference_chunk = reference[reference_start:reference_stop]
+            reference_norm = np.einsum(
+                "ij,ij->i", reference_chunk, reference_chunk
+            )
+            squared = (
+                point_norm[:, None]
+                + reference_norm[None, :]
+                - 2.0 * point_chunk @ reference_chunk.T
+            )
+            chunk_min = np.minimum(
+                chunk_min,
+                np.maximum(squared, 0.0).min(axis=1),
+            )
+        result[point_start:point_stop] = np.sqrt(chunk_min)
+    return result
 
 
 def stratified_farthest_point_sampling(
@@ -165,16 +182,15 @@ def stratified_farthest_point_sampling(
     normalized_points = (points - center) / scale
     normalized_reference = (reference - center) / scale
     if len(reference):
-        distances = np.linalg.norm(
-            normalized_points[:, None, :] - normalized_reference[None, :, :],
-            axis=2,
-        ).min(axis=1)
+        distances = _nearest_reference_distances(
+            normalized_points, normalized_reference
+        )
     else:
         distances = np.linalg.norm(
             normalized_points - normalized_points.mean(axis=0), axis=1
         )
 
-    budget = min(plan.dft_budget, len(points))
+    budget = min(plan.max_selected, len(points))
     selected: list[int] = []
     novelty: list[float] = []
     counts = {group: 0 for group in sorted(set(groups))}

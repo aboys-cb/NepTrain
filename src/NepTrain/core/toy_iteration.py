@@ -44,7 +44,7 @@ class ToyIterationReport:
     profile: str
     generations_requested: int
     generations_completed: int
-    budgets: tuple[int, ...]
+    max_selected: tuple[int, ...]
     steps: tuple[int, ...]
     candidate_counts: tuple[int, ...]
     selected_counts: tuple[int, ...]
@@ -108,10 +108,12 @@ class ToyIterationAdapter:
         profile: str,
         initial_training: Path,
         validation: Path,
+        candidate_count: int = 24,
     ):
         self.profile = profile
         self.initial_training = initial_training.resolve()
         self.validation = validation.resolve()
+        self.candidate_count = int(candidate_count)
         self.scenario_ladder = ScenarioLadder(
             {
                 "smoke_passed": 100,
@@ -187,7 +189,7 @@ class ToyIterationAdapter:
         candidates = toy_candidate_frames(
             self.profile,
             context.plan.seed,
-            context.plan.candidate_count,
+            self.candidate_count,
             generation=context.generation,
             temperatures=tuple(by_temperature),
             pressure=context.plan.pressure,
@@ -230,14 +232,7 @@ class ToyIterationAdapter:
 
     def _select(self, context: StageContext) -> StageOutcome:
         all_candidates = _frames(context.artifacts["candidates"])
-        source_counts: dict[str, int] = {}
-        candidates = []
-        for frame in all_candidates:
-            source = str(frame.info["source_id"])
-            source_index = source_counts.get(source, 0)
-            source_counts[source] = source_index + 1
-            if source_index % context.plan.frame_stride == 0:
-                candidates.append(frame)
+        candidates = list(all_candidates)
         training = _frames(context.artifacts["training_input"])
         candidate_ids = [structure_id(frame) for frame in candidates]
         strata = [
@@ -259,8 +254,8 @@ class ToyIterationAdapter:
         return StageOutcome(
             artifacts={"selected_input": selected_path, "selection_result": result_path},
             metrics={
-                "candidate_count_before_thinning": len(all_candidates),
-                "candidate_count_after_thinning": len(candidates),
+                "candidate_count_before_deduplication": len(all_candidates),
+                "candidate_count_after_deduplication": len(candidates),
                 "selected_count": len(selected),
                 "remaining_novelty": result.remaining_novelty,
                 "counts_by_stratum": dict(result.counts_by_stratum),
@@ -449,7 +444,7 @@ def run_toy_iteration_smoke(
     profile: str = "spin",
     generations: int = 2,
     seed: int = 20260721,
-    dft_budget: int = 8,
+    max_selected: int = 8,
     force: bool = False,
 ) -> ToyIterationReport:
     if profile not in {"ordinary", "spin"}:
@@ -471,8 +466,7 @@ def run_toy_iteration_smoke(
     plans = progressive_plans(
         generations,
         seed=seed,
-        initial_budget=dft_budget,
-        candidate_target=24,
+        max_selected=max_selected,
         initial_steps=100,
     )
 
@@ -533,19 +527,19 @@ def run_toy_iteration_smoke(
         and deterministic
         and resume_reused
         and all(count > 0 for count in selected_counts)
-        and all(b <= a for a, b in zip(
-            [plan.dft_budget for plan in plans],
-            [plan.dft_budget for plan in plans][1:],
-        ))
+        and all(plan.max_selected == max_selected for plan in plans)
         and all(b > a for a, b in zip(training_counts, training_counts[1:]))
     )
     report = ToyIterationReport(
         profile=profile,
         generations_requested=generations,
         generations_completed=len(summaries),
-        budgets=tuple(plan.dft_budget for plan in plans),
+        max_selected=tuple(plan.max_selected for plan in plans),
         steps=tuple(plan.steps for plan in plans),
-        candidate_counts=tuple(plan.candidate_count for plan in plans),
+        candidate_counts=tuple(
+            int(summary.metrics["explore"]["candidate_count"])
+            for summary in summaries
+        ),
         selected_counts=selected_counts,
         strata_counts=strata_counts,
         remaining_novelty=remaining_novelty,
