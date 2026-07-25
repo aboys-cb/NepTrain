@@ -11,6 +11,14 @@ from ase import Atoms
 
 SPIN_KEY = "spin"
 MFORCE_KEY = "mforce"
+_SPIN_ALIASES = ("spins",)
+_MFORCE_ALIASES = (
+    "mforces",
+    "force_mag",
+    "forces_mag",
+    "magnetic_force",
+    "magnetic_forces",
+)
 
 
 class SpinDataError(ValueError):
@@ -31,13 +39,24 @@ def _vector_array(atoms: Atoms, key: str) -> np.ndarray | None:
 def canonicalize_spin_arrays(atoms: Atoms) -> Atoms:
     """Migrate accepted legacy aliases to singular canonical array names."""
 
-    for canonical, alias in ((SPIN_KEY, "spins"), (MFORCE_KEY, "mforces")):
-        if canonical in atoms.arrays and alias in atoms.arrays:
-            if not np.array_equal(atoms.arrays[canonical], atoms.arrays[alias]):
-                raise SpinDataError(f"ambiguous {canonical}: {canonical} and {alias} differ")
-            del atoms.arrays[alias]
-        elif alias in atoms.arrays:
-            atoms.set_array(canonical, np.asarray(atoms.arrays.pop(alias)))
+    for canonical, aliases in (
+        (SPIN_KEY, _SPIN_ALIASES),
+        (MFORCE_KEY, _MFORCE_ALIASES),
+    ):
+        names = [name for name in (canonical, *aliases) if name in atoms.arrays]
+        if not names:
+            continue
+        source = names[0]
+        reference = np.asarray(atoms.arrays[source])
+        for name in names[1:]:
+            if not np.array_equal(reference, atoms.arrays[name]):
+                raise SpinDataError(
+                    f"ambiguous {canonical}: {source} and {name} differ"
+                )
+        if canonical not in atoms.arrays:
+            atoms.set_array(canonical, reference.copy())
+        for alias in aliases:
+            atoms.arrays.pop(alias, None)
     return atoms
 
 
@@ -71,7 +90,7 @@ def prepare_spin_for_dft(atoms: Atoms) -> bool:
 def collect_mforce_from_results(atoms: Atoms, results: dict) -> None:
     """Copy a calculator magnetic-force result into canonical extxyz storage."""
 
-    for key in (MFORCE_KEY, "mforces"):
+    for key in (MFORCE_KEY, *_MFORCE_ALIASES):
         if key in results:
             atoms.set_array(MFORCE_KEY, np.asarray(results[key], dtype=np.float64))
             return

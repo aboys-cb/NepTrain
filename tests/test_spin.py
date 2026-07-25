@@ -49,6 +49,41 @@ def test_spin_labels_are_mandatory_for_training():
         validate_spin_dataset([atoms], require_mforce=True)
 
 
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "mforces",
+        "force_mag",
+        "forces_mag",
+        "magnetic_force",
+        "magnetic_forces",
+    ],
+)
+def test_mforce_aliases_are_canonicalized_for_training(alias: str):
+    atoms = Atoms("Fe", positions=[[0, 0, 0]])
+    spin = np.asarray([[1.0, 0.0, 0.0]])
+    mforce = np.asarray([[0.1, 0.2, 0.3]])
+    atoms.set_array("spin", spin)
+    atoms.set_array(alias, mforce)
+
+    validate_spin_dataset([atoms], require_mforce=True)
+
+    assert alias not in atoms.arrays
+    np.testing.assert_allclose(atoms.arrays["mforce"], mforce)
+
+
+def test_conflicting_mforce_alias_is_rejected():
+    atoms = Atoms("Fe", positions=[[0, 0, 0]])
+    atoms.set_array("spin", np.asarray([[1.0, 0.0, 0.0]]))
+    atoms.set_array("mforce", np.asarray([[0.1, 0.2, 0.3]]))
+    atoms.set_array("force_mag", np.asarray([[0.3, 0.2, 0.1]]))
+
+    with pytest.raises(
+        SpinDataError, match="ambiguous mforce: mforce and force_mag differ"
+    ):
+        validate_spin_dataset([atoms], require_mforce=True)
+
+
 def test_spin_is_forwarded_to_dft_and_mforce_is_collected():
     atoms = Atoms("Fe", positions=[[0, 0, 0]])
     spin = np.asarray([[1.0, 2.0, 3.0]])
