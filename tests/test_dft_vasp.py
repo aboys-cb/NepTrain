@@ -118,13 +118,15 @@ def test_vasp_auto_mode_honors_template_kspacing(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
     request = _request(tmp_path)
     request.input_file.write_text(
-        "IBRION = -1\nNSW = 0\nISPIN = 1\nKSPACING = 0.25\n",
+        "IBRION = -1\nNSW = 0\nISPIN = 1\n"
+        "KSPACING = 0.25\nKGAMMA = .TRUE.\n",
         encoding="utf-8",
     )
 
     label(request, "vasp")
 
-    assert _FakeVaspInput.last_settings["kspacing"] == pytest.approx(0.25)
+    assert "kspacing" not in _FakeVaspInput.last_settings
+    assert "kgamma" not in _FakeVaspInput.last_settings
     assert "kpts" not in _FakeVaspInput.last_settings
 
 

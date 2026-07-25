@@ -6,22 +6,32 @@ from NepTrain.core.config import load_config
 from NepTrain.core.template import init_project
 
 
-def test_init_project_writes_a_valid_narrow_schema_v5(tmp_path):
+def test_init_project_writes_a_valid_narrow_schema_v7(tmp_path):
     project = init_project("local", tmp_path)
     config, changes = load_config(project)
 
     assert changes == []
-    assert config["schema_version"] == 5
+    assert config["schema_version"] == 7
     assert config["training"]["backend"] == "torchnep"
     assert config["md"]["backend"] == "lammps"
-    assert config["sampling"]["conditions"]["temperature_path"] == [300]
-    assert config["sampling"]["conditions"]["production_temperatures"] == [300]
-    assert config["sampling"]["progression"]["replicas"]["production_ready"] == 3
+    route = config["sampling"]["routes"][0]
+    assert route["id"] == "default"
+    assert route["structures"] == ["./structures"]
+    assert route["template_path"] == "./lammps-nvt.in"
+    assert route["conditions"]["temperature_path"] == [300]
+    assert route["conditions"]["production_temperatures"] == [300]
+    assert route["progression"]["replicas"]["production_ready"] == 3
     assert (
-        config["sampling"]["progression"]["steps"]["smoke_passed"]
+        route["progression"]["steps"]["smoke_passed"]
         == 10000
     )
+    assert "evaluation" not in config
+    assert "structures" not in config["md"]
+    assert "template_path" not in config["md"]
     assert "plugin_path" not in config["md"]
+    assert config["dft"]["kpoint_mode"] == "auto"
+    assert "kspacing" not in config["dft"]
+    assert "kpoints" not in config["dft"]
     template = (tmp_path / "lammps-nvt.in").read_text(encoding="utf-8")
     assert "{{ temperature }}" in template
     assert "{{ steps }}" in template
@@ -32,6 +42,10 @@ def test_init_project_writes_a_valid_narrow_schema_v5(tmp_path):
     assert (tmp_path / "lammps-nvt.in").is_file()
     assert (tmp_path / "INCAR").is_file()
     assert (tmp_path / "INPUT").is_file()
+    assert "KSPACING = 0.2" in (tmp_path / "INCAR").read_text(encoding="utf-8")
+    assert "kspacing        0.2" in (
+        tmp_path / "INPUT"
+    ).read_text(encoding="utf-8")
 
 
 def test_init_never_rewrites_an_existing_project_without_force(tmp_path):

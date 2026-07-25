@@ -64,7 +64,11 @@ def run_native_vasp(
             raise NativeVaspError(
                 "VASP kpoint_mode=kspacing requires KSPACING in the request or INCAR"
             )
-        if active_kspacing is not None:
+        if request.kpoint_mode == "auto" and template_kspacing is not None:
+            # read_incar() already loaded KSPACING and KGAMMA.  Do not rewrite
+            # either value: in auto mode the user input remains authoritative.
+            pass
+        elif active_kspacing is not None:
             settings.update(kspacing=active_kspacing, kgamma=request.use_gamma)
         else:
             a, b, c, *_ = atoms.cell.cellpar()

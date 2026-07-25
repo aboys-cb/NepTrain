@@ -1,54 +1,42 @@
-schema_version: 5
+schema_version: 7
 
 training:
   backend: torchnep
   initial_path: ./train.xyz
   config_path: ./nep.in
   device: cuda
-  torch_backend: auto
-  precision: float32
-  use_compile: false
-  finetune_lr_scale: 0.1
-  seed: 20260723
 
 md:
   backend: lammps
-  structures: ./structures
-  template_path: ./lammps.in
   inference_backend: auto
   spin: false
-  lmp: lmp
-  mpiexec: mpirun
-  mpi_ranks: 4
 
 sampling:
-  mode: auto
-
-  conditions:
-    temperature_path:
-      - 300
-      - 500
-      - 700
-    production_temperatures:
-      - 300
-      - 700
-    pressure: 0.0
-    spin_temperature:
-
-  progression:
-    # Minimum MD wave size. NepTrain may add more same-model runs until the
-    # derived labeling floor is reached or the unlocked frontier is exhausted.
-    md_runs_per_iteration: 4
-    steps:
-      smoke_passed: 10000
-      short_stable: 40000
-      long_stable: 160000
-      production_ready: 640000
-    replicas:
-      smoke_passed: 1
-      short_stable: 1
-      long_stable: 2
-      production_ready: 3
+  routes:
+    - id: default
+      structures:
+        - ./structures
+      template_path: ./lammps.in
+      conditions:
+        temperature_path:
+          - 300
+          - 500
+          - 700
+        production_temperatures:
+          - 300
+          - 700
+        pressure: 0.0
+      progression:
+        steps:
+          smoke_passed: 10000
+          short_stable: 40000
+          long_stable: 160000
+          production_ready: 640000
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 2
+          production_ready: 3
 
   candidate_pool:
     pre_failure_frames: 2
@@ -62,19 +50,16 @@ sampling:
       max_spin_magnitude: 20.0
 
   selection:
-    method: fps
     # Maximum DFT selections per active-model round; the regular floor is 50.
     max_selected: 100
-    min_novelty: 0.0
+    novelty: auto
 
 dft:
   backend: vasp
-  n_cpu: 32
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
-  kpoints_use_gamma: true
-  use_k_stype: kspacing
-  kspacing: 0.2
+  # Prefer KSPACING/KGAMMA already written in INCAR.
+  kpoint_mode: auto
 
 evaluation:
   validation_path: ./validation.xyz
@@ -85,16 +70,17 @@ evaluation:
 
 workflow:
   id: fe-workflow
-  max_iterations: 12
+  max_model_generations: 12
   seed: 20260721
 
 execution:
   poll_interval: 30
-  routes:
+  stage_targets:
     training: gpu
     sampling: cpu
     labeling: dft
     analysis: cpu
+  sampling_route_targets: {}
   targets:
     gpu:
       executor: slurm

@@ -29,7 +29,11 @@ class ScenarioMaturityError(ValueError):
 class ScenarioAttempt:
     attempt_id: str
     scenario_id: str
+    route_id: str
+    route_fingerprint: str
+    template_sha256: str
     structure_id: str
+    structure_hash: str
     temperature: float
     pressure: float
     previous_level: str
@@ -41,9 +45,17 @@ class ScenarioAttempt:
     seed: int
 
 
-def _scenario_id(structure_id: str, temperature: float, pressure: float) -> str:
+def _scenario_id(
+    route_id: str,
+    route_fingerprint: str,
+    structure_id: str,
+    temperature: float,
+    pressure: float,
+) -> str:
     payload = json.dumps(
         {
+            "route_id": route_id,
+            "route_fingerprint": route_fingerprint,
             "structure_id": structure_id,
             "temperature": float(temperature),
             "pressure": float(pressure),
@@ -261,18 +273,28 @@ class ScenarioLadder:
     def _record(
         self,
         scenarios: Mapping[str, Any],
+        route_id: str,
+        route_fingerprint: str,
         structure_id: str,
         temperature: float,
         pressure: float,
     ) -> Mapping[str, Any]:
         return scenarios.get(
-            _scenario_id(structure_id, temperature, pressure),
+            _scenario_id(
+                route_id,
+                route_fingerprint,
+                structure_id,
+                temperature,
+                pressure,
+            ),
             {"maturity": "untested", "evidence": []},
         )
 
     def _temperature_unlocked(
         self,
         scenarios: Mapping[str, Any],
+        route_id: str,
+        route_fingerprint: str,
         structure_id: str,
         temperature_index: int,
         pressure: float,
@@ -281,6 +303,8 @@ class ScenarioLadder:
             return True
         previous = self._record(
             scenarios,
+            route_id,
+            route_fingerprint,
             structure_id,
             self.temperature_path[temperature_index - 1],
             pressure,
@@ -295,6 +319,8 @@ class ScenarioLadder:
     ) -> str | None:
         current = str(record["maturity"])
         if current == "untested":
+            return "smoke_passed"
+        if record.get("canary_model_id") != model_id:
             return "smoke_passed"
         if temperature not in self.production_temperatures:
             return None
@@ -321,7 +347,7 @@ class ScenarioLadder:
         return sum(
             bool(item.get("accepted"))
             and item.get("target_level") == target
-            and (target != "production_ready" or item.get("model_id") == model_id)
+            and item.get("model_id") == model_id
             for item in record.get("evidence", [])
         )
 
@@ -329,6 +355,9 @@ class ScenarioLadder:
         self,
         structure_ids: Sequence[str],
         *,
+        route_id: str = "default",
+        route_fingerprint: str = "default",
+        template_sha256: str = "default",
         pressure: float,
         generation: int,
         seed: int,
@@ -342,8 +371,15 @@ class ScenarioLadder:
             raise ScenarioMaturityError(
                 "generation and scenario limit must be positive"
             )
-        if not model_id:
-            raise ScenarioMaturityError("scenario scheduling requires model_id")
+        if (
+            not model_id
+            or not route_id
+            or not route_fingerprint
+            or not template_sha256
+        ):
+            raise ScenarioMaturityError(
+                "scenario scheduling requires route identity and model_id"
+            )
         structures = sorted(set(str(value) for value in structure_ids))
         if not structures or any(not value for value in structures):
             raise ScenarioMaturityError(
@@ -364,12 +400,28 @@ class ScenarioLadder:
         for structure_index, structure in enumerate(structures):
             for temperature_index, temperature in enumerate(self.temperature_path):
                 if not self._temperature_unlocked(
-                    scenarios, structure, temperature_index, pressure
+                    scenarios,
+                    route_id,
+                    route_fingerprint,
+                    structure,
+                    temperature_index,
+                    pressure,
                 ):
                     continue
-                identifier = _scenario_id(structure, temperature, pressure)
+                identifier = _scenario_id(
+                    route_id,
+                    route_fingerprint,
+                    structure,
+                    temperature,
+                    pressure,
+                )
                 record = self._record(
-                    scenarios, structure, temperature, pressure
+                    scenarios,
+                    route_id,
+                    route_fingerprint,
+                    structure,
+                    temperature,
+                    pressure,
                 )
                 target = self._target(record, temperature, model_id)
                 if target is None:
@@ -415,9 +467,20 @@ class ScenarioLadder:
         if not candidates and state.get("validation_accepted") is False:
             for structure in structures:
                 for temperature in self.production_temperatures:
-                    identifier = _scenario_id(structure, temperature, pressure)
+                    identifier = _scenario_id(
+                        route_id,
+                        route_fingerprint,
+                        structure,
+                        temperature,
+                        pressure,
+                    )
                     record = self._record(
-                        scenarios, structure, temperature, pressure
+                        scenarios,
+                        route_id,
+                        route_fingerprint,
+                        structure,
+                        temperature,
+                        pressure,
                     )
                     if record["maturity"] != "production_ready":
                         continue
@@ -459,7 +522,11 @@ class ScenarioLadder:
                 ScenarioAttempt(
                     attempt_id=attempt_id,
                     scenario_id=value["scenario_id"],
+                    route_id=route_id,
+                    route_fingerprint=route_fingerprint,
+                    template_sha256=template_sha256,
                     structure_id=value["structure_id"],
+                    structure_hash=value["structure_id"],
                     temperature=float(value["temperature"]),
                     pressure=float(pressure),
                     previous_level=value["previous_level"],
@@ -478,11 +545,12 @@ class ScenarioLadder:
         attempts: Sequence[ScenarioAttempt | Mapping[str, Any]],
         *,
         completed: Mapping[str, bool],
-        diagnostic_accepted: Mapping[str, bool],
+        diagnostic_accepted: Mapping[str, bool | None],
         history: Mapping[str, Any] | None = None,
         diagnostic: Mapping[str, Any] | None = None,
         validation: Mapping[str, Any] | None = None,
-        validation_accepted: bool,
+        evidence_validation: Mapping[str, Any] | None = None,
+        validation_accepted: bool | None,
         model_improved: bool,
         novelty_converged: bool,
         final_model_id: str,
@@ -500,8 +568,13 @@ class ScenarioLadder:
             ("completion", completed),
             ("diagnostic", diagnostic_accepted),
         ):
+            valid_values = (
+                (bool,)
+                if name == "completion"
+                else (bool, type(None))
+            )
             if set(values) != attempt_ids or not all(
-                isinstance(value, bool) for value in values.values()
+                isinstance(value, valid_values) for value in values.values()
             ):
                 raise ScenarioMaturityError(
                     f"scenario {name} results must match every planned attempt"
@@ -531,7 +604,11 @@ class ScenarioLadder:
                 attempt.scenario_id,
                 {
                     "scenario_id": attempt.scenario_id,
+                    "route_id": attempt.route_id,
+                    "route_fingerprint": attempt.route_fingerprint,
+                    "template_sha256": attempt.template_sha256,
                     "structure_id": attempt.structure_id,
+                    "structure_hash": attempt.structure_hash,
                     "temperature": attempt.temperature,
                     "pressure": attempt.pressure,
                     "maturity": "untested",
@@ -539,14 +616,18 @@ class ScenarioLadder:
                 },
             )
             if (
-                record["structure_id"] != attempt.structure_id
+                record["route_id"] != attempt.route_id
+                or record["route_fingerprint"] != attempt.route_fingerprint
+                or record["template_sha256"] != attempt.template_sha256
+                or record["structure_id"] != attempt.structure_id
+                or record["structure_hash"] != attempt.structure_hash
                 or float(record["temperature"]) != attempt.temperature
                 or float(record["pressure"]) != attempt.pressure
             ):
                 raise ScenarioMaturityError("scenario identity metadata changed")
             trusted = bool(
                 completed[attempt.attempt_id]
-                and diagnostic_accepted[attempt.attempt_id]
+                and diagnostic_accepted[attempt.attempt_id] is not False
             )
             record["evidence"].append(
                 {
@@ -565,7 +646,11 @@ class ScenarioLadder:
                     "diagnostic": _compact_metrics(
                         attempt_diagnostics.get(attempt.attempt_id, {})
                     ),
-                    "validation": _compact_metrics(validation or {}),
+                    "validation": _compact_metrics(
+                        evidence_validation
+                        if evidence_validation is not None
+                        else (validation or {})
+                    ),
                 }
             )
 
@@ -591,11 +676,15 @@ class ScenarioLadder:
             if accepted < self.replicas[target]:
                 continue
             if target != "production_ready":
+                canary_changed = record.get("canary_model_id") != model_id
+                record["canary_model_id"] = model_id
                 if (
                     MATURITY_LEVELS.index(target)
                     > MATURITY_LEVELS.index(record["maturity"])
                 ):
                     record["maturity"] = target
+                    promoted_count += 1
+                elif canary_changed and model_id == final_model_id:
                     promoted_count += 1
             else:
                 changed = (
@@ -603,6 +692,7 @@ class ScenarioLadder:
                     or record.get("verified_model_id") != model_id
                 )
                 record["maturity"] = "production_ready"
+                record["canary_model_id"] = model_id
                 record["verified_model_id"] = model_id
                 promoted_count += int(changed and model_id == final_model_id)
 
@@ -622,13 +712,15 @@ class ScenarioLadder:
             (attempt.generation for attempt in normalized),
             default=state.get("last_generation", 0),
         )
-        state["validation_accepted"] = bool(validation_accepted)
+        state["validation_accepted"] = validation_accepted
         state["last_model_id"] = final_model_id
         state["last_promoted_count"] = promoted_count
         progress_made = bool(promoted_count or model_improved)
         state["no_progress_rounds"] = (
             0
-            if progress_made or validation_accepted or not novelty_converged
+            if progress_made
+            or validation_accepted is True
+            or not novelty_converged
             else int(state.get("no_progress_rounds", 0)) + 1
         )
         return state
@@ -637,6 +729,8 @@ class ScenarioLadder:
         self,
         structure_ids: Sequence[str],
         *,
+        route_id: str = "default",
+        route_fingerprint: str = "default",
         pressure: float,
         model_id: str,
         history: Mapping[str, Any],
@@ -648,7 +742,12 @@ class ScenarioLadder:
         return all(
             (
                 record := self._record(
-                    scenarios, str(structure), temperature, pressure
+                    scenarios,
+                    route_id,
+                    route_fingerprint,
+                    str(structure),
+                    temperature,
+                    pressure,
                 )
             ).get("maturity")
             == "production_ready"

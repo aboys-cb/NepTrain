@@ -21,6 +21,7 @@ import traceback
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .iteration import GenerationPlan, StageContext, StageOutcome
+from .sampling_route import load_sampling_routes
 
 
 class ExecutionError(RuntimeError):
@@ -60,7 +61,7 @@ def _slurm_state(value: str) -> str:
 
 _STAGE_CONFIG_PATH_FIELDS = {
     "train": ("training.config_path", "training.test_path"),
-    "explore": ("md.structures", "md.template_path"),
+    "explore": (),
     "select": (),
     "label": ("dft.input_path", "dft.resource_path"),
     "diagnose": (),
@@ -92,7 +93,11 @@ _STAGE_ARTIFACTS = {
     "evaluate": (
         "training_input",
         "training_set",
+        "model",
+        "checkpoint",
+        "labeled",
         "retrained_model",
+        "retrained_checkpoint",
         "retraining_decision",
         "model_lineage",
         "scenario_plan",
@@ -104,9 +109,9 @@ _STAGE_ARTIFACTS = {
 _STAGE_PREVIOUS_ARTIFACTS = {
     "train": (
         "training_set",
-        "retrained_model",
-        "retrained_checkpoint",
-        "model_lineage",
+        "activated_model",
+        "activated_checkpoint",
+        "active_model_lineage",
     ),
     "explore": ("scenario_maturity",),
     "select": (),
@@ -228,7 +233,7 @@ class ExecutionTarget:
     cpus_per_task: int | None = None
     gpus_per_node: int | None = None
     directives: tuple[str, ...] = ()
-    overrides: Mapping[str, Any] = field(default_factory=dict)
+    dft_resource_path: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -287,16 +292,27 @@ class ExecutionTarget:
             raise ExecutionError(f"execution target {name} has invalid cpus_per_task")
         if gpus is not None and int(gpus) < 0:
             raise ExecutionError(f"execution target {name} has invalid gpus_per_node")
-        overrides = dict(value.get("overrides", {}))
-        for dotted in overrides:
-            if dotted.split(".", 1)[0] not in {
-                "training",
-                "md",
-                "dft",
-                "evaluation",
-            }:
+        dft_resource_path = value.get("dft_resource_path")
+        if dft_resource_path is not None and any(
+            character in str(dft_resource_path) for character in "\r\n"
+        ):
+            raise ExecutionError(
+                f"execution target {name}.dft_resource_path cannot contain newlines"
+            )
+        if dft_resource_path is not None:
+            resource_text = str(dft_resource_path)
+            if not (
+                Path(resource_text).is_absolute()
+                or resource_text.startswith("~/")
+            ):
                 raise ExecutionError(
-                    f"execution target {name} has unsupported override {dotted}"
+                    f"execution target {name}.dft_resource_path must be absolute "
+                    "or start with ~/"
+                )
+            if ".." in Path(resource_text.removeprefix("~/")).parts:
+                raise ExecutionError(
+                    f"execution target {name}.dft_resource_path cannot contain "
+                    "parent traversal"
                 )
         environment = dict(value.get("environment", {}))
         invalid_environment = [
@@ -334,7 +350,9 @@ class ExecutionTarget:
             cpus_per_task=int(cpus) if cpus is not None else None,
             gpus_per_node=int(gpus) if gpus is not None else None,
             directives=directives,
-            overrides=overrides,
+            dft_resource_path=(
+                str(dft_resource_path) if dft_resource_path is not None else None
+            ),
             environment={
                 str(key): str(item)
                 for key, item in environment.items()
@@ -416,12 +434,29 @@ def build_stage_task(
     config: Mapping[str, Any],
     initial_training: Path,
     context: StageContext,
+    stage_input: Mapping[str, Any] | None = None,
 ) -> StageTask:
     """Build an immutable, self-contained task directory."""
 
     if stage not in _STAGE_CONFIG_PATH_FIELDS:
         raise ExecutionError(f"unsupported stage task: {stage}")
 
+    requested_route_id = str((stage_input or {}).get("route_id", ""))
+    route_identities = (
+        [
+            {
+                "route_id": route.route_id,
+                "route_fingerprint": route.fingerprint,
+            }
+            for route in load_sampling_routes(
+                config["sampling"],
+                base_dir=workflow_root,
+            )
+            if not requested_route_id or route.route_id == requested_route_id
+        ]
+        if config.get("sampling", {}).get("routes")
+        else []
+    )
     identity = {
         "workflow_id": workflow_id,
         "generation": generation,
@@ -429,6 +464,8 @@ def build_stage_task(
         "attempt": attempt,
         "plan_sha256": plan.sha256,
         "target": target.name,
+        "sampling_routes": route_identities,
+        "stage_input": dict(stage_input or {}),
     }
     task_id = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
@@ -449,8 +486,20 @@ def build_stage_task(
     inputs = temporary / "inputs"
     inputs.mkdir(parents=True, exist_ok=True)
     portable_config = json.loads(json.dumps(config))
-    for dotted, replacement in target.overrides.items():
-        _set_dotted(portable_config, dotted, replacement)
+    if stage == "explore" and requested_route_id:
+        portable_config["sampling"]["routes"] = [
+            route
+            for route in portable_config["sampling"]["routes"]
+            if str(route["id"]) == requested_route_id
+        ]
+        if len(portable_config["sampling"]["routes"]) != 1:
+            raise ExecutionError(
+                f"explore task refers to unknown route {requested_route_id}"
+            )
+    if stage == "label" and target.dft_resource_path:
+        portable_config.setdefault("dft", {})["resource_path"] = (
+            target.dft_resource_path
+        )
 
     path_fields = set(_STAGE_CONFIG_PATH_FIELDS[stage])
     evaluation = portable_config.get("evaluation", {})
@@ -466,7 +515,7 @@ def build_stage_task(
         value = _get_dotted(portable_config, dotted)
         if value in {None, "", "auto"}:
             continue
-        if dotted in target.overrides:
+        if dotted == "dft.resource_path" and target.dft_resource_path:
             continue
         source = _resolve_path(value, workflow_root)
         suffix = source.suffix if source.is_file() else ""
@@ -479,6 +528,38 @@ def build_stage_task(
             dotted,
             str(destination.relative_to(temporary)),
         )
+
+    if stage == "explore":
+        for route_index, route in enumerate(
+            portable_config.get("sampling", {}).get("routes", [])
+        ):
+            route_root = (
+                inputs
+                / "sampling"
+                / "routes"
+                / f"{route_index:03d}-{route['id']}"
+            )
+            source = _resolve_path(
+                route["template_path"], workflow_root
+            )
+            destination = route_root / f"template{source.suffix}"
+            _copy_input(source, destination)
+            route["template_path"] = str(
+                destination.relative_to(temporary)
+            )
+            copied_structures = []
+            for structure_index, value in enumerate(route["structures"]):
+                source = _resolve_path(value, workflow_root)
+                destination = (
+                    route_root / "structures" / str(structure_index)
+                )
+                if source.is_file():
+                    destination = destination.with_suffix(source.suffix)
+                _copy_input(source, destination)
+                copied_structures.append(
+                    str(destination.relative_to(temporary))
+                )
+            route["structures"] = copied_structures
 
     initial_destination = inputs / "initial" / initial_training.name
     if not initial_destination.exists():
@@ -514,6 +595,7 @@ def build_stage_task(
         "config": portable_config,
         "initial_training": str(initial_destination.relative_to(temporary)),
         "plan": asdict(plan),
+        "stage_input": dict(stage_input or {}),
         "artifacts": copy_artifacts(
             context.artifacts, "current", _STAGE_ARTIFACTS[stage]
         ),
@@ -584,7 +666,6 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             )
             config = descriptor["config"]
             plan_value = dict(descriptor["plan"])
-            plan_value["temperatures"] = tuple(plan_value["temperatures"])
             plan = GenerationPlan(**plan_value)
             resolve = lambda value: _safe_relative(bundle, value, "task input path")
             artifacts = {
@@ -613,6 +694,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     artifacts=artifacts,
                     previous_artifacts=previous,
                     stage_dir=work_dir,
+                    stage_input=dict(descriptor.get("stage_input", {})),
                 ),
             )
             result_root = bundle / "result"

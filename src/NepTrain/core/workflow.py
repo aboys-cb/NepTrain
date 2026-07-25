@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from .workflow_workspace import WorkflowWorkspace
+from .sampling_route import load_sampling_routes
 
 
 class WorkflowError(RuntimeError):
@@ -199,10 +200,15 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
     for key in ("config_path", "test_path"):
         if training.get(key):
             training[key] = _absolute_path(training[key], base_dir)
-    md = resolved.get("md", {})
-    for key in ("structures", "template_path"):
-        if md.get(key):
-            md[key] = _absolute_path(md[key], base_dir)
+    for route in resolved.get("sampling", {}).get("routes", []):
+        route["structures"] = [
+            _absolute_path(value, base_dir)
+            for value in route.get("structures", [])
+        ]
+        if route.get("template_path"):
+            route["template_path"] = _absolute_path(
+                route["template_path"], base_dir
+            )
     dft = resolved.get("dft", {})
     for key in ("input_path", "resource_path"):
         if dft.get(key):
@@ -317,20 +323,20 @@ def _plans(
 ) -> tuple[Any, ...]:
     from .iteration import progressive_plans
 
-    conditions = sampling["conditions"]
-    progression = sampling["progression"]
     selection = sampling["selection"]
-    steps = progression["steps"]
+    novelty = selection.get("novelty", "auto")
+    if novelty == "auto":
+        selection_threshold = 0.0
+        completion_threshold = 0.0
+    else:
+        selection_threshold = float(novelty["selection_threshold"])
+        completion_threshold = float(novelty["completion_threshold"])
     plans = progressive_plans(
-        int(settings.get("max_iterations", 1)),
+        int(settings.get("max_model_generations", 1)),
         seed=int(settings.get("seed", 20260721)),
         max_selected=int(selection["max_selected"]),
-        initial_steps=int(steps["smoke_passed"]),
-        temperatures=tuple(
-            float(value) for value in conditions["temperature_path"]
-        ),
-        pressure=float(conditions.get("pressure", 0.0)),
-        min_novelty=float(selection.get("min_novelty", 0.0)),
+        selection_novelty_threshold=selection_threshold,
+        completion_coverage_threshold=completion_threshold,
     )
     return plans
 
@@ -338,20 +344,33 @@ def _plans(
 def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     paths: list[tuple[str, Path]] = []
     training = config.get("training", {})
-    md = config.get("md", {})
+    sampling = config.get("sampling", {})
     dft = config.get("dft", {})
     evaluation = config.get("evaluation", {})
     for role, value in (
         ("training_config", training.get("config_path")),
         ("training_test", training.get("test_path")),
-        ("md_structures", md.get("structures")),
-        ("md_template", md.get("template_path")),
         ("dft_input", dft.get("input_path")),
         ("dft_resources", dft.get("resource_path")),
         ("evaluation_validation", evaluation.get("validation_path")),
     ):
         if value and value != "auto":
             paths.append((role, Path(value)))
+    for route in sampling.get("routes", []):
+        route_id = str(route["id"])
+        paths.append(
+            (
+                f"sampling_route_{route_id}_template",
+                Path(route["template_path"]),
+            )
+        )
+        paths.extend(
+            (
+                f"sampling_route_{route_id}_structure_{index}",
+                Path(value),
+            )
+            for index, value in enumerate(route["structures"])
+        )
     for name, target in config.get("execution", {}).get("targets", {}).items():
         setup_script = target.get("setup_script")
         if setup_script and setup_script != "auto":
@@ -531,17 +550,16 @@ def prepare_workflow(
     except ConfigError as error:
         raise WorkflowError(f"invalid project configuration: {error}") from error
     config = _resolved_config(config, source_config.parent)
-    labeling_target_name = config["execution"]["routes"]["labeling"]
+    labeling_target_name = config["execution"]["stage_targets"]["labeling"]
     labeling_target = config["execution"]["targets"][labeling_target_name]
-    target_overrides = labeling_target.get("overrides", {})
-    dft_backend = target_overrides.get("dft.backend", config["dft"]["backend"])
-    dft_resource = target_overrides.get(
-        "dft.resource_path", config["dft"].get("resource_path")
+    dft_backend = config["dft"]["backend"]
+    dft_resource = labeling_target.get(
+        "dft_resource_path", config["dft"].get("resource_path")
     )
     if dft_backend in {"vasp", "abacus"} and not dft_resource:
         raise WorkflowError(
-            f"{dft_backend} workflows require dft.resource_path or the "
-            "labeling target override dft.resource_path"
+            f"{dft_backend} workflows require dft.resource_path or "
+            "execution.targets.<labeling>.dft_resource_path"
         )
     settings = config.get("workflow", {})
     selected_id = workflow_id or str(settings.get("id", output.name))
@@ -595,6 +613,19 @@ def prepare_workflow(
     save_config(portable_config, resolved_config)
     runtime_config = _resolved_config(portable_config, workspace.root)
     dependencies = _dependencies(runtime_config)
+    sampling_routes = [
+        {
+            "route_id": route.route_id,
+            "route_fingerprint": route.fingerprint,
+            "template_sha256": route.template_sha256,
+            "structure_source_sha256": list(
+                route.structure_source_sha256
+            ),
+        }
+        for route in load_sampling_routes(
+            runtime_config["sampling"], base_dir=workspace.root
+        )
+    ]
     plan_paths: list[Path] = []
     for plan in plans:
         plan_path = workspace.plans_dir / f"generation-{plan.generation}.json"
@@ -603,7 +634,7 @@ def prepare_workflow(
     script_paths: list[Path] = []
 
     manifest = {
-        "version": 3,
+        "version": 4,
         "layout_version": workspace.version,
         "orchestration": "controller-v1",
         "workflow_id": selected_id,
@@ -620,6 +651,7 @@ def prepare_workflow(
             {"path": str(path), "sha256": _sha256(path)} for path in script_paths
         ],
         "dependencies": dependencies,
+        "sampling_routes": sampling_routes,
         "jobs": [],
     }
     _write_json(manifest_path, manifest)
@@ -650,9 +682,9 @@ def extend_workflow(
             )
 
         portable_config, _ = load_config(preparation.config_file)
-        portable_config.setdefault("workflow", {})["max_iterations"] = int(
-            total_generations
-        )
+        portable_config.setdefault("workflow", {})[
+            "max_model_generations"
+        ] = int(total_generations)
         config = _resolved_config(
             portable_config, preparation.config_file.parent
         )
@@ -1191,9 +1223,12 @@ def _generation_science(
         "completed_stages": tuple(stage for stage in _STAGES if stage in stages),
         "plan": {
             "max_selected": int(plan["max_selected"]),
-            "steps": int(plan["steps"]),
-            "temperatures": tuple(float(value) for value in plan["temperatures"]),
-            "pressure": float(plan.get("pressure", 0.0)),
+            "selection_novelty_threshold": float(
+                plan.get("selection_novelty_threshold", 0.0)
+            ),
+            "completion_coverage_threshold": float(
+                plan.get("completion_coverage_threshold", 0.0)
+            ),
         },
         "sampling": {
             "candidate_count": explore.get("candidate_count"),
@@ -1413,39 +1448,59 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         current = controller.get("current")
         jobs = []
         for item in controller.get("history", []):
-            handle = item.get("handle") or {}
             if item.get("completed_at"):
                 execution_state = "COMPLETED"
             elif item.get("cancelled_at"):
                 execution_state = "CANCELLED"
             else:
                 execution_state = "FAILED"
-            jobs.append(
-                {
-                    "attempt": f"attempt-{item.get('attempt', 1)}",
-                    "script": f"{item.get('target', '-')}/{item.get('stage', '-')}",
-                    "job_id": handle.get("execution_id"),
-                    "dependency": None,
-                    "state": execution_state,
-                    "current": False,
-                    "detail": item.get("failure")
-                    or (item.get("cancellation") or {}).get("detail"),
-                }
+            task_records = (
+                item.get("tasks", [])
+                if item.get("kind") == "task_group"
+                else [item]
             )
+            for task_record in task_records:
+                handle = task_record.get("handle") or {}
+                jobs.append(
+                    {
+                        "attempt": f"attempt-{item.get('attempt', 1)}",
+                        "script": (
+                            f"{task_record.get('target', '-')}/"
+                            f"{item.get('stage', '-')}"
+                        ),
+                        "job_id": handle.get("execution_id"),
+                        "dependency": None,
+                        "state": execution_state,
+                        "current": False,
+                        "detail": item.get("failure")
+                        or (item.get("cancellation") or {}).get("detail"),
+                    }
+                )
         if current:
-            handle = current.get("handle") or {}
-            observed = str(current.get("observed_state", controller_state)).upper()
-            jobs.append(
-                {
-                    "attempt": f"attempt-{current.get('attempt', 1)}",
-                    "script": f"{current.get('target', '-')}/{current.get('stage', '-')}",
-                    "job_id": handle.get("execution_id"),
-                    "dependency": None,
-                    "state": observed,
-                    "current": True,
-                    "detail": current.get("detail"),
-                }
+            task_records = (
+                current.get("tasks", [])
+                if current.get("kind") == "task_group"
+                else [current]
             )
+            for task_record in task_records:
+                handle = task_record.get("handle") or {}
+                observed = str(
+                    task_record.get("observed_state", controller_state)
+                ).upper()
+                jobs.append(
+                    {
+                        "attempt": f"attempt-{current.get('attempt', 1)}",
+                        "script": (
+                            f"{task_record.get('target', '-')}/"
+                            f"{current.get('stage', '-')}"
+                        ),
+                        "job_id": handle.get("execution_id"),
+                        "dependency": None,
+                        "state": observed,
+                        "current": True,
+                        "detail": task_record.get("detail"),
+                    }
+                )
         state = progress.state
         reason = progress.reason
         next_action = None
@@ -1456,7 +1511,11 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             )
         elif controller_state == "budget_exhausted":
             state = "budget_exhausted"
-            reason = str(controller.get("reason", "iteration budget exhausted"))
+            reason = str(
+                controller.get(
+                    "reason", "model-generation budget exhausted"
+                )
+            )
             next_action = (
                 f"neptrain workflow extend "
                 f"{shlex.quote(str(preparation.output_dir))} "
@@ -1772,7 +1831,6 @@ def _retry_failed_workflow_locked(
         value = json.loads(
             preparation.plans[progress.generation - 1].read_text(encoding="utf-8")
         )
-        value["temperatures"] = tuple(value["temperatures"])
         controller = GenerationController(
             WorkflowWorkspace.locate(output).controller_root,
             preparation.workflow_id,

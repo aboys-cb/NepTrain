@@ -6,7 +6,8 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Sequence
+from collections import Counter
+from typing import Mapping, Sequence
 
 from ase import Atoms
 from ase.io import write as ase_write
@@ -37,6 +38,8 @@ class CandidatePoolManifest:
     available_md_runs: int
     scheduled_md_runs: int
     failed_md_runs: int
+    route_fingerprints: Mapping[str, str]
+    counts_by_route: Mapping[str, int]
 
     @property
     def frontier_exhausted(self) -> bool:
@@ -63,6 +66,8 @@ def write_candidate_pool(
         )
     model_id = file_sha256(model_path)
     output = []
+    route_fingerprints: dict[str, str] = {}
+    counts_by_route: Counter[str] = Counter()
     for frame in frames:
         copied = frame.copy()
         existing = copied.info.get("sampling_model_sha256")
@@ -72,6 +77,22 @@ def write_candidate_pool(
             )
         copied.info["model_generation"] = int(generation)
         copied.info["sampling_model_sha256"] = model_id
+        route_id = str(copied.info.get("route_id", ""))
+        route_fingerprint = str(
+            copied.info.get("route_fingerprint", "")
+        )
+        if not route_id or not route_fingerprint:
+            raise CandidatePoolError(
+                "candidate frame is missing sampling route provenance"
+            )
+        existing_route = route_fingerprints.setdefault(
+            route_id, route_fingerprint
+        )
+        if existing_route != route_fingerprint:
+            raise CandidatePoolError(
+                "one route id has multiple fingerprints in the candidate pool"
+            )
+        counts_by_route[route_id] += 1
         output.append(copied)
     candidates_path.parent.mkdir(parents=True, exist_ok=True)
     ase_write(candidates_path, output, format="extxyz")
@@ -83,11 +104,13 @@ def write_candidate_pool(
         available_md_runs=int(available_md_runs),
         scheduled_md_runs=int(scheduled_md_runs),
         failed_md_runs=int(failed_md_runs),
+        route_fingerprints=dict(sorted(route_fingerprints.items())),
+        counts_by_route=dict(sorted(counts_by_route.items())),
     )
     manifest_path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 **asdict(manifest),
                 "frontier_exhausted": manifest.frontier_exhausted,
             },
@@ -110,7 +133,7 @@ def validate_candidate_pool(
     """Fail closed if a selection stage sees stale or mixed-model candidates."""
 
     value = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if value.get("version") != 1:
+    if value.get("version") != 2:
         raise CandidatePoolError("unsupported candidate pool manifest")
     manifest = CandidatePoolManifest(
         generation=int(value["generation"]),
@@ -120,6 +143,14 @@ def validate_candidate_pool(
         available_md_runs=int(value["available_md_runs"]),
         scheduled_md_runs=int(value["scheduled_md_runs"]),
         failed_md_runs=int(value["failed_md_runs"]),
+        route_fingerprints={
+            str(key): str(item)
+            for key, item in value["route_fingerprints"].items()
+        },
+        counts_by_route={
+            str(key): int(item)
+            for key, item in value["counts_by_route"].items()
+        },
     )
     expected_model = file_sha256(model_path)
     if manifest.generation != generation:
@@ -128,6 +159,8 @@ def validate_candidate_pool(
         raise CandidatePoolError("candidate pool belongs to another sampling model")
     if manifest.frame_count != len(frames):
         raise CandidatePoolError("candidate pool frame count drifted")
+    observed_routes: dict[str, str] = {}
+    observed_counts: Counter[str] = Counter()
     for frame in frames:
         if int(frame.info.get("model_generation", -1)) != generation:
             raise CandidatePoolError(
@@ -137,6 +170,26 @@ def validate_candidate_pool(
             raise CandidatePoolError(
                 "candidate frame belongs to another sampling model"
             )
+        route_id = str(frame.info.get("route_id", ""))
+        route_fingerprint = str(frame.info.get("route_fingerprint", ""))
+        if not route_id or not route_fingerprint:
+            raise CandidatePoolError(
+                "candidate frame is missing sampling route provenance"
+            )
+        previous = observed_routes.setdefault(route_id, route_fingerprint)
+        if previous != route_fingerprint:
+            raise CandidatePoolError(
+                "candidate pool mixes fingerprints for one route id"
+            )
+        observed_counts[route_id] += 1
+    if dict(sorted(observed_routes.items())) != dict(
+        manifest.route_fingerprints
+    ):
+        raise CandidatePoolError("candidate pool route fingerprints drifted")
+    if dict(sorted(observed_counts.items())) != dict(
+        manifest.counts_by_route
+    ):
+        raise CandidatePoolError("candidate pool route counts drifted")
     return manifest
 
 

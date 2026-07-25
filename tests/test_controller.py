@@ -10,6 +10,8 @@ import sys
 import time
 
 import pytest
+from ase import Atoms
+from ase.io import write as ase_write
 
 from NepTrain.core.workflow import extend_workflow, workflow_status, prepare_workflow
 from NepTrain.core.controller import (
@@ -50,10 +52,6 @@ def _plan() -> GenerationPlan:
         generation=1,
         seed=7,
         max_selected=2,
-        min_novelty=0.0,
-        temperatures=(300.0,),
-        pressure=0.0,
-        steps=2,
     )
 
 
@@ -161,6 +159,116 @@ def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
     assert not any(path.name == "POTCAR" for path in task.bundle.rglob("*"))
 
 
+def test_remote_stage_bundle_carries_only_activated_model_across_generations(
+    tmp_path,
+):
+    initial = _write(tmp_path / "initial.xyz")
+    validation = _write(tmp_path / "validation.xyz")
+    training_config = _write(tmp_path / "nep.in")
+    current = {
+        name: _write(tmp_path / "current" / f"{name}.dat")
+        for name in (
+            "training_input",
+            "training_set",
+            "model",
+            "checkpoint",
+            "labeled",
+            "retrained_model",
+            "retrained_checkpoint",
+            "retraining_decision",
+            "model_lineage",
+            "scenario_plan",
+            "acquisition_signals",
+            "selection_result",
+            "md_attempts",
+        )
+    }
+    config = {
+        "training": {
+            "initial_path": str(initial),
+            "config_path": str(training_config),
+        },
+        "md": {"spin": False},
+        "evaluation": {
+            "validation_path": str(validation),
+            "max_rmse": {"energy_rmse": 1, "force_rmse": 1},
+        },
+    }
+    evaluate_task = build_stage_task(
+        tmp_path / "evaluate-tasks",
+        workflow_root=tmp_path,
+        workflow_id="activation",
+        generation=1,
+        stage="evaluate",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation-1",
+            plan=_plan(),
+            artifacts=current,
+            previous_artifacts={},
+        ),
+    )
+    evaluate_descriptor = json.loads(
+        evaluate_task.descriptor.read_text()
+    )
+    assert set(evaluate_descriptor["artifacts"]) == set(current)
+
+    previous = {
+        "training_set": current["training_set"],
+        "activated_model": _write(
+            tmp_path / "previous" / "activated-model.dat"
+        ),
+        "activated_checkpoint": _write(
+            tmp_path / "previous" / "activated-checkpoint.dat"
+        ),
+        "active_model_lineage": _write(
+            tmp_path / "previous" / "active-model-lineage.json",
+            "{}\n",
+        ),
+        "retrained_model": current["retrained_model"],
+        "model_lineage": current["model_lineage"],
+    }
+    train_task = build_stage_task(
+        tmp_path / "train-tasks",
+        workflow_root=tmp_path,
+        workflow_id="activation",
+        generation=2,
+        stage="train",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=GenerationPlan(
+            generation=2,
+            seed=8,
+            max_selected=2,
+        ),
+        config=config,
+        initial_training=initial,
+        context=StageContext(
+            generation=2,
+            generation_dir=tmp_path / "generation-2",
+            plan=GenerationPlan(
+                generation=2,
+                seed=8,
+                max_selected=2,
+            ),
+            artifacts={},
+            previous_artifacts=previous,
+        ),
+    )
+    train_descriptor = json.loads(train_task.descriptor.read_text())
+    assert set(train_descriptor["previous_artifacts"]) == {
+        "training_set",
+        "activated_model",
+        "activated_checkpoint",
+        "active_model_lineage",
+    }
+
+
 def test_stage_result_rejects_paths_outside_the_bundle(tmp_path):
     outside = _write(tmp_path / "outside.dat")
     bundle = tmp_path / "task"
@@ -193,7 +301,7 @@ _STAGE_ARTIFACTS = {
     "diagnose": ("acquisition_signals",),
     "merge": ("training_set",),
     "retrain": ("retrained_model",),
-    "evaluate": ("signals",),
+    "evaluate": ("signals", "activated_model"),
 }
 
 
@@ -206,14 +314,55 @@ class ImmediateExecutor:
         self.launches.append((task.stage, task.target))
         result_root = task.bundle / "result" / "artifacts"
         artifacts = {}
-        for name in _STAGE_ARTIFACTS[task.stage]:
-            path = _write(result_root / name / f"{name}.dat", name + "\n")
+        descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+        names = _STAGE_ARTIFACTS[task.stage]
+        if task.stage == "explore":
+            names = ("candidates", "md_attempts", "scenario_plan")
+        for name in names:
+            path = result_root / name / (
+                f"{name}.xyz" if name == "candidates" else f"{name}.json"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name == "candidates":
+                route = descriptor["identity"]["sampling_routes"][0]
+                frame = Atoms("Fe", positions=[[0.01, 0.0, 0.0]])
+                frame.info.update(
+                    route_id=route["route_id"],
+                    route_fingerprint=route["route_fingerprint"],
+                )
+                ase_write(path, frame, format="extxyz")
+            elif name == "md_attempts":
+                model_path = task.bundle / descriptor["artifacts"]["model"]
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "model_sha256": _sha256(model_path),
+                            "routes": [],
+                            "attempts": [{"completed": True}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            elif name == "scenario_plan":
+                model_path = task.bundle / descriptor["artifacts"]["model"]
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 3,
+                            "model_id": _sha256(model_path),
+                            "routes": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                _write(path, name + "\n")
             artifacts[name] = {
                 "path": str(path.relative_to(task.bundle)),
                 "sha256": _sha256(path),
                 "size": path.stat().st_size,
             }
-        descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
         metrics = (
             {"accepted": True, "workflow_converged": True}
             if task.stage == "evaluate"
@@ -252,42 +401,51 @@ class ImmediateExecutor:
 def _controller_inputs(tmp_path: Path):
     initial = _write(tmp_path / "initial.xyz")
     _write(tmp_path / "nep.in")
-    _write(tmp_path / "structures.xyz")
+    ase_write(
+        tmp_path / "structures.xyz",
+        Atoms("Fe", positions=[[0.0, 0.0, 0.0]]),
+        format="extxyz",
+    )
+    _write(tmp_path / "lammps.in", "run {{ steps }}\n")
     _write(tmp_path / "validation.xyz")
     config = _write(
         tmp_path / "project.yaml",
         """
-schema_version: 5
+schema_version: 7
 training:
   backend: gpumd
   initial_path: ./initial.xyz
   config_path: ./nep.in
 md:
   backend: lammps
-  structures: ./structures.xyz
   spin: false
 sampling:
-  mode: auto
-  conditions:
-    temperature_path: [300]
-    production_temperatures: [300]
-    pressure: 0
-    spin_temperature:
-  progression:
-    md_runs_per_iteration: 1
-    steps:
-      smoke_passed: 2
-      short_stable: 8
-      long_stable: 32
-      production_ready: 128
+  routes:
+    - id: default
+      structures: [./structures.xyz]
+      template_path: ./lammps.in
+      conditions:
+        temperature_path: [300]
+        production_temperatures: [300]
+        pressure: 0
+      progression:
+        steps:
+          smoke_passed: 2
+          short_stable: 8
+          long_stable: 32
+          production_ready: 128
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 2
+          production_ready: 3
   candidate_pool:
     pre_failure_frames: 2
     bad_tail_frames: 1
     health: {}
   selection:
-    method: fps
     max_selected: 2
-    min_novelty: 0
+    novelty: auto
 dft:
   backend: toy
 evaluation:
@@ -297,14 +455,15 @@ evaluation:
     force_rmse: 1
 workflow:
   id: controller-test
-  max_iterations: 1
+  max_model_generations: 1
 execution:
   poll_interval: 0.2
-  routes:
+  stage_targets:
     training: gpu
     sampling: md
     labeling: dft
     analysis: cpu
+  sampling_route_targets: {}
   targets:
     gpu: {executor: process}
     md: {executor: process}
@@ -346,6 +505,143 @@ def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     manifest = json.loads(preparation.manifest.read_text())
     assert manifest["orchestration"] == "controller-v1"
     assert manifest["scripts"] == []
+
+
+def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    text = config.read_text(encoding="utf-8")
+    second_route = """
+    - id: second
+      structures: [./structures.xyz]
+      template_path: ./lammps.in
+      conditions:
+        temperature_path: [500]
+        production_temperatures: [500]
+        pressure: 0
+      progression:
+        steps:
+          smoke_passed: 2
+          short_stable: 8
+          long_stable: 32
+          production_ready: 128
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 2
+          production_ready: 3
+"""
+    text = text.replace(
+        "  candidate_pool:\n", second_route + "  candidate_pool:\n"
+    )
+    text = text.replace(
+        "  sampling_route_targets: {}\n",
+        "  sampling_route_targets:\n    second: md2\n",
+    )
+    text = text.replace(
+        "    dft: {executor: process}\n",
+        "    dft: {executor: process}\n    md2: {executor: process}\n",
+    )
+    config.write_text(text, encoding="utf-8")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, launches),
+    )
+
+    controller.tick()
+    controller.tick()
+
+    current = controller.state["current"]
+    assert current["kind"] == "task_group"
+    assert len(current["tasks"]) == 2
+    assert {item["target"] for item in current["tasks"]} == {"md", "md2"}
+    assert {item["route_id"] for item in current["tasks"]} == {
+        "default",
+        "second",
+    }
+    assert all(item["handle"] is not None for item in current["tasks"])
+    assert [stage for stage, _ in launches].count("explore") == 2
+
+
+def test_md_wave_retry_preserves_completed_attempts(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    text = config.read_text(encoding="utf-8")
+    second_route = """
+    - id: second
+      structures: [./structures.xyz]
+      template_path: ./lammps.in
+      conditions:
+        temperature_path: [500]
+        production_temperatures: [500]
+        pressure: 0
+      progression:
+        steps:
+          smoke_passed: 2
+          short_stable: 8
+          long_stable: 32
+          production_ready: 128
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 2
+          production_ready: 3
+"""
+    text = text.replace(
+        "  candidate_pool:\n", second_route + "  candidate_pool:\n"
+    )
+    text = text.replace(
+        "    dft: {executor: process}\n",
+        "    dft: {executor: process}\n    md2: {executor: process}\n",
+    )
+    text = text.replace(
+        "  sampling_route_targets: {}\n",
+        "  sampling_route_targets:\n    second: md2\n",
+    )
+    config.write_text(text, encoding="utf-8")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    failed_once = {"md2": False}
+
+    class FailOnceExecutor(ImmediateExecutor):
+        def inspect(self, handle):
+            if self.target.name == "md2" and not failed_once["md2"]:
+                failed_once["md2"] = True
+                return ExecutionStatus("failed", "node failure")
+            return ExecutionStatus("completed")
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: FailOnceExecutor(target, launches),
+    )
+    controller.tick()
+    controller.tick()
+    assert controller.tick().state == "failed"
+    current = controller.state["current"]
+    failed_task = next(
+        item for item in current["tasks"] if item["target"] == "md2"
+    )
+    completed_task = next(
+        item for item in current["tasks"] if item["target"] == "md"
+    )
+    assert failed_task["terminal_failure"] is True
+    assert completed_task["collected_bundle"]
+
+    controller.retry()
+    controller.tick()
+    controller.tick()
+
+    assert [
+        target
+        for stage, target in launches
+        if stage == "explore"
+    ] == ["md", "md2", "md2"]
+    ledger = json.loads(
+        (preparation.output_dir / ".neptrain/ledger.json").read_text()
+    )
+    assert "explore" in ledger["generations"]["1"]["stages"]
 
 
 class EvaluationStateExecutor(ImmediateExecutor):
@@ -446,10 +742,24 @@ def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
         (preparation.output_dir / ".neptrain/controller.json").read_text()
     )
     assert len(state["history"]) == 8
-    assert {item["handle"]["execution_id"] for item in state["history"]} == {
-        "12345"
+    execution_ids = {
+        task["handle"]["execution_id"]
+        for item in state["history"]
+        for task in (
+            item["tasks"]
+            if item.get("kind") == "task_group"
+            else [item]
+        )
     }
-    assert [item["target"] for item in state["history"]] == [
+    assert execution_ids == {"12345"}
+    assert [
+        (
+            item["tasks"][0]["target"]
+            if item.get("kind") == "task_group"
+            else item["target"]
+        )
+        for item in state["history"]
+    ] == [
         "gpu",
         "md",
         "cpu",
@@ -478,7 +788,10 @@ def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
 def test_controller_refuses_drifted_workflow_inputs(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
-    (preparation.output_dir / "inputs/md/structures.xyz").write_text(
+    (
+        preparation.output_dir
+        / "inputs/sampling/routes/default/structures/0.xyz"
+    ).write_text(
         "changed\n", encoding="utf-8"
     )
 
@@ -906,19 +1219,39 @@ task = json.loads((bundle / 'task.json').read_text())
 stage = task['identity']['stage']
 names = {
     'train': ('training_input', 'model'),
-    'explore': ('candidates',),
+    'explore': ('candidates', 'md_attempts', 'scenario_plan'),
     'select': ('selected_input', 'selection_result'),
     'label': ('labeled',),
     'diagnose': ('acquisition_signals',),
     'merge': ('training_set',),
     'retrain': ('retrained_model',),
-    'evaluate': ('signals',),
+    'evaluate': ('signals', 'activated_model'),
 }[stage]
 artifacts = {}
 for name in names:
-    path = bundle / 'result' / 'artifacts' / name / f'{name}.dat'
+    suffix = '.xyz' if name == 'candidates' else '.dat'
+    path = bundle / 'result' / 'artifacts' / name / f'{name}{suffix}'
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(name + '\\n')
+    if stage == 'explore' and name == 'candidates':
+        route = task['identity']['sampling_routes'][0]
+        path.write_text(
+            '1\\n'
+            f"route_id={route['route_id']} "
+            f"route_fingerprint={route['route_fingerprint']}\\n"
+            'Fe 0.0 0.0 0.0\\n'
+        )
+    elif stage == 'explore' and name in {'md_attempts', 'scenario_plan'}:
+        model_path = bundle / task['artifacts']['model']
+        model_id = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        value = (
+            {'version': 2, 'model_sha256': model_id, 'routes': [],
+             'attempts': [{'completed': True}]}
+            if name == 'md_attempts'
+            else {'version': 3, 'model_id': model_id, 'routes': []}
+        )
+        path.write_text(json.dumps(value))
+    else:
+        path.write_text(name + '\\n')
     artifacts[name] = {
         'path': str(path.relative_to(bundle)),
         'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -991,19 +1324,39 @@ stage = task['identity']['stage']
 time.sleep(0.35)
 names = {
     'train': ('training_input', 'model'),
-    'explore': ('candidates',),
+    'explore': ('candidates', 'md_attempts', 'scenario_plan'),
     'select': ('selected_input', 'selection_result'),
     'label': ('labeled',),
     'diagnose': ('acquisition_signals',),
     'merge': ('training_set',),
     'retrain': ('retrained_model',),
-    'evaluate': ('signals',),
+    'evaluate': ('signals', 'activated_model'),
 }[stage]
 artifacts = {}
 for name in names:
-    path = bundle / 'result' / 'artifacts' / name / f'{name}.dat'
+    suffix = '.xyz' if name == 'candidates' else '.dat'
+    path = bundle / 'result' / 'artifacts' / name / f'{name}{suffix}'
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(name + '\\n')
+    if stage == 'explore' and name == 'candidates':
+        route = task['identity']['sampling_routes'][0]
+        path.write_text(
+            '1\\n'
+            f"route_id={route['route_id']} "
+            f"route_fingerprint={route['route_fingerprint']}\\n"
+            'Fe 0.0 0.0 0.0\\n'
+        )
+    elif stage == 'explore' and name in {'md_attempts', 'scenario_plan'}:
+        model_path = bundle / task['artifacts']['model']
+        model_id = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        value = (
+            {'version': 2, 'model_sha256': model_id, 'routes': [],
+             'attempts': [{'completed': True}]}
+            if name == 'md_attempts'
+            else {'version': 3, 'model_id': model_id, 'routes': []}
+        )
+        path.write_text(json.dumps(value))
+    else:
+        path.write_text(name + '\\n')
     artifacts[name] = {
         'path': str(path.relative_to(bundle)),
         'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),

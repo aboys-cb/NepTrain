@@ -8,7 +8,7 @@ from NepTrain.core.config import ConfigError, load_config
 
 def _project(**overrides):
     value = {
-        "schema_version": 5,
+        "schema_version": 7,
         "training": {
             "backend": "torchnep",
             "initial_path": "./train.xyz",
@@ -16,35 +16,43 @@ def _project(**overrides):
         },
         "md": {
             "backend": "lammps",
-            "structures": "./structures",
             "spin": False,
         },
         "sampling": {
-            "mode": "auto",
-            "conditions": {
-                "temperature_path": [300],
-                "production_temperatures": [300],
-                "pressure": 0.0,
-                "spin_temperature": None,
-            },
-            "progression": {
-                "md_runs_per_iteration": 1,
-                "steps": {
-                    "smoke_passed": 100,
-                    "short_stable": 400,
-                    "long_stable": 1600,
-                    "production_ready": 6400,
-                },
-            },
+            "routes": [
+                {
+                    "id": "default",
+                    "structures": ["./structures"],
+                    "template_path": "./lammps.in",
+                    "conditions": {
+                        "temperature_path": [300],
+                        "production_temperatures": [300],
+                        "pressure": 0.0,
+                    },
+                    "progression": {
+                        "steps": {
+                            "smoke_passed": 100,
+                            "short_stable": 400,
+                            "long_stable": 1600,
+                            "production_ready": 6400,
+                        },
+                        "replicas": {
+                            "smoke_passed": 1,
+                            "short_stable": 1,
+                            "long_stable": 2,
+                            "production_ready": 3,
+                        },
+                    },
+                }
+            ],
             "candidate_pool": {
                 "pre_failure_frames": 2,
                 "bad_tail_frames": 1,
                 "health": {},
             },
             "selection": {
-                "method": "fps",
                 "max_selected": 100,
-                "min_novelty": 0.0,
+                "novelty": "auto",
             },
         },
         "dft": {"backend": "toy"},
@@ -52,14 +60,15 @@ def _project(**overrides):
             "validation_path": "./validation.xyz",
             "max_rmse": {"energy_rmse": 1, "force_rmse": 1},
         },
-        "workflow": {"max_iterations": 1},
+        "workflow": {"max_model_generations": 1},
         "execution": {
-            "routes": {
+            "stage_targets": {
                 "training": "local",
                 "sampling": "local",
                 "labeling": "local",
                 "analysis": "local",
             },
+            "sampling_route_targets": {},
             "targets": {"local": {"executor": "process"}},
         },
     }
@@ -75,14 +84,14 @@ def _write(tmp_path: Path, value: dict) -> Path:
     return path
 
 
-def test_schema_v5_loads_without_migration(tmp_path):
+def test_schema_v7_loads_without_migration(tmp_path):
     config, changes = load_config(_write(tmp_path, _project()))
-    assert config["schema_version"] == 5
-    assert config["sampling"]["conditions"]["temperature_path"] == [300]
+    assert config["schema_version"] == 7
+    assert config["sampling"]["routes"][0]["conditions"]["temperature_path"] == [300]
     assert changes == []
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8])
 def test_legacy_and_future_schemas_are_rejected(tmp_path, version):
     value = _project()
     value["schema_version"] = version
@@ -98,9 +107,9 @@ def test_unknown_legacy_fields_are_rejected(tmp_path):
 
 
 def test_unknown_section_fields_are_rejected(tmp_path):
-    with pytest.raises(ConfigError, match="sampling.conditions.*temperatrues"):
+    with pytest.raises(ConfigError, match="conditions.*temperatrues"):
         value = _project()
-        value["sampling"]["conditions"]["temperatrues"] = [500]
+        value["sampling"]["routes"][0]["conditions"]["temperatrues"] = [500]
         load_config(
             _write(tmp_path, value)
         )
@@ -124,12 +133,13 @@ def test_pre_fps_candidate_caps_are_rejected(tmp_path, section, field):
 
 def test_temperature_steps_and_pressure_have_one_md_source(tmp_path):
     value = _project()
-    value["sampling"]["conditions"].update(
+    route = value["sampling"]["routes"][0]
+    route["conditions"].update(
         temperature_path=[400, 800],
         production_temperatures=[400, 800],
         pressure=5.0,
     )
-    value["sampling"]["progression"]["steps"] = {
+    route["progression"]["steps"] = {
         "smoke_passed": 2000,
         "short_stable": 8000,
         "long_stable": 32000,
@@ -138,15 +148,22 @@ def test_temperature_steps_and_pressure_have_one_md_source(tmp_path):
     config, _ = load_config(
         _write(tmp_path, value)
     )
-    assert config["sampling"]["conditions"]["temperature_path"] == [400, 800]
-    assert config["sampling"]["conditions"]["pressure"] == 5.0
-    assert config["sampling"]["progression"]["steps"]["smoke_passed"] == 2000
-    assert not {"temperatures", "initial_steps", "pressure"} & set(config["md"])
+    loaded_route = config["sampling"]["routes"][0]
+    assert loaded_route["conditions"]["temperature_path"] == [400, 800]
+    assert loaded_route["conditions"]["pressure"] == 5.0
+    assert loaded_route["progression"]["steps"]["smoke_passed"] == 2000
+    assert not {
+        "structures",
+        "template_path",
+        "temperatures",
+        "initial_steps",
+        "pressure",
+    } & set(config["md"])
 
 
 def test_temperature_path_and_production_targets_are_validated(tmp_path):
     value = _project()
-    value["sampling"]["conditions"].update(
+    value["sampling"]["routes"][0]["conditions"].update(
         temperature_path=[300, 700, 500],
         production_temperatures=[300, 900],
     )
@@ -161,9 +178,20 @@ def test_torchnep_finetune_learning_rate_must_be_positive(tmp_path):
         )
 
 
-def test_spin_md_requires_spin_temperature(tmp_path):
-    with pytest.raises(ConfigError, match="spin_temperature"):
-        load_config(_write(tmp_path, _project(md={"spin": True})))
+def test_spin_md_uses_lattice_temperature_by_default(tmp_path):
+    value = _project(
+        md={"spin": True},
+        dft={"backend": "abacus"},
+        evaluation={
+            "max_rmse": {
+                "energy_rmse": 1,
+                "force_rmse": 1,
+                "mforce_rmse": 1,
+            }
+        },
+    )
+    config, _ = load_config(_write(tmp_path, value))
+    assert "spin_temperature" not in config["sampling"]["routes"][0]["conditions"]
 
 
 def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
@@ -178,7 +206,6 @@ def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
             }
         },
     )
-    value["sampling"]["conditions"]["spin_temperature"] = 300
     config, _ = load_config(
         _write(tmp_path, value)
     )
@@ -187,9 +214,51 @@ def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
 
 def test_spin_workflow_rejects_vasp(tmp_path):
     value = _project(md={"spin": True}, dft={"backend": "vasp"})
-    value["sampling"]["conditions"]["spin_temperature"] = 300
     with pytest.raises(ConfigError, match="VASP labeling"):
         load_config(_write(tmp_path, value))
+
+
+def test_dft_kpoints_default_to_input_authoritative_auto_mode(tmp_path):
+    value = _project(dft={"backend": "vasp"})
+
+    config, _ = load_config(_write(tmp_path, value))
+
+    assert config["dft"].get("kpoint_mode", "auto") == "auto"
+    assert "kspacing" not in config["dft"]
+    assert "kpoints" not in config["dft"]
+
+
+@pytest.mark.parametrize(
+    "dft",
+    [
+        {"backend": "vasp", "kpoint_mode": "auto", "kspacing": 0.2},
+        {"backend": "vasp", "kpoint_mode": "auto", "kpoints": [4, 4, 4]},
+        {
+            "backend": "vasp",
+            "kpoint_mode": "kspacing",
+            "kspacing": 0.2,
+            "kpoints": [4, 4, 4],
+        },
+        {
+            "backend": "vasp",
+            "kpoint_mode": "kpoints",
+            "kpoints": [4, 4, 4],
+            "kspacing": 0.2,
+        },
+    ],
+)
+def test_dft_kpoint_modes_reject_competing_authorities(tmp_path, dft):
+    with pytest.raises(ConfigError, match="kspacing|kpoints"):
+        load_config(_write(tmp_path, _project(dft=dft)))
+
+
+def test_explicit_dft_kpoint_modes_are_valid(tmp_path):
+    for dft in (
+        {"backend": "vasp", "kpoint_mode": "kspacing", "kspacing": 0.2},
+        {"backend": "abacus", "kpoint_mode": "kpoints", "kpoints": [4, 4, 4]},
+    ):
+        config, _ = load_config(_write(tmp_path, _project(dft=dft)))
+        assert config["dft"]["kpoint_mode"] == dft["kpoint_mode"]
 
 
 @pytest.mark.parametrize(
@@ -208,4 +277,97 @@ def test_failure_window_config_is_validated(tmp_path, settings, message):
     else:
         value["sampling"]["candidate_pool"].update(settings)
     with pytest.raises(ConfigError, match=message):
+        load_config(_write(tmp_path, value))
+
+
+def test_sampling_routes_are_the_only_automatic_sampling_authority(tmp_path):
+    value = _project()
+    value["md"]["structures"] = "./legacy.xyz"
+    with pytest.raises(ConfigError, match="unknown md fields.*structures"):
+        load_config(_write(tmp_path, value))
+
+    value = _project()
+    value["sampling"]["conditions"] = {"temperature_path": [300]}
+    with pytest.raises(ConfigError, match="unknown sampling fields.*conditions"):
+        load_config(_write(tmp_path, value))
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("md", "mpi_ranks"), 4),
+        (("sampling", "mode"), "auto"),
+        (
+            ("sampling", "routes", 0, "progression", "md_runs_per_iteration"),
+            4,
+        ),
+        (("sampling", "selection", "min_novelty"), 0.0),
+        (("dft", "n_cpu"), 4),
+        (("dft", "use_k_stype"), "kspacing"),
+        (("workflow", "max_iterations"), 4),
+        (("execution", "routes"), {}),
+        (("execution", "targets", "local", "overrides"), {}),
+    ],
+)
+def test_schema_v7_rejects_removed_duplicate_controls(tmp_path, path, value):
+    project = _project()
+    target = project
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ConfigError, match=str(path[-1])):
+        load_config(_write(tmp_path, project))
+
+
+def test_routes_require_unique_ids_and_explicit_bindings(tmp_path):
+    value = _project()
+    value["sampling"]["routes"].append(
+        {
+            **value["sampling"]["routes"][0],
+            "structures": ["./other.xyz"],
+        }
+    )
+    with pytest.raises(ConfigError, match="duplicate id"):
+        load_config(_write(tmp_path, value))
+
+    value = _project()
+    del value["sampling"]["routes"][0]["template_path"]
+    with pytest.raises(ConfigError, match="template_path is required"):
+        load_config(_write(tmp_path, value))
+
+    value = _project()
+    value["sampling"]["routes"][0]["structures"] = []
+    with pytest.raises(ConfigError, match="structures must be a non-empty"):
+        load_config(_write(tmp_path, value))
+
+
+def test_same_structure_may_be_listed_by_multiple_explicit_routes(tmp_path):
+    value = _project()
+    second = {
+        **value["sampling"]["routes"][0],
+        "id": "second",
+        "conditions": {
+            **value["sampling"]["routes"][0]["conditions"],
+            "temperature_path": [500, 1000],
+            "production_temperatures": [1000],
+        },
+    }
+    value["sampling"]["routes"].append(second)
+    config, _ = load_config(_write(tmp_path, value))
+    assert [route["structures"] for route in config["sampling"]["routes"]] == [
+        ["./structures"],
+        ["./structures"],
+    ]
+
+
+def test_workflow_allows_evaluation_to_be_omitted(tmp_path):
+    value = _project()
+    del value["evaluation"]
+    config, _ = load_config(_write(tmp_path, value))
+    assert "evaluation" not in config
+
+
+def test_partial_evaluation_is_rejected(tmp_path):
+    value = _project(evaluation={"validation_path": None})
+    with pytest.raises(ConfigError, match="when evaluation is configured"):
         load_config(_write(tmp_path, value))

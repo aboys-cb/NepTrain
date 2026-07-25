@@ -31,6 +31,7 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
     initial = _write(tmp_path / "initial.xyz")
     _write(tmp_path / "nep.in")
     _write(tmp_path / "structure.xyz")
+    _write(tmp_path / "lammps.in", "run {{ steps }}\n")
     _write(tmp_path / "validation.xyz")
     _write(tmp_path / "gpu-env.sh", "module load cuda\n")
     _write(tmp_path / "cpu-env.sh", "module load lammps\n")
@@ -38,7 +39,7 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
     config = _write(
         tmp_path / "job.yaml",
         """
-schema_version: 5
+schema_version: 7
 training:
   backend: torchnep
   initial_path: ./initial.xyz
@@ -46,31 +47,35 @@ training:
   device: cuda
 md:
   backend: lammps
-  structures: ./structure.xyz
   inference_backend: cpu
   spin: false
 sampling:
-  mode: auto
-  conditions:
-    temperature_path: [300, 500]
-    production_temperatures: [300, 500]
-    pressure: 0
-    spin_temperature:
-  progression:
-    md_runs_per_iteration: 2
-    steps:
-      smoke_passed: 10
-      short_stable: 40
-      long_stable: 160
-      production_ready: 640
+  routes:
+    - id: default
+      structures: [./structure.xyz]
+      template_path: ./lammps.in
+      conditions:
+        temperature_path: [300, 500]
+        production_temperatures: [300, 500]
+        pressure: 0
+      progression:
+        steps:
+          smoke_passed: 10
+          short_stable: 40
+          long_stable: 160
+          production_ready: 640
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 2
+          production_ready: 3
   candidate_pool:
     pre_failure_frames: 2
     bad_tail_frames: 1
     health: {}
   selection:
-    method: fps
     max_selected: 100
-    min_novelty: 0
+    novelty: auto
 dft:
   backend: toy
 evaluation:
@@ -80,15 +85,16 @@ evaluation:
     force_rmse: 1.0
 workflow:
   id: controller-smoke
-  max_iterations: 3
+  max_model_generations: 3
   seed: 17
 execution:
   poll_interval: 0.2
-  routes:
+  stage_targets:
     training: training
     sampling: cpu
     labeling: dft
     analysis: cpu
+  sampling_route_targets: {}
   targets:
     training:
       executor: slurm
@@ -130,25 +136,20 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert all(path.parent == workspace.plans_dir for path in result.plans)
     assert workspace.tasks_dir.is_dir()
     manifest = json.loads(result.manifest.read_text())
-    assert manifest["version"] == 3
+    assert manifest["version"] == 4
     assert manifest["orchestration"] == "controller-v1"
     assert manifest["scripts"] == []
 
     project_text = result.config_file.read_text()
-    assert "schema_version: 5" in project_text
+    assert "schema_version: 7" in project_text
     assert "workflow.slurm" not in project_text
     assert "execution:" in project_text
     assert "inputs/training/nep.in" in project_text
-    assert "inputs/md/structures.xyz" in project_text
+    assert "inputs/sampling/routes/default/structures/0.xyz" in project_text
     assert "inputs/validation/validation.xyz" in project_text
     plans = [json.loads(path.read_text()) for path in result.plans]
-    assert [plan["steps"] for plan in plans] == [10, 10, 10]
     assert [plan["max_selected"] for plan in plans] == [100, 100, 100]
-    assert [plan["temperatures"] for plan in plans] == [
-        [300.0, 500.0],
-        [300.0, 500.0],
-        [300.0, 500.0],
-    ]
+    assert all("temperatures" not in plan and "steps" not in plan for plan in plans)
 
 
 def test_prepare_only_cli_does_not_start_controller(tmp_path: Path, capsys):
@@ -236,7 +237,7 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     )
     output = capsys.readouterr().out
     assert "State: prepared" in output
-    assert "Ledger: iteration 1, stage train" in output
+    assert "Ledger: generation 1, stage train" in output
     assert "G1 not started: FPS selects up to 100" in output
     assert "Executor: 0/0 stages completed" in output
 

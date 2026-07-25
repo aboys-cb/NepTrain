@@ -39,6 +39,20 @@ def _copy_file(source: Path, target: Path) -> None:
     temporary.replace(target)
 
 
+def _copy_path(source: Path, target: Path) -> None:
+    if source.is_file():
+        _copy_file(source, target)
+        return
+    if not source.is_dir():
+        raise FileNotFoundError(f"workflow input does not exist: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    shutil.copytree(source, temporary)
+    temporary.replace(target)
+
+
 @dataclass(frozen=True)
 class WorkflowWorkspace:
     """Own every durable path in one workflow directory.
@@ -223,8 +237,29 @@ class WorkflowWorkspace:
 
         copy_path("training", "config_path", "training/nep")
         copy_path("training", "test_path", "validation/training-test")
-        copy_path("md", "structures", "md/structures")
-        copy_path("md", "template_path", "md/template")
+        for route in snapshot.get("sampling", {}).get("routes", []):
+            route_root = (
+                self.inputs_dir / "sampling" / "routes" / str(route["id"])
+            )
+            template_source = Path(route["template_path"])
+            template_target = (
+                route_root / f"template{template_source.suffix}"
+            )
+            _copy_path(template_source, template_target)
+            route["template_path"] = str(
+                template_target.relative_to(self.root)
+            )
+            copied_structures = []
+            for index, raw in enumerate(route["structures"]):
+                source = Path(raw)
+                target = route_root / "structures" / str(index)
+                if source.is_file():
+                    target = target.with_suffix(source.suffix)
+                _copy_path(source, target)
+                copied_structures.append(
+                    str(target.relative_to(self.root))
+                )
+            route["structures"] = copied_structures
         copy_path("dft", "input_path", "dft/input")
         copy_path("evaluation", "validation_path", "validation/validation")
         for name, profile in snapshot.get("execution", {}).get(
@@ -269,7 +304,7 @@ class WorkflowWorkspace:
                 for name, record in stage.get("artifacts", {}).items()
             }
             required = {
-                "retrained_model": self.results_dir / "nep.txt",
+                "activated_model": self.results_dir / "nep.txt",
                 "training_set": self.results_dir / "train.xyz",
                 "signals": self.results_dir / "metrics.json",
             }
@@ -286,18 +321,32 @@ class WorkflowWorkspace:
             _copy_file(artifacts[name], target)
         _write_json(self.results_dir / "summary.json", summary)
         evaluation = summary["metrics"].get("evaluate", {})
-        lines = [
-            f"# NepTrain workflow 结果\n",
-            f"- 最新验收代：{generation}",
-            f"- Energy RMSE：{evaluation.get('energy_rmse', 'n/a')}",
-            f"- Force RMSE：{evaluation.get('force_rmse', 'n/a')}",
-            f"- Virial RMSE：{evaluation.get('virial_rmse', 'n/a')}",
-            "",
-            "最终模型：`nep.txt`",
-            "最终训练集：`train.xyz`",
-            "完整指标：`metrics.json`",
-            "",
-        ]
+        lines = [f"# NepTrain workflow 结果\n"]
+        if evaluation.get("evaluation_configured") is False:
+            lines.extend(
+                [
+                    f"- 最新完成代：{generation}",
+                    "- 独立 evaluation：未配置",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"- 最新验收代：{generation}",
+                    f"- Energy RMSE：{evaluation.get('energy_rmse', 'n/a')}",
+                    f"- Force RMSE：{evaluation.get('force_rmse', 'n/a')}",
+                    f"- Virial RMSE：{evaluation.get('virial_rmse', 'n/a')}",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "最终模型：`nep.txt`",
+                "最终训练集：`train.xyz`",
+                "完整指标：`metrics.json`",
+                "",
+            ]
+        )
         (self.results_dir / "summary.md").write_text(
             "\n".join(lines), encoding="utf-8"
         )

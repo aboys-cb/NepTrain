@@ -55,3 +55,17 @@ def test_md_cli_keeps_template_owned_parameters_out_of_the_interface():
         "--midpoint-iter",
     ):
         assert removed not in completed.stdout
+
+
+def test_dft_cli_rejects_competing_kpoint_overrides():
+    completed = _help(
+        "dft",
+        "input.xyz",
+        "--kspacing",
+        "0.2",
+        "--ka",
+        "4,4,4",
+    )
+
+    assert completed.returncode == 2
+    assert "not allowed with argument" in completed.stderr

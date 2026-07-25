@@ -22,7 +22,6 @@ from .iteration import (
     GenerationPlan,
     StageContext,
     StageOutcome,
-    progressive_plans,
     stratified_farthest_point_sampling,
 )
 from .spin import validate_spin_dataset
@@ -37,6 +36,20 @@ from .toy_workflow import (
 
 class ToyIterationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ToyGenerationPlan(GenerationPlan):
+    """Toy-only sampling physics used by the deterministic smoke workflow."""
+
+    steps: int = 100
+    temperatures: tuple[float, ...] = (300.0, 500.0, 700.0)
+    pressure: float = 0.0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.steps < 1 or not self.temperatures:
+            raise ValueError("toy steps and temperatures must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -141,7 +154,7 @@ class ToyIterationAdapter:
     def _train(self, context: StageContext) -> StageOutcome:
         if context.generation > 1:
             training_input = context.previous_artifacts["training_set"]
-            model = context.previous_artifacts["retrained_model"]
+            model = context.previous_artifacts["activated_model"]
             frames = _frames(training_input)
             validate_spin_dataset(frames, require_mforce=True)
             return StageOutcome(
@@ -422,7 +435,11 @@ class ToyIterationAdapter:
         maturity_path = context.generation_dir / "scenario-maturity.json"
         _write_json(maturity_path, maturity)
         return StageOutcome(
-            artifacts={"signals": output, "scenario_maturity": maturity_path},
+            artifacts={
+                "signals": output,
+                "scenario_maturity": maturity_path,
+                "activated_model": context.artifacts["retrained_model"],
+            },
             metrics=signals,
         )
 
@@ -463,11 +480,13 @@ def run_toy_iteration_smoke(
             raise ToyIterationError(f"Toy iteration output already exists: {root}")
         shutil.rmtree(root)
     root.mkdir(parents=True)
-    plans = progressive_plans(
-        generations,
-        seed=seed,
-        max_selected=max_selected,
-        initial_steps=100,
+    plans = tuple(
+        ToyGenerationPlan(
+            generation=offset + 1,
+            seed=seed + offset,
+            max_selected=max_selected,
+        )
+        for offset in range(generations)
     )
 
     initial, validation = _prepare_inputs(root, profile, seed)

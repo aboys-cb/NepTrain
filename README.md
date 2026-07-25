@@ -30,7 +30,7 @@ LAMMPS、VASP 和 ABACUS 由用户或计算平台提供。使用 NEPAdapters LAM
 export LAMMPS_PLUGIN_PATH=/path/to/nepadapters/lib
 ```
 
-NepTrain 只接受 `schema_version: 5`。旧 `train/vasp/gpumd/nep` 命令和旧配置不再
+NepTrain 只接受 `schema_version: 7`。旧 `train/vasp/gpumd/nep` 命令和旧配置不再
 兼容，也不会被静默迁移。
 
 ## 独立运行一个步骤
@@ -96,7 +96,7 @@ neptrain dft candidates.xyz \
 ```
 
 提供 `--project` 后，未在命令行覆盖的 backend、输入模板、温度、压强、步数和
-运行参数会直接读取 schema-v5 项目；命令行只需要写本次确实要改的值。
+运行参数会直接读取 schema-v7 项目；命令行只需要写本次确实要改的值。
 
 本地 `process` target 前台执行。Slurm target 提交后立即返回：
 
@@ -114,7 +114,7 @@ neptrain task cancel runs/dft-...
 
 ## 自动 workflow
 
-创建一个严格的 schema-v5 项目：
+创建一个严格的 schema-v7 项目：
 
 ```bash
 neptrain workflow init --profile slurm --directory fe-project
@@ -163,53 +163,45 @@ neptrain workflow stop workflow --cancel-jobs
 取消记录会写入 workflow 历史；以后恢复时会为该阶段创建新的可追踪 attempt。
 独立手动任务使用 `neptrain task cancel` 明确取消。
 
-## schema v5
+## schema v7
 
-温度、压强和 MD 步数只有 `sampling` 一个权威位置：
+自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、LAMMPS
+模板、条件和递进策略：
 
 ```yaml
-schema_version: 5
+schema_version: 7
 
 training:
   backend: torchnep
   initial_path: ./train.xyz
   config_path: ./nep.in
   device: cuda
-  torch_backend: auto
-  precision: float32
-  use_compile: false
-  finetune_lr_scale: 0.1
-  seed: 20260723
 
 md:
   backend: lammps
   inference_backend: auto
-  structures: ./structures
-  template_path: ./lammps-nvt.in
   spin: false
-  mpi_ranks: 4
-  lmp: lmp
-  mpiexec: mpirun
 
 sampling:
-  mode: auto
-  conditions:
-    temperature_path: [300, 500, 700]
-    production_temperatures: [300, 700]
-    pressure: 0.0
-    spin_temperature:
-  progression:
-    md_runs_per_iteration: 4
-    steps:
-      smoke_passed: 10000
-      short_stable: 40000
-      long_stable: 160000
-      production_ready: 640000
-    replicas:
-      smoke_passed: 1
-      short_stable: 1
-      long_stable: 2
-      production_ready: 3
+  routes:
+    - id: default
+      structures: [./structures]
+      template_path: ./lammps-nvt.in
+      conditions:
+        temperature_path: [300, 500, 700]
+        production_temperatures: [300, 700]
+        pressure: 0.0
+      progression:
+        steps:
+          smoke_passed: 10000
+          short_stable: 40000
+          long_stable: 160000
+          production_ready: 640000
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 2
+          production_ready: 3
   candidate_pool:
     pre_failure_frames: 2
     bad_tail_frames: 1
@@ -221,18 +213,14 @@ sampling:
       max_mforce: 100.0
       max_spin_magnitude: 20.0
   selection:
-    method: fps
     max_selected: 100
-    min_novelty: 0.0
+    novelty: auto
 
 dft:
   backend: vasp
-  n_cpu: 4
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
-  kpoints_use_gamma: true
-  use_k_stype: kspacing
-  kspacing: 0.2
+  kpoint_mode: auto
 
 evaluation:
   validation_path: ./validation.xyz
@@ -243,16 +231,18 @@ evaluation:
 
 workflow:
   id: fe-workflow
-  max_iterations: 12
+  max_model_generations: 12
   seed: 20260721
 
 execution:
   poll_interval: 30
-  routes:
+  stage_targets:
     training: v100
     sampling: cpu
     labeling: dft
     analysis: cpu
+  # 可选：未列出的 route 使用 stage_targets.sampling。
+  sampling_route_targets: {}
   targets:
     v100:
       executor: slurm
@@ -278,9 +268,15 @@ execution:
         NEPTRAIN_VASP_COMMAND: srun vasp_std
 ```
 
-`md` 只选择 MD Adapter、结构、LAMMPS 模板和运行命令。温度、压强、递进步数、
+`md` 只选择 MD Adapter 和推理后端。结构、LAMMPS 模板、温度、压强和递进步数
+都由 `sampling.routes` 管理。
 轨迹健康检查和 FPS 批量上限统一放在 `sampling`。`timestep`、`tdamp`、`pdamp`、
 `spin_alpha` 和 dump 频率直接写在用户的 LAMMPS 模板中。
+
+`dft.kpoint_mode: auto` 优先保留 INCAR 中的 `KSPACING`/`KGAMMA`
+或 ABACUS INPUT 中的 `kspacing`；生成的默认输入已给出可直接修改的
+`0.2`。只有显式选择 `kspacing` 或 `kpoints` 模式时，NepTrain 才接管
+k 点设置。
 
 `temperature_path` 是严格有序的温度探路路径，只有前一个温度通过才解锁下一个。
 `production_temperatures` 才会继续跑 short、long 和 production；其余温度只做
@@ -298,9 +294,11 @@ evaluate 并写入 lineage，下一轮 MD 才会启动。若当前模型已通�
 
 每个 replica 都会得到 NepTrain 派生的确定性 `{{ seed }}`；用户模板可把它同时
 用于 `velocity create` 和 DynSpin thermostat，保证重复运行可复现但 replica
-彼此独立。`min_novelty: 0` 表示只记录 FPS 新颖度而不把它作为收敛硬门槛。
+彼此独立。`novelty: auto` 不伪造误差校准：选择阶段接受所有正新颖度候选，
+完成条件要求当前池没有剩余覆盖缺口。需要显式阈值时，可同时配置
+`selection_threshold` 和 `completion_threshold`。
 
-`workflow.max_iterations` 是最大采样轮预算。生产温度、最长时长、replica、轨迹诊断和
+`workflow.max_model_generations` 是最大模型代数预算。生产温度、最长时长、replica、轨迹诊断和
 validation 全部通过后会提前完成；预算耗尽或连续无进展会分别报告
 `budget_exhausted` 或 `stalled`，不会误报为 `complete`。
 
@@ -315,8 +313,10 @@ LAMMPS plugin 由 `execution.targets.*.setup_script` 加载，例如在
 外部程序默认从 `PATH` 查找：`nep`、`gpumd`、`lmp`、`vasp_std` 和 `abacus`。
 平台命令不同时，在 target 的 `environment` 中设置
 `NEPTRAIN_NEP_COMMAND`、`NEPTRAIN_GPUMD_COMMAND`、
-`NEPTRAIN_VASP_COMMAND` 或 `NEPTRAIN_ABACUS_COMMAND`，不再读取用户目录下的
-隐式配置。
+`NEPTRAIN_LMP_COMMAND`、`NEPTRAIN_MPIEXEC`、`NEPTRAIN_VASP_COMMAND` 或
+`NEPTRAIN_ABACUS_COMMAND`，不再读取用户目录下的隐式配置。自动 MD 的 MPI
+rank 数和 DFT 的 CPU 数取当前任务的 `SLURM_CPUS_PER_TASK`；手动命令仍可用
+`--mpi-ranks` 或 `--cpus` 显式指定。
 
 如果 DFT 位于另一台 Slurm 超算：
 
@@ -328,11 +328,12 @@ LAMMPS plugin 由 `execution.targets.*.setup_script` 加载，例如在
       command: /path/to/python -m NepTrain.cli.cli
       partition: compute
       cpus_per_task: 32
-      overrides:
-        dft.resource_path: /shared/pseudopotentials/PBE
+      dft_resource_path: /shared/pseudopotentials/PBE
 ```
 
-大型赝势库不会跨平台复制；远端路径必须通过 target `overrides` 明确给出。
+大型赝势库不会跨平台复制；远端路径必须通过 target 的
+`dft_resource_path` 明确给出。target 不能覆盖温度、DFT 精度或 validation 等
+科学配置。
 
 ## Spin 数据契约
 

@@ -17,6 +17,7 @@ from NepTrain.core.md.lammps import (
     run_lammps,
     write_lammps_data,
 )
+from NepTrain.core.md import MdRequest, run_md
 
 
 def test_compute_property_order_drives_dump_meaning():
@@ -27,6 +28,61 @@ def test_compute_property_order_drives_dump_meaning():
     assert columns["c_spin[2]"] == "spx"
     assert columns["c_spin[4]"] == "spz"
     assert columns["c_spin[7]"] == "fmz"
+
+
+def test_custom_template_receives_route_variables_without_ensemble_inference(
+    tmp_path: Path, monkeypatch
+):
+    template = tmp_path / "custom.in"
+    template.write_text(
+        "{{ route_id }} {{ replica }} {{ temperature }} {{ steps }}\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_lammps(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            trajectory=kwargs["output_file"],
+            backend="cpu",
+            pair_style="nep/cpu",
+            completed=True,
+            last_step=25,
+            failure_code=None,
+            failure_reason=None,
+            health_report=None,
+        )
+
+    monkeypatch.setattr("NepTrain.core.md.run.run_lammps", fake_lammps)
+    request = MdRequest(
+        atoms=Atoms("Fe", positions=[[0, 0, 0]]),
+        model_file=tmp_path / "nep.txt",
+        output_dir=tmp_path / "run",
+        output_file=tmp_path / "run" / "trajectory.xyz",
+        temperature=500,
+        pressure=2,
+        steps=25,
+        seed=9,
+        replica=3,
+        ensemble="mc-md-custom",
+        template_path=template,
+        route_id="route_b",
+        route_fingerprint="f" * 64,
+    )
+
+    result = run_md(request, "lammps")
+
+    assert result.completed is True
+    assert captured["variables"] == {
+        "temperature": 500,
+        "spin_temperature": None,
+        "pressure": 2,
+        "steps": 25,
+        "seed": 9,
+        "replica": 3,
+        "route_id": "route_b",
+        "route_fingerprint": "f" * 64,
+    }
 
 
 def test_read_spin_dump_reconstructs_full_vector(tmp_path: Path):

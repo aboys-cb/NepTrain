@@ -39,13 +39,14 @@ class _PublishingAdapter:
             }
             if self.complete_artifacts:
                 artifacts["signals"] = path
+                artifacts["activated_model"] = path
         return StageOutcome(artifacts=artifacts, metrics=metrics)
 
 
 def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: Path):
     workspace = WorkflowWorkspace.create(tmp_path / "al-nonmag")
     controller = GenerationController(workspace.root, "al-nonmag")
-    plan = GenerationPlan(1, 7, 2, 10, (300.0,))
+    plan = GenerationPlan(1, 7, 2)
 
     summary = controller.run_generation(plan, _PublishingAdapter())
 
@@ -55,7 +56,7 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
     assert (workspace.generation_dir(1) / "sampling/md/explore.txt").is_file()
     assert (workspace.generation_dir(1) / "labeling/label.txt").is_file()
     assert (workspace.generation_dir(1) / "training/retrain/retrain.txt").is_file()
-    assert (workspace.results_dir / "nep.txt").read_text() == "retrain\n"
+    assert json.loads((workspace.results_dir / "nep.txt").read_text()) == "evaluate"
     assert (workspace.results_dir / "train.xyz").read_text() == "merge\n"
     assert json.loads((workspace.results_dir / "metrics.json").read_text()) == "evaluate"
     assert "最新验收代：1" in (workspace.results_dir / "summary.md").read_text()
@@ -64,7 +65,7 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
 def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):
     workspace = WorkflowWorkspace.create(tmp_path / "broken")
     controller = GenerationController(workspace.root, "broken")
-    plan = GenerationPlan(1, 7, 2, 10, (300.0,))
+    plan = GenerationPlan(1, 7, 2)
 
     with pytest.raises(IterationError, match="missing publishable artifacts"):
         controller.run_generation(plan, _PublishingAdapter(complete_artifacts=False))

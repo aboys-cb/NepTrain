@@ -98,7 +98,6 @@ def _record_matches(record: Mapping[str, Any]) -> bool:
 
 def _plan(path: Path) -> GenerationPlan:
     value = json.loads(path.read_text(encoding="utf-8"))
-    value["temperatures"] = tuple(value["temperatures"])
     return GenerationPlan(**value)
 
 
@@ -194,7 +193,11 @@ class PersistentController:
             self.workspace.root, self.workflow_id
         )
         self.executor_factory = executor_factory
-        self.targets, self.routes = self._execution_config(
+        (
+            self.targets,
+            self.stage_targets,
+            self.sampling_route_targets,
+        ) = self._execution_config(
             self.config, self.workspace.root
         )
         self.state = _read_json(
@@ -213,18 +216,24 @@ class PersistentController:
     @staticmethod
     def _execution_config(
         config: Mapping[str, Any], base_dir: Path
-    ) -> tuple[dict[str, ExecutionTarget], dict[str, str]]:
+    ) -> tuple[dict[str, ExecutionTarget], dict[str, str], dict[str, str]]:
         execution = config.get("execution", {})
         raw_targets = execution.get("targets", {})
         routes = {
             str(key): str(value)
-            for key, value in dict(execution.get("routes", {})).items()
+            for key, value in dict(execution.get("stage_targets", {})).items()
+        }
+        sampling_route_targets = {
+            str(key): str(value)
+            for key, value in dict(
+                execution.get("sampling_route_targets", {})
+            ).items()
         }
         required = {"training", "sampling", "labeling", "analysis"}
         missing = sorted(required - set(routes))
         if missing:
             raise ControllerError(
-                "execution.routes is missing " + ", ".join(missing)
+                "execution.stage_targets is missing " + ", ".join(missing)
             )
         targets = {}
         for name, value in dict(raw_targets).items():
@@ -236,12 +245,16 @@ class PersistentController:
                 if local.is_file():
                     normalized["setup_script"] = str(local)
             targets[str(name)] = ExecutionTarget.from_mapping(str(name), normalized)
-        unknown = sorted(set(routes.values()) - set(targets))
+        unknown = sorted(
+            (set(routes.values()) | set(sampling_route_targets.values()))
+            - set(targets)
+        )
         if unknown:
             raise ControllerError(
-                "execution.routes refers to unknown targets: " + ", ".join(unknown)
+                "execution target mapping refers to unknown targets: "
+                + ", ".join(unknown)
             )
-        return targets, routes
+        return targets, routes, sampling_route_targets
 
     def _save(self) -> None:
         self.state["heartbeat_at"] = _now()
@@ -271,7 +284,7 @@ class PersistentController:
                 if evaluate.get("workflow_converged") is True:
                     self.state["state"] = "complete"
                     self.state["reason"] = (
-                        f"workflow converged after iteration {plan.generation}"
+                        f"workflow converged after model generation {plan.generation}"
                     )
                     self.state["current"] = None
                     self._save()
@@ -290,7 +303,7 @@ class PersistentController:
             return plan, stage, context
         self.state["state"] = "budget_exhausted"
         self.state["reason"] = (
-            "maximum iterations reached before the production trust envelope "
+            "maximum model generations reached before the production trust envelope "
             "and validation targets both converged"
         )
         self.state["current"] = None
@@ -333,6 +346,21 @@ class PersistentController:
                 raise ControllerError(
                     f"stage result {key} does not match controller intent"
                 )
+        return self._install_outcome(
+            plan=plan,
+            stage=stage,
+            attempt=attempt,
+            outcome=outcome,
+        )
+
+    def _install_outcome(
+        self,
+        *,
+        plan: GenerationPlan,
+        stage: str,
+        attempt: int,
+        outcome: StageOutcome,
+    ) -> Any:
         root = self.workspace.stage_dir(plan.generation, stage) / "artifacts" / f"attempt-{attempt}"
         installed = {}
         for name, source in outcome.artifacts.items():
@@ -348,9 +376,149 @@ class PersistentController:
             StageOutcome(artifacts=installed, metrics=outcome.metrics),
         )
 
+    def _tick_task_group(self, current: dict[str, Any]) -> ControllerTick:
+        from .execution import StageTask
+
+        running = 0
+        unknown = 0
+        for item in current["tasks"]:
+            target = self.targets[str(item["target"])]
+            executor = self.executor_factory(target)
+            task = StageTask(
+                str(item["task_id"]),
+                self.workflow_id,
+                int(current["generation"]),
+                str(current["stage"]),
+                str(item["target"]),
+                Path(item["bundle"]),
+            )
+            if item.get("handle") is None:
+                handle = executor.launch(task)
+                item["handle"] = asdict(handle)
+                item["submitted_at"] = _now()
+                self._save()
+                running += 1
+                continue
+            handle = ExecutionHandle.from_mapping(item["handle"])
+            if item.get("collected_bundle") or item.get("terminal_failure"):
+                continue
+            status = executor.inspect(handle)
+            item["observed_state"] = status.state
+            item["observed_at"] = _now()
+            item["detail"] = status.detail
+            if status.state == "failed":
+                item["terminal_failure"] = True
+                item["failure"] = (
+                    status.detail or f"MD task {item['task_id']} failed"
+                )
+                self._save()
+                continue
+            if status.state in {"running", "unknown"}:
+                if status.state == "unknown":
+                    unknown += 1
+                else:
+                    running += 1
+                continue
+            collected = executor.collect(handle)
+            item["collected_bundle"] = str(collected)
+            item["completed_at"] = _now()
+            self._save()
+
+        if any(
+            not item.get("collected_bundle")
+            and not item.get("terminal_failure")
+            for item in current["tasks"]
+        ):
+            self.state["state"] = "degraded" if unknown else "running"
+            self._save()
+            return ControllerTick(
+                str(self.state["state"]),
+                int(current["generation"]),
+                str(current["stage"]),
+                detail=(
+                    f"{len(current['tasks']) - running - unknown}/"
+                    f"{len(current['tasks'])} MD tasks complete"
+                ),
+            )
+        failures = [
+            item for item in current["tasks"] if item.get("terminal_failure")
+        ]
+        if failures:
+            self.state["state"] = "failed"
+            self.state["reason"] = (
+                f"{len(failures)} of {len(current['tasks'])} MD tasks failed; "
+                "retry will preserve completed task results"
+            )
+            self._save()
+            return ControllerTick(
+                "failed",
+                int(current["generation"]),
+                str(current["stage"]),
+                detail=self.state["reason"],
+            )
+
+        plan = next(
+            item
+            for item in self.plans
+            if item.generation == int(current["generation"])
+        )
+        _, context = self.generation_controller.stage_context(plan, "explore")
+        outcomes: list[StageOutcome] = []
+        for item in current["tasks"]:
+            value, outcome = load_stage_result(item["collected_bundle"])
+            expected = {
+                "task_id": item["task_id"],
+                "workflow_id": self.workflow_id,
+                "generation": plan.generation,
+                "stage": "explore",
+                "plan_sha256": plan.sha256,
+            }
+            if any(
+                value.get(key) != expected_value
+                for key, expected_value in expected.items()
+            ):
+                raise ControllerError(
+                    f"MD task result identity does not match {item['task_id']}"
+                )
+            outcomes.append(outcome)
+        from .workflow_iteration import WorkflowIterationAdapter
+
+        adapter = WorkflowIterationAdapter(
+            self.config,
+            initial_training=self.initial_training,
+            base_dir=self.workspace.root,
+        )
+        merged = adapter.merge_explore_outcomes(context, outcomes)
+        summary = self._install_outcome(
+            plan=plan,
+            stage="explore",
+            attempt=int(current["attempt"]),
+            outcome=merged,
+        )
+        archived = dict(current)
+        archived["completed_at"] = _now()
+        archived["metrics"] = dict(summary.metrics)
+        self.state.setdefault("history", []).append(archived)
+        self.state["current"] = None
+        self.state["state"] = "idle"
+        self.state.pop("reason", None)
+        self._save()
+        return ControllerTick(
+            "idle",
+            plan.generation,
+            "explore",
+            detail=f"merged {len(outcomes)} MD tasks",
+        )
+
     def tick(self) -> ControllerTick:
         self.state = _read_json(self.workspace.controller_file, self.state)
         current = self.state.get("current")
+        if current is not None:
+            if current.get("kind") == "task_group":
+                result = self._tick_task_group(current)
+                if self.state.get("current") is not None:
+                    return result
+                current = None
         if current is not None:
             target = self.targets[str(current["target"])]
             executor = self.executor_factory(target)
@@ -447,8 +615,70 @@ class PersistentController:
                 str(self.state["state"]), detail=str(self.state.get("reason", ""))
             )
         plan, stage, context = next_value
+        if stage == "explore":
+            from .workflow_iteration import WorkflowIterationAdapter
+
+            adapter = WorkflowIterationAdapter(
+                self.config,
+                initial_training=self.initial_training,
+                base_dir=self.workspace.root,
+            )
+            attempt_specs = adapter.plan_explore_attempts(context)
+            if not attempt_specs:
+                raise ControllerError(
+                    "sampling frontier has no unlocked MD attempts"
+                )
+            attempt = self._attempt(plan.generation, stage)
+            tasks = []
+            for spec in attempt_specs:
+                target_name = self.sampling_route_targets.get(
+                    str(spec["route_id"]),
+                    self.stage_targets["sampling"],
+                )
+                target = self.targets[target_name]
+                task = build_stage_task(
+                    self.workspace.tasks_dir,
+                    workflow_root=self.workspace.root,
+                    workflow_id=self.workflow_id,
+                    generation=plan.generation,
+                    stage=stage,
+                    attempt=attempt,
+                    target=target,
+                    plan=plan,
+                    config=self.config,
+                    initial_training=self.initial_training,
+                    context=context,
+                    stage_input={
+                        "route_id": spec["route_id"],
+                        "attempt_ids": [spec["attempt_id"]],
+                        "allow_empty": True,
+                    },
+                )
+                tasks.append(
+                    {
+                        "task_id": task.task_id,
+                        "route_id": spec["route_id"],
+                        "route_fingerprint": spec["route_fingerprint"],
+                        "scenario_attempt_id": spec["attempt_id"],
+                        "target": target_name,
+                        "bundle": str(task.bundle),
+                        "handle": None,
+                    }
+                )
+            self.state["current"] = {
+                "kind": "task_group",
+                "generation": plan.generation,
+                "stage": stage,
+                "resource": "sampling",
+                "attempt": attempt,
+                "tasks": tasks,
+                "created_at": _now(),
+            }
+            self.state["state"] = "launching"
+            self._save()
+            return self.tick()
         resource = _RESOURCE_FOR_STAGE[stage]
-        target_name = self.routes[resource]
+        target_name = self.stage_targets[resource]
         target = self.targets[target_name]
         attempt = self._attempt(plan.generation, stage)
         task = build_stage_task(
@@ -501,6 +731,36 @@ class PersistentController:
             self.generation_controller.reopen_rejected(rejected[0], from_stage="retrain")
         current = self.state.get("current")
         if current is not None:
+            if current.get("kind") == "task_group":
+                retried = 0
+                for item in current["tasks"]:
+                    if item.get("collected_bundle"):
+                        continue
+                    handle = item.get("handle")
+                    if handle is not None:
+                        item.setdefault("retry_history", []).append(
+                            {
+                                "handle": handle,
+                                "failed_at": _now(),
+                                "failure": item.get("detail")
+                                or self.state.get("reason", "manual retry"),
+                            }
+                        )
+                    item["handle"] = None
+                    item.pop("terminal_failure", None)
+                    item.pop("failure", None)
+                    item.pop("observed_state", None)
+                    item.pop("observed_at", None)
+                    item.pop("detail", None)
+                    retried += 1
+                if not retried:
+                    raise ControllerError(
+                        "MD task group has no failed or unfinished tasks to retry"
+                    )
+                self.state["state"] = "launching"
+                self.state.pop("reason", None)
+                self._save()
+                return
             archived = dict(current)
             archived["failed_at"] = _now()
             archived["failure"] = self.state.get("reason", "manual retry")
@@ -705,6 +965,52 @@ def stop_workflow(
             )
             controller._save()
             result["current_execution"] = {"action": "none"}
+            return result
+        if current.get("kind") == "task_group":
+            records = []
+            for item in current["tasks"]:
+                handle_value = item.get("handle")
+                if handle_value is None or item.get("collected_bundle"):
+                    continue
+                target_name = str(item["target"])
+                handle = ExecutionHandle.from_mapping(handle_value)
+                executor = controller.executor_factory(
+                    controller.targets[target_name]
+                )
+                status = executor.cancel(handle)
+                records.append(
+                    {
+                        "target": target_name,
+                        "executor": handle.executor,
+                        "execution_id": handle.execution_id,
+                        "action": status.state,
+                        "detail": status.detail,
+                    }
+                )
+                if status.state not in {
+                    "cancelled",
+                    "failed",
+                    "completed",
+                    "cancelling",
+                }:
+                    raise ControllerError(
+                        "MD task cancellation returned unsafe state "
+                        f"{status.state}"
+                    )
+            archived = dict(current)
+            archived["cancelled_at"] = _now()
+            archived["cancellations"] = records
+            controller.state.setdefault("history", []).append(archived)
+            controller.state["current"] = None
+            controller.state["state"] = "stopped"
+            controller.state["reason"] = (
+                "controller stopped and current MD task group was cancelled"
+            )
+            controller._save()
+            result["current_execution"] = {
+                "action": "group_cancelled",
+                "tasks": records,
+            }
             return result
         handle_value = current.get("handle")
         if handle_value is None:

@@ -283,10 +283,30 @@ def test_production_readiness_is_rechecked_after_model_changes():
         model_id="model-2",
         history=history,
     )
-    assert recheck[0].target_level == "production_ready"
+    assert recheck[0].target_level == "smoke_passed"
     history = _record(
         ladder,
         recheck,
+        history=history,
+        final_model_id="model-2",
+    )
+    record = next(iter(history["scenarios"].values()))
+    assert record["maturity"] == "production_ready"
+    assert record["canary_model_id"] == "model-2"
+    assert record["verified_model_id"] == "model-1"
+    production_recheck = ladder.schedule(
+        ["structure-a"],
+        pressure=0.0,
+        generation=6,
+        seed=6,
+        limit=1,
+        model_id="model-2",
+        history=history,
+    )
+    assert production_recheck[0].target_level == "production_ready"
+    history = _record(
+        ladder,
+        production_recheck,
         history=history,
         accepted=False,
         final_model_id="model-2",

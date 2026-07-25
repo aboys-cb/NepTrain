@@ -43,20 +43,18 @@ class GenerationPlan:
     generation: int
     seed: int
     max_selected: int
-    steps: int
-    temperatures: tuple[float, ...]
-    pressure: float = 0.0
-    min_novelty: float = 0.0
+    selection_novelty_threshold: float = 0.0
+    completion_coverage_threshold: float = 0.0
 
     def __post_init__(self) -> None:
         if self.generation < 1:
             raise ValueError("generation must be at least 1")
         if self.seed < 0 or self.max_selected < 1:
             raise ValueError("seed and max_selected must be positive")
-        if self.steps < 1 or not self.temperatures:
-            raise ValueError("steps and temperatures must be non-empty")
-        if self.min_novelty < 0:
-            raise ValueError("min_novelty must be non-negative")
+        if self.selection_novelty_threshold < 0:
+            raise ValueError("selection_novelty_threshold must be non-negative")
+        if self.completion_coverage_threshold < 0:
+            raise ValueError("completion_coverage_threshold must be non-negative")
 
     @property
     def sha256(self) -> str:
@@ -68,20 +66,12 @@ def progressive_plans(
     *,
     seed: int = 20260721,
     max_selected: int = 8,
-    initial_steps: int = 100,
-    temperatures: Sequence[float] = (300.0, 500.0, 700.0),
-    pressure: float = 0.0,
-    min_novelty: float = 0.0,
+    selection_novelty_threshold: float = 0.0,
+    completion_coverage_threshold: float = 0.0,
 ) -> tuple[GenerationPlan, ...]:
-    """Build visible per-generation plans for the auto sampling policy.
+    """Build model-generation plans without duplicating route physics."""
 
-    All requested thermodynamic conditions are available from the first
-    generation. Scenario maturity decides which condition runs next and how
-    many MD steps it receives. Every valid dump frame remains eligible for
-    global FPS; ``max_selected`` is the only selection-size limit.
-    """
-
-    if generations < 1 or not temperatures or max_selected < 1:
+    if generations < 1 or max_selected < 1:
         raise ValueError("invalid automatic sampling progression")
     plans = []
     for offset in range(generations):
@@ -91,10 +81,8 @@ def progressive_plans(
                 generation=generation,
                 seed=seed + offset,
                 max_selected=int(max_selected),
-                steps=initial_steps,
-                temperatures=tuple(float(value) for value in temperatures),
-                pressure=float(pressure),
-                min_novelty=float(min_novelty),
+                selection_novelty_threshold=float(selection_novelty_threshold),
+                completion_coverage_threshold=float(completion_coverage_threshold),
             )
         )
     return tuple(plans)
@@ -198,8 +186,8 @@ def stratified_farthest_point_sampling(
     while len(selected) < budget:
         novelty_gate = (
             np.ones(len(points), dtype=bool)
-            if plan.min_novelty == 0.0
-            else distances > plan.min_novelty
+            if plan.selection_novelty_threshold == 0.0
+            else distances > plan.selection_novelty_threshold
         )
         eligible = np.flatnonzero(available & novelty_gate)
         if not len(eligible):
@@ -246,6 +234,7 @@ class StageContext:
     artifacts: Mapping[str, Path]
     previous_artifacts: Mapping[str, Path]
     stage_dir: Path | None = None
+    stage_input: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def work_dir(self) -> Path:

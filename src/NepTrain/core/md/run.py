@@ -28,6 +28,7 @@ class MdRequest:
     temperature: float
     steps: int
     seed: int = 12345
+    replica: int = 1
     timestep: float = 0.001
     ensemble: str = "nvt"
     pressure: float = 0.0
@@ -41,6 +42,8 @@ class MdRequest:
     pre_failure_frames: int = 2
     bad_tail_frames: int = 1
     health: Mapping[str, object] = field(default_factory=dict)
+    route_id: str = ""
+    route_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,10 +98,15 @@ def _run_gpumd(request: MdRequest) -> MdResult:
 
 
 def run_md(request: MdRequest, backend: str) -> MdResult:
-    if request.ensemble not in {"nvt", "npt"}:
+    if request.template_path is None and request.ensemble not in {"nvt", "npt"}:
         raise MdError("ensemble must be nvt or npt")
-    if request.steps <= 0 or request.timestep <= 0 or request.seed < 1:
-        raise MdError("steps, timestep, and seed must be positive")
+    if (
+        request.steps <= 0
+        or request.timestep <= 0
+        or request.seed < 1
+        or request.replica < 1
+    ):
+        raise MdError("steps, timestep, seed, and replica must be positive")
     if request.mpi_ranks < 1:
         raise MdError("mpi_ranks must be at least 1")
     if request.pre_failure_frames < 0 or request.bad_tail_frames < 1:
@@ -121,6 +129,9 @@ def run_md(request: MdRequest, backend: str) -> MdResult:
         "pressure": request.pressure,
         "steps": request.steps,
         "seed": request.seed,
+        "replica": request.replica,
+        "route_id": request.route_id,
+        "route_fingerprint": request.route_fingerprint,
     }
     try:
         result = run_lammps(

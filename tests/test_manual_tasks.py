@@ -61,6 +61,28 @@ def test_local_manual_dft_splits_and_publishes_in_input_order(tmp_path):
     assert all(frame.calc and "energy" in frame.calc.results for frame in frames)
 
 
+def test_manual_dft_defaults_to_input_authoritative_kpoints(tmp_path):
+    source = _structures(tmp_path / "input.xyz", count=1)
+    dft_input = tmp_path / "INPUT"
+    dft_input.write_text("INPUT_PARAMETERS\nkspacing 0.25\n", encoding="utf-8")
+    operation = prepare_dft(
+        source,
+        backend="toy",
+        output=tmp_path / "labeled.xyz",
+        workdir=tmp_path / "run",
+        target=ExecutionTarget("local", "process"),
+        input_file=dft_input,
+    )
+
+    request = json.loads(
+        (
+            operation.root / "shards" / "000000" / "request.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert request["kpoint_mode"] == "auto"
+    assert request["kspacing"] is None
+
+
 def test_manual_step_refuses_to_overwrite_an_existing_result(tmp_path):
     source = _structures(tmp_path / "input.xyz")
     output = tmp_path / "labeled.xyz"
@@ -152,7 +174,7 @@ def test_slurm_manual_md_expands_structure_temperature_matrix(
     assert "#SBATCH --array=0,1,2,3,4,5%3" in script
 
 
-def test_target_overrides_are_recorded_in_manual_requests(tmp_path):
+def test_manual_md_runtime_options_are_explicit_request_inputs(tmp_path):
     source = _structures(tmp_path / "input.xyz", count=1)
     model = tmp_path / "nep.txt"
     model.write_text("fixture\n", encoding="utf-8")
@@ -168,13 +190,11 @@ def test_target_overrides_are_recorded_in_manual_requests(tmp_path):
             "slurm",
             partition="cpu",
             cpus_per_task=4,
-            overrides={
-                "md.lmp": "/opt/lammps/lmp",
-                "md.mpi_ranks": 4,
-                "md.inference_backend": "cpu",
-            },
         ),
         steps=10,
+        lmp="/opt/lammps/lmp",
+        mpi_ranks=4,
+        inference_backend="cpu",
     )
 
     request = json.loads(

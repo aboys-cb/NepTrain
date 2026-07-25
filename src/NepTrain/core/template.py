@@ -1,4 +1,4 @@
-"""Create one strict schema-v5 project without touching existing files."""
+"""Create one strict schema-v7 project without touching existing files."""
 
 from __future__ import annotations
 
@@ -51,51 +51,45 @@ def _project(profile: str) -> dict:
             "analysis": "cpu",
         }
     return {
-        "schema_version": 5,
+        "schema_version": 7,
         "training": {
             "backend": "torchnep",
             "initial_path": "./train.xyz",
             "config_path": "./nep.in",
             "device": "cuda",
-            "torch_backend": "auto",
-            "precision": "float32",
-            "use_compile": False,
-            "finetune_lr_scale": 0.1,
-            "seed": 20260723,
         },
         "md": {
             "backend": "lammps",
             "inference_backend": "auto",
-            "structures": "./structures",
-            "template_path": "./lammps-nvt.in",
             "spin": False,
-            "lmp": "lmp",
-            "mpiexec": "mpirun",
-            "mpi_ranks": 1,
         },
         "sampling": {
-            "mode": "auto",
-            "conditions": {
-                "temperature_path": [300],
-                "production_temperatures": [300],
-                "pressure": 0.0,
-                "spin_temperature": None,
-            },
-            "progression": {
-                "md_runs_per_iteration": 4,
-                "steps": {
-                    "smoke_passed": 10000,
-                    "short_stable": 40000,
-                    "long_stable": 160000,
-                    "production_ready": 640000,
+            "routes": [
+                {
+                    "id": "default",
+                    "structures": ["./structures"],
+                    "template_path": "./lammps-nvt.in",
+                    "conditions": {
+                        "temperature_path": [300],
+                        "production_temperatures": [300],
+                        "pressure": 0.0,
+                    },
+                    "progression": {
+                        "steps": {
+                            "smoke_passed": 10000,
+                            "short_stable": 40000,
+                            "long_stable": 160000,
+                            "production_ready": 640000,
+                        },
+                        "replicas": {
+                            "smoke_passed": 1,
+                            "short_stable": 1,
+                            "long_stable": 2,
+                            "production_ready": 3,
+                        },
+                    },
                 },
-                "replicas": {
-                    "smoke_passed": 1,
-                    "short_stable": 1,
-                    "long_stable": 2,
-                    "production_ready": 3,
-                },
-            },
+            ],
             "candidate_pool": {
                 "pre_failure_frames": 2,
                 "bad_tail_frames": 1,
@@ -109,36 +103,25 @@ def _project(profile: str) -> dict:
                 },
             },
             "selection": {
-                "method": "fps",
                 "max_selected": 100,
-                "min_novelty": 0.0,
+                "novelty": "auto",
             },
         },
         "dft": {
             "backend": "vasp",
-            "n_cpu": 1,
-            "kpoints_use_gamma": True,
             "input_path": "./INCAR",
             "resource_path": None,
-            "use_k_stype": "kspacing",
-            "kspacing": 0.2,
-        },
-        "evaluation": {
-            "validation_path": "./validation.xyz",
-            "inference_backend": "auto",
-            "max_rmse": {
-                "energy_rmse": 0.05,
-                "force_rmse": 0.2,
-            },
+            "kpoint_mode": "auto",
         },
         "workflow": {
             "id": "workflow",
-            "max_iterations": 12,
+            "max_model_generations": 12,
             "seed": 20260721,
         },
         "execution": {
             "poll_interval": 30,
-            "routes": routes,
+            "stage_targets": routes,
+            "sampling_route_targets": {},
             "targets": targets,
         },
     }
@@ -186,8 +169,9 @@ def init_project(profile: str, destination: str | Path, *, force: bool = False) 
                 path.write_text(content, encoding="utf-8")
                 path.chmod(0o755)
     utils.print_success(
-        f"Created {project}. Add train.xyz, validation.xyz, nep.in and structures; "
-        "then run `neptrain doctor --project project.yaml`."
+        f"Created {project}. Add train.xyz, nep.in and route structures; "
+        "optionally configure evaluation, then run "
+        "`neptrain doctor --project project.yaml`."
     )
     return project
 

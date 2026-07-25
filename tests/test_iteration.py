@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from NepTrain.core.iteration import (
 )
 from NepTrain.core.md import MdResult
 from NepTrain.core.toy_iteration import (
+    ToyGenerationPlan,
     ToyIterationAdapter,
     run_toy_iteration_smoke,
 )
@@ -55,51 +57,66 @@ def test_descriptor_backend_receives_every_frame_in_bounded_batches(tmp_path):
 def _sampling(
     temperatures=(300.0,),
     *,
+    structures,
+    template,
     steps=(100, 400, 1600, 6400),
-    md_runs=4,
     max_selected=8,
 ):
     return {
-        "mode": "auto",
-        "conditions": {
-            "temperature_path": list(temperatures),
-            "production_temperatures": list(temperatures),
-            "pressure": 0.0,
-            "spin_temperature": "auto",
-        },
-        "progression": {
-            "md_runs_per_iteration": md_runs,
-            "steps": dict(
-                zip(
-                    (
-                        "smoke_passed",
-                        "short_stable",
-                        "long_stable",
-                        "production_ready",
+        "routes": [
+            {
+                "id": "default",
+                "structures": [str(structures)],
+                "template_path": str(template),
+                "conditions": {
+                    "temperature_path": list(temperatures),
+                    "production_temperatures": list(temperatures),
+                    "pressure": 0.0,
+                },
+                "progression": {
+                    "steps": dict(
+                        zip(
+                            (
+                                "smoke_passed",
+                                "short_stable",
+                                "long_stable",
+                                "production_ready",
+                            ),
+                            steps,
+                        )
                     ),
-                    steps,
-                )
-            ),
-        },
+                    "replicas": {
+                        "smoke_passed": 1,
+                        "short_stable": 1,
+                        "long_stable": 2,
+                        "production_ready": 3,
+                    },
+                },
+            }
+        ],
         "candidate_pool": {
             "pre_failure_frames": 2,
             "bad_tail_frames": 1,
             "health": {},
         },
         "selection": {
-            "method": "fps",
             "max_selected": max_selected,
-            "min_novelty": 0.0,
+            "novelty": "auto",
         },
     }
+
+
+def _with_route(frames):
+    for frame in frames:
+        frame.info.setdefault("route_id", "default")
+        frame.info.setdefault("route_fingerprint", "f" * 64)
+    return frames
 
 
 def test_progression_keeps_the_user_selection_limit_constant():
     plans = progressive_plans(4, max_selected=100)
 
-    assert [plan.steps for plan in plans] == [100, 100, 100, 100]
     assert [plan.max_selected for plan in plans] == [100, 100, 100, 100]
-    assert [len(plan.temperatures) for plan in plans] == [3, 3, 3, 3]
 
 
 def test_regular_label_floor_is_derived_from_the_user_maximum():
@@ -113,7 +130,7 @@ def test_candidate_pool_rejects_a_different_sampling_model(tmp_path: Path):
     second_model = tmp_path / "model-b.txt"
     first_model.write_text("a\n", encoding="utf-8")
     second_model.write_text("b\n", encoding="utf-8")
-    candidates = toy_candidate_frames("ordinary", 811, 2)
+    candidates = _with_route(toy_candidate_frames("ordinary", 811, 2))
     candidates_path = tmp_path / "candidates.xyz"
     manifest = tmp_path / "candidate-pool.json"
     write_candidate_pool(
@@ -143,7 +160,7 @@ def test_stratified_fps_is_input_order_independent_and_balanced():
     )
     candidate_ids = ["a1", "a2", "a3", "b1", "b2", "b3"]
     strata = ["A", "A", "A", "B", "B", "B"]
-    plan = GenerationPlan(1, 1, 4, 100, (300.0,))
+    plan = GenerationPlan(1, 1, 4)
     first = stratified_farthest_point_sampling(
         points, np.asarray([[0.0, 0.0]]), candidate_ids, strata, plan
     )
@@ -161,7 +178,7 @@ def test_stratified_fps_is_input_order_independent_and_balanced():
 
 
 def test_zero_min_novelty_allows_duplicate_smoke_candidates():
-    plan = GenerationPlan(1, 1, 1, 2, (10.0,), min_novelty=0.0)
+    plan = GenerationPlan(1, 1, 1, selection_novelty_threshold=0.0)
     result = stratified_farthest_point_sampling(
         np.asarray([[1.0, 1.0], [1.0, 1.0]]),
         np.asarray([[1.0, 1.0]]),
@@ -188,10 +205,10 @@ def test_two_generation_toy_workflow_is_deterministic_and_resumable(tmp_path: Pa
     assert report.selected_counts == (8, 8)
     assert report.training_counts[1] > report.training_counts[0]
     assert report.coverage_p95[1] < report.coverage_p95[0]
-    assert report.scenario_steps == ((100,), (100, 400))
+    assert report.scenario_steps == ((100,), (100,))
     assert report.maturity_counts == (
         {"smoke_passed": 1},
-        {"short_stable": 1, "smoke_passed": 1},
+        {"smoke_passed": 2},
     )
     assert report.deterministic_selection
     assert report.resume_reused_artifacts
@@ -223,18 +240,14 @@ def test_toy_generations_keep_all_temperature_strata_visible(tmp_path: Path):
     assert max(report.strata_counts[2].values()) - min(
         report.strata_counts[2].values()
     ) <= 1
-    assert report.scenario_steps[2] == (100, 400, 1600)
-    assert report.maturity_counts[2] == {
-        "long_stable": 1,
-        "short_stable": 1,
-        "smoke_passed": 1,
-    }
+    assert report.scenario_steps[2] == (100,)
+    assert report.maturity_counts[2] == {"smoke_passed": 3}
 
 
 def test_controller_rejects_completed_artifact_drift(tmp_path: Path):
     root = tmp_path / "drift"
     run_toy_iteration_smoke(root, profile="spin", generations=1, seed=17)
-    plan = progressive_plans(1, seed=17)
+    plan = (ToyGenerationPlan(1, 17, 8),)
     adapter = ToyIterationAdapter(
         profile="spin",
         initial_training=root / "initial-train.xyz",
@@ -336,9 +349,11 @@ def test_controller_rejects_plan_change_after_generation_started(tmp_path: Path)
             return StageOutcome({f"{stage}_artifact": artifact}, metrics)
 
     controller = GenerationController(tmp_path / "plan-drift", "plan-drift")
-    original = GenerationPlan(1, 1, 2, 100, (300.0,))
+    original = GenerationPlan(1, 1, 2)
     controller.run_workflow((original,), AcceptingAdapter())
-    changed = GenerationPlan(1, 1, 2, 200, (300.0,))
+    changed = GenerationPlan(
+        1, 1, 2, completion_coverage_threshold=0.1
+    )
 
     with pytest.raises(IterationError, match="plan changed"):
         controller.run_workflow((changed,), AcceptingAdapter())
@@ -428,7 +443,10 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
         request.output_dir.mkdir(parents=True, exist_ok=True)
         model = request.output_dir / "nep.txt"
         checkpoint = request.output_dir / "checkpoint.pt"
-        model.write_text("fake spin_nep_lite model\n", encoding="utf-8")
+        model.write_text(
+            f"fake spin_nep_lite model {len(training_requests)}\n",
+            encoding="utf-8",
+        )
         checkpoint.write_text("checkpoint\n", encoding="utf-8")
         return TrainingResult(backend, model, None, checkpoint)
 
@@ -475,9 +493,10 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     def fake_descriptors(_model, frames):
         return toy_raw_features(frames, "spin")
 
-    def fake_predict(_model, frames, backend):
+    def fake_predict(model, frames, backend):
         calls.append(("predict", backend, len(frames)))
-        scale = 10.0 if len(frames) == 3 else 1.0
+        candidate = model.read_text(encoding="utf-8").strip().endswith("2")
+        scale = 1.0 if candidate or len(frames) != 3 else 10.0
         return {
             "energy_rmse": 0.1 * scale,
             "force_rmse": 0.2 * scale,
@@ -493,14 +512,14 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
         },
         "md": {
             "backend": "lammps",
-            "structures": str(structure),
             "spin": True,
             "mpi_ranks": 1,
         },
         "sampling": _sampling(
             (300.0, 500.0),
+            structures=structure,
+            template=config_file,
             steps=(40, 160, 640, 2560),
-            md_runs=2,
             max_selected=3,
         ),
         "dft": {"software": "toy", "teacher_profile": "spin"},
@@ -525,7 +544,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     adapter = WorkflowIterationAdapter(
         config, initial_training=initial, runtime=runtime
     )
-    plan = GenerationPlan(1, 19, 3, 40, (300.0, 500.0))
+    plan = GenerationPlan(1, 19, 3)
     summary = GenerationController(
         tmp_path / "workflow", "real-contract-toy-labels"
     ).run_generation(plan, adapter)
@@ -557,7 +576,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     md_attempts = json.loads(summary.artifacts["md_attempts"].read_text())
     assert all(item["completed"] for item in md_attempts["attempts"])
     assert len([call for call in calls if call[0] == "train"]) == 2
-    assert len([call for call in calls if call[0] == "predict"]) == 3
+    assert len([call for call in calls if call[0] == "predict"]) == 6
     assert calls[0] == ("train", "torchnep", "cuda")
     assert training_requests[0].config_file == config_file
     assert training_requests[1].config_file.name == "torchnep-finetune.in"
@@ -606,15 +625,12 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
             if key != "validation_path"
         },
     }
-    fallback_summary = GenerationController(
-        tmp_path / "fallback-workflow", "fallback"
-    ).run_generation(
-        plan,
+    with pytest.raises(
+        WorkflowIterationError, match="evaluation.validation_path"
+    ):
         WorkflowIterationAdapter(
             fallback_config, initial_training=initial, runtime=runtime
-        ),
-    )
-    assert fallback_summary.accepted
+        )
     assert all(request.test_file is None for request in training_requests)
 
 
@@ -640,7 +656,12 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     config = {
         "training": {"backend": "torchnep", "config_path": str(config_file)},
         "md": {"backend": "lammps", "spin": True},
-        "sampling": _sampling((100.0,), max_selected=20),
+        "sampling": _sampling(
+            (100.0,),
+            structures=initial,
+            template=config_file,
+            max_selected=20,
+        ),
         "dft": {"software": "toy", "teacher_profile": "spin"},
         "evaluation": {
             "validation_path": str(validation),
@@ -682,7 +703,7 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     write_candidate_pool(
         candidates_path,
         manifest,
-        ase_read(candidates_path, index=":"),
+        _with_route(ase_read(candidates_path, index=":")),
         generation=1,
         model_path=model,
         requested_md_runs=4,
@@ -693,7 +714,7 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     context = StageContext(
         generation=1,
         generation_dir=tmp_path,
-        plan=GenerationPlan(1, 1, 20, 10, (100.0,)),
+        plan=GenerationPlan(1, 1, 20),
         artifacts={
             "candidates": candidates_path,
             "candidate_pool_manifest": manifest,
@@ -722,7 +743,7 @@ def test_workflow_selection_describes_every_unique_valid_dump_frame(
     initial_frame = ToyTeacher("ordinary").label(
         toy_candidate_frames("ordinary", 401, 1)[0]
     )
-    candidates = toy_candidate_frames("ordinary", 402, 20)
+    candidates = _with_route(toy_candidate_frames("ordinary", 402, 20))
     for index, frame in enumerate(candidates):
         frame.info.update(
             source_id=f"source-{index % 2}",
@@ -756,7 +777,11 @@ def test_workflow_selection_describes_every_unique_valid_dump_frame(
         {
             "training": {"backend": "gpumd"},
             "md": {"backend": "lammps", "spin": False},
-            "sampling": _sampling(max_selected=4),
+            "sampling": _sampling(
+                structures=initial,
+                template=initial,
+                max_selected=4,
+            ),
             "dft": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(initial),
@@ -770,7 +795,7 @@ def test_workflow_selection_describes_every_unique_valid_dump_frame(
         StageContext(
             generation=1,
             generation_dir=tmp_path,
-            plan=GenerationPlan(1, 1, 4, 10, (300.0,)),
+            plan=GenerationPlan(1, 1, 4),
             artifacts={
                 "candidates": candidates_path,
                 "candidate_pool_manifest": manifest,
@@ -833,11 +858,13 @@ def test_explore_accumulates_same_model_md_waves_to_the_derived_floor(
             "training": {"backend": "gpumd", "config_path": str(config_file)},
             "md": {
                 "backend": "lammps",
-                "structures": str(structures),
                 "spin": False,
             },
             "sampling": _sampling(
-                (300.0,), md_runs=1, max_selected=4
+                (300.0,),
+                structures=structures,
+                template=config_file,
+                max_selected=4,
             ),
             "dft": {"backend": "toy"},
             "evaluation": {
@@ -852,21 +879,21 @@ def test_explore_accumulates_same_model_md_waves_to_the_derived_floor(
         StageContext(
             generation=1,
             generation_dir=tmp_path,
-            plan=GenerationPlan(1, 11, 4, 100, (300.0,)),
+            plan=GenerationPlan(1, 11, 4),
             artifacts={"model": model, "training_input": initial},
             previous_artifacts={},
             stage_dir=tmp_path / "explore",
         )
     )
 
-    assert len(md_calls) == 2
-    assert outcome.metrics["unique_candidate_count"] == 2
+    assert len(md_calls) == 3
+    assert outcome.metrics["unique_candidate_count"] == 3
     assert outcome.metrics["regular_batch_minimum"] == 2
     manifest = json.loads(
         outcome.artifacts["candidate_pool_manifest"].read_text()
     )
     assert manifest["model_sha256"] == outcome.metrics["sampling_model_sha256"]
-    assert manifest["scheduled_md_runs"] == 2
+    assert manifest["scheduled_md_runs"] == 3
     assert manifest["available_md_runs"] == 3
 
 
@@ -923,19 +950,26 @@ def test_next_md_round_uses_the_newly_published_model(tmp_path: Path):
             last_step=request.steps,
         )
 
-    def always_needs_update(_model, _frames, _backend):
-        return {"energy_rmse": 2.0, "force_rmse": 2.0}
+    def model_sensitive_errors(model, _frames, _backend):
+        value = (
+            0.5
+            if model.read_text(encoding="utf-8").strip() == "model-2"
+            else 2.0
+        )
+        return {"energy_rmse": value, "force_rmse": value}
 
     adapter = WorkflowIterationAdapter(
         {
             "training": {"backend": "gpumd", "config_path": str(config_file)},
             "md": {
                 "backend": "lammps",
-                "structures": str(structures),
                 "spin": False,
             },
             "sampling": _sampling(
-                (300.0,), md_runs=1, max_selected=2
+                (300.0,),
+                structures=structures,
+                template=config_file,
+                max_selected=2,
             ),
             "dft": {"backend": "toy"},
             "evaluation": {
@@ -950,18 +984,208 @@ def test_next_md_round_uses_the_newly_published_model(tmp_path: Path):
             descriptors=lambda _model, frames: toy_raw_features(
                 frames, "ordinary"
             ),
-            predict=always_needs_update,
+            predict=model_sensitive_errors,
         ),
     )
     controller = GenerationController(tmp_path / "workflow", "model-handoff")
-    controller.run_generation(
-        GenerationPlan(1, 31, 2, 100, (300.0,)), adapter
+    first = controller.run_generation(
+        GenerationPlan(1, 31, 2), adapter
     )
     controller.run_generation(
-        GenerationPlan(2, 32, 2, 100, (300.0,)), adapter
+        GenerationPlan(2, 32, 2), adapter
     )
 
+    assert first.metrics["evaluate"]["candidate_activation_accepted"] is True
+    assert first.artifacts["activated_model"].read_text().strip() == "model-2"
     assert md_models == ["model-1", "model-2"]
+
+
+@pytest.mark.parametrize(
+    ("candidate_error", "candidate_accepted", "active_model_text"),
+    (
+        (0.5, True, "candidate"),
+        (3.0, False, "parent"),
+    ),
+)
+def test_candidate_model_must_pass_activation_before_the_next_round(
+    tmp_path: Path,
+    candidate_error: float,
+    candidate_accepted: bool,
+    active_model_text: str,
+):
+    teacher = ToyTeacher("ordinary")
+    initial = tmp_path / "initial.xyz"
+    labeled = tmp_path / "labeled.xyz"
+    training_set = tmp_path / "train.xyz"
+    validation = tmp_path / "validation.xyz"
+    initial_frames = [
+        teacher.label(toy_candidate_frames("ordinary", 941, 1)[0])
+    ]
+    labeled_frames = [
+        teacher.label(toy_candidate_frames("ordinary", 942, 1)[0])
+    ]
+    ase_write(initial, initial_frames, format="extxyz")
+    ase_write(labeled, labeled_frames, format="extxyz")
+    ase_write(
+        training_set,
+        [*initial_frames, *labeled_frames],
+        format="extxyz",
+    )
+    ase_write(
+        validation,
+        [teacher.label(toy_candidate_frames("ordinary", 943, 1)[0])],
+        format="extxyz",
+    )
+    config_file = tmp_path / "nep.in"
+    config_file.write_text("type 1 Fe\n", encoding="utf-8")
+    parent = tmp_path / "parent.nep"
+    candidate = tmp_path / "candidate.nep"
+    parent.write_text("parent\n", encoding="utf-8")
+    candidate.write_text("candidate\n", encoding="utf-8")
+    parent_checkpoint = tmp_path / "parent.pt"
+    candidate_checkpoint = tmp_path / "candidate.pt"
+    parent_checkpoint.write_text("parent checkpoint\n", encoding="utf-8")
+    candidate_checkpoint.write_text("candidate checkpoint\n", encoding="utf-8")
+
+    def errors(model, _frames, _backend):
+        value = (
+            candidate_error
+            if model.read_text(encoding="utf-8").strip() == "candidate"
+            else 2.0
+        )
+        return {"energy_rmse": value, "force_rmse": value}
+
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {"backend": "gpumd", "config_path": str(config_file)},
+            "md": {"backend": "lammps", "spin": False},
+            "sampling": _sampling(
+                (300.0,),
+                structures=initial,
+                template=config_file,
+            ),
+            "dft": {"backend": "toy"},
+            "evaluation": {
+                "validation_path": str(validation),
+                "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
+            },
+        },
+        initial_training=initial,
+        runtime=WorkflowRuntime(predict=errors),
+    )
+    parent_sha = hashlib.sha256(parent.read_bytes()).hexdigest()
+    candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+    def write_json(name, value):
+        path = tmp_path / name
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    work_dir = tmp_path / "evaluate"
+    work_dir.mkdir()
+    outcome = adapter._evaluate(
+        StageContext(
+            generation=1,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(1, 1, 2),
+            artifacts={
+                "training_input": initial,
+                "training_set": training_set,
+                "labeled": labeled,
+                "model": parent,
+                "checkpoint": parent_checkpoint,
+                "retrained_model": candidate,
+                "retrained_checkpoint": candidate_checkpoint,
+                "retraining_decision": write_json(
+                    "retraining-decision.json", {"retrained": True}
+                ),
+                "model_lineage": write_json(
+                    "model-lineage.json",
+                    {
+                        "generation": 1,
+                        "parent_model_sha256": parent_sha,
+                        "candidate_model_sha256": candidate_sha,
+                        "model_updated": True,
+                        "trained_on_current_labels": True,
+                        "training_dataset_sha256": hashlib.sha256(
+                            training_set.read_bytes()
+                        ).hexdigest(),
+                        "training_count": 2,
+                        "pending_label_count": 0,
+                    },
+                ),
+                "acquisition_signals": write_json(
+                    "acquisition-signals.json",
+                    {
+                        "attempt_accepted": {},
+                        "attempt_metrics": {},
+                    },
+                ),
+                "selection_result": write_json(
+                    "selection-result.json", {"remaining_novelty": 0.0}
+                ),
+                "scenario_plan": write_json(
+                        "scenario-plan.json",
+                        {
+                            "version": 3,
+                            "model_id": parent_sha,
+                            "routes": [
+                                {
+                                    "route_id": "default",
+                                    "route_fingerprint": (
+                                        adapter.routes[0].fingerprint
+                                    ),
+                                    "template_sha256": (
+                                        adapter.routes[0].template_sha256
+                                    ),
+                                    "structure_ids": [],
+                                    "pressure": 0.0,
+                                    "attempts": [],
+                                    "completed": {},
+                                }
+                            ],
+                        },
+                ),
+            },
+            previous_artifacts={},
+            stage_dir=work_dir,
+        )
+    )
+
+    assert outcome.metrics["accepted"] is True
+    assert (
+        outcome.metrics["candidate_activation_accepted"]
+        is candidate_accepted
+    )
+    assert (
+        outcome.artifacts["activated_model"].read_text().strip()
+        == active_model_text
+    )
+    expected_checkpoint = (
+        candidate_checkpoint if candidate_accepted else parent_checkpoint
+    )
+    assert outcome.artifacts["activated_checkpoint"] == expected_checkpoint
+    next_round = adapter._train(
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(2, 2, 2),
+            artifacts={},
+            previous_artifacts={
+                "training_set": training_set,
+                "activated_model": outcome.artifacts["activated_model"],
+                "activated_checkpoint": outcome.artifacts[
+                    "activated_checkpoint"
+                ],
+                "active_model_lineage": outcome.artifacts[
+                    "active_model_lineage"
+                ],
+            },
+            stage_dir=tmp_path / "next-round",
+        )
+    )
+    assert next_round.artifacts["model"] == outcome.artifacts["activated_model"]
+    assert next_round.artifacts["checkpoint"] == expected_checkpoint
 
 
 def test_retrain_updates_only_when_diagnostics_require_a_new_model(
@@ -1003,7 +1227,11 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
                 "config_path": str(config_file),
             },
             "md": {"backend": "lammps", "spin": False},
-            "sampling": _sampling((300.0,)),
+            "sampling": _sampling(
+                (300.0,),
+                structures=initial,
+                template=config_file,
+            ),
             "dft": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(validation),
@@ -1033,7 +1261,7 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
         StageContext(
             generation=1,
             generation_dir=tmp_path,
-            plan=GenerationPlan(1, 1, 2, 10, (300.0,)),
+            plan=GenerationPlan(1, 1, 2),
             artifacts={
                 "training_input": initial,
                 "training_set": initial,
@@ -1054,16 +1282,26 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
     assert lineage["model_updated"] is False
     assert lineage["parent_model_sha256"] == lineage["candidate_model_sha256"]
     assert len(training_calls) == 0
+    reused_lineage = tmp_path / "reused-active-lineage.json"
+    reused_lineage.write_text(
+        json.dumps(
+            {
+                "generation": 1,
+                "active_model_sha256": lineage["candidate_model_sha256"],
+            }
+        ),
+        encoding="utf-8",
+    )
     reused = adapter._train(
         StageContext(
             generation=2,
             generation_dir=tmp_path,
-            plan=GenerationPlan(2, 2, 2, 10, (300.0,)),
+            plan=GenerationPlan(2, 2, 2),
             artifacts={},
             previous_artifacts={
                 "training_set": initial,
-                "retrained_model": outcome.artifacts["retrained_model"],
-                "model_lineage": outcome.artifacts["model_lineage"],
+                "activated_model": outcome.artifacts["retrained_model"],
+                "active_model_lineage": reused_lineage,
             },
             stage_dir=tmp_path / "next-reuse",
         )
@@ -1080,7 +1318,7 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
         StageContext(
             generation=2,
             generation_dir=tmp_path,
-            plan=GenerationPlan(2, 2, 2, 10, (300.0,)),
+            plan=GenerationPlan(2, 2, 2),
             artifacts={
                 "training_input": initial,
                 "training_set": initial,
@@ -1106,16 +1344,28 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
         != updated_lineage["candidate_model_sha256"]
     )
     assert len(training_calls) == 1
+    activated_lineage = tmp_path / "updated-active-lineage.json"
+    activated_lineage.write_text(
+        json.dumps(
+            {
+                "generation": 2,
+                "active_model_sha256": updated_lineage[
+                    "candidate_model_sha256"
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     next_updated = adapter._train(
         StageContext(
             generation=3,
             generation_dir=tmp_path,
-            plan=GenerationPlan(3, 3, 2, 10, (300.0,)),
+            plan=GenerationPlan(3, 3, 2),
             artifacts={},
             previous_artifacts={
                 "training_set": initial,
-                "retrained_model": updated.artifacts["retrained_model"],
-                "model_lineage": updated.artifacts["model_lineage"],
+                "activated_model": updated.artifacts["retrained_model"],
+                "active_model_lineage": activated_lineage,
             },
             stage_dir=tmp_path / "next-update",
         )
@@ -1127,9 +1377,11 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
 
 
 @pytest.mark.parametrize("backend", ["vasp", "abacus"])
+@pytest.mark.parametrize("kpoint_mode", ["auto", "kpoints"])
 def test_workflow_label_routes_production_dft_through_label_interface(
-    tmp_path: Path, backend: str
+    tmp_path: Path, backend: str, kpoint_mode: str, monkeypatch
 ):
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "4")
     initial = tmp_path / "initial.xyz"
     validation = tmp_path / "validation.xyz"
     selected_input = tmp_path / "selected.xyz"
@@ -1165,20 +1417,24 @@ def test_workflow_label_routes_production_dft_through_label_interface(
         calls.append((request, selected_backend))
         return LabelResult(selected_backend, request.output_file, tuple(frames))
 
+    dft_options = {
+        "backend": backend,
+        "input_path": str(input_file),
+        "resource_path": str(resource_dir),
+        "gamma_centered": True,
+    }
+    if kpoint_mode == "kpoints":
+        dft_options.update(kpoint_mode="kpoints", kpoints=[2, 3, 4])
+
     adapter = WorkflowIterationAdapter(
         {
             "training": {"backend": "gpumd", "config_path": str(config_file)},
             "md": {"backend": "lammps", "spin": False},
-            "sampling": _sampling(),
-                "dft": {
-                    "backend": backend,
-                    "n_cpu": 4,
-                    "input_path": str(input_file),
-                "resource_path": str(resource_dir),
-                "kpoints_use_gamma": True,
-                "use_k_stype": "kpoints",
-                "kpoints": [2, 3, 4],
-            },
+            "sampling": _sampling(
+                structures=initial,
+                template=config_file,
+            ),
+            "dft": dft_options,
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
@@ -1194,7 +1450,7 @@ def test_workflow_label_routes_production_dft_through_label_interface(
         StageContext(
             generation=1,
             generation_dir=generation_dir,
-            plan=GenerationPlan(1, 1, 2, 10, (300.0,)),
+            plan=GenerationPlan(1, 1, 2),
             artifacts={"selected_input": selected_input},
             previous_artifacts={},
         )
@@ -1206,7 +1462,9 @@ def test_workflow_label_routes_production_dft_through_label_interface(
     assert request.resource_dir == resource_dir
     assert request.n_cpu == 4
     assert request.use_gamma is True
-    assert request.kpoint_mode == "kpoints"
-    assert request.ka == (2, 3, 4)
+    assert request.kpoint_mode == kpoint_mode
+    assert request.ka == (
+        (2, 3, 4) if kpoint_mode == "kpoints" else (1, 1, 1)
+    )
     assert request.kspacing is None
     assert outcome.metrics == {"backend": backend, "labeled_count": 2}

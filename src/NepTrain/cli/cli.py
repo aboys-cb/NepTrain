@@ -68,11 +68,10 @@ def _print_scientific_progress(generations):
         state = generation["state"].replace("_", " ")
         plan = generation["plan"]
         if generation["state"] == "not_started":
-            temperatures = ", ".join(f"{value:g}" for value in plan["temperatures"])
             print(
                 f"  G{number} {state}: FPS selects up to "
-                f"{plan['max_selected']}, {plan['steps']} MD steps, "
-                f"T={temperatures} K"
+                f"{plan['max_selected']}; MD conditions come from "
+                "sampling routes"
             )
             continue
 
@@ -150,10 +149,10 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
     print(f"State: {status.state}")
     print(
         f"Progress: {status.completed_generations}/{status.total_generations} "
-        "iterations"
+        "model generations"
     )
     if status.generation is not None:
-        print(f"Ledger: iteration {status.generation}, stage {status.stage}")
+        print(f"Ledger: generation {status.generation}, stage {status.stage}")
     else:
         print("Ledger: complete")
     print(f"Reason: {status.reason}")
@@ -317,14 +316,14 @@ def run_extend_command(args):
     from NepTrain.core.workflow import WorkflowError, extend_workflow
 
     try:
-        preparation = extend_workflow(args.project, args.iterations)
+        preparation = extend_workflow(args.project, args.generations)
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     print(
         json.dumps(
             {
                 "workflow_id": preparation.workflow_id,
-                "total_iterations": len(preparation.plans),
+                "total_model_generations": len(preparation.plans),
                 "project": str(preparation.output_dir),
             },
             indent=2,
@@ -714,38 +713,34 @@ def run_manual_md_command(args):
         target_from_project,
     )
 
-    project, base = _manual_project(args.project)
+    project, _ = _manual_project(args.project)
     settings = project.get("md", {})
     sampling = project.get("sampling", {})
-    conditions = sampling.get("conditions", {})
-    progression = sampling.get("progression", {})
     candidate_pool = sampling.get("candidate_pool", {})
-    progression_steps = progression.get("steps", {})
     target = target_from_project(args.project, args.target, route="sampling")
     operation = prepare_md(
         args.input,
         backend=args.backend or settings.get("backend", "lammps"),
         model_file=args.model,
         temperatures=args.temperature
-        or conditions.get("temperature_path", [300.0]),
+        or [300.0],
         output=args.output,
         workdir=args.workdir,
         target=target,
         steps=args.steps
         if args.steps is not None
-        else int(progression_steps.get("smoke_passed", 10000)),
+        else 10000,
         pressure=args.pressure
         if args.pressure is not None
-        else float(conditions.get("pressure", 0.0)),
+        else 0.0,
         ensemble=args.ensemble or "nvt",
-        template_path=args.template
-        or _project_path(base, settings.get("template_path")),
+        template_path=args.template,
         spin=args.spin
         if args.spin is not None
         else bool(settings.get("spin", False)),
         spin_temperature=args.spin_temperature
         if args.spin_temperature is not None
-        else conditions.get("spin_temperature"),
+        else None,
         inference_backend=args.inference_backend
         or settings.get("inference_backend", "auto"),
         lmp=args.lmp or settings.get("lmp", "lmp"),
@@ -784,12 +779,19 @@ def run_manual_dft_command(args):
     project, base = _manual_project(args.project)
     settings = project.get("dft", {})
     target = target_from_project(args.project, args.target, route="labeling")
-    use_k_stype = settings.get("use_k_stype", "kspacing")
-    kspacing = (
-        args.kspacing
-        if args.kspacing is not None
-        else settings.get("kspacing")
-    )
+    if args.kspacing is not None:
+        kpoint_mode = "kspacing"
+        kspacing = args.kspacing
+    elif args.ka is not None:
+        kpoint_mode = "kpoints"
+        kspacing = None
+    else:
+        kpoint_mode = settings.get("kpoint_mode", "auto")
+        kspacing = (
+            settings.get("kspacing")
+            if kpoint_mode == "kspacing"
+            else None
+        )
     operation = prepare_dft(
         args.input,
         backend=args.backend or settings.get("backend", "vasp"),
@@ -804,17 +806,14 @@ def run_manual_dft_command(args):
         use_gamma=(
             args.gamma
             if args.gamma is not None
-            else bool(settings.get("kpoints_use_gamma", False))
+            else bool(settings.get("gamma_centered", False))
         ),
-        kpoint_mode=(
-            "kspacing" if args.kspacing is not None else use_k_stype
-        ),
+        kpoint_mode=kpoint_mode,
         kspacing=kspacing,
         ka=args.ka or settings.get("kpoints", [1, 1, 1]),
         structures_per_job=args.structures_per_job,
         max_concurrent=args.max_concurrent,
-        teacher_profile=args.teacher_profile
-        or settings.get("teacher_profile", "ordinary"),
+        teacher_profile=args.teacher_profile or "ordinary",
         force=args.force,
     )
     _print_manual_status(
@@ -948,8 +947,9 @@ def build_manual_dft(subparsers):
     parser.add_argument(
         "--gamma", action=argparse.BooleanOptionalAction, default=None
     )
-    parser.add_argument("--kspacing", type=float)
-    parser.add_argument("--ka", type=_parse_ka)
+    kpoints = parser.add_mutually_exclusive_group()
+    kpoints.add_argument("--kspacing", type=float)
+    kpoints.add_argument("--ka", type=_parse_ka)
     parser.add_argument("--structures-per-job", type=int, default=1)
     parser.add_argument("--max-concurrent", type=int, default=20)
     parser.add_argument("--output", "-o", default="./labeled.xyz")
@@ -985,7 +985,7 @@ def build_workflow_commands(subparsers):
         "workflow", help="Prepare and control an automated active-learning workflow."
     )
     actions = parser.add_subparsers(dest="workflow_action", required=True)
-    init = actions.add_parser("init", help="Create a strict schema-v5 project.")
+    init = actions.add_parser("init", help="Create a strict schema-v7 project.")
     init.set_defaults(func=init_template)
     init.add_argument("--profile", choices=["local", "slurm"], default="slurm")
     init.add_argument("--directory", default=".")
@@ -1018,11 +1018,11 @@ def build_workflow_commands(subparsers):
     resume.add_argument("project")
 
     extend = actions.add_parser(
-        "extend", help="Increase the maximum model-iteration budget."
+        "extend", help="Increase the maximum model-generation budget."
     )
     extend.set_defaults(func=run_extend_command)
     extend.add_argument("project")
-    extend.add_argument("iterations", type=int)
+    extend.add_argument("generations", type=int)
 
     stop = actions.add_parser(
         "stop", help="Stop the controller without cancelling compute jobs."

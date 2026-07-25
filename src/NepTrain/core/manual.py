@@ -136,7 +136,7 @@ def target_from_project(
     project_path = Path(project).expanduser().resolve()
     config, _ = load_config(project_path)
     execution = config["execution"]
-    name = target_name or execution["routes"][route]
+    name = target_name or execution["stage_targets"][route]
     try:
         raw = dict(execution["targets"][name])
     except KeyError as error:
@@ -235,15 +235,6 @@ def prepare_training(
     seed: int = 20260723,
     force: bool = False,
 ) -> ManualOperation:
-    backend = str(target.overrides.get("training.backend", backend))
-    device = str(target.overrides.get("training.device", device))
-    torch_backend = str(
-        target.overrides.get("training.torch_backend", torch_backend)
-    )
-    precision = str(target.overrides.get("training.precision", precision))
-    use_compile = bool(
-        target.overrides.get("training.use_compile", use_compile)
-    )
     payload = {
         "backend": backend,
         "train": str(Path(train_file).expanduser().resolve()),
@@ -307,18 +298,18 @@ def prepare_dft(
 ) -> ManualOperation:
     if structures_per_job < 1:
         raise ManualTaskError("structures_per_job must be at least 1")
-    backend = str(target.overrides.get("dft.backend", backend))
-    teacher_profile = str(
-        target.overrides.get("dft.teacher_profile", teacher_profile)
-    )
-    effective_resource = target.overrides.get(
-        "dft.resource_path",
-        str(Path(resource_dir).expanduser().resolve()) if resource_dir else None,
+    effective_resource = (
+        target.dft_resource_path
+        or (
+            str(Path(resource_dir).expanduser().resolve())
+            if resource_dir
+            else None
+        )
     )
     if backend in {"vasp", "abacus"} and not effective_resource:
         raise ManualTaskError(
             f"{backend} labeling requires --resources, dft.resource_path, "
-            "or the target override dft.resource_path"
+            "or execution.targets.<name>.dft_resource_path"
         )
     if (
         backend in {"vasp", "abacus"}
@@ -331,11 +322,11 @@ def prepare_dft(
     effective_n_cpu = int(
         n_cpu
         if n_cpu is not None
-        else target.overrides.get("dft.n_cpu", target.cpus_per_task or 1)
+        else target.cpus_per_task or 1
     )
-    if target.host and resource_dir and "dft.resource_path" not in target.overrides:
+    if target.host and resource_dir and not target.dft_resource_path:
         raise ManualTaskError(
-            "remote DFT targets require overrides.dft.resource_path; "
+            "remote DFT targets require dft_resource_path; "
             "large resource directories are not copied"
         )
     output_path = _output_path(output, force=force)
@@ -419,13 +410,6 @@ def prepare_md(
     max_concurrent: int = 20,
     force: bool = False,
 ) -> ManualOperation:
-    backend = str(target.overrides.get("md.backend", backend))
-    inference_backend = str(
-        target.overrides.get("md.inference_backend", inference_backend)
-    )
-    lmp = str(target.overrides.get("md.lmp", lmp))
-    mpiexec = str(target.overrides.get("md.mpiexec", mpiexec))
-    mpi_ranks = int(target.overrides.get("md.mpi_ranks", mpi_ranks))
     output_path = _output_path(output, force=force)
     frames = _frames(Path(source))
     if not temperatures:
