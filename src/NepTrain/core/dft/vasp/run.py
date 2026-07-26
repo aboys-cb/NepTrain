@@ -49,6 +49,9 @@ def calculate_vasp(atoms: Atoms, args):
             kpoint_mode=str(getattr(args, "kpoint_mode", "auto")),
             kspacing=args.kspacing,
             ka=tuple(int(value) for value in args.ka),
+            flat_single_case=bool(
+                getattr(args, "flat_single_case", False)
+            ),
         ),
         case_index=atoms_index,
     )

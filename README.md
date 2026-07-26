@@ -117,7 +117,11 @@ neptrain task cancel runs/dft-...
 创建一个严格的 schema-v7 项目：
 
 ```bash
-neptrain workflow init --profile slurm --directory fe-project
+neptrain workflow init \
+  --profile slurm \
+  --ensemble npt \
+  --dft-backend vasp \
+  --directory fe-project
 cd fe-project
 ```
 
@@ -137,8 +141,11 @@ neptrain workflow run project.yaml --prepare-only
 确认项目快照后运行：
 
 ```bash
-neptrain workflow run project.yaml
+neptrain workflow run workflow
 ```
+
+也可以跳过单独准备，直接执行
+`neptrain workflow run project.yaml` 完成创建并启动。
 
 输出目录默认使用 `workflow.id`，也可用 `--output` 覆盖。Controller 默认脱离终端，
 不占计算节点，也不依赖 Slurm `afterok`。
@@ -153,20 +160,24 @@ neptrain workflow stop workflow
 neptrain workflow extend workflow 5
 ```
 
-`stop` 默认只停止 workflow Controller，不取消已在运行的计算任务；恢复后会接管同一任务。
-如果本次流程已经确定作废，同时取消当前排队或运行的计算任务：
+`stop` 默认同时停止 workflow Controller，并取消当前排队或运行的计算任务。取消记录
+会写入 workflow 历史；以后恢复时会为该阶段创建新的可追踪 attempt。
+如果只想暂时停止 Controller、保留当前任务继续计算：
 
 ```bash
-neptrain workflow stop workflow --cancel-jobs
+neptrain workflow stop workflow --keep-jobs
 ```
 
-取消记录会写入 workflow 历史；以后恢复时会为该阶段创建新的可追踪 attempt。
 独立手动任务使用 `neptrain task cancel` 明确取消。
+
+`workflow run` 同时接受项目 YAML 和已准备的 workflow 目录。第一次启动
+`--prepare-only` 的目录优先使用 `workflow run`；`workflow resume` 用于恢复
+暂停、失败或中断过的流程。
 
 ## schema v7
 
 自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、LAMMPS
-模板、条件和递进策略：
+模板和温度路径。默认压强、递进策略、轨迹帧策略和 FPS 上限无需重复填写：
 
 ```yaml
 schema_version: 7
@@ -186,35 +197,9 @@ sampling:
   routes:
     - id: default
       structures: [./structures]
-      template_path: ./lammps-nvt.in
+      template_path: ./lammps.in
       conditions:
         temperature_path: [300, 500, 700]
-        production_temperatures: [300, 700]
-        pressure: 0.0
-      progression:
-        steps:
-          smoke_passed: 10000
-          short_stable: 40000
-          long_stable: 160000
-          production_ready: 640000
-        replicas:
-          smoke_passed: 1
-          short_stable: 1
-          long_stable: 2
-          production_ready: 3
-  candidate_pool:
-    pre_failure_frames: 2
-    bad_tail_frames: 1
-    health:
-      min_distance_ratio: 0.5
-      min_volume_ratio: 0.5
-      max_volume_ratio: 2.0
-      max_force: 100.0
-      max_mforce: 100.0
-      max_spin_magnitude: 20.0
-  selection:
-    max_selected: 100
-    novelty: auto
 
 dft:
   backend: vasp
@@ -235,14 +220,11 @@ workflow:
   seed: 20260721
 
 execution:
-  poll_interval: 30
   stage_targets:
     training: v100
     sampling: cpu
     labeling: dft
     analysis: cpu
-  # 可选：未列出的 route 使用 stage_targets.sampling。
-  sampling_route_targets: {}
   targets:
     v100:
       executor: slurm
@@ -279,8 +261,9 @@ execution:
 k 点设置。
 
 `temperature_path` 是严格有序的温度探路路径，只有前一个温度通过才解锁下一个。
-`production_temperatures` 才会继续跑 short、long 和 production；其余温度只做
-便宜的 smoke 探路。所有通过健康检查的 dump 帧都会参与全局 FPS；系统只会去除
+默认全部温度都会继续跑 short、long 和 production。显式设置
+`production_temperatures` 后，其余温度只做便宜的 smoke 探路。所有通过健康检查
+的 dump 帧都会参与全局 FPS；系统只会去除
 训练集已有结构和完全重复结构，不会在描述符计算前按 stride 或数量上限抽帧。
 `max_selected` 是一个采样轮最多选去 DFT 的结构数。系统自动把常规积累下限设为
 它的一半（默认 100 对应 50）；当前场景 frontier 耗尽或物理失败抢救时可以提前
@@ -379,6 +362,10 @@ workflow/
 `results/` 只发布最新通过验收的 `nep.txt`、`train.xyz` 和指标。
 `generations/` 保存每代科学证据，内部任务、锁、manifest 和 ledger 放在
 `.neptrain/`。
+
+每代目录直接是 `train/`、`md/`、`select/`、`dft/`、`diagnose/`、
+`dataset/`、`retrain/` 和 `evaluate/`。训练输出、loss 和模型发布到对应阶段
+目录，`calculation` 软链指向真实执行目录。
 
 开发阶段的确定性工作流 smoke：
 

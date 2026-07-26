@@ -9,6 +9,8 @@ from typing import Any, Mapping
 
 from ruamel.yaml import YAML
 
+from .sampling_route import MATURITY_STAGES
+
 
 CURRENT_SCHEMA_VERSION = 7
 
@@ -50,6 +52,8 @@ _FIELDS: dict[str, set[str]] = {
         "kpoint_mode",
         "kpoints",
         "kspacing",
+        "structures_per_job",
+        "max_concurrent",
     },
     "evaluation": {
         "validation_path",
@@ -92,12 +96,6 @@ _ROUTE_CONDITION_FIELDS = {
     "pressure",
 }
 _ROUTE_PROGRESSION_FIELDS = {"steps", "replicas"}
-_MATURITY_STAGES = (
-    "smoke_passed",
-    "short_stable",
-    "long_stable",
-    "production_ready",
-)
 _TARGET_FIELDS = {
     "executor",
     "host",
@@ -164,24 +162,26 @@ def _validate_progression(
             f"unknown sampling.routes[{route_id}].progression fields: "
             + ", ".join(unknown)
         )
+    if not progression:
+        return
     steps = progression.get("steps", {})
     if not isinstance(steps, Mapping):
         raise ConfigError(
             f"sampling.routes[{route_id}].progression.steps must be a mapping"
         )
-    if set(steps) != set(_MATURITY_STAGES):
+    if set(steps) != set(MATURITY_STAGES):
         raise ConfigError(
             f"sampling.routes[{route_id}].progression.steps must define "
-            + ", ".join(_MATURITY_STAGES)
+            + ", ".join(MATURITY_STAGES)
         )
     if any(
         isinstance(steps[name], bool) or not isinstance(steps[name], int)
-        for name in _MATURITY_STAGES
+        for name in MATURITY_STAGES
     ):
         raise ConfigError(
             f"sampling.routes[{route_id}].progression.steps must be integers"
         )
-    ordered_steps = [int(steps[name]) for name in _MATURITY_STAGES]
+    ordered_steps = [int(steps[name]) for name in MATURITY_STAGES]
     if any(value < 1 for value in ordered_steps) or any(
         later <= earlier
         for earlier, later in zip(ordered_steps, ordered_steps[1:])
@@ -192,22 +192,22 @@ def _validate_progression(
         )
     replicas = progression.get("replicas")
     if not isinstance(replicas, Mapping) or set(replicas) != set(
-        _MATURITY_STAGES
+        MATURITY_STAGES
     ):
         raise ConfigError(
             f"sampling.routes[{route_id}].progression.replicas must define "
-            + ", ".join(_MATURITY_STAGES)
+            + ", ".join(MATURITY_STAGES)
         )
     if any(
         isinstance(replicas[name], bool) or not isinstance(replicas[name], int)
-        for name in _MATURITY_STAGES
+        for name in MATURITY_STAGES
     ):
         raise ConfigError(
             f"sampling.routes[{route_id}].progression.replicas values "
             "must be positive integers"
         )
     invalid_replicas = any(
-        int(replicas[name]) < 1 for name in _MATURITY_STAGES
+        int(replicas[name]) < 1 for name in MATURITY_STAGES
     )
     if invalid_replicas:
         raise ConfigError(
@@ -289,7 +289,7 @@ def _validate_sampling_routes(sampling: Mapping[str, Any]) -> list[Mapping[str, 
                     f"sampling.routes[{route_id}].conditions."
                     "production_temperatures must be a subset of temperature_path"
                 )
-        pressure = conditions.get("pressure")
+        pressure = conditions.get("pressure", 0.0)
         if (
             isinstance(pressure, bool)
             or not isinstance(pressure, (int, float))
@@ -391,7 +391,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
         TrajectoryHealthPolicy.from_mapping(candidate_pool.get("health", {}))
     except TrajectoryHealthError as error:
         raise ConfigError(str(error)) from error
-    if int(selection.get("max_selected", 0)) < 1:
+    if int(selection.get("max_selected", 100)) < 1:
         raise ConfigError("sampling.selection.max_selected must be positive")
     novelty = selection.get("novelty", "auto")
     if novelty != "auto":
@@ -436,6 +436,13 @@ def validate_config(config: Mapping[str, Any]) -> None:
         )
     if not isinstance(dft.get("gamma_centered", False), bool):
         raise ConfigError("dft.gamma_centered must be boolean")
+    for field, default in (
+        ("structures_per_job", 1),
+        ("max_concurrent", 20),
+    ):
+        value = dft.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigError(f"dft.{field} must be a positive integer")
     if dft.get("backend", "vasp") != "toy" and kpoint_mode == "kspacing":
         kspacing = dft.get("kspacing")
         if (

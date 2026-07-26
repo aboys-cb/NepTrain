@@ -27,6 +27,10 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
         (output / "nep_best.txt").write_text("nep4 1 Fe\n", encoding="utf-8")
         (output / "nep_final.txt").write_text("nep4 1 Fe\n", encoding="utf-8")
         (output / "checkpoint.pt").write_bytes(b"checkpoint")
+        (output / "checkpoint_stage1.pt").write_bytes(b"stage 1")
+        (output / "loss.out").write_text("loss\n", encoding="utf-8")
+        (output / "force_train.out").write_text("forces\n", encoding="utf-8")
+        (output / "output.log").write_text("training log\n", encoding="utf-8")
 
     monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(train_nep=fake_train_nep))
     monkeypatch.setitem(
@@ -61,6 +65,12 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
     assert result.best_model == output / "nep.txt"
     assert result.best_model.read_text(encoding="utf-8") == "nep4 1 Fe\n"
     assert result.checkpoint == output / "checkpoint.pt"
+    assert set(result.outputs) == {
+        "checkpoint_stage1.pt",
+        "force_train.out",
+        "loss.out",
+        "output.log",
+    }
     assert captured["finetune_from"] == str(finetune)
     assert captured["resume_from"] is None
     assert seeds == [("cpu", 20260723), ("cuda", 20260723)]

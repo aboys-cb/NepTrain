@@ -586,6 +586,35 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert ("md", "lammps", 300.0, 40) in calls
     assert ("md", "lammps", 500.0, 40) not in calls
 
+    flat_md_root = tmp_path / "flat-md-output"
+    flat_md_context = StageContext(
+        generation=1,
+        generation_dir=flat_md_root,
+        plan=plan,
+        artifacts={"model": summary.artifacts["model"]},
+        previous_artifacts={},
+        stage_dir=flat_md_root,
+        flat_output=True,
+    )
+    attempts = adapter.plan_explore_attempts(flat_md_context)
+    assert len(attempts) == 1
+    adapter.run_stage(
+        "explore",
+        StageContext(
+            generation=1,
+            generation_dir=flat_md_root,
+            plan=plan,
+            artifacts={"model": summary.artifacts["model"]},
+            previous_artifacts={},
+            stage_dir=flat_md_root,
+            stage_input={"attempt_ids": [attempts[0]["attempt_id"]]},
+            flat_output=True,
+        ),
+    )
+    assert (flat_md_root / "trajectory.xyz").is_file()
+    assert not (flat_md_root / "calculations").exists()
+    assert not (flat_md_root / "md").exists()
+
     overlap_config = {
         **config,
         "evaluation": {

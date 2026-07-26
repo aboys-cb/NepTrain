@@ -17,35 +17,73 @@ def test_init_project_writes_a_valid_narrow_schema_v7(tmp_path):
     route = config["sampling"]["routes"][0]
     assert route["id"] == "default"
     assert route["structures"] == ["./structures"]
-    assert route["template_path"] == "./lammps-nvt.in"
+    assert route["template_path"] == "./lammps.in"
     assert route["conditions"]["temperature_path"] == [300]
-    assert route["conditions"]["production_temperatures"] == [300]
-    assert route["progression"]["replicas"]["production_ready"] == 3
-    assert (
-        route["progression"]["steps"]["smoke_passed"]
-        == 10000
-    )
+    assert "production_temperatures" not in route["conditions"]
+    assert "pressure" not in route["conditions"]
+    assert "progression" not in route
+    assert "candidate_pool" not in config["sampling"]
+    assert "selection" not in config["sampling"]
     assert "evaluation" not in config
     assert "structures" not in config["md"]
     assert "template_path" not in config["md"]
     assert "plugin_path" not in config["md"]
     assert config["dft"]["kpoint_mode"] == "auto"
+    assert config["dft"]["structures_per_job"] == 1
+    assert config["dft"]["max_concurrent"] == 20
     assert "kspacing" not in config["dft"]
     assert "kpoints" not in config["dft"]
-    template = (tmp_path / "lammps-nvt.in").read_text(encoding="utf-8")
+    template = (tmp_path / "lammps.in").read_text(encoding="utf-8")
     assert "{{ temperature }}" in template
     assert "{{ steps }}" in template
     assert "{{ tdamp }}" not in template
     assert "{{ plugin_command }}" not in template
     assert "current_job" not in config
     assert "duration_ps_every_generation" not in config["md"]
-    assert (tmp_path / "lammps-nvt.in").is_file()
+    assert (tmp_path / "lammps.in").is_file()
     assert (tmp_path / "INCAR").is_file()
-    assert (tmp_path / "INPUT").is_file()
+    assert not (tmp_path / "INPUT").exists()
     assert "KSPACING = 0.2" in (tmp_path / "INCAR").read_text(encoding="utf-8")
-    assert "kspacing        0.2" in (
-        tmp_path / "INPUT"
+
+
+def test_init_selects_only_the_requested_spin_abacus_templates(tmp_path):
+    project = init_project(
+        "local",
+        tmp_path,
+        ensemble="nvt",
+        spin=True,
+        dft_backend="abacus",
+    )
+    config, _ = load_config(project)
+
+    assert config["md"]["spin"] is True
+    assert config["dft"]["backend"] == "abacus"
+    assert config["dft"]["input_path"] == "./INPUT"
+    assert (tmp_path / "lammps.in").is_file()
+    assert (tmp_path / "INPUT").is_file()
+    assert not (tmp_path / "INCAR").exists()
+    assert "fix integrator all dynspin/glsd/nvt" in (
+        tmp_path / "lammps.in"
     ).read_text(encoding="utf-8")
+
+
+def test_init_rejects_spin_vasp_combination(tmp_path):
+    with pytest.raises(ValueError, match="dft-backend abacus"):
+        init_project("local", tmp_path, spin=True)
+
+
+def test_force_switch_removes_obsolete_generated_dft_input(tmp_path):
+    init_project("local", tmp_path)
+    init_project(
+        "local",
+        tmp_path,
+        spin=True,
+        dft_backend="abacus",
+        force=True,
+    )
+
+    assert (tmp_path / "INPUT").is_file()
+    assert not (tmp_path / "INCAR").exists()
 
 
 def test_init_never_rewrites_an_existing_project_without_force(tmp_path):

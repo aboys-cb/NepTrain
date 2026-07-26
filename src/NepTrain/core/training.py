@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import random
 import shutil
+from typing import Mapping
 
 from ase.io import read as ase_read
 import numpy as np
@@ -39,6 +40,7 @@ class TrainingResult:
     best_model: Path
     final_model: Path | None
     checkpoint: Path | None
+    outputs: Mapping[str, Path] = field(default_factory=dict)
 
 
 def _validate_training_data(path: Path) -> bool:
@@ -130,11 +132,21 @@ def _train_torchnep(request: TrainingRequest) -> TrainingResult:
     shutil.copy2(best, canonical)
     final = request.output_dir / "nep_final.txt"
     checkpoint = request.output_dir / "checkpoint.pt"
+    outputs = {
+        path.name: path
+        for path in sorted(request.output_dir.glob("*.out"))
+        if path.is_file()
+    }
+    for name in ("output.log", "checkpoint_stage1.pt"):
+        path = request.output_dir / name
+        if path.is_file():
+            outputs[name] = path
     return TrainingResult(
         backend="torchnep",
         best_model=canonical,
         final_model=final if final.is_file() else None,
         checkpoint=checkpoint if checkpoint.is_file() else None,
+        outputs=outputs,
     )
 
 

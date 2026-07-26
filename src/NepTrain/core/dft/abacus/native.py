@@ -40,6 +40,7 @@ class NativeAbacusRequest:
     kpoint_mode: str
     kspacing: float | None
     ka: tuple[int, int, int]
+    flat_single_case: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,10 @@ def run_native_abacus(
         atoms=input_frame, require_orbitals=basis_type == "lcao"
     )
     case_dir = _new_attempt_directory(
-        request.work_dir, case_index, input_frame.get_chemical_formula()
+        request.work_dir,
+        case_index,
+        input_frame.get_chemical_formula(),
+        flat_single_case=request.flat_single_case,
     )
     ordered_indices = _render_case(
         case_dir,
@@ -378,13 +382,33 @@ def _constraint_mobility(atoms: Atoms) -> np.ndarray:
     return mobility
 
 
-def _new_attempt_directory(work_dir: Path, index: int, formula: str) -> Path:
+def _new_attempt_directory(
+    work_dir: Path,
+    index: int,
+    formula: str,
+    *,
+    flat_single_case: bool = False,
+) -> Path:
+    if flat_single_case:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        if not any(work_dir.iterdir()):
+            return work_dir
+        attempt = 2
+        while (work_dir / f"retry-{attempt:04d}").exists():
+            attempt += 1
+        directory = work_dir / f"retry-{attempt:04d}"
+        directory.mkdir()
+        return directory
     case_root = work_dir / f"{index:06d}-{formula}"
-    case_root.mkdir(parents=True, exist_ok=True)
-    attempt = 1
-    while (case_root / f"attempt-{attempt:04d}").exists():
+    try:
+        case_root.mkdir(parents=True)
+        return case_root
+    except FileExistsError:
+        pass
+    attempt = 2
+    while (case_root / f"retry-{attempt:04d}").exists():
         attempt += 1
-    directory = case_root / f"attempt-{attempt:04d}"
+    directory = case_root / f"retry-{attempt:04d}"
     directory.mkdir()
     return directory
 

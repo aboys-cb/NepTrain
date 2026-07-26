@@ -17,6 +17,8 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from ase.io import read as ase_read
+
 from .workflow_workspace import WorkflowWorkspace
 from .config import ConfigError, load_config
 from .execution import (
@@ -163,14 +165,14 @@ class PersistentController:
         executor_factory: ExecutorFactory = executor_for,
     ):
         self.workspace = WorkflowWorkspace.locate(project)
-        if self.workspace.version != 2:
+        if self.workspace.version != 3:
             raise ControllerError(
-                "persistent controllers require workflow layout v2; migrate the project first"
+                "persistent controllers require workflow layout v3"
             )
         self.manifest = _read_json(self.workspace.manifest)
-        if self.manifest.get("orchestration") != "controller-v1":
+        if self.manifest.get("orchestration") != "controller":
             raise ControllerError(
-                "workflow was prepared for the legacy Slurm dependency chain"
+                "workflow was not prepared for the current controller"
             )
         for record in [
             self.manifest["config"],
@@ -361,14 +363,31 @@ class PersistentController:
         attempt: int,
         outcome: StageOutcome,
     ) -> Any:
-        root = self.workspace.stage_dir(plan.generation, stage) / "artifacts" / f"attempt-{attempt}"
+        root = self.workspace.stage_dir(plan.generation, stage)
         installed = {}
         for name, source in outcome.artifacts.items():
-            destination = root / name / source.name
+            destination = root / source.name
+            existing_name = next(
+                (
+                    artifact_name
+                    for artifact_name, artifact_path in installed.items()
+                    if artifact_path == destination
+                ),
+                None,
+            )
+            if existing_name is not None:
+                if _sha256(source) != _sha256(destination):
+                    raise ControllerError(
+                        f"stage artifacts {existing_name} and {name} both "
+                        f"publish as {destination.name}"
+                    )
+                installed[name] = destination
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_suffix(destination.suffix + ".tmp")
-            shutil.copy2(source, temporary)
-            temporary.replace(destination)
+            if source.resolve() != destination.resolve():
+                temporary = destination.with_suffix(destination.suffix + ".tmp")
+                shutil.copy2(source, temporary)
+                temporary.replace(destination)
             installed[name] = destination
         return self.generation_controller.commit_stage(
             plan,
@@ -376,9 +395,91 @@ class PersistentController:
             StageOutcome(artifacts=installed, metrics=outcome.metrics),
         )
 
+    def _publish_calculation_link(
+        self,
+        *,
+        generation: int,
+        stage: str,
+        bundle: Path,
+        grouped: bool = False,
+        link_name_override: str | None = None,
+    ) -> Path | None:
+        work = bundle / "output"
+        if not work.is_dir():
+            work = bundle / "work"
+        if not work.is_dir():
+            return None
+        target = work
+        link_name = target.name
+        preferred = {
+            "train": "training",
+            "retrain": "retraining",
+            "label": "calculation",
+        }.get(stage)
+        if preferred is not None:
+            candidates = sorted(
+                path
+                for path in work.iterdir()
+                if path.is_dir() and path.name.startswith(preferred)
+            )
+            if len(candidates) == 1:
+                target = candidates[0]
+                link_name = target.name
+        elif stage == "explore":
+            candidates = sorted(
+                path for path in (work / "md").glob("*") if path.is_dir()
+            )
+            if len(candidates) == 1:
+                target = candidates[0]
+            attempts = work / "md-attempts.json"
+            if attempts.is_file():
+                values = _read_json(attempts, {}).get("attempts", [])
+                if len(values) == 1 and values[0].get("source_id"):
+                    link_name = str(values[0]["source_id"])
+            if link_name == work.name:
+                link_name = bundle.name
+
+        stage_root = self.workspace.stage_dir(generation, stage)
+        if link_name_override is not None:
+            if not link_name_override or Path(link_name_override).name != link_name_override:
+                raise ControllerError("calculation link name must be a simple name")
+            link_name = link_name_override
+        if grouped and stage == "label":
+            link = stage_root / link_name
+        elif grouped:
+            link = stage_root / "calculations" / link_name
+        else:
+            link = stage_root / "calculation"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        relative_target = Path(os.path.relpath(target, start=link.parent))
+        if link.is_symlink():
+            if Path(os.readlink(link)) == relative_target:
+                return link
+            link.unlink()
+        elif link.exists():
+            raise ControllerError(
+                f"cannot publish calculation link over existing path: {link}"
+            )
+        temporary = link.with_name(link.name + ".tmp")
+        temporary.unlink(missing_ok=True)
+        temporary.symlink_to(relative_target, target_is_directory=True)
+        temporary.replace(link)
+        return link
+
     def _tick_task_group(self, current: dict[str, Any]) -> ControllerTick:
         from .execution import StageTask
 
+        stage = str(current["stage"])
+        maximum = int(current.get("max_concurrent", len(current["tasks"])))
+        inflight = sum(
+            item.get("handle") is not None
+            and not item.get("collected_bundle")
+            and not item.get("terminal_failure")
+            for item in current["tasks"]
+        )
+        group_failed = any(
+            item.get("terminal_failure") for item in current["tasks"]
+        )
         running = 0
         unknown = 0
         for item in current["tasks"]:
@@ -393,10 +494,13 @@ class PersistentController:
                 Path(item["bundle"]),
             )
             if item.get("handle") is None:
+                if group_failed or inflight >= maximum:
+                    continue
                 handle = executor.launch(task)
                 item["handle"] = asdict(handle)
                 item["submitted_at"] = _now()
                 self._save()
+                inflight += 1
                 running += 1
                 continue
             handle = ExecutionHandle.from_mapping(item["handle"])
@@ -408,8 +512,9 @@ class PersistentController:
             item["detail"] = status.detail
             if status.state == "failed":
                 item["terminal_failure"] = True
+                group_failed = True
                 item["failure"] = (
-                    status.detail or f"MD task {item['task_id']} failed"
+                    status.detail or f"{stage} task {item['task_id']} failed"
                 )
                 self._save()
                 continue
@@ -421,9 +526,38 @@ class PersistentController:
                 continue
             collected = executor.collect(handle)
             item["collected_bundle"] = str(collected)
+            self._publish_calculation_link(
+                generation=int(current["generation"]),
+                stage=str(current["stage"]),
+                bundle=Path(collected),
+                grouped=True,
+                link_name_override=item.get("display_name"),
+            )
             item["completed_at"] = _now()
             self._save()
 
+        failures = [
+            item for item in current["tasks"] if item.get("terminal_failure")
+        ]
+        active = any(
+            item.get("handle") is not None
+            and not item.get("collected_bundle")
+            and not item.get("terminal_failure")
+            for item in current["tasks"]
+        )
+        if failures and not active:
+            self.state["state"] = "failed"
+            self.state["reason"] = (
+                f"{len(failures)} of {len(current['tasks'])} {stage} tasks failed; "
+                "retry will preserve completed task results"
+            )
+            self._save()
+            return ControllerTick(
+                "failed",
+                int(current["generation"]),
+                stage,
+                detail=self.state["reason"],
+            )
         if any(
             not item.get("collected_bundle")
             and not item.get("terminal_failure")
@@ -436,25 +570,10 @@ class PersistentController:
                 int(current["generation"]),
                 str(current["stage"]),
                 detail=(
-                    f"{len(current['tasks']) - running - unknown}/"
-                    f"{len(current['tasks'])} MD tasks complete"
+                    f"{sum(bool(item.get('collected_bundle')) for item in current['tasks'])}/"
+                    f"{len(current['tasks'])} {stage} tasks complete; "
+                    f"{running} running"
                 ),
-            )
-        failures = [
-            item for item in current["tasks"] if item.get("terminal_failure")
-        ]
-        if failures:
-            self.state["state"] = "failed"
-            self.state["reason"] = (
-                f"{len(failures)} of {len(current['tasks'])} MD tasks failed; "
-                "retry will preserve completed task results"
-            )
-            self._save()
-            return ControllerTick(
-                "failed",
-                int(current["generation"]),
-                str(current["stage"]),
-                detail=self.state["reason"],
             )
 
         plan = next(
@@ -462,7 +581,7 @@ class PersistentController:
             for item in self.plans
             if item.generation == int(current["generation"])
         )
-        _, context = self.generation_controller.stage_context(plan, "explore")
+        _, context = self.generation_controller.stage_context(plan, stage)
         outcomes: list[StageOutcome] = []
         for item in current["tasks"]:
             value, outcome = load_stage_result(item["collected_bundle"])
@@ -470,7 +589,7 @@ class PersistentController:
                 "task_id": item["task_id"],
                 "workflow_id": self.workflow_id,
                 "generation": plan.generation,
-                "stage": "explore",
+                "stage": stage,
                 "plan_sha256": plan.sha256,
             }
             if any(
@@ -488,10 +607,15 @@ class PersistentController:
             initial_training=self.initial_training,
             base_dir=self.workspace.root,
         )
-        merged = adapter.merge_explore_outcomes(context, outcomes)
+        if stage == "explore":
+            merged = adapter.merge_explore_outcomes(context, outcomes)
+        elif stage == "label":
+            merged = adapter.merge_label_outcomes(context, outcomes)
+        else:
+            raise ControllerError(f"unsupported grouped stage: {stage}")
         summary = self._install_outcome(
             plan=plan,
-            stage="explore",
+            stage=stage,
             attempt=int(current["attempt"]),
             outcome=merged,
         )
@@ -506,8 +630,8 @@ class PersistentController:
         return ControllerTick(
             "idle",
             plan.generation,
-            "explore",
-            detail=f"merged {len(outcomes)} MD tasks",
+            stage,
+            detail=f"merged {len(outcomes)} {stage} tasks",
         )
 
     def tick(self) -> ControllerTick:
@@ -587,6 +711,11 @@ class PersistentController:
             collected = executor.collect(handle)
             plan = next(
                 item for item in self.plans if item.generation == int(current["generation"])
+            )
+            self._publish_calculation_link(
+                generation=plan.generation,
+                stage=str(current["stage"]),
+                bundle=Path(collected),
             )
             summary = self._install_result(
                 plan=plan,
@@ -677,6 +806,73 @@ class PersistentController:
             self.state["state"] = "launching"
             self._save()
             return self.tick()
+        if (
+            stage == "label"
+            and self.config.get("dft", {}).get("backend", "vasp")
+            in {"vasp", "abacus"}
+        ):
+            frames = ase_read(context.artifacts["selected_input"], index=":")
+            if not isinstance(frames, list):
+                frames = [frames]
+            structures_per_job = int(
+                self.config.get("dft", {}).get("structures_per_job", 1)
+            )
+            maximum = int(
+                self.config.get("dft", {}).get("max_concurrent", 20)
+            )
+            target_name = self.stage_targets["labeling"]
+            target = self.targets[target_name]
+            attempt = self._attempt(plan.generation, stage)
+            tasks = []
+            for start in range(0, len(frames), structures_per_job):
+                stop = min(start + structures_per_job, len(frames))
+                batch_index = start // structures_per_job + 1
+                task = build_stage_task(
+                    self.workspace.tasks_dir,
+                    workflow_root=self.workspace.root,
+                    workflow_id=self.workflow_id,
+                    generation=plan.generation,
+                    stage=stage,
+                    attempt=attempt,
+                    target=target,
+                    plan=plan,
+                    config=self.config,
+                    initial_training=self.initial_training,
+                    context=context,
+                    stage_input={
+                        "batch_index": batch_index,
+                        "frame_indices": list(range(start, stop)),
+                    },
+                )
+                display_name = (
+                    f"{start + 1:06d}-{frames[start].get_chemical_formula()}"
+                    if stop - start == 1
+                    else f"{start + 1:06d}-{stop:06d}"
+                )
+                tasks.append(
+                    {
+                        "task_id": task.task_id,
+                        "batch_index": batch_index,
+                        "frame_indices": list(range(start, stop)),
+                        "display_name": display_name,
+                        "target": target_name,
+                        "bundle": str(task.bundle),
+                        "handle": None,
+                    }
+                )
+            self.state["current"] = {
+                "kind": "task_group",
+                "generation": plan.generation,
+                "stage": stage,
+                "resource": "labeling",
+                "attempt": attempt,
+                "max_concurrent": maximum,
+                "tasks": tasks,
+                "created_at": _now(),
+            }
+            self.state["state"] = "launching"
+            self._save()
+            return self.tick()
         resource = _RESOURCE_FOR_STAGE[stage]
         target_name = self.stage_targets[resource]
         target = self.targets[target_name]
@@ -755,7 +951,8 @@ class PersistentController:
                     retried += 1
                 if not retried:
                     raise ControllerError(
-                        "MD task group has no failed or unfinished tasks to retry"
+                        f"{current['stage']} task group has no failed or "
+                        "unfinished tasks to retry"
                     )
                 self.state["state"] = "launching"
                 self.state.pop("reason", None)
@@ -891,7 +1088,16 @@ def start_controller(
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline:
         if workspace.controller_pid.is_file() and controller_running(workspace.root):
-            return process.pid
+            try:
+                state = _read_json(workspace.controller_file)
+            except (FileNotFoundError, json.JSONDecodeError):
+                state = {}
+            if (
+                int(state.get("pid", -1)) == process.pid
+                and state.get("state") == "running"
+                and "reason" not in state
+            ):
+                return process.pid
         if process.poll() is not None:
             detail = workspace.controller_log.read_text(encoding="utf-8", errors="replace")[-4000:]
             raise ControllerError(f"controller failed to start: {detail.strip()}")
@@ -922,14 +1128,14 @@ def stop_controller(project: str | Path) -> None:
 def stop_workflow(
     project: str | Path,
     *,
-    cancel_jobs: bool = False,
+    cancel_jobs: bool = True,
     executor_factory: ExecutorFactory = executor_for,
 ) -> dict[str, Any]:
-    """Stop the controller and optionally cancel its current execution.
+    """Stop the controller and cancel its current execution by default.
 
-    Cancellation is intentionally explicit. A successfully cancelled task is
-    archived and removed from ``current`` so a later resume creates a new,
-    traceable attempt instead of inspecting the cancelled handle again.
+    ``cancel_jobs=False`` keeps the current execution for a later resume.
+    A successfully cancelled task is archived and removed from ``current`` so
+    a later resume creates a new, traceable attempt.
     """
 
     workspace = WorkflowWorkspace.locate(project)
@@ -994,7 +1200,7 @@ def stop_workflow(
                     "cancelling",
                 }:
                     raise ControllerError(
-                        "MD task cancellation returned unsafe state "
+                        f"{current['stage']} task cancellation returned unsafe state "
                         f"{status.state}"
                     )
             archived = dict(current)
@@ -1004,7 +1210,8 @@ def stop_workflow(
             controller.state["current"] = None
             controller.state["state"] = "stopped"
             controller.state["reason"] = (
-                "controller stopped and current MD task group was cancelled"
+                f"controller stopped and current {current['stage']} "
+                "task group was cancelled"
             )
             controller._save()
             result["current_execution"] = {

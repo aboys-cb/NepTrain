@@ -20,6 +20,9 @@ import time
 import traceback
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from ase.io import read as ase_read
+from ase.io import write as ase_write
+
 from .iteration import GenerationPlan, StageContext, StageOutcome
 from .sampling_route import load_sampling_routes
 
@@ -121,6 +124,16 @@ _STAGE_PREVIOUS_ARTIFACTS = {
     "retrain": ("signals", "scenario_maturity"),
     "evaluate": ("signals", "scenario_maturity"),
 }
+_STAGE_DIRECTORY_LABELS = {
+    "train": "train",
+    "explore": "md",
+    "select": "select",
+    "label": "dft",
+    "diagnose": "diagnose",
+    "merge": "merge",
+    "retrain": "retrain",
+    "evaluate": "evaluate",
+}
 
 
 def _now() -> str:
@@ -194,6 +207,17 @@ def _set_dotted(value: dict[str, Any], dotted: str, replacement: Any) -> None:
     current[keys[-1]] = replacement
 
 
+def _delete_dotted(value: dict[str, Any], dotted: str) -> None:
+    keys = dotted.split(".")
+    current: Any = value
+    for key in keys[:-1]:
+        if not isinstance(current, dict) or key not in current:
+            return
+        current = current[key]
+    if isinstance(current, dict):
+        current.pop(keys[-1], None)
+
+
 def _resolve_path(value: str | Path, root: Path) -> Path:
     path = Path(value).expanduser()
     return (root / path).resolve() if not path.is_absolute() else path.resolve()
@@ -215,6 +239,35 @@ def _safe_relative(base: Path, value: str | Path, label: str) -> Path:
 def _validate_artifact_name(name: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
         raise ExecutionError(f"invalid stage artifact name: {name}")
+
+
+def _safe_name(value: str, fallback: str = "task") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-.")
+    return cleaned or fallback
+
+
+def _task_directory_name(
+    *,
+    generation: int,
+    stage: str,
+    attempt: int,
+    task_id: str,
+    stage_input: Mapping[str, Any],
+) -> str:
+    parts = [f"g{generation:04d}", _STAGE_DIRECTORY_LABELS[stage]]
+    route_id = str(stage_input.get("route_id", "")).strip()
+    if route_id:
+        parts.append(_safe_name(route_id, "route"))
+    attempt_ids = stage_input.get("attempt_ids", ())
+    if isinstance(attempt_ids, Sequence) and not isinstance(attempt_ids, str):
+        first_attempt_id = next(iter(attempt_ids), None)
+        if first_attempt_id:
+            parts.append(_safe_name(str(first_attempt_id), "sample")[:8])
+    batch_index = stage_input.get("batch_index")
+    if batch_index is not None:
+        parts.append(f"{int(batch_index):06d}")
+    parts.extend([f"a{attempt}", task_id[:8]])
+    return "-".join(parts)
 
 
 @dataclass(frozen=True)
@@ -454,7 +507,8 @@ def build_stage_task(
             )
             if not requested_route_id or route.route_id == requested_route_id
         ]
-        if config.get("sampling", {}).get("routes")
+        if stage in {"explore", "evaluate"}
+        and config.get("sampling", {}).get("routes")
         else []
     )
     identity = {
@@ -470,7 +524,14 @@ def build_stage_task(
     task_id = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:24]
-    bundle = tasks_dir / task_id
+    directory_name = _task_directory_name(
+        generation=generation,
+        stage=stage,
+        attempt=attempt,
+        task_id=task_id,
+        stage_input=dict(stage_input or {}),
+    )
+    bundle = tasks_dir / directory_name
     if bundle.exists():
         descriptor = bundle / "task.json"
         if not descriptor.is_file():
@@ -480,10 +541,11 @@ def build_stage_task(
             raise ExecutionError(f"task id collision at {bundle}")
         return StageTask(task_id, workflow_id, generation, stage, target.name, bundle)
 
-    temporary = tasks_dir / f".{task_id}.building"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    temporary = tasks_dir / f".{directory_name}.building"
     if temporary.exists():
         shutil.rmtree(temporary)
-    inputs = temporary / "inputs"
+    inputs = temporary / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     portable_config = json.loads(json.dumps(config))
     if stage == "explore" and requested_route_id:
@@ -502,15 +564,25 @@ def build_stage_task(
         )
 
     path_fields = set(_STAGE_CONFIG_PATH_FIELDS[stage])
+    if stage == "train" and generation > 1:
+        path_fields.clear()
     evaluation = portable_config.get("evaluation", {})
-    validation_field = (
-        "evaluation.validation_path"
-        if evaluation.get("validation_path")
-        else "training.test_path"
-    )
-    path_fields.add(validation_field)
-    if portable_config.get("md", {}).get("spin", False):
-        path_fields.add("training.config_path")
+    if stage == "evaluate":
+        validation_field = (
+            "evaluation.validation_path"
+            if evaluation.get("validation_path")
+            else "training.test_path"
+        )
+        path_fields.add(validation_field)
+    all_path_fields = {
+        dotted
+        for fields in _STAGE_CONFIG_PATH_FIELDS.values()
+        for dotted in fields
+    } | {"evaluation.validation_path", "training.initial_path"}
+    for dotted in sorted(all_path_fields - path_fields):
+        _delete_dotted(portable_config, dotted)
+    if stage not in {"explore", "evaluate"}:
+        portable_config.get("sampling", {}).pop("routes", None)
     for dotted in sorted(path_fields):
         value = _get_dotted(portable_config, dotted)
         if value in {None, "", "auto"}:
@@ -529,44 +601,39 @@ def build_stage_task(
             str(destination.relative_to(temporary)),
         )
 
-    if stage == "explore":
-        for route_index, route in enumerate(
-            portable_config.get("sampling", {}).get("routes", [])
-        ):
-            route_root = (
-                inputs
-                / "sampling"
-                / "routes"
-                / f"{route_index:03d}-{route['id']}"
-            )
-            source = _resolve_path(
-                route["template_path"], workflow_root
-            )
-            destination = route_root / f"template{source.suffix}"
-            _copy_input(source, destination)
-            route["template_path"] = str(
-                destination.relative_to(temporary)
-            )
-            copied_structures = []
-            for structure_index, value in enumerate(route["structures"]):
-                source = _resolve_path(value, workflow_root)
-                destination = (
-                    route_root / "structures" / str(structure_index)
-                )
-                if source.is_file():
-                    destination = destination.with_suffix(source.suffix)
-                _copy_input(source, destination)
-                copied_structures.append(
-                    str(destination.relative_to(temporary))
-                )
-            route["structures"] = copied_structures
-
-    initial_destination = inputs / "initial" / initial_training.name
-    if not initial_destination.exists():
-        _copy_input(initial_training, initial_destination)
-    portable_config.setdefault("training", {})["initial_path"] = str(
-        initial_destination.relative_to(temporary)
+    routes = (
+        portable_config.get("sampling", {}).get("routes", [])
+        if stage in {"explore", "evaluate"}
+        else []
     )
+    for route_index, route in enumerate(routes):
+        route_root = (
+            inputs
+            / "sampling"
+            / "routes"
+            / f"{route_index:03d}-{route['id']}"
+        )
+        source = _resolve_path(route["template_path"], workflow_root)
+        destination = route_root / f"template{source.suffix}"
+        _copy_input(source, destination)
+        route["template_path"] = str(destination.relative_to(temporary))
+        copied_structures = []
+        for structure_index, value in enumerate(route["structures"]):
+            source = _resolve_path(value, workflow_root)
+            destination = route_root / "structures" / str(structure_index)
+            if source.is_file():
+                destination = destination.with_suffix(source.suffix)
+            _copy_input(source, destination)
+            copied_structures.append(str(destination.relative_to(temporary)))
+        route["structures"] = copied_structures
+
+    initial_value = None
+    if stage == "train" and generation == 1:
+        initial_destination = inputs / "initial" / initial_training.name
+        if not initial_destination.exists():
+            _copy_input(initial_training, initial_destination)
+        initial_value = str(initial_destination.relative_to(temporary))
+        portable_config.setdefault("training", {})["initial_path"] = initial_value
     if target.setup_script:
         setup_source = Path(target.setup_script).expanduser()
         if setup_source.is_file():
@@ -582,18 +649,53 @@ def build_stage_task(
             _validate_artifact_name(name)
             source = values[name]
             source = Path(source).resolve()
-            destination = inputs / "artifacts" / category / name / source.name
-            _copy_input(source, destination)
+            destination = (
+                inputs / "artifacts" / f"{category}-{name}--{source.name}"
+            )
+            if stage == "label" and name == "selected_input":
+                raw_indices = (stage_input or {}).get("frame_indices")
+                if raw_indices is None:
+                    _copy_input(source, destination)
+                else:
+                    if (
+                        not isinstance(raw_indices, Sequence)
+                        or isinstance(raw_indices, str)
+                        or not raw_indices
+                    ):
+                        raise ExecutionError(
+                            "label frame_indices must be a non-empty sequence"
+                        )
+                    indices = [int(value) for value in raw_indices]
+                    if indices != sorted(set(indices)) or indices[0] < 0:
+                        raise ExecutionError(
+                            "label frame_indices must be unique sorted "
+                            "non-negative integers"
+                        )
+                    frames = ase_read(source, index=":")
+                    if not isinstance(frames, list):
+                        frames = [frames]
+                    if indices[-1] >= len(frames):
+                        raise ExecutionError(
+                            "label frame_indices exceed selected input size"
+                        )
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    ase_write(
+                        destination,
+                        [frames[index] for index in indices],
+                        format="extxyz",
+                    )
+            else:
+                _copy_input(source, destination)
             copied[name] = str(destination.relative_to(temporary))
         return copied
 
     descriptor = {
-        "protocol": "neptrain.stage-task.v1",
+        "protocol": "neptrain.stage-task.v2",
         "task_id": task_id,
         "identity": identity,
         "created_at": _now(),
         "config": portable_config,
-        "initial_training": str(initial_destination.relative_to(temporary)),
+        "initial_training": initial_value,
         "plan": asdict(plan),
         "stage_input": dict(stage_input or {}),
         "artifacts": copy_artifacts(
@@ -605,7 +707,6 @@ def build_stage_task(
             _STAGE_PREVIOUS_ARTIFACTS[stage],
         ),
     }
-    _write_json(temporary / "task.json", descriptor)
     records = [
         {
             "path": str(path.relative_to(temporary)),
@@ -613,31 +714,25 @@ def build_stage_task(
             "size": path.stat().st_size,
         }
         for path in sorted(temporary.rglob("*"))
-        if path.is_file() and path.name != "manifest.json"
+        if path.is_file() and path.name != "task.json"
     ]
-    _write_json(
-        temporary / "manifest.json",
-        {"protocol": "neptrain.stage-task.v1", "files": records},
-    )
+    descriptor["files"] = records
+    _write_json(temporary / "task.json", descriptor)
     temporary.replace(bundle)
     return StageTask(task_id, workflow_id, generation, stage, target.name, bundle)
 
 
 def _verify_task_bundle(bundle: Path) -> dict[str, Any]:
-    manifest_path = bundle / "manifest.json"
     descriptor_path = bundle / "task.json"
-    if not manifest_path.is_file() or not descriptor_path.is_file():
-        raise ExecutionError("stage task is missing task.json or manifest.json")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("protocol") != "neptrain.stage-task.v1":
-        raise ExecutionError("unsupported stage task protocol")
-    for record in manifest.get("files", []):
+    if not descriptor_path.is_file():
+        raise ExecutionError("stage task is missing task.json")
+    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    if descriptor.get("protocol") != "neptrain.stage-task.v2":
+        raise ExecutionError("unsupported stage task descriptor")
+    for record in descriptor.get("files", []):
         path = _safe_relative(bundle, record["path"], "task manifest path")
         if not path.is_file() or _sha256(path) != record["sha256"]:
             raise ExecutionError(f"stage task input drifted: {path}")
-    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
-    if descriptor.get("protocol") != "neptrain.stage-task.v1":
-        raise ExecutionError("unsupported stage task descriptor")
     return descriptor
 
 
@@ -646,7 +741,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
 
     bundle = Path(bundle_path).expanduser().resolve()
     bundle.mkdir(parents=True, exist_ok=True)
-    lock_path = bundle / "worker.lock"
+    lock_path = bundle / ".worker.lock"
     with lock_path.open("a+", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -678,12 +773,14 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             }
             from .workflow_iteration import WorkflowIterationAdapter
 
-            work_dir = bundle / "work"
+            work_dir = bundle / "output"
             work_dir.mkdir(parents=True, exist_ok=True)
+            initial_value = descriptor.get("initial_training")
             adapter = WorkflowIterationAdapter(
                 config,
-                initial_training=resolve(descriptor["initial_training"]),
+                initial_training=resolve(initial_value) if initial_value else None,
                 base_dir=bundle,
+                active_stage=str(descriptor["identity"]["stage"]),
             )
             outcome = adapter.run_stage(
                 descriptor["identity"]["stage"],
@@ -695,12 +792,9 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     previous_artifacts=previous,
                     stage_dir=work_dir,
                     stage_input=dict(descriptor.get("stage_input", {})),
+                    flat_output=True,
                 ),
             )
-            result_root = bundle / "result"
-            if result_root.exists():
-                shutil.rmtree(result_root)
-            result_root.mkdir(parents=True)
             result_artifacts = {}
             for name, raw_path in sorted(outcome.artifacts.items()):
                 _validate_artifact_name(str(name))
@@ -709,16 +803,20 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     raise ExecutionError(
                         f"stage worker did not produce artifact {source}"
                     )
-                destination = result_root / "artifacts" / name / source.name
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+                try:
+                    source.relative_to(work_dir.resolve())
+                    destination = source
+                except ValueError:
+                    destination = work_dir / f"{name}--{source.name}"
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
                 result_artifacts[name] = {
                     "path": str(destination.relative_to(bundle)),
                     "sha256": _sha256(destination),
                     "size": destination.stat().st_size,
                 }
             result = {
-                "protocol": "neptrain.stage-result.v1",
+                "protocol": "neptrain.stage-result.v2",
                 "task_id": descriptor["task_id"],
                 "workflow_id": descriptor["identity"]["workflow_id"],
                 "generation": descriptor["identity"]["generation"],
@@ -759,7 +857,7 @@ def load_stage_result(bundle_path: str | Path) -> tuple[dict[str, Any], StageOut
     if not path.is_file():
         raise ExecutionError(f"stage result does not exist: {path}")
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("protocol") != "neptrain.stage-result.v1":
+    if value.get("protocol") != "neptrain.stage-result.v2":
         raise ExecutionError("unsupported stage result protocol")
     artifacts = {}
     for name, record in value.get("artifacts", {}).items():
@@ -774,7 +872,9 @@ def load_stage_result(bundle_path: str | Path) -> tuple[dict[str, Any], StageOut
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
-class _Transport:
+class ExecutionTransport:
+    """Shared local/SSH command and file transport for all execution paths."""
+
     def __init__(self, target: ExecutionTarget, runner: CommandRunner = subprocess.run):
         self.target = target
         self.runner = runner
@@ -783,6 +883,176 @@ class _Transport:
     def remote(self) -> bool:
         return self.target.host is not None
 
+    def run_script(
+        self,
+        script: str,
+        *arguments: str | Path,
+        check: bool = False,
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        if not self.remote:
+            raise ExecutionError("remote script requires an SSH execution target")
+        command = [
+            "ssh",
+            str(self.target.host),
+            "bash",
+            "-s",
+            "--",
+            *(str(value) for value in arguments),
+        ]
+        try:
+            completed = self.runner(
+                command,
+                input=script if script.endswith("\n") else script + "\n",
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ExecutionError(
+                f"remote command timed out after {timeout}s on {self.target.name}"
+            ) from error
+        if check and completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise ExecutionError(f"execution command failed: {detail}")
+        return completed
+
+    def copy(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        recursive: bool = False,
+        check: bool = False,
+        timeout: int = 300,
+    ) -> subprocess.CompletedProcess[str]:
+        if not self.remote:
+            raise ExecutionError("remote copy requires an SSH execution target")
+        command = ["scp"]
+        if recursive:
+            command.append("-r")
+        command.extend([str(source), str(destination)])
+        try:
+            completed = self.runner(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ExecutionError(
+                f"remote copy timed out after {timeout}s for {self.target.name}"
+            ) from error
+        if check and completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise ExecutionError(f"execution copy failed: {detail}")
+        return completed
+
+    def fetch_paths(
+        self,
+        remote_root: str | Path,
+        members: Sequence[str | Path],
+        destination_root: str | Path,
+    ) -> tuple[str, ...]:
+        """Fetch existing remote paths with one archive transfer."""
+
+        if not self.remote:
+            raise ExecutionError("remote fetch requires an SSH execution target")
+        relative_members = []
+        for value in members:
+            relative = Path(value)
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not relative.parts
+            ):
+                raise ExecutionError(
+                    "remote fetch paths must stay inside the requested root"
+                )
+            relative_members.append(relative.as_posix())
+        if not relative_members:
+            return ()
+
+        destination = Path(destination_root).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        token = f"{os.getpid()}-{time.time_ns()}"
+        archive_name = f".neptrain-fetch-{token}.tar.gz"
+        remote_base = str(remote_root).rstrip("/")
+        remote_archive = f"{remote_base}/{archive_name}"
+        local_archive = destination / archive_name
+        prepared = self.run_script(
+            """set -eo pipefail
+root=$1
+archive=$2
+shift 2
+cd "$root"
+existing=()
+for member in "$@"; do
+  if test -e "$member"; then
+    existing+=("$member")
+  fi
+done
+if [ "${#existing[@]}" -eq 0 ]; then
+  tar -czf "$archive" --files-from /dev/null
+else
+  tar -czf "$archive" -- "${existing[@]}"
+fi
+""",
+            remote_base,
+            archive_name,
+            *relative_members,
+        )
+        if prepared.returncode != 0:
+            raise ExecutionError(
+                (
+                    prepared.stderr
+                    or prepared.stdout
+                    or "cannot prepare remote result archive"
+                ).strip()
+            )
+        try:
+            self.copy(
+                f"{self.target.host}:{remote_archive}",
+                local_archive,
+                check=True,
+            )
+            with tarfile.open(local_archive, "r:gz") as archive:
+                archived = archive.getmembers()
+                for member in archived:
+                    target = _safe_relative(
+                        destination,
+                        member.name,
+                        "remote archive member",
+                    )
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    if not member.isfile():
+                        raise ExecutionError(
+                            "remote archive contains an unsupported member"
+                        )
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ExecutionError(
+                            "remote archive contains an unreadable file"
+                        )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_suffix(target.suffix + ".tmp")
+                    with source, temporary.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+                    temporary.replace(target)
+            return tuple(member.name for member in archived)
+        finally:
+            local_archive.unlink(missing_ok=True)
+            try:
+                self.run_script('rm -f "$1"\n', remote_archive)
+            except ExecutionError:
+                # A cleanup timeout must not hide the transfer or validation
+                # error that brought us here.
+                pass
+
     def run(
         self,
         args: Sequence[str],
@@ -790,6 +1060,7 @@ class _Transport:
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = False,
+        timeout: int = 60,
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         actual_cwd = cwd
@@ -815,14 +1086,21 @@ cd "$root"
 exec "$@"
 """
             input_text = script if input_text is None else input_text
-        completed = self.runner(
-            command,
-            cwd=actual_cwd,
-            input=input_text,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            completed = self.runner(
+                command,
+                cwd=actual_cwd,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ExecutionError(
+                f"execution command timed out after {timeout}s on "
+                f"{self.target.name}"
+            ) from error
         if check and completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
             raise ExecutionError(f"execution command failed: {detail}")
@@ -832,84 +1110,77 @@ exec "$@"
         if not self.remote:
             return str(task.bundle)
         root = str(self.target.work_root)
-        remote_bundle = f"{root.rstrip('/')}/{task.workflow_id}/tasks/{task.task_id}"
-        remote_archive = f"{root.rstrip('/')}/{task.workflow_id}/incoming/{task.task_id}.tar.gz"
+        remote_name = task.bundle.name
+        remote_bundle = (
+            f"{root.rstrip('/')}/{task.workflow_id}/jobs/{remote_name}"
+        )
+        remote_archive = (
+            f"{root.rstrip('/')}/{task.workflow_id}/incoming/{remote_name}.tar.gz"
+        )
         setup = """set -eo pipefail
 root=$1
 workflow=$2
-task=$3
+name=$3
 case "$root" in
   '~/'*) root="$HOME/${root:2}" ;;
   /*) ;;
   *) exit 2 ;;
 esac
-mkdir -p "$root/$workflow/incoming" "$root/$workflow/tasks"
-if [ -f "$root/$workflow/tasks/$task/task.json" ]; then exit 0; fi
+mkdir -p "$root/$workflow/incoming" "$root/$workflow/jobs"
+if [ -f "$root/$workflow/jobs/$name/task.json" ]; then exit 0; fi
 """
-        completed = self.runner(
-            ["ssh", str(self.target.host), "bash", "-s", "--", root, task.workflow_id, task.task_id],
-            input=setup,
-            capture_output=True,
-            text=True,
-            check=False,
+        completed = self.run_script(
+            setup,
+            root,
+            task.workflow_id,
+            remote_name,
         )
         if completed.returncode != 0:
             raise ExecutionError((completed.stderr or completed.stdout).strip())
-        remote_exists = self.runner(
-            ["ssh", str(self.target.host), "test", "-f", f"{remote_bundle}/task.json"],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).returncode == 0
+        remote_exists = (
+            self.run_script(
+                'test -f "$1"\n',
+                f"{remote_bundle}/task.json",
+            ).returncode
+            == 0
+        )
         if remote_exists:
             return remote_bundle
-        archive = task.bundle.parent / f".{task.task_id}.upload.tar.gz"
+        archive = task.bundle.parent / f".{remote_name}.upload.tar.gz"
         try:
             with tarfile.open(archive, "w:gz") as handle:
-                handle.add(task.bundle, arcname=task.task_id)
+                handle.add(task.bundle, arcname=remote_name)
             digest = _sha256(archive)
-            upload = self.runner(
-                ["scp", str(archive), f"{self.target.host}:{remote_archive}"],
-                capture_output=True,
-                text=True,
-                check=False,
+            upload = self.copy(
+                archive,
+                f"{self.target.host}:{remote_archive}",
             )
             if upload.returncode != 0:
                 raise ExecutionError((upload.stderr or upload.stdout).strip())
             extract = """set -eo pipefail
 root=$1
 workflow=$2
-task=$3
+name=$3
 expected=$4
 case "$root" in
   '~/'*) root="$HOME/${root:2}" ;;
 esac
-archive="$root/$workflow/incoming/$task.tar.gz"
+archive="$root/$workflow/incoming/$name.tar.gz"
 actual=$(sha256sum "$archive" | cut -d' ' -f1)
 [ "$actual" = "$expected" ]
-temporary="$root/$workflow/tasks/.$task.extracting"
+temporary="$root/$workflow/jobs/.$name.extracting"
 rm -rf "$temporary"
 mkdir -p "$temporary"
 tar -xzf "$archive" -C "$temporary" --strip-components=1
-mv "$temporary" "$root/$workflow/tasks/$task"
+mv "$temporary" "$root/$workflow/jobs/$name"
 rm -f "$archive"
 """
-            completed = self.runner(
-                [
-                    "ssh",
-                    str(self.target.host),
-                    "bash",
-                    "-s",
-                    "--",
-                    root,
-                    task.workflow_id,
-                    task.task_id,
-                    digest,
-                ],
-                input=extract,
-                capture_output=True,
-                text=True,
-                check=False,
+            completed = self.run_script(
+                extract,
+                root,
+                task.workflow_id,
+                remote_name,
+                digest,
             )
             if completed.returncode != 0:
                 raise ExecutionError((completed.stderr or completed.stdout).strip())
@@ -922,26 +1193,25 @@ rm -f "$archive"
         if not self.remote:
             return local
         remote = str(handle.remote_bundle)
-        for name in ("result.json", "execution.json"):
-            completed = self.runner(
-                ["scp", f"{self.target.host}:{remote}/{name}", str(local / name)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if completed.returncode != 0:
-                raise ExecutionError((completed.stderr or completed.stdout).strip())
-        destination = local / "result"
-        if destination.exists():
-            shutil.rmtree(destination)
-        completed = self.runner(
-            ["scp", "-r", f"{self.target.host}:{remote}/result", str(destination)],
-            capture_output=True,
-            text=True,
-            check=False,
+        self.fetch_paths(
+            remote,
+            ("result.json", "execution.json", "result"),
+            local,
         )
-        if completed.returncode != 0:
-            raise ExecutionError((completed.stderr or completed.stdout).strip())
+        for name in ("result.json", "execution.json"):
+            if not (local / name).is_file():
+                raise ExecutionError(
+                    f"remote stage result is missing required file: {name}"
+                )
+        result = json.loads((local / "result.json").read_text(encoding="utf-8"))
+        for record in result.get("artifacts", {}).values():
+            destination = _safe_relative(
+                local, record["path"], "result artifact path"
+            )
+            if not destination.is_file():
+                raise ExecutionError(
+                    f"remote stage result is missing artifact: {record['path']}"
+                )
         return local
 
 
@@ -1034,7 +1304,7 @@ class ProcessExecutor:
 
     def __init__(self, target: ExecutionTarget, runner: CommandRunner = subprocess.run):
         self.target = target
-        self.transport = _Transport(target, runner)
+        self.transport = ExecutionTransport(target, runner)
 
     def launch(self, task: StageTask) -> ExecutionHandle:
         _prepare_setup(self.target, task)
@@ -1057,11 +1327,13 @@ class ProcessExecutor:
         for key, value in self.target.environment.items():
             lines.append(f"export {key}={shlex.quote(value)}")
         lines.extend([f"cd {shlex.quote(bundle)}", f"exec {_worker_command(self.target, bundle)}"])
-        script = task.bundle / "process.sh"
+        script_name = "submit.sh"
+        log_name = "stdout.log"
+        script = task.bundle / script_name
         script.write_text("\n".join(lines) + "\n", encoding="utf-8")
         script.chmod(0o755)
         if self.target.host is None:
-            log = (task.bundle / "process.log").open("ab")
+            log = (task.bundle / log_name).open("ab")
             try:
                 process = subprocess.Popen(
                     ["bash", str(script)],
@@ -1081,11 +1353,9 @@ class ProcessExecutor:
                 str(task.bundle),
             )
         # The script was created after the initial deployment; upload it alone.
-        uploaded = self.transport.runner(
-            ["scp", str(script), f"{self.target.host}:{bundle}/process.sh"],
-            capture_output=True,
-            text=True,
-            check=False,
+        uploaded = self.transport.copy(
+            script,
+            f"{self.target.host}:{bundle}/{script_name}",
         )
         if uploaded.returncode != 0:
             raise ExecutionError((uploaded.stderr or uploaded.stdout).strip())
@@ -1101,16 +1371,15 @@ if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null && \
   cat worker.pid
   exit 0
 fi
-nohup setsid bash process.sh > process.log 2>&1 < /dev/null &
+nohup setsid bash "$2" > "$3" 2>&1 < /dev/null &
 echo $! > worker.pid
 cat worker.pid
 """
-        completed = self.transport.runner(
-            ["ssh", str(self.target.host), "bash", "-s", "--", bundle],
-            input=launch,
-            capture_output=True,
-            text=True,
-            check=False,
+        completed = self.transport.run_script(
+            launch,
+            bundle,
+            script_name,
+            log_name,
         )
         if completed.returncode != 0:
             raise ExecutionError((completed.stderr or completed.stdout).strip())
@@ -1170,12 +1439,9 @@ else
   echo '{"state":"FAILED","error":"remote worker exited without a result"}'
 fi
 """
-        completed = self.transport.runner(
-            ["ssh", str(self.target.host), "bash", "-s", "--", str(handle.remote_bundle)],
-            input=script,
-            capture_output=True,
-            text=True,
-            check=False,
+        completed = self.transport.run_script(
+            script,
+            str(handle.remote_bundle),
         )
         if completed.returncode != 0:
             return ExecutionStatus("unknown", (completed.stderr or completed.stdout).strip())
@@ -1246,20 +1512,11 @@ for _ in $(seq 1 20); do
 done
 exit 4
 """
-        completed = self.transport.runner(
-            [
-                "ssh",
-                str(self.target.host),
-                "bash",
-                "-s",
-                "--",
-                bundle,
-                str(pid),
-            ],
-            input=script,
-            capture_output=True,
-            text=True,
-            check=False,
+        completed = self.transport.run_script(
+            script,
+            bundle,
+            str(pid),
+            timeout=15,
         )
         if completed.returncode == 3:
             return ExecutionStatus("failed", "remote process already exited")
@@ -1279,7 +1536,7 @@ class SlurmExecutor:
 
     def __init__(self, target: ExecutionTarget, runner: CommandRunner = subprocess.run):
         self.target = target
-        self.transport = _Transport(target, runner)
+        self.transport = ExecutionTransport(target, runner)
 
     @staticmethod
     def _job_name(task_id: str) -> str:
@@ -1300,12 +1557,9 @@ bundle=$1
 test -f "$bundle/execution.json" || exit 3
 cat "$bundle/execution.json"
 """
-            completed = self.transport.runner(
-                ["ssh", str(self.target.host), "bash", "-s", "--", bundle],
-                input=script,
-                capture_output=True,
-                text=True,
-                check=False,
+            completed = self.transport.run_script(
+                script,
+                bundle,
             )
             if completed.returncode != 0:
                 return None
@@ -1323,27 +1577,29 @@ cat "$bundle/execution.json"
         return None
 
     def _find_job(self, name: str, bundle: str) -> str | None:
-        for args in (
-            ["squeue", "--noheader", "--name", name, "--format", "%A|%j"],
-            ["sacct", "--noheader", "--parsable2", "--name", name, "--format", "JobIDRaw,JobName"],
-        ):
-            completed = self.transport.run(
-                [bundle, *args] if self.target.host else args,
-                cwd=Path(bundle) if not self.target.host else None,
-            )
-            if completed.returncode != 0:
-                continue
-            for line in completed.stdout.splitlines():
-                columns = line.strip().split("|")
-                if len(columns) >= 2 and columns[0].isdigit() and columns[1] == name:
-                    return columns[0]
+        # Only active jobs are safe to recover by deterministic job name.
+        # Historical sacct rows can outlive a deleted/reprepared workflow and
+        # therefore cannot prove ownership of the current task bundle.
+        args = ["squeue", "--noheader", "--name", name, "--format", "%A|%j"]
+        completed = self.transport.run(
+            [bundle, *args] if self.target.host else args,
+            cwd=Path(bundle) if not self.target.host else None,
+        )
+        if completed.returncode != 0:
+            return None
+        for line in completed.stdout.splitlines():
+            columns = line.strip().split("|")
+            if len(columns) >= 2 and columns[0].isdigit() and columns[1] == name:
+                return columns[0]
         return None
 
     def launch(self, task: StageTask) -> ExecutionHandle:
         if os.environ.get("SLURM_JOB_ID") and self.target.host is None:
             raise ExecutionError("workflow controller must run on the Slurm login node")
         _prepare_setup(self.target, task)
-        script = task.bundle / "job.sbatch"
+        script_name = "submit.sh"
+        output_name = "stdout-%j.log"
+        script = task.bundle / script_name
         bundle = self.transport.deploy(task)
         recovered_worker = self._worker_status(bundle)
         if recovered_worker is not None and recovered_worker.terminal:
@@ -1362,7 +1618,7 @@ cat "$bundle/execution.json"
         lines = [
             "#!/bin/bash",
             f"#SBATCH --job-name={self._job_name(task.task_id)}",
-            f"#SBATCH --output={bundle}/scheduler-%j.out",
+            f"#SBATCH --output={bundle}/{output_name}",
             f"#SBATCH --time={self.target.time}",
             f"#SBATCH --partition={self.target.partition}",
         ]
@@ -1387,11 +1643,9 @@ cat "$bundle/execution.json"
         lines.extend([f"cd {shlex.quote(bundle)}", _worker_command(self.target, bundle), ""])
         script.write_text("\n".join(lines), encoding="utf-8")
         if self.target.host:
-            uploaded = self.transport.runner(
-                ["scp", str(script), f"{self.target.host}:{bundle}/job.sbatch"],
-                capture_output=True,
-                text=True,
-                check=False,
+            uploaded = self.transport.copy(
+                script,
+                f"{self.target.host}:{bundle}/{script_name}",
             )
             if uploaded.returncode != 0:
                 raise ExecutionError((uploaded.stderr or uploaded.stdout).strip())
@@ -1407,7 +1661,7 @@ cat "$bundle/execution.json"
                 remote_bundle=bundle if self.target.host else None,
                 metadata={"job_name": name},
             )
-        args = ["sbatch", "--parsable", "job.sbatch"]
+        args = ["sbatch", "--parsable", script_name]
         completed = self.transport.run(
             [bundle, *args] if self.target.host else args,
             cwd=task.bundle if not self.target.host else None,
@@ -1529,6 +1783,7 @@ __all__ = [
     "ExecutionHandle",
     "ExecutionStatus",
     "ExecutionTarget",
+    "ExecutionTransport",
     "ProcessExecutor",
     "SlurmExecutor",
     "StageExecutor",

@@ -11,6 +11,7 @@ import time
 
 import pytest
 from ase import Atoms
+from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from NepTrain.core.workflow import extend_workflow, workflow_status, prepare_workflow
@@ -54,7 +55,6 @@ def _plan() -> GenerationPlan:
         max_selected=2,
     )
 
-
 def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypatch):
     initial = _write(tmp_path / "initial.xyz")
     training_config = _write(tmp_path / "nep.in")
@@ -88,6 +88,12 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
             previous_artifacts={},
         ),
     )
+    descriptor = json.loads(task.descriptor.read_text())
+    assert descriptor["protocol"] == "neptrain.stage-task.v2"
+    assert task.bundle.name.startswith("g0001-md-a1-")
+    assert (task.bundle / "input").is_dir()
+    assert not (task.bundle / "inputs").exists()
+    assert not (task.bundle / "manifest.json").exists()
 
     class FakeWorkflow:
         def __init__(self, *_args, **_kwargs):
@@ -95,6 +101,7 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
 
         def run_stage(self, stage, context):
             assert stage == "explore"
+            assert context.flat_output is True
             assert context.artifacts["model"].read_text() == "fixture\n"
             output = _write(context.work_dir / "candidates.xyz", "candidate\n")
             return StageOutcome({"candidates": output}, {"candidate_count": 1})
@@ -106,8 +113,12 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
     assert run_stage_worker(task.bundle) == 0
     value, outcome = load_stage_result(task.bundle)
     assert value["task_id"] == task.task_id
+    assert value["protocol"] == "neptrain.stage-result.v2"
     assert outcome.metrics == {"candidate_count": 1}
     assert outcome.artifacts["candidates"].read_text() == "candidate\n"
+    assert outcome.artifacts["candidates"] == task.bundle / "output" / "candidates.xyz"
+    assert not (task.bundle / "work").exists()
+    assert not (task.bundle / "result").exists()
 
 
 def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
@@ -155,8 +166,69 @@ def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
 
     descriptor = json.loads(task.descriptor.read_text())
     assert set(descriptor["artifacts"]) == {"model"}
-    assert descriptor["config"]["dft"]["resource_path"] == str(dft_resource)
+    assert "resource_path" not in descriptor["config"]["dft"]
+    assert descriptor["initial_training"] is None
+    assert "routes" not in descriptor["config"].get("sampling", {})
+    assert "validation_path" not in descriptor["config"]["evaluation"]
+    assert "initial_path" not in descriptor["config"]["training"]
+    assert not (task.bundle / "input" / "initial").exists()
+    assert not (task.bundle / "input" / "sampling").exists()
+    assert not (task.bundle / "input" / "config" / "evaluation").exists()
     assert not any(path.name == "POTCAR" for path in task.bundle.rglob("*"))
+
+
+def test_train_stage_bundle_skips_sampling_route_inputs(tmp_path):
+    initial = _write(tmp_path / "initial.xyz")
+    training_config = _write(tmp_path / "nep.in")
+    template = _write(tmp_path / "lammps.in", "run {{ steps }}\n")
+    structure = _write(tmp_path / "structure.xyz")
+    task = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="portable-routes",
+        generation=1,
+        stage="train",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config={
+            "training": {
+                "initial_path": str(initial),
+                "config_path": str(training_config),
+            },
+            "sampling": {
+                "routes": [
+                    {
+                        "id": "default",
+                        "structures": [str(structure)],
+                        "template_path": str(template),
+                        "conditions": {
+                            "temperature_path": [50],
+                            "pressure": 0,
+                        },
+                        "progression": {
+                            "steps": {"smoke_passed": 20},
+                            "replicas": {"smoke_passed": 1},
+                        },
+                    }
+                ]
+            },
+            "md": {"spin": False},
+        },
+        initial_training=initial,
+        context=StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation",
+            plan=_plan(),
+            artifacts={},
+            previous_artifacts={},
+        ),
+    )
+
+    descriptor = json.loads(task.descriptor.read_text())
+    assert "routes" not in descriptor["config"]["sampling"]
+    assert (task.bundle / descriptor["initial_training"]).read_text() == "fixture\n"
+    assert not (task.bundle / "input" / "sampling").exists()
 
 
 def test_remote_stage_bundle_carries_only_activated_model_across_generations(
@@ -261,6 +333,9 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
         ),
     )
     train_descriptor = json.loads(train_task.descriptor.read_text())
+    assert train_descriptor["initial_training"] is None
+    assert "config_path" not in train_descriptor["config"]["training"]
+    assert not (train_task.bundle / "input" / "initial").exists()
     assert set(train_descriptor["previous_artifacts"]) == {
         "training_set",
         "activated_model",
@@ -276,7 +351,7 @@ def test_stage_result_rejects_paths_outside_the_bundle(tmp_path):
     (bundle / "result.json").write_text(
         json.dumps(
             {
-                "protocol": "neptrain.stage-result.v1",
+                "protocol": "neptrain.stage-result.v2",
                 "artifacts": {
                     "model": {
                         "path": "../outside.dat",
@@ -319,8 +394,15 @@ class ImmediateExecutor:
         if task.stage == "explore":
             names = ("candidates", "md_attempts", "scenario_plan")
         for name in names:
-            path = result_root / name / (
-                f"{name}.xyz" if name == "candidates" else f"{name}.json"
+            filename = (
+                f"{name}.xyz"
+                if name in {"candidates", "selected_input", "labeled"}
+                else f"{name}.json"
+            )
+            path = (
+                task.bundle / "output" / filename
+                if task.stage == "label"
+                else result_root / name / filename
             )
             path.parent.mkdir(parents=True, exist_ok=True)
             if name == "candidates":
@@ -331,6 +413,22 @@ class ImmediateExecutor:
                     route_fingerprint=route["route_fingerprint"],
                 )
                 ase_write(path, frame, format="extxyz")
+            elif name == "selected_input":
+                ase_write(
+                    path,
+                    [
+                        Atoms("Fe", positions=[[0.01 * index, 0.0, 0.0]])
+                        for index in range(1, 4)
+                    ],
+                    format="extxyz",
+                )
+            elif name == "labeled":
+                source = task.bundle / descriptor["artifacts"]["selected_input"]
+                ase_write(
+                    path,
+                    ase_read(source, index=":"),
+                    format="extxyz",
+                )
             elif name == "md_attempts":
                 model_path = task.bundle / descriptor["artifacts"]["model"]
                 path.write_text(
@@ -363,15 +461,24 @@ class ImmediateExecutor:
                 "sha256": _sha256(path),
                 "size": path.stat().st_size,
             }
-        metrics = (
-            {"accepted": True, "workflow_converged": True}
-            if task.stage == "evaluate"
-            else {}
-        )
+        if task.stage == "evaluate":
+            metrics = {"accepted": True, "workflow_converged": True}
+        elif task.stage == "label":
+            metrics = {
+                "backend": descriptor["config"]["dft"]["backend"],
+                "labeled_count": len(
+                    ase_read(
+                        task.bundle / descriptor["artifacts"]["selected_input"],
+                        index=":",
+                    )
+                ),
+            }
+        else:
+            metrics = {}
         (task.bundle / "result.json").write_text(
             json.dumps(
                 {
-                    "protocol": "neptrain.stage-result.v1",
+                    "protocol": "neptrain.stage-result.v2",
                     "task_id": task.task_id,
                     "workflow_id": task.workflow_id,
                     "generation": task.generation,
@@ -503,8 +610,87 @@ def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     ledger = json.loads((preparation.output_dir / ".neptrain/ledger.json").read_text())
     assert ledger["generations"]["1"]["accepted"] is True
     manifest = json.loads(preparation.manifest.read_text())
-    assert manifest["orchestration"] == "controller-v1"
-    assert manifest["scripts"] == []
+    assert manifest["orchestration"] == "controller"
+    assert "scripts" not in manifest
+
+
+def test_controller_publishes_flat_outputs_and_real_calculation_link(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    plan = controller.plans[0]
+    bundle = preparation.output_dir / ".neptrain" / "jobs" / "training-task"
+    calculation = bundle / "output"
+    model = _write(calculation / "nep.txt", "model\n")
+    loss = _write(calculation / "loss.out", "loss\n")
+
+    link = controller._publish_calculation_link(
+        generation=1,
+        stage="train",
+        bundle=bundle,
+    )
+    summary = controller._install_outcome(
+        plan=plan,
+        stage="train",
+        attempt=1,
+        outcome=StageOutcome(
+            artifacts={"model": model, "training_output_loss_out": loss}
+        ),
+    )
+
+    training = preparation.output_dir / "generations" / "0001" / "train"
+    assert link == training / "calculation"
+    assert link.is_symlink()
+    assert (link / "loss.out").read_text(encoding="utf-8") == "loss\n"
+    assert (training / "nep.txt").read_text() == "model\n"
+    assert (training / "loss.out").read_text() == "loss\n"
+    assert summary.artifacts["model"] == training / "nep.txt"
+
+
+def test_controller_publishes_flat_md_calculation_link(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    bundle = (
+        preparation.output_dir
+        / ".neptrain"
+        / "jobs"
+        / "g0001-md-default-a1-demo"
+    )
+    output = bundle / "output"
+    _write(output / "log.lammps", "done\n")
+    _write(
+        output / "md-attempts.json",
+        json.dumps(
+            {
+                "attempts": [
+                    {
+                        "source_id": "g1-default-sdemo-T50-P0-r1-attempt",
+                    }
+                ]
+            }
+        ),
+    )
+
+    link = controller._publish_calculation_link(
+        generation=1,
+        stage="explore",
+        bundle=bundle,
+        grouped=True,
+    )
+
+    expected = (
+        preparation.output_dir
+        / "generations"
+        / "0001"
+        / "md"
+        / "calculations"
+        / "g1-default-sdemo-T50-P0-r1-attempt"
+    )
+    assert link == expected
+    assert link.is_symlink()
+    assert (link / "log.lammps").read_text(encoding="utf-8") == "done\n"
+    assert not (output / "md").exists()
 
 
 def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
@@ -564,6 +750,70 @@ def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
     }
     assert all(item["handle"] is not None for item in current["tasks"])
     assert [stage for stage, _ in launches].count("explore") == 2
+
+
+def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 2\n")
+    (tmp_path / "potpaw").mkdir()
+    text = config.read_text(encoding="utf-8").replace(
+        "dft:\n  backend: toy\n",
+        (
+            "dft:\n"
+            "  backend: vasp\n"
+            "  input_path: ./INCAR\n"
+            "  resource_path: ./potpaw\n"
+            "  structures_per_job: 1\n"
+            "  max_concurrent: 2\n"
+        ),
+    )
+    config.write_text(text, encoding="utf-8")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, launches),
+    )
+
+    for _ in range(20):
+        controller.tick()
+        current = controller.state.get("current") or {}
+        if current.get("stage") == "label":
+            break
+    else:
+        raise AssertionError("controller did not reach grouped DFT labeling")
+
+    assert current["kind"] == "task_group"
+    assert current["max_concurrent"] == 2
+    assert len(current["tasks"]) == 3
+    assert sum(item["handle"] is not None for item in current["tasks"]) == 2
+    assert [stage for stage, _ in launches].count("label") == 2
+    for item in current["tasks"]:
+        descriptor = json.loads(
+            (Path(item["bundle"]) / "task.json").read_text(encoding="utf-8")
+        )
+        selected = (
+            Path(item["bundle"])
+            / descriptor["artifacts"]["selected_input"]
+        )
+        assert len(ase_read(selected, index=":")) == 1
+
+    controller.tick()
+    assert [stage for stage, _ in launches].count("label") == 2
+    controller.tick()
+    assert [stage for stage, _ in launches].count("label") == 3
+    controller.tick()
+    controller.tick()
+
+    ledger = json.loads(
+        (preparation.output_dir / ".neptrain/ledger.json").read_text()
+    )
+    label = ledger["generations"]["1"]["stages"]["label"]
+    assert label["metrics"]["labeled_count"] == 3
+    assert label["metrics"]["batch_count"] == 3
+    dft_root = preparation.output_dir / "generations" / "0001" / "dft"
+    assert len(list(dft_root.glob("00000*-Fe"))) == 3
+    assert not (dft_root / "calculations").exists()
 
 
 def test_md_wave_retry_preserves_completed_attempts(tmp_path):
@@ -922,13 +1172,42 @@ def test_slurm_executor_is_idempotent_without_afterok(tmp_path):
 
     assert first.execution_id == second.execution_id == "123"
     assert runner.submissions == 1
-    script = (bundle / "job.sbatch").read_text()
+    script = (bundle / "submit.sh").read_text()
     assert "#SBATCH --partition=cpu" in script
     assert "#SBATCH --cpus-per-task=4" in script
+    assert f"#SBATCH --output={bundle}/stdout-%j.log" in script
     assert "--dependency" not in script
     assert executor.inspect(first).state == "running"
     runner.state = "COMPLETED"
     assert executor.inspect(first).state == "completed"
+
+
+def test_slurm_executor_does_not_claim_historical_same_name_job(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    task = StageTask("abc", "demo", 1, "train", "slurm", bundle)
+
+    class HistoricalRunner(SlurmRunner):
+        def __call__(self, args, **kwargs):
+            args = list(args)
+            if args[0] == "squeue" and "--name" in args:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "sacct" and "--name" in args:
+                return subprocess.CompletedProcess(
+                    args, 0, "111|nt-abc\n", ""
+                )
+            return super().__call__(args, **kwargs)
+
+    runner = HistoricalRunner()
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="cpu"),
+        runner=runner,
+    )
+
+    handle = executor.launch(task)
+
+    assert handle.execution_id == "123"
+    assert runner.submissions == 1
 
 
 def test_slurm_executor_recognizes_site_annotated_cancelled_state(tmp_path):
@@ -1062,7 +1341,7 @@ class CancellableExecutor:
         return ExecutionStatus("cancelled", "test cancellation accepted")
 
 
-def test_stop_workflow_cancels_and_archives_current_execution(tmp_path):
+def test_stop_workflow_cancels_and_archives_current_execution_by_default(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     controller = PersistentController(preparation.output_dir)
@@ -1074,14 +1353,14 @@ def test_stop_workflow_cancels_and_archives_current_execution(tmp_path):
         "resource": "training",
         "target": "gpu",
         "attempt": 1,
-        "bundle": str(preparation.output_dir / ".neptrain/tasks/task-1"),
+        "bundle": str(preparation.output_dir / ".neptrain/jobs/task-1"),
         "handle": {
             "task_id": "task-1",
             "target": "gpu",
             "executor": "slurm",
             "execution_id": "123",
             "local_bundle": str(
-                preparation.output_dir / ".neptrain/tasks/task-1"
+                preparation.output_dir / ".neptrain/jobs/task-1"
             ),
         },
     }
@@ -1090,7 +1369,6 @@ def test_stop_workflow_cancels_and_archives_current_execution(tmp_path):
 
     result = stop_workflow(
         preparation.output_dir,
-        cancel_jobs=True,
         executor_factory=lambda target: CancellableExecutor(
             target, cancellations
         ),
@@ -1124,14 +1402,14 @@ def test_stop_workflow_preserves_current_until_cancellation_is_terminal(
         "resource": "training",
         "target": "gpu",
         "attempt": 1,
-        "bundle": str(preparation.output_dir / ".neptrain/tasks/task-1"),
+        "bundle": str(preparation.output_dir / ".neptrain/jobs/task-1"),
         "handle": {
             "task_id": "task-1",
             "target": "gpu",
             "executor": "slurm",
             "execution_id": "123",
             "local_bundle": str(
-                preparation.output_dir / ".neptrain/tasks/task-1"
+                preparation.output_dir / ".neptrain/jobs/task-1"
             ),
         },
     }
@@ -1258,7 +1536,7 @@ for name in names:
         'size': path.stat().st_size,
     }
 result = {
-    'protocol': 'neptrain.stage-result.v1',
+    'protocol': 'neptrain.stage-result.v2',
     'task_id': task['task_id'],
     'workflow_id': task['identity']['workflow_id'],
     'generation': task['identity']['generation'],
@@ -1363,7 +1641,7 @@ for name in names:
         'size': path.stat().st_size,
     }
 (bundle / 'result.json').write_text(json.dumps({
-    'protocol': 'neptrain.stage-result.v1',
+    'protocol': 'neptrain.stage-result.v2',
     'task_id': task['task_id'],
     'workflow_id': task['identity']['workflow_id'],
     'generation': task['identity']['generation'],

@@ -62,6 +62,7 @@ def _namespace(request: LabelRequest) -> SimpleNamespace:
         kpoint_mode=request.kpoint_mode,
         kspacing=request.kspacing,
         ka=list(request.ka),
+        flat_single_case=bool(request.options.get("flat_single_case", False)),
     )
 
 

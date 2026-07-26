@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
@@ -8,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from NepTrain.cli.cli import run_project_command, run_status_command
+from NepTrain.cli.cli import (
+    run_project_command,
+    run_resume_command,
+    run_status_command,
+)
 from NepTrain.core.workflow import (
     WorkflowError,
     WorkflowResume,
@@ -16,7 +19,6 @@ from NepTrain.core.workflow import (
     extend_workflow,
     prepare_workflow,
     resume_workflow,
-    submit_workflow,
 )
 from NepTrain.core.workflow_workspace import WorkflowWorkspace
 
@@ -131,14 +133,13 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     workspace = WorkflowWorkspace.locate(result.output_dir)
 
     assert result.workflow_id == "controller-smoke"
-    assert result.scripts == ()
     assert len(result.plans) == 3
     assert all(path.parent == workspace.plans_dir for path in result.plans)
     assert workspace.tasks_dir.is_dir()
     manifest = json.loads(result.manifest.read_text())
-    assert manifest["version"] == 4
-    assert manifest["orchestration"] == "controller-v1"
-    assert manifest["scripts"] == []
+    assert manifest["version"] == 5
+    assert manifest["orchestration"] == "controller"
+    assert "scripts" not in manifest
 
     project_text = result.config_file.read_text()
     assert "schema_version: 7" in project_text
@@ -169,6 +170,7 @@ def test_prepare_only_cli_does_not_start_controller(tmp_path: Path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["project"] == str(output)
     assert payload["started"] is False
+    assert payload["next_action"] == f"neptrain workflow run {output}"
     assert not (output / ".neptrain/controller.pid").exists()
 
 
@@ -242,7 +244,7 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     assert "Executor: 0/0 stages completed" in output
 
 
-def test_completed_workflow_extends_plans_without_job_scripts(tmp_path: Path):
+def test_completed_workflow_extends_plans(tmp_path: Path):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     original = [path.read_bytes() for path in preparation.plans]
@@ -266,7 +268,6 @@ def test_completed_workflow_extends_plans_without_job_scripts(tmp_path: Path):
     extended = extend_workflow(preparation.output_dir, 5)
 
     assert len(extended.plans) == 5
-    assert extended.scripts == ()
     assert [path.read_bytes() for path in extended.plans[:3]] == original
     manifest = json.loads(extended.manifest.read_text())
     assert manifest["extensions"][-1]["to_generations"] == 5
@@ -288,24 +289,25 @@ def test_workflow_rejects_prepared_input_drift(tmp_path: Path):
         workflow_status(preparation.output_dir)
 
 
-def test_controller_workflow_rejects_legacy_dependency_submission(tmp_path: Path):
-    config, initial = _inputs(tmp_path)
-    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
-    with pytest.raises(WorkflowError, match="do not submit a Slurm dependency"):
-        submit_workflow(preparation)
-
-
-def test_run_on_existing_project_uses_resume_interface(tmp_path: Path, monkeypatch, capsys):
+def test_run_starts_existing_prepared_workflow_directory(
+    tmp_path: Path, monkeypatch, capsys
+):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     expected = WorkflowResume(
         preparation.workflow_id,
-        "resume",
-        ("123",),
+        "start",
         preparation.manifest,
+        controller_pid=123,
     )
-    monkeypatch.setattr("NepTrain.core.workflow.resume_workflow", lambda _path: expected)
 
+    def fake_resume(path, *, foreground=False, poll_interval=None):
+        assert Path(path) == preparation.output_dir
+        assert foreground is False
+        assert poll_interval is None
+        return expected
+
+    monkeypatch.setattr("NepTrain.core.workflow.resume_workflow", fake_resume)
     run_project_command(
         SimpleNamespace(
             project=str(preparation.output_dir),
@@ -319,11 +321,30 @@ def test_run_on_existing_project_uses_resume_interface(tmp_path: Path, monkeypat
     )
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["action"] == "resume"
-    assert payload["job_ids"] == ["123"]
+    assert payload["action"] == "start"
+    assert payload["controller_pid"] == 123
+    assert payload["manifest"] == str(preparation.manifest)
 
 
-def test_run_existing_project_forwards_foreground_controller_options(
+def test_run_directory_rejects_project_creation_options(tmp_path: Path):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+
+    with pytest.raises(WorkflowError, match="--prepare-only"):
+        run_project_command(
+            SimpleNamespace(
+                project=str(preparation.output_dir),
+                initial_training=None,
+                output=None,
+                workflow_id=None,
+                prepare_only=True,
+                foreground=False,
+                poll_interval=None,
+            )
+        )
+
+
+def test_resume_command_uses_existing_workflow_interface(
     tmp_path: Path, monkeypatch, capsys
 ):
     config, initial = _inputs(tmp_path)
@@ -331,35 +352,20 @@ def test_run_existing_project_forwards_foreground_controller_options(
     expected = WorkflowResume(
         preparation.workflow_id,
         "resume",
-        (),
         preparation.manifest,
-        controller_exit_code=0,
+        controller_pid=123,
     )
-    calls = []
 
-    def fake_resume(path, **options):
-        calls.append((Path(path), options))
+    def fake_resume(path):
+        assert Path(path) == preparation.output_dir
         return expected
 
     monkeypatch.setattr("NepTrain.core.workflow.resume_workflow", fake_resume)
-
-    run_project_command(
-        SimpleNamespace(
-            project=str(preparation.output_dir),
-            initial_training=None,
-            output=None,
-            workflow_id=None,
-            prepare_only=False,
-            foreground=True,
-            poll_interval=0.5,
-        )
-    )
+    run_resume_command(SimpleNamespace(project=str(preparation.output_dir)))
 
     payload = json.loads(capsys.readouterr().out)
-    assert calls == [
-        (preparation.output_dir, {"foreground": True, "poll_interval": 0.5})
-    ]
-    assert payload["controller_exit_code"] == 0
+    assert payload["action"] == "resume"
+    assert payload["controller_pid"] == 123
     assert "job_ids" not in payload
 
 
@@ -376,5 +382,20 @@ def test_resume_completed_workflow_is_an_idempotent_noop(
     result = resume_workflow(preparation.output_dir)
 
     assert result.action == "complete"
-    assert result.job_ids == ()
     assert result.controller_pid is None
+
+
+def test_resume_prepared_workflow_reports_start_action(
+    tmp_path: Path, monkeypatch
+):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    monkeypatch.setattr(
+        "NepTrain.core.controller.start_controller",
+        lambda *_args, **_kwargs: 123,
+    )
+
+    result = resume_workflow(preparation.output_dir)
+
+    assert result.action == "start"
+    assert result.controller_pid == 123

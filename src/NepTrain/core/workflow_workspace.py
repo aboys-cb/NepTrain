@@ -9,16 +9,16 @@ import shutil
 from typing import Any, Mapping
 
 
-_LAYOUT_VERSION = 2
+_LAYOUT_VERSION = 3
 _STAGE_DIRECTORIES = {
-    "train": "training/bootstrap",
-    "explore": "sampling/md",
-    "select": "sampling/selection",
-    "label": "labeling",
-    "diagnose": "evaluation/acquisition",
+    "train": "train",
+    "explore": "md",
+    "select": "select",
+    "label": "dft",
+    "diagnose": "diagnose",
     "merge": "dataset",
-    "retrain": "training/retrain",
-    "evaluate": "evaluation/post-train",
+    "retrain": "retrain",
+    "evaluate": "evaluate",
 }
 
 
@@ -57,9 +57,9 @@ def _copy_path(source: Path, target: Path) -> None:
 class WorkflowWorkspace:
     """Own every durable path in one workflow directory.
 
-    Layout v2 keeps the machine state below ``.neptrain`` and exposes only
+    Layout v3 keeps the machine state below ``.neptrain`` and exposes only
     inputs, generation evidence, logs, and accepted results at the project
-    root. Legacy layouts are rejected instead of being silently migrated.
+    root. Test-phase layouts are intentionally not migrated or retained.
     """
 
     root: Path
@@ -79,9 +79,7 @@ class WorkflowWorkspace:
             workspace.generations_dir,
             workspace.logs_dir,
             workspace.plans_dir,
-            workspace.jobs_dir,
             workspace.tasks_dir,
-            workspace.locks_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         _write_json(
@@ -103,8 +101,8 @@ class WorkflowWorkspace:
             "- `.neptrain/`：账本、计划、可移植任务和执行状态，通常无需编辑。\n"
             "\n常用命令：`neptrain workflow status .`、"
             "`neptrain workflow resume .`、`neptrain workflow stop .`。\n"
-            "流程作废并需要取消当前计算任务时使用："
-            "`neptrain workflow stop . --cancel-jobs`。\n",
+            "`stop` 默认同时取消当前计算任务；仅停止 Controller 时使用："
+            "`neptrain workflow stop . --keep-jobs`。\n",
             encoding="utf-8",
         )
         return workspace
@@ -118,9 +116,8 @@ class WorkflowWorkspace:
         layout = candidate / ".neptrain" / "layout.json"
         if layout.is_file():
             value = json.loads(layout.read_text(encoding="utf-8"))
-            if value.get("layout") != "neptrain.workflow" or int(
-                value.get("version", 0)
-            ) != _LAYOUT_VERSION:
+            version = int(value.get("version", 0))
+            if value.get("layout") != "neptrain.workflow" or version != _LAYOUT_VERSION:
                 raise ValueError(f"unsupported workflow layout: {layout}")
             return cls(candidate)
         raise FileNotFoundError(f"NepTrain workflow does not exist: {candidate}")
@@ -163,11 +160,11 @@ class WorkflowWorkspace:
 
     @property
     def jobs_dir(self) -> Path:
-        return self.internal_dir / "jobs"
+        return self.internal_dir / "scheduler"
 
     @property
     def tasks_dir(self) -> Path:
-        return self.internal_dir / "tasks"
+        return self.internal_dir / "jobs"
 
     @property
     def locks_dir(self) -> Path:
@@ -175,7 +172,7 @@ class WorkflowWorkspace:
 
     @property
     def manifest_lock(self) -> Path:
-        return self.locks_dir / "manifest.lock"
+        return self.internal_dir / ".manifest.lock"
 
     @property
     def ledger(self) -> Path:
@@ -183,7 +180,7 @@ class WorkflowWorkspace:
 
     @property
     def ledger_lock(self) -> Path:
-        return self.locks_dir / "ledger.lock"
+        return self.internal_dir / ".ledger.lock"
 
     @property
     def controller_file(self) -> Path:
@@ -191,7 +188,7 @@ class WorkflowWorkspace:
 
     @property
     def controller_lock(self) -> Path:
-        return self.locks_dir / "controller.lock"
+        return self.internal_dir / ".controller.lock"
 
     @property
     def controller_pid(self) -> Path:

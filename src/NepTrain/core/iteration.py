@@ -235,13 +235,14 @@ class StageContext:
     previous_artifacts: Mapping[str, Path]
     stage_dir: Path | None = None
     stage_input: Mapping[str, Any] = field(default_factory=dict)
+    flat_output: bool = False
 
     @property
     def work_dir(self) -> Path:
         """Directory owned by the current stage.
 
-        Legacy and direct controller users keep writing to ``generation_dir``;
-        workflow layout v2 gives each stage a focused subdirectory.
+        Direct controller users keep writing to ``generation_dir``; workflow
+        layout v3 gives each stage a focused subdirectory.
         """
 
         return self.stage_dir or self.generation_dir
@@ -283,7 +284,7 @@ class GenerationController:
             workspace = WorkflowWorkspace.locate(self.root)
         except FileNotFoundError:
             workspace = None
-        if workspace is not None and workspace.version == 2:
+        if workspace is not None and workspace.version == 3:
             self.workspace = workspace
             self.ledger_path = workspace.ledger
             self.lock_path = workspace.ledger_lock
@@ -450,6 +451,7 @@ class GenerationController:
                     if self.workspace is not None
                     else generation_dir
                 ),
+                flat_output=self.workspace is not None,
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
             return requested, context
@@ -565,6 +567,7 @@ class GenerationController:
                     if self.workspace is not None
                     else generation_dir
                 ),
+                flat_output=self.workspace is not None,
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
             outcome = adapter.run_stage(requested, context)

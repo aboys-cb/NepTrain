@@ -19,6 +19,48 @@ class SamplingRouteError(ValueError):
     """Raised when an explicit sampling route is incomplete or ambiguous."""
 
 
+MATURITY_STAGES = (
+    "smoke_passed",
+    "short_stable",
+    "long_stable",
+    "production_ready",
+)
+DEFAULT_PROGRESSION = {
+    "steps": {
+        "smoke_passed": 10000,
+        "short_stable": 40000,
+        "long_stable": 160000,
+        "production_ready": 640000,
+    },
+    "replicas": {
+        "smoke_passed": 1,
+        "short_stable": 1,
+        "long_stable": 2,
+        "production_ready": 3,
+    },
+}
+
+
+def normalized_progression(
+    value: Mapping[str, Any] | None,
+) -> dict[str, dict[str, int]]:
+    source = value or {}
+    steps = source.get("steps") or {}
+    replicas = source.get("replicas") or {}
+    return {
+        "steps": {
+            name: int(steps.get(name, DEFAULT_PROGRESSION["steps"][name]))
+            for name in MATURITY_STAGES
+        },
+        "replicas": {
+            name: int(
+                replicas.get(name, DEFAULT_PROGRESSION["replicas"][name])
+            )
+            for name in MATURITY_STAGES
+        },
+    }
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -100,11 +142,15 @@ class SamplingRoute:
             )
         raw_conditions = value.get("conditions")
         raw_progression = value.get("progression")
-        if not isinstance(raw_conditions, Mapping) or not isinstance(
+        if not isinstance(raw_conditions, Mapping):
+            raise SamplingRouteError(
+                f"sampling route {route_id!r} requires conditions"
+            )
+        if raw_progression is not None and not isinstance(
             raw_progression, Mapping
         ):
             raise SamplingRouteError(
-                f"sampling route {route_id!r} requires conditions and progression"
+                f"sampling route {route_id!r} progression must be a mapping"
             )
         temperature_path = [
             float(item) for item in raw_conditions["temperature_path"]
@@ -117,18 +163,9 @@ class SamplingRoute:
                     "production_temperatures", temperature_path
                 )
             ],
-            "pressure": float(raw_conditions["pressure"]),
+            "pressure": float(raw_conditions.get("pressure", 0.0)),
         }
-        progression: dict[str, Any] = {
-            "steps": {
-                str(key): int(item)
-                for key, item in raw_progression["steps"].items()
-            },
-            "replicas": {
-                str(key): int(item)
-                for key, item in raw_progression["replicas"].items()
-            },
-        }
+        progression = normalized_progression(raw_progression)
         template_sha256 = _sha256(template_path)
         source_hashes = tuple(_path_digest(path) for path in structure_paths)
         fingerprint_payload = {
@@ -171,7 +208,10 @@ def load_sampling_routes(
 
 
 __all__ = [
+    "DEFAULT_PROGRESSION",
+    "MATURITY_STAGES",
     "SamplingRoute",
     "SamplingRouteError",
     "load_sampling_routes",
+    "normalized_progression",
 ]

@@ -11,7 +11,13 @@ from ruamel.yaml import YAML
 from NepTrain import utils
 
 
-def _project(profile: str) -> dict:
+def _project(
+    profile: str,
+    *,
+    ensemble: str,
+    spin: bool,
+    dft_backend: str,
+) -> dict:
     if profile == "local":
         targets = {"local": {"executor": "process"}}
         routes = {
@@ -61,57 +67,26 @@ def _project(profile: str) -> dict:
         "md": {
             "backend": "lammps",
             "inference_backend": "auto",
-            "spin": False,
+            "spin": spin,
         },
         "sampling": {
             "routes": [
                 {
                     "id": "default",
                     "structures": ["./structures"],
-                    "template_path": "./lammps-nvt.in",
+                    "template_path": "./lammps.in",
                     "conditions": {
                         "temperature_path": [300],
-                        "production_temperatures": [300],
-                        "pressure": 0.0,
-                    },
-                    "progression": {
-                        "steps": {
-                            "smoke_passed": 10000,
-                            "short_stable": 40000,
-                            "long_stable": 160000,
-                            "production_ready": 640000,
-                        },
-                        "replicas": {
-                            "smoke_passed": 1,
-                            "short_stable": 1,
-                            "long_stable": 2,
-                            "production_ready": 3,
-                        },
                     },
                 },
             ],
-            "candidate_pool": {
-                "pre_failure_frames": 2,
-                "bad_tail_frames": 1,
-                "health": {
-                    "min_distance_ratio": 0.5,
-                    "min_volume_ratio": 0.5,
-                    "max_volume_ratio": 2.0,
-                    "max_force": 100.0,
-                    "max_mforce": 100.0,
-                    "max_spin_magnitude": 20.0,
-                },
-            },
-            "selection": {
-                "max_selected": 100,
-                "novelty": "auto",
-            },
         },
         "dft": {
-            "backend": "vasp",
-            "input_path": "./INCAR",
-            "resource_path": None,
+            "backend": dft_backend,
+            "input_path": "./INCAR" if dft_backend == "vasp" else "./INPUT",
             "kpoint_mode": "auto",
+            "structures_per_job": 1,
+            "max_concurrent": 20,
         },
         "workflow": {
             "id": "workflow",
@@ -119,15 +94,27 @@ def _project(profile: str) -> dict:
             "seed": 20260721,
         },
         "execution": {
-            "poll_interval": 30,
             "stage_targets": routes,
-            "sampling_route_targets": {},
             "targets": targets,
         },
     }
 
 
-def init_project(profile: str, destination: str | Path, *, force: bool = False) -> Path:
+def init_project(
+    profile: str,
+    destination: str | Path,
+    *,
+    ensemble: str = "npt",
+    spin: bool = False,
+    dft_backend: str = "vasp",
+    force: bool = False,
+) -> Path:
+    if ensemble not in {"npt", "nvt"}:
+        raise ValueError("ensemble must be npt or nvt")
+    if dft_backend not in {"vasp", "abacus"}:
+        raise ValueError("dft_backend must be vasp or abacus")
+    if spin and dft_backend != "abacus":
+        raise ValueError("spin workflows require --dft-backend abacus")
     root = Path(destination).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     project = root / "project.yaml"
@@ -138,13 +125,38 @@ def init_project(profile: str, destination: str | Path, *, force: bool = False) 
     yaml = YAML()
     yaml.indent(mapping=2, sequence=4, offset=2)
     with project.open("w", encoding="utf-8") as handle:
-        yaml.dump(_project(profile), handle)
+        yaml.dump(
+            _project(
+                profile,
+                ensemble=ensemble,
+                spin=spin,
+                dft_backend=dft_backend,
+            ),
+            handle,
+        )
     (root / "structures").mkdir(exist_ok=True)
-    for name in ("nvt.in", "npt.in", "spin-nvt.in", "spin-npt.in"):
-        source = files("NepTrain.core.md").joinpath(f"templates/{name}")
-        shutil.copyfile(source, root / f"lammps-{name}")
-    shutil.copyfile(files("NepTrain.core.dft.vasp").joinpath("INCAR"), root / "INCAR")
-    shutil.copyfile(files("NepTrain.core.dft.abacus").joinpath("INPUT"), root / "INPUT")
+    if force:
+        for obsolete in (
+            "lammps-nvt.in",
+            "lammps-npt.in",
+            "lammps-spin-nvt.in",
+            "lammps-spin-npt.in",
+            "INCAR" if dft_backend == "abacus" else "INPUT",
+        ):
+            (root / obsolete).unlink(missing_ok=True)
+    template_name = f"{'spin-' if spin else ''}{ensemble}.in"
+    source = files("NepTrain.core.md").joinpath(f"templates/{template_name}")
+    shutil.copyfile(source, root / "lammps.in")
+    if dft_backend == "vasp":
+        shutil.copyfile(
+            files("NepTrain.core.dft.vasp").joinpath("INCAR"),
+            root / "INCAR",
+        )
+    else:
+        shutil.copyfile(
+            files("NepTrain.core.dft.abacus").joinpath("INPUT"),
+            root / "INPUT",
+        )
     if profile == "slurm":
         scripts = {
             "env-training.sh": (
@@ -179,4 +191,11 @@ def init_project(profile: str, destination: str | Path, *, force: bool = False) 
 def init_template(args):
     """Argparse adapter kept internal to the new ``workflow init`` command."""
 
-    return init_project(args.profile, args.directory, force=args.force)
+    return init_project(
+        args.profile,
+        args.directory,
+        ensemble=args.ensemble,
+        spin=args.spin,
+        dft_backend=args.dft_backend,
+        force=args.force,
+    )

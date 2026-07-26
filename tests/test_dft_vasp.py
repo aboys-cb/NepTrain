@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -94,7 +95,7 @@ def test_vasp_nonmagnetic_single_point_is_normalized_and_provenanced(
         restored.info["virial"],
         -64.0 * np.asarray([[1.0, 0.6, 0.5], [0.6, 2.0, 0.4], [0.5, 0.4, 3.0]]),
     )
-    case = tmp_path / "work" / "000001-Al" / "attempt-0001"
+    case = tmp_path / "work" / "000001-Al"
     manifest = json.loads((case / "vasp-result.json").read_text())
     assert manifest["status"] == "completed"
     assert set(manifest["input_sha256"]) == {"INCAR", "POSCAR", "KPOINTS", "POTCAR"}
@@ -109,8 +110,29 @@ def test_vasp_retry_uses_a_fresh_attempt_directory(tmp_path: Path, monkeypatch):
     label(request, "vasp")
 
     case = tmp_path / "work" / "000001-Al"
-    assert (case / "attempt-0001" / "vasp-result.json").is_file()
-    assert (case / "attempt-0002" / "vasp-result.json").is_file()
+    assert (case / "vasp-result.json").is_file()
+    assert (case / "retry-0002" / "vasp-result.json").is_file()
+
+
+def test_vasp_single_structure_workflow_job_uses_flat_output(
+    tmp_path: Path, monkeypatch
+):
+    native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
+    monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
+    request = replace(
+        _request(tmp_path),
+        options={"flat_single_case": True},
+    )
+
+    label(request, "vasp")
+    label(request, "vasp")
+
+    assert (request.work_dir / "INCAR").is_file()
+    assert (request.work_dir / "vasp-result.json").is_file()
+    assert (
+        request.work_dir / "retry-0002" / "vasp-result.json"
+    ).is_file()
+    assert not (request.work_dir / "000001-Al").exists()
 
 
 def test_vasp_auto_mode_honors_template_kspacing(tmp_path: Path, monkeypatch):
@@ -144,7 +166,6 @@ def test_vasp_rejects_relaxation_template_before_launch(tmp_path: Path, monkeypa
             tmp_path
             / "work"
             / "000001-Al"
-            / "attempt-0001"
             / "vasp-result.json"
         ).read_text()
     )
@@ -162,11 +183,12 @@ def test_vasp_rejects_nonconverged_result(tmp_path: Path, monkeypatch):
         label(_request(tmp_path), "vasp")
 
 
-def test_vasp_rejects_magnetic_incar(tmp_path: Path, monkeypatch):
+def test_vasp_accepts_collinear_spin_polarized_incar(tmp_path: Path, monkeypatch):
     native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
     request = _request(tmp_path)
     request.input_file.write_text("IBRION = -1\nNSW = 0\nISPIN = 2\n", encoding="utf-8")
 
-    with pytest.raises(NativeVaspError, match="ISPIN=1"):
-        label(request, "vasp")
+    result = label(request, "vasp")
+
+    assert result.output_file.is_file()

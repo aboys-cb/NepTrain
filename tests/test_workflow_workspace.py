@@ -52,10 +52,14 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
 
     assert summary.accepted is True
     assert workspace.ledger == workspace.root / ".neptrain" / "ledger.json"
+    assert workspace.version == 3
+    assert workspace.tasks_dir == workspace.root / ".neptrain" / "jobs"
+    assert not (workspace.internal_dir / "tasks").exists()
+    assert not (workspace.internal_dir / "locks").exists()
     assert workspace.generation_dir(1).name == "0001"
-    assert (workspace.generation_dir(1) / "sampling/md/explore.txt").is_file()
-    assert (workspace.generation_dir(1) / "labeling/label.txt").is_file()
-    assert (workspace.generation_dir(1) / "training/retrain/retrain.txt").is_file()
+    assert (workspace.generation_dir(1) / "md/explore.txt").is_file()
+    assert (workspace.generation_dir(1) / "dft/label.txt").is_file()
+    assert (workspace.generation_dir(1) / "retrain/retrain.txt").is_file()
     assert json.loads((workspace.results_dir / "nep.txt").read_text()) == "evaluate"
     assert (workspace.results_dir / "train.xyz").read_text() == "merge\n"
     assert json.loads((workspace.results_dir / "metrics.json").read_text()) == "evaluate"
@@ -84,3 +88,16 @@ def test_workspace_rejects_legacy_layout(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError, match="workflow does not exist"):
         WorkflowWorkspace.locate(legacy)
+
+
+def test_workspace_rejects_previous_layout_versions(tmp_path: Path):
+    root = tmp_path / "existing-v2"
+    internal = root / ".neptrain"
+    internal.mkdir(parents=True)
+    (internal / "layout.json").write_text(
+        json.dumps({"layout": "neptrain.workflow", "version": 2}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported workflow layout"):
+        WorkflowWorkspace.locate(root)

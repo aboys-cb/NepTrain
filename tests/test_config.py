@@ -91,6 +91,41 @@ def test_schema_v7_loads_without_migration(tmp_path):
     assert changes == []
 
 
+def test_sampling_defaults_do_not_need_to_be_repeated_in_project_yaml(tmp_path):
+    value = _project()
+    route = value["sampling"]["routes"][0]
+    route["conditions"] = {"temperature_path": [300]}
+    route.pop("progression")
+    value["sampling"].pop("candidate_pool")
+    value["sampling"].pop("selection")
+
+    config, changes = load_config(_write(tmp_path, value))
+
+    assert changes == []
+    assert "progression" not in config["sampling"]["routes"][0]
+    assert "candidate_pool" not in config["sampling"]
+    assert "selection" not in config["sampling"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("structures_per_job", 0),
+        ("structures_per_job", True),
+        ("max_concurrent", 0),
+        ("max_concurrent", 1.5),
+    ],
+)
+def test_dft_parallelism_requires_positive_integers(tmp_path, field, value):
+    with pytest.raises(ConfigError, match=rf"dft\.{field}"):
+        load_config(
+            _write(
+                tmp_path,
+                _project(dft={field: value}),
+            )
+        )
+
+
 @pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8])
 def test_legacy_and_future_schemas_are_rejected(tmp_path, version):
     value = _project()

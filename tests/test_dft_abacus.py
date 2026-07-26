@@ -142,7 +142,7 @@ def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
         frames[0].info["virial"],
         np.diag([-10.0, -20.0, -30.0]) * 64.0 * 0.0006241509125883258,
     )
-    case = tmp_path / "work" / "000001-Al" / "attempt-0001"
+    case = tmp_path / "work" / "000001-Al"
     assert "Al.PBE" not in (case / "STRU").read_text(encoding="utf-8")
     assert "Al.UPF" in (case / "STRU").read_text(encoding="utf-8")
     assert "1 1 1 0 0 0" in (case / "KPT").read_text(encoding="utf-8")
@@ -205,7 +205,7 @@ def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
     np.testing.assert_allclose(reread.arrays["spin"], spin)
     np.testing.assert_allclose(reread.arrays["mforce"], frame.arrays["mforce"])
 
-    case = tmp_path / "work" / "000001-AlFe2" / "attempt-0001"
+    case = tmp_path / "work" / "000001-AlFe2"
     rendered_input = (case / "INPUT").read_text(encoding="utf-8")
     for setting in (
         "nspin 4",
@@ -385,7 +385,7 @@ def test_abacus_auto_mode_honors_input_kspacing(tmp_path: Path, monkeypatch):
 
     module.run_abacus(args)
 
-    case = tmp_path / "work" / "000001-Al" / "attempt-0001"
+    case = tmp_path / "work" / "000001-Al"
     assert "kspacing 0.25" in (case / "INPUT").read_text(encoding="utf-8")
     assert not (case / "KPT").exists()
 

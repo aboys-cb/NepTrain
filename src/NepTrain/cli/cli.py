@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 from NepTrain import __version__
 
 
@@ -187,7 +188,7 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
 
 
 def run_project_command(args):
-    """Start or continue a workflow through the small user interface."""
+    """Start from either a project YAML file or a prepared workflow."""
 
     from NepTrain.core.workflow import (
         WorkflowError,
@@ -199,23 +200,27 @@ def run_project_command(args):
     project = Path(args.project).expanduser()
     try:
         if project.is_dir():
-            resume_options = {}
-            if getattr(args, "foreground", False):
-                resume_options["foreground"] = True
-            if getattr(args, "poll_interval", None) is not None:
-                resume_options["poll_interval"] = args.poll_interval
-            result = resume_workflow(project, **resume_options)
-            payload = {
-                "workflow_id": result.workflow_id,
-                "action": result.action,
-                "manifest": str(result.manifest),
-            }
-            if result.controller_pid is not None:
-                payload["controller_pid"] = result.controller_pid
-            elif result.controller_exit_code is not None:
-                payload["controller_exit_code"] = result.controller_exit_code
-            else:
-                payload["job_ids"] = list(result.job_ids)
+            invalid = [
+                option
+                for option, value in (
+                    ("--initial-training", args.initial_training),
+                    ("--output", args.output),
+                    ("--workflow-id", args.workflow_id),
+                    ("--prepare-only", args.prepare_only),
+                )
+                if value
+            ]
+            if invalid:
+                raise WorkflowError(
+                    f"{', '.join(invalid)} can only be used with a project "
+                    "YAML file"
+                )
+            result = resume_workflow(
+                project,
+                foreground=getattr(args, "foreground", False),
+                poll_interval=getattr(args, "poll_interval", None),
+            )
+            payload = _workflow_resume_payload(result)
         else:
             initial_training = args.initial_training
             output = args.output
@@ -237,13 +242,16 @@ def run_project_command(args):
                         else path.resolve()
                     )
                 if not output:
-                    workflow_id = str(config.get("workflow", {}).get("id", "")).strip()
+                    workflow_id = str(
+                        config.get("workflow", {}).get("id", "")
+                    ).strip()
                     if workflow_id:
                         output = str((project.parent / workflow_id).resolve())
             if not initial_training or not output:
                 raise WorkflowError(
-                    "starting from a project file requires training.initial_path "
-                    "(or --initial-training) and workflow.id (or --output)"
+                    "starting from a project file requires "
+                    "training.initial_path (or --initial-training) and "
+                    "workflow.id (or --output)"
                 )
             preparation = prepare_workflow(
                 project,
@@ -257,7 +265,12 @@ def run_project_command(args):
                 "manifest": str(preparation.manifest),
                 "started": not args.prepare_only,
             }
-            if not args.prepare_only:
+            if args.prepare_only:
+                payload["next_action"] = (
+                    f"neptrain workflow run "
+                    f"{shlex.quote(str(preparation.output_dir))}"
+                )
+            else:
                 try:
                     controller_result = start_controller(
                         preparation.output_dir,
@@ -270,8 +283,8 @@ def run_project_command(args):
                     payload["controller_exit_code"] = controller_result
                 else:
                     payload["controller_pid"] = controller_result
-    except WorkflowError as error:
-        raise SystemExit(f"NepTrain: error: {error}") from error
+    except WorkflowError:
+        raise
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
@@ -290,26 +303,29 @@ def run_status_command(args):
 
 
 def run_resume_command(args):
-    from dataclasses import asdict
     from NepTrain.core.workflow import WorkflowError, resume_workflow
 
     try:
         result = resume_workflow(args.project)
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
+    payload = _workflow_resume_payload(result)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _workflow_resume_payload(result):
+    from dataclasses import asdict
+
     payload = asdict(result)
-    payload["job_ids"] = list(result.job_ids)
     payload["manifest"] = str(result.manifest)
     if result.controller_pid is not None:
-        payload.pop("job_ids", None)
         payload.pop("controller_exit_code", None)
     elif result.controller_exit_code is not None:
-        payload.pop("job_ids", None)
         payload.pop("controller_pid", None)
     else:
         payload.pop("controller_pid", None)
         payload.pop("controller_exit_code", None)
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    return payload
 
 
 def run_extend_command(args):
@@ -420,30 +436,35 @@ def run_doctor(args):
                 + " ".join(shlex.quote(tool) for tool in required)
                 + "; do command -v \"$tool\" >/dev/null; done\n"
             )
-            if target.host:
+            command = (
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    target.host,
+                    "bash",
+                    "-s",
+                ]
+                if target.host
+                else ["bash", "-s"]
+            )
+            try:
                 completed = subprocess.run(
-                    [
-                        "ssh",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "ConnectTimeout=10",
-                        target.host,
-                        "bash",
-                        "-s",
-                    ],
+                    command,
                     input=probe,
                     capture_output=True,
                     text=True,
                     check=False,
+                    timeout=30,
                 )
-            else:
-                completed = subprocess.run(
-                    ["bash", "-s"],
-                    input=probe,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+            except subprocess.TimeoutExpired:
+                completed = subprocess.CompletedProcess(
+                    command,
+                    124,
+                    stdout="",
+                    stderr="probe timed out after 30s",
                 )
             available = completed.returncode == 0
             location = target.host or "local"
@@ -471,11 +492,20 @@ def run_doctor(args):
         else:
             probe_command = shlex.split(args.lmp)
             probe_command.append("-h")
-            completed = subprocess.run(
-                probe_command,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                completed = subprocess.run(
+                    probe_command,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                completed = subprocess.CompletedProcess(
+                    probe_command,
+                    124,
+                    stdout="",
+                    stderr="LAMMPS help probe timed out after 30s",
+                )
             help_text = completed.stdout + completed.stderr
             pair = "nep/gpu/kk" if selected_inference == "cuda" else "nep/cpu"
             pair_available = pair in help_text
@@ -645,8 +675,50 @@ def build_select(subparsers):
     group.add_argument("--n_max", "-n", type=int, help="The number of radial basis functions,default 8", default=8)
     group.add_argument("--l_max", "-l", type=int, help="The maximum degree of spherical harmonics,default 6", default=6)
 
-def _print_manual_status(value):
-    print(json.dumps(value, indent=2, sort_keys=True))
+def _print_manual_status(value, *, json_output=False):
+    if json_output:
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return
+    kind = value.get("kind")
+    operation_id = value.get("operation_id")
+    if kind or operation_id:
+        task = str(kind or "task")
+        if operation_id:
+            task += f" ({operation_id})"
+        print(f"Task: {task}")
+    labels = (
+        ("state", "State"),
+        ("scheduler_state", "Scheduler"),
+        ("job_id", "Job"),
+        ("run_directory", "Run directory"),
+        ("remote_directory", "Remote directory"),
+        ("result", "Result"),
+        ("reason", "Reason"),
+    )
+    for key, label in labels:
+        item = value.get(key)
+        if item not in (None, "", [], {}):
+            print(f"{label}: {item}")
+    completed = value.get("completed")
+    total = value.get("total")
+    if completed is not None and total is not None:
+        print(f"Progress: {completed}/{total}")
+    errors = value.get("errors")
+    if errors:
+        print("Errors:")
+        for error in errors:
+            print(f"- {error}")
+    logs = value.get("logs")
+    if logs:
+        print("Logs:")
+        for log in logs:
+            print(f"- {log}")
+    run_directory = value.get("run_directory")
+    state = str(value.get("state", "")).lower()
+    if run_directory and state in {"prepared", "submitted", "running", "unknown"}:
+        print(f"Next: neptrain task wait {shlex.quote(str(run_directory))}")
+    elif run_directory and state == "failed":
+        print(f"Next: neptrain task retry {shlex.quote(str(run_directory))}")
 
 
 def _manual_project(project):
@@ -702,7 +774,8 @@ def run_manual_train_command(args):
     _print_manual_status(
         submit_operation(
             operation, wait=args.wait, poll_interval=args.poll_interval
-        )
+        ),
+        json_output=args.json,
     )
 
 
@@ -765,7 +838,8 @@ def run_manual_md_command(args):
     _print_manual_status(
         submit_operation(
             operation, wait=args.wait, poll_interval=args.poll_interval
-        )
+        ),
+        json_output=args.json,
     )
 
 
@@ -819,7 +893,8 @@ def run_manual_dft_command(args):
     _print_manual_status(
         submit_operation(
             operation, wait=args.wait, poll_interval=args.poll_interval
-        )
+        ),
+        json_output=args.json,
     )
 
 
@@ -846,7 +921,7 @@ def run_task_command(args):
         value = {"run_directory": str(operation.root), "logs": operation_logs(operation)}
     else:  # pragma: no cover - argparse owns this invariant
         raise ValueError(args.task_action)
-    _print_manual_status(value)
+    _print_manual_status(value, json_output=args.json)
 
 
 def run_manual_worker_command(args):
@@ -858,7 +933,7 @@ def run_manual_worker_command(args):
 def _add_execution_options(parser):
     parser.add_argument(
         "--project",
-        help="Schema-v4 project providing reusable execution targets.",
+        help="Schema-v7 project providing reusable execution targets.",
     )
     parser.add_argument("--target", help="Execution target name from project.yaml.")
     parser.add_argument("--workdir", help="Durable run directory.")
@@ -868,6 +943,11 @@ def _add_execution_options(parser):
         help="Wait for submitted Slurm work and publish the final result.",
     )
     parser.add_argument("--poll-interval", type=float, default=10.0)
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the machine-readable task record.",
+    )
 
 
 def _parse_ka(value):
@@ -972,12 +1052,14 @@ def build_task_commands(subparsers):
         command = actions.add_parser(name, help=help_text)
         command.set_defaults(func=run_task_command)
         command.add_argument("run", help="Manual run directory.")
+        command.add_argument("--json", action="store_true")
     wait = actions.add_parser(
         "wait", help="Wait until the run completes, fails, or is cancelled."
     )
     wait.set_defaults(func=run_task_command)
     wait.add_argument("run", help="Manual run directory.")
     wait.add_argument("--poll-interval", type=float, default=10.0)
+    wait.add_argument("--json", action="store_true")
 
 
 def build_workflow_commands(subparsers):
@@ -988,14 +1070,25 @@ def build_workflow_commands(subparsers):
     init = actions.add_parser("init", help="Create a strict schema-v7 project.")
     init.set_defaults(func=init_template)
     init.add_argument("--profile", choices=["local", "slurm"], default="slurm")
+    init.add_argument("--ensemble", choices=["npt", "nvt"], default="npt")
+    init.add_argument("--spin", action="store_true")
+    init.add_argument(
+        "--dft-backend",
+        choices=["vasp", "abacus"],
+        default="vasp",
+    )
     init.add_argument("--directory", default=".")
     init.add_argument("--force", action="store_true")
 
     run = actions.add_parser(
-        "run", help="Prepare a workflow and start its persistent controller."
+        "run",
+        help=(
+            "Create a workflow from project YAML, or start an existing "
+            "prepared workflow directory."
+        ),
     )
     run.set_defaults(func=run_project_command)
-    run.add_argument("project", help="Project YAML or workflow directory.")
+    run.add_argument("project", help="Project YAML or prepared workflow directory.")
     run.add_argument("--initial-training")
     run.add_argument("--output")
     run.add_argument("--workflow-id")
@@ -1012,7 +1105,7 @@ def build_workflow_commands(subparsers):
     status.add_argument("--jobs", action="store_true")
 
     resume = actions.add_parser(
-        "resume", help="Restart a stopped or failed workflow controller."
+        "resume", help="Start or restart an existing workflow controller."
     )
     resume.set_defaults(func=run_resume_command)
     resume.add_argument("project")
@@ -1025,14 +1118,17 @@ def build_workflow_commands(subparsers):
     extend.add_argument("generations", type=int)
 
     stop = actions.add_parser(
-        "stop", help="Stop the controller without cancelling compute jobs."
+        "stop", help="Stop the controller and cancel its current compute jobs."
     )
     stop.set_defaults(func=run_stop_command)
     stop.add_argument("project")
-    stop.add_argument(
-        "--cancel-jobs",
-        action="store_true",
-        help="Also cancel the workflow's current process or Slurm job.",
+    cancellation = stop.add_mutually_exclusive_group()
+    cancellation.set_defaults(cancel_jobs=True)
+    cancellation.add_argument(
+        "--keep-jobs",
+        dest="cancel_jobs",
+        action="store_false",
+        help="Stop only the controller and keep current compute jobs running.",
     )
 
 
@@ -1087,7 +1183,8 @@ def main():
         pass
     args = parser.parse_args()
     try:
-        return args.func(args)
+        result = args.func(args)
+        return result if type(result) is int else None
     except Exception as error:
         from NepTrain.core.workflow import WorkflowError
         from NepTrain.core.config import ConfigError

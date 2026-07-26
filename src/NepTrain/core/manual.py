@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 import traceback
@@ -26,7 +27,7 @@ from typing import Any, Mapping, Sequence
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
-from .execution import ExecutionTarget
+from .execution import ExecutionTarget, ExecutionTransport
 
 
 class ManualTaskError(RuntimeError):
@@ -64,14 +65,23 @@ class ManualOperation:
     kind: str
     target: ExecutionTarget
     shard_count: int
+    jobs_directory: str = "jobs"
 
     @property
     def descriptor(self) -> Path:
         return self.root / "operation.json"
 
+    @property
+    def jobs_root(self) -> Path:
+        return self.root / self.jobs_directory
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _progress(message: str) -> None:
+    print(f"[NepTrain] {message}", file=sys.stderr, flush=True)
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -170,7 +180,8 @@ def _prepare_root(
     )
     if root.exists():
         raise ManualTaskError(f"run directory already exists: {root}")
-    (root / "shards").mkdir(parents=True)
+    (root / "jobs").mkdir(parents=True)
+    (root / "logs").mkdir()
     return root, operation_id
 
 
@@ -192,7 +203,7 @@ def _write_operation(
     kind: str,
     target: ExecutionTarget,
     output: Path,
-    shards: Sequence[Mapping[str, Any]],
+    jobs: Sequence[Mapping[str, Any]],
     max_concurrent: int,
 ) -> ManualOperation:
     if max_concurrent < 1:
@@ -203,7 +214,7 @@ def _write_operation(
         _copy(setup, packaged)
         target = replace(target, setup_script="./inputs/setup.sh")
     value = {
-        "protocol": "neptrain.manual-operation.v1",
+        "protocol": "neptrain.manual-operation.v2",
         "operation_id": operation_id,
         "kind": kind,
         "created_at": _now(),
@@ -211,11 +222,14 @@ def _write_operation(
         "target": asdict(target),
         "output": str(output.expanduser().resolve()),
         "max_concurrent": int(max_concurrent),
-        "shards": [dict(item) for item in shards],
+        "jobs": [dict(item) for item in jobs],
         "attempts": [],
     }
     _write_json(root / "operation.json", value)
-    return ManualOperation(root, operation_id, kind, target, len(shards))
+    _progress(
+        f"{kind}: prepared {len(jobs)} job(s) in {root}"
+    )
+    return ManualOperation(root, operation_id, kind, target, len(jobs))
 
 
 def prepare_training(
@@ -235,6 +249,7 @@ def prepare_training(
     seed: int = 20260723,
     force: bool = False,
 ) -> ManualOperation:
+    _progress(f"train: reading inputs from {Path(train_file).expanduser()}")
     payload = {
         "backend": backend,
         "train": str(Path(train_file).expanduser().resolve()),
@@ -243,12 +258,12 @@ def prepare_training(
     }
     output_path = _output_path(output, force=force)
     root, operation_id = _prepare_root("train", workdir, payload)
-    shard = root / "shards" / "000000"
-    shard.mkdir()
+    job = root / "jobs" / "000000"
+    job.mkdir()
     request = {
         "backend": backend,
-        "train_file": str(Path(_copy(Path(train_file), shard / "train.xyz")).relative_to(root)),
-        "config_file": str(Path(_copy(Path(config_file), shard / "nep.in")).relative_to(root)),
+        "train_file": str(Path(_copy(Path(train_file), job / "train.xyz")).relative_to(root)),
+        "config_file": str(Path(_copy(Path(config_file), job / "nep.in")).relative_to(root)),
         "test_file": None,
         "restart_file": None,
         "device": device,
@@ -259,20 +274,20 @@ def prepare_training(
     }
     if test_file:
         request["test_file"] = str(
-            Path(_copy(Path(test_file), shard / "test.xyz")).relative_to(root)
+            Path(_copy(Path(test_file), job / "test.xyz")).relative_to(root)
         )
     if restart_file:
         request["restart_file"] = str(
-            Path(_copy(Path(restart_file), shard / "restart")).relative_to(root)
+            Path(_copy(Path(restart_file), job / "restart")).relative_to(root)
         )
-    _write_json(shard / "request.json", request)
+    _write_json(job / "request.json", request)
     return _write_operation(
         root,
         operation_id=operation_id,
         kind="train",
         target=target,
         output=output_path,
-        shards=[{"index": 0, "request": "shards/000000/request.json"}],
+        jobs=[{"index": 0, "request": "jobs/000000/request.json"}],
         max_concurrent=1,
     )
 
@@ -329,8 +344,13 @@ def prepare_dft(
             "remote DFT targets require dft_resource_path; "
             "large resource directories are not copied"
         )
+    _progress(f"dft: reading structures from {Path(source).expanduser()}")
     output_path = _output_path(output, force=force)
     frames = _frames(Path(source))
+    _progress(
+        f"dft: read {len(frames)} structure(s); "
+        f"{structures_per_job} structure(s) per Slurm task"
+    )
     payload = {
         "backend": backend,
         "source": str(Path(source).expanduser().resolve()),
@@ -344,18 +364,18 @@ def prepare_dft(
         if input_file
         else None
     )
-    shards = []
+    jobs = []
     for index, start in enumerate(range(0, len(frames), structures_per_job)):
-        shard = root / "shards" / f"{index:06d}"
-        shard.mkdir()
+        job = root / "jobs" / f"{index:06d}"
+        job.mkdir()
         ase_write(
-            shard / "input.xyz",
+            job / "input.xyz",
             frames[start : start + structures_per_job],
             format="extxyz",
         )
         request = {
             "backend": backend,
-            "source": str((shard / "input.xyz").relative_to(root)),
+            "source": str((job / "input.xyz").relative_to(root)),
             "input_file": copied_input,
             "resource_dir": effective_resource,
             "n_cpu": effective_n_cpu,
@@ -365,13 +385,13 @@ def prepare_dft(
             "ka": [int(value) for value in ka],
             "teacher_profile": teacher_profile,
         }
-        _write_json(shard / "request.json", request)
-        shards.append(
+        _write_json(job / "request.json", request)
+        jobs.append(
             {
                 "index": index,
                 "first_frame": start,
                 "frame_count": min(structures_per_job, len(frames) - start),
-                "request": str((shard / "request.json").relative_to(root)),
+                "request": str((job / "request.json").relative_to(root)),
             }
         )
     return _write_operation(
@@ -380,7 +400,7 @@ def prepare_dft(
         kind="dft",
         target=target,
         output=output_path,
-        shards=shards,
+        jobs=jobs,
         max_concurrent=max_concurrent,
     )
 
@@ -410,8 +430,13 @@ def prepare_md(
     max_concurrent: int = 20,
     force: bool = False,
 ) -> ManualOperation:
+    _progress(f"md: reading structures from {Path(source).expanduser()}")
     output_path = _output_path(output, force=force)
     frames = _frames(Path(source))
+    _progress(
+        f"md: read {len(frames)} structure(s) across "
+        f"{len(temperatures)} temperature(s)"
+    )
     if not temperatures:
         raise ManualTaskError("at least one temperature is required")
     payload = {
@@ -435,16 +460,16 @@ def prepare_md(
         if template_path
         else None
     )
-    shards = []
+    jobs = []
     index = 0
     for frame_index, frame in enumerate(frames):
         for temperature in temperatures:
-            shard = root / "shards" / f"{index:06d}"
-            shard.mkdir()
-            ase_write(shard / "input.xyz", frame, format="extxyz")
+            job = root / "jobs" / f"{index:06d}"
+            job.mkdir()
+            ase_write(job / "input.xyz", frame, format="extxyz")
             request = {
                 "backend": backend,
-                "source": str((shard / "input.xyz").relative_to(root)),
+                "source": str((job / "input.xyz").relative_to(root)),
                 "model_file": model,
                 "temperature": float(temperature),
                 "steps": int(steps),
@@ -461,13 +486,13 @@ def prepare_md(
                 "bad_tail_frames": int(bad_tail_frames),
                 "health": dict(health or {}),
             }
-            _write_json(shard / "request.json", request)
-            shards.append(
+            _write_json(job / "request.json", request)
+            jobs.append(
                 {
                     "index": index,
                     "frame": frame_index,
                     "temperature": float(temperature),
-                    "request": str((shard / "request.json").relative_to(root)),
+                    "request": str((job / "request.json").relative_to(root)),
                 }
             )
             index += 1
@@ -477,7 +502,7 @@ def prepare_md(
         kind="md",
         target=target,
         output=output_path,
-        shards=shards,
+        jobs=jobs,
         max_concurrent=max_concurrent,
     )
 
@@ -485,8 +510,18 @@ def prepare_md(
 def load_operation(path: str | Path) -> ManualOperation:
     root = Path(path).expanduser().resolve()
     descriptor = _read_json(root / "operation.json")
-    if descriptor.get("protocol") != "neptrain.manual-operation.v1":
+    protocol = descriptor.get("protocol")
+    if protocol not in {
+        "neptrain.manual-operation.v1",
+        "neptrain.manual-operation.v2",
+    }:
         raise ManualTaskError(f"not a NepTrain manual run: {root}")
+    jobs_directory = (
+        "jobs"
+        if protocol == "neptrain.manual-operation.v2"
+        else "shards"
+    )
+    jobs = descriptor.get("jobs", descriptor.get("shards", []))
     return ManualOperation(
         root=root,
         operation_id=str(descriptor["operation_id"]),
@@ -494,7 +529,8 @@ def load_operation(path: str | Path) -> ManualOperation:
         target=ExecutionTarget.from_mapping(
             str(descriptor["target"]["name"]), descriptor["target"]
         ),
-        shard_count=len(descriptor["shards"]),
+        shard_count=len(jobs),
+        jobs_directory=jobs_directory,
     )
 
 
@@ -508,13 +544,14 @@ def _resolve(root: Path, value: str | None) -> Path | None:
 def run_manual_worker(root_path: str | Path, index: int) -> int:
     operation = load_operation(root_path)
     descriptor = _read_json(operation.descriptor)
-    if index < 0 or index >= len(descriptor["shards"]):
-        raise ManualTaskError(f"shard index out of range: {index}")
-    shard_meta = descriptor["shards"][index]
-    shard = operation.root / "shards" / f"{index:06d}"
-    request = _read_json(operation.root / shard_meta["request"])
-    execution = shard / "execution.json"
-    lock_path = shard / "worker.lock"
+    jobs = descriptor.get("jobs", descriptor.get("shards", []))
+    if index < 0 or index >= len(jobs):
+        raise ManualTaskError(f"job index out of range: {index}")
+    job_meta = jobs[index]
+    job = operation.jobs_root / f"{index:06d}"
+    request = _read_json(operation.root / job_meta["request"])
+    execution = job / "execution.json"
+    lock_path = job / ".worker.lock"
     with lock_path.open("a+", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -525,10 +562,12 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 execution,
                 {"state": "RUNNING", "pid": os.getpid(), "started_at": _now()},
             )
-            result_dir = shard / "result"
-            if result_dir.exists():
-                shutil.rmtree(result_dir)
-            result_dir.mkdir()
+            result_file = _expected_job_result(operation, job)
+            result_file.unlink(missing_ok=True)
+            calculation_dir = job / "calculation"
+            if calculation_dir.exists():
+                shutil.rmtree(calculation_dir)
+            calculation_dir.mkdir()
             if operation.kind == "train":
                 from .training import TrainingRequest, train
 
@@ -536,7 +575,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                     TrainingRequest(
                         config_file=_resolve(operation.root, request["config_file"]),
                         train_file=_resolve(operation.root, request["train_file"]),
-                        output_dir=shard / "work" / "training",
+                        output_dir=calculation_dir,
                         test_file=_resolve(operation.root, request.get("test_file")),
                         restart_file=_resolve(
                             operation.root, request.get("restart_file")
@@ -549,7 +588,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                     ),
                     request["backend"],
                 )
-                shutil.copy2(result.best_model, result_dir / "nep.txt")
+                shutil.copy2(result.best_model, result_file)
                 metrics = {"backend": result.backend}
             elif operation.kind == "dft":
                 from .dft import LabelRequest, label
@@ -557,8 +596,8 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 result = label(
                     LabelRequest(
                         source=_resolve(operation.root, request["source"]),
-                        output_file=result_dir / "labeled.xyz",
-                        work_dir=shard / "work" / "dft",
+                        output_file=result_file,
+                        work_dir=calculation_dir,
                         input_file=_resolve(
                             operation.root, request.get("input_file")
                         ),
@@ -587,8 +626,8 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                         model_file=_resolve(
                             operation.root, request["model_file"]
                         ),
-                        output_dir=shard / "work" / "md",
-                        output_file=result_dir / "trajectory.xyz",
+                        output_dir=calculation_dir,
+                        output_file=result_file,
                         temperature=float(request["temperature"]),
                         steps=int(request["steps"]),
                         pressure=float(request["pressure"]),
@@ -615,7 +654,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
             else:
                 raise ManualTaskError(f"unsupported manual task: {operation.kind}")
             _write_json(
-                shard / "result.json",
+                job / "result.json",
                 {"completed_at": _now(), "metrics": metrics},
             )
             _write_json(
@@ -664,15 +703,15 @@ def _remote_root(operation: ManualOperation) -> str:
 
 def _deploy_remote(operation: ManualOperation) -> str:
     target = operation.target
+    transport = ExecutionTransport(target)
     remote = _remote_root(operation)
     archive = operation.root.parent / f".{operation.operation_id}.tar.gz"
     try:
         if remote.startswith("~/"):
-            home_result = subprocess.run(
-                ["ssh", str(target.host), "bash", "-lc", 'printf %s "$HOME"'],
+            _progress(f"{operation.kind}: resolving remote home on {target.name}")
+            home_result = transport.run_script(
+                'printf %s "$HOME"',
                 check=True,
-                capture_output=True,
-                text=True,
             )
             remote_home = home_result.stdout.strip()
             if not remote_home.startswith("/"):
@@ -680,37 +719,38 @@ def _deploy_remote(operation: ManualOperation) -> str:
                     f"remote target {target.name} returned an invalid home directory"
                 )
             remote = remote_home.rstrip("/") + "/" + remote[2:]
+        _progress(f"{operation.kind}: packing portable task inputs")
         with tarfile.open(archive, "w:gz") as handle:
             handle.add(operation.root, arcname=operation.operation_id)
         remote_parent = remote.rsplit("/", 1)[0]
-        subprocess.run(
-            ["ssh", str(target.host), "mkdir", "-p", remote_parent],
+        _progress(f"{operation.kind}: creating remote run directory on {target.name}")
+        transport.run_script(
+            'mkdir -p -- "$1"',
+            remote_parent,
             check=True,
-            capture_output=True,
-            text=True,
         )
-        subprocess.run(
-            ["scp", str(archive), f"{target.host}:{remote_parent}/"],
+        _progress(
+            f"{operation.kind}: uploading {archive.stat().st_size} bytes to {target.name}"
+        )
+        transport.copy(
+            archive,
+            f"{target.host}:{remote_parent}/",
             check=True,
-            capture_output=True,
-            text=True,
         )
-        command = (
-            f"cd {shlex.quote(remote_parent)} && "
-            f"tar -xzf {shlex.quote(archive.name)} && rm -f {shlex.quote(archive.name)}"
-        )
-        subprocess.run(
-            ["ssh", str(target.host), "bash", "-lc", command],
+        _progress(f"{operation.kind}: extracting remote task bundle")
+        transport.run_script(
+            """set -eo pipefail
+cd "$1"
+tar -xzf "$2"
+rm -f -- "$2"
+""",
+            remote_parent,
+            archive.name,
             check=True,
-            capture_output=True,
-            text=True,
         )
-    except subprocess.CalledProcessError as error:
-        raise ManualTaskError(
-            (error.stderr or error.stdout or "remote deployment failed").strip()
-        ) from error
     finally:
         archive.unlink(missing_ok=True)
+    _progress(f"{operation.kind}: remote task ready at {remote}")
     return remote
 
 
@@ -719,14 +759,14 @@ def _slurm_script(
 ) -> str:
     target = operation.target
     if not indices:
-        raise ManualTaskError("no shards selected for submission")
+        raise ManualTaskError("no jobs selected for submission")
     array = ",".join(str(value) for value in indices)
     if len(indices) > 1:
         array += f"%{_read_json(operation.descriptor)['max_concurrent']}"
     lines = [
         "#!/bin/bash",
         f"#SBATCH --job-name=nt-{operation.operation_id}",
-        f"#SBATCH --output={root}/scheduler-%A_%a.out",
+        f"#SBATCH --output={root}/logs/scheduler-%A_%a.out",
         f"#SBATCH --time={target.time}",
         f"#SBATCH --partition={target.partition}",
         f"#SBATCH --array={array}",
@@ -775,7 +815,13 @@ def submit_operation(
                 "remote process targets are not supported for manual steps; "
                 "use a Slurm target or run the command on that platform"
             )
+        _progress(
+            f"{operation.kind}: running {operation.shard_count} local job(s)"
+        )
         for index in range(operation.shard_count):
+            _progress(
+                f"{operation.kind}: local job {index + 1}/{operation.shard_count}"
+            )
             if run_manual_worker(operation.root, index) != 0:
                 break
         status = refresh_operation(operation)
@@ -791,25 +837,30 @@ def submit_operation(
     script = operation.root / "job.sbatch"
     script.write_text(_slurm_script(operation, remote, indices), encoding="utf-8")
     if operation.target.host:
-        subprocess.run(
-            ["scp", str(script), f"{operation.target.host}:{remote}/job.sbatch"],
+        transport = ExecutionTransport(operation.target)
+        _progress(f"{operation.kind}: uploading Slurm submission script")
+        transport.copy(
+            script,
+            f"{operation.target.host}:{remote}/job.sbatch",
             check=True,
-            capture_output=True,
-            text=True,
         )
-        completed = subprocess.run(
-            [
-                "ssh",
-                str(operation.target.host),
-                "bash",
-                "-lc",
-                f"cd {shlex.quote(remote)} && sbatch --parsable job.sbatch",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        _progress(
+            f"{operation.kind}: submitting {operation.shard_count} Slurm task(s) "
+            f"with max concurrency "
+            f"{_read_json(operation.descriptor)['max_concurrent']}"
+        )
+        completed = transport.run_script(
+            """set -eo pipefail
+cd "$1"
+sbatch --parsable "$2"
+""",
+            remote,
+            "job.sbatch",
         )
     else:
+        _progress(
+            f"{operation.kind}: submitting {operation.shard_count} Slurm task(s)"
+        )
         completed = subprocess.run(
             ["sbatch", "--parsable", "job.sbatch"],
             cwd=operation.root,
@@ -822,17 +873,50 @@ def submit_operation(
     job_id = completed.stdout.strip().split(";", 1)[0]
     if not job_id.isdigit():
         raise ManualTaskError(f"Slurm returned an invalid job id: {job_id}")
+    _progress(f"{operation.kind}: submitted Slurm job {job_id}")
     descriptor = _read_json(operation.descriptor)
     descriptor["state"] = "submitted"
     descriptor["job_id"] = job_id
     descriptor["remote_root"] = remote if operation.target.host else None
+    if operation.target.host:
+        (operation.root / "remote.txt").write_text(
+            f"host: {operation.target.host}\npath: {remote}\n",
+            encoding="utf-8",
+        )
     descriptor["attempts"].append(
         {"submitted_at": _now(), "job_id": job_id, "indices": indices}
     )
     _write_json(operation.descriptor, descriptor)
     if wait:
         return wait_operation(operation, poll_interval=poll_interval)
+    _progress(f"{operation.kind}: checking initial scheduler state")
     return refresh_operation(operation)
+
+
+def _result_filename(kind: str) -> str:
+    return {
+        "train": "nep.txt",
+        "dft": "labeled.xyz",
+        "md": "trajectory.xyz",
+    }[kind]
+
+
+def _expected_job_result(operation: ManualOperation, job: Path) -> Path:
+    if operation.jobs_directory == "shards":
+        return job / "result" / _result_filename(operation.kind)
+    return job / _result_filename(operation.kind)
+
+
+def _completed_job_is_collectable(
+    operation: ManualOperation, job: Path
+) -> bool:
+    execution = job / "execution.json"
+    return (
+        execution.is_file()
+        and _read_json(execution).get("state") == "COMPLETED"
+        and (job / "result.json").is_file()
+        and _expected_job_result(operation, job).is_file()
+    )
 
 
 def _sync_remote_results(operation: ManualOperation) -> None:
@@ -840,115 +924,113 @@ def _sync_remote_results(operation: ManualOperation) -> None:
     remote = descriptor.get("remote_root")
     if not remote:
         return
-    listed = subprocess.run(
-        [
-            "ssh",
-            str(operation.target.host),
-            "bash",
-            "-lc",
-            f"find {shlex.quote(remote + '/shards')} -mindepth 2 -maxdepth 2 "
-            "-name execution.json -type f -print",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if listed.returncode != 0:
-        return
-    prefix = remote.rstrip("/") + "/shards/"
-    for remote_execution in listed.stdout.splitlines():
-        if not remote_execution.startswith(prefix):
-            continue
-        relative = remote_execution[len(prefix) :]
-        match = re.fullmatch(r"([0-9]{6})/execution\.json", relative)
-        if not match:
-            continue
-        index = int(match.group(1))
-        if index >= operation.shard_count:
-            continue
-        shard = operation.root / "shards" / f"{index:06d}"
-        execution = shard / "execution.json"
-        if execution.is_file():
-            local_state = _read_json(execution).get("state")
-            if local_state in {"COMPLETED", "FAILED"}:
-                continue
-        copied = subprocess.run(
-            [
-                "scp",
-                f"{operation.target.host}:{remote_execution}",
-                str(execution),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if copied.returncode != 0 or not execution.is_file():
-            continue
-        if _read_json(execution).get("state") != "COMPLETED":
-            continue
-        remote_shard = remote_execution.rsplit("/", 1)[0]
-        subprocess.run(
-            [
-                "scp",
-                f"{operation.target.host}:{remote_shard}/result.json",
-                str(shard / "result.json"),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        result = shard / "result"
-        if not result.exists():
-            subprocess.run(
-                [
-                    "scp",
-                    "-r",
-                    f"{operation.target.host}:{remote_shard}/result",
-                    str(result),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
+    lock_path = operation.root / ".remote-sync.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        members = []
+        incomplete = []
+        for index in range(operation.shard_count):
+            relative = f"{index:06d}"
+            job = operation.jobs_root / relative
+            execution = job / "execution.json"
+            state = (
+                _read_json(execution).get("state")
+                if execution.is_file()
+                else None
             )
-
-
-def _all_shards_completed(operation: ManualOperation) -> bool:
-    for index in range(operation.shard_count):
-        execution = (
-            operation.root / "shards" / f"{index:06d}" / "execution.json"
+            synchronized = state == "FAILED" or (
+                state == "COMPLETED"
+                and _completed_job_is_collectable(operation, job)
+            )
+            if synchronized:
+                continue
+            incomplete.append(index)
+            members.extend(
+                (
+                    f"{relative}/execution.json",
+                    f"{relative}/result.json",
+                    (
+                        f"{relative}/result"
+                        if operation.jobs_directory == "shards"
+                        else f"{relative}/{_result_filename(operation.kind)}"
+                    ),
+                )
+            )
+        if not incomplete:
+            return
+        _progress(
+            f"{operation.kind}: synchronizing {len(incomplete)} incomplete "
+            "remote job(s) in one archive"
         )
-        if not execution.is_file():
-            return False
-        if _read_json(execution).get("state") != "COMPLETED":
+        transport = ExecutionTransport(operation.target)
+        archived = transport.fetch_paths(
+            f"{remote.rstrip('/')}/{operation.jobs_directory}",
+            members,
+            operation.jobs_root,
+        )
+        _progress(
+            f"{operation.kind}: received {len(archived)} remote result "
+            "path(s)"
+        )
+
+
+def _all_jobs_completed(operation: ManualOperation) -> bool:
+    for index in range(operation.shard_count):
+        job = operation.jobs_root / f"{index:06d}"
+        if not _completed_job_is_collectable(operation, job):
             return False
     return True
 
 
+def _ensure_visible_result(
+    operation: ManualOperation, output: Path
+) -> None:
+    visible_result = operation.root / _result_filename(operation.kind)
+    if visible_result.resolve() == output.resolve():
+        return
+    temporary_link = visible_result.with_name(f".{visible_result.name}.link")
+    temporary_link.unlink(missing_ok=True)
+    temporary_link.symlink_to(os.path.relpath(output, operation.root))
+    temporary_link.replace(visible_result)
+
+
+def _ensure_remote_pointer(
+    operation: ManualOperation, remote: str | None
+) -> None:
+    if not operation.target.host or not remote:
+        return
+    pointer = operation.root / "remote.txt"
+    value = f"host: {operation.target.host}\npath: {remote}\n"
+    if not pointer.is_file() or pointer.read_text(encoding="utf-8") != value:
+        pointer.write_text(value, encoding="utf-8")
+
+
 def _collect_unlocked(operation: ManualOperation) -> Path:
     descriptor = _read_json(operation.descriptor)
+    _ensure_remote_pointer(operation, descriptor.get("remote_root"))
     output = Path(descriptor["output"])
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
     if operation.kind == "train":
         shutil.copy2(
-            operation.root / "shards" / "000000" / "result" / "nep.txt",
+            _expected_job_result(
+                operation,
+                operation.jobs_root / "000000",
+            ),
             temporary,
         )
     else:
         frames = []
-        filename = "labeled.xyz" if operation.kind == "dft" else "trajectory.xyz"
         for index in range(operation.shard_count):
-            path = (
-                operation.root
-                / "shards"
-                / f"{index:06d}"
-                / "result"
-                / filename
+            path = _expected_job_result(
+                operation,
+                operation.jobs_root / f"{index:06d}",
             )
             loaded = ase_read(path, index=":")
             frames.extend(loaded if isinstance(loaded, list) else [loaded])
         ase_write(temporary, frames, format="extxyz")
     temporary.replace(output)
+    _ensure_visible_result(operation, output)
     descriptor["state"] = "complete"
     descriptor["completed_at"] = _now()
     descriptor["result"] = str(output)
@@ -957,19 +1039,19 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
 
 
 def _collect(operation: ManualOperation) -> Path:
-    lock_path = operation.root / "collection.lock"
+    lock_path = operation.root / ".collection.lock"
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         descriptor = _read_json(operation.descriptor)
         if descriptor.get("state") == "complete":
             return Path(descriptor["result"])
-        if not _all_shards_completed(operation):
+        if not _all_jobs_completed(operation):
             raise ManualTaskError("cannot publish an incomplete manual operation")
         return _collect_unlocked(operation)
 
 
 def _publish_if_ready(operation: ManualOperation) -> None:
-    if _all_shards_completed(operation):
+    if _all_jobs_completed(operation):
         _collect(operation)
 
 
@@ -998,11 +1080,13 @@ def _aggregate_slurm_states(states: Sequence[str]) -> str | None:
 def _run_on_target(
     operation: ManualOperation, command: Sequence[str]
 ) -> subprocess.CompletedProcess:
-    arguments = list(command)
     if operation.target.host:
-        arguments = ["ssh", str(operation.target.host), *arguments]
+        return ExecutionTransport(operation.target).run_script(
+            'exec "$@"',
+            *command,
+        )
     return subprocess.run(
-        arguments,
+        list(command),
         capture_output=True,
         text=True,
         check=False,
@@ -1048,6 +1132,11 @@ def _slurm_job_state(
 def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
     _sync_remote_results(operation)
     descriptor = _read_json(operation.descriptor)
+    _ensure_remote_pointer(operation, descriptor.get("remote_root"))
+    if descriptor.get("state") == "complete" and descriptor.get("result"):
+        output = Path(descriptor["result"])
+        if output.is_file():
+            _ensure_visible_result(operation, output)
     scheduler_state = None
     scheduler_error = None
     if (
@@ -1060,7 +1149,7 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
     states = []
     errors = []
     for index in range(operation.shard_count):
-        path = operation.root / "shards" / f"{index:06d}" / "execution.json"
+        path = operation.jobs_root / f"{index:06d}" / "execution.json"
         if not path.is_file():
             states.append("PENDING")
             continue
@@ -1082,10 +1171,10 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
                 )
     if descriptor.get("state") == "cancelled" or scheduler_state == "CANCELLED":
         state = "cancelled"
-        reason = f"{states.count('COMPLETED')}/{operation.shard_count} shards completed before cancellation"
+        reason = f"{states.count('COMPLETED')}/{operation.shard_count} jobs completed before cancellation"
     elif errors:
         state = "failed"
-        reason = f"{len(errors)} of {operation.shard_count} shards failed"
+        reason = f"{len(errors)} of {operation.shard_count} jobs failed"
     elif states and all(value == "COMPLETED" for value in states):
         if descriptor.get("state") != "complete":
             try:
@@ -1098,13 +1187,13 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
                 errors.append({"index": None, "error": str(error)})
         if errors:
             state = "failed"
-            reason = "all shards completed but the final result could not be published"
+            reason = "all jobs completed but the final result could not be published"
         else:
             state = "complete"
-            reason = "all shards completed and the final result was published"
+            reason = "all jobs completed and the final result was published"
     elif any(value == "RUNNING" for value in states) or scheduler_state == "RUNNING":
         state = "running"
-        reason = f"{states.count('COMPLETED')}/{operation.shard_count} shards completed"
+        reason = f"{states.count('COMPLETED')}/{operation.shard_count} jobs completed"
     elif scheduler_state == "COMPLETED":
         missing = [
             index for index, shard_state in enumerate(states)
@@ -1113,15 +1202,15 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
         errors.extend(
             {
                 "index": index,
-                "error": "Slurm completed without a shard result",
+                "error": "Slurm completed without a job result",
             }
             for index in missing
         )
         state = "failed"
-        reason = f"{len(missing)} shards produced no result"
+        reason = f"{len(missing)} jobs produced no result"
     else:
         state = descriptor.get("state", "prepared")
-        reason = f"{states.count('COMPLETED')}/{operation.shard_count} shards completed"
+        reason = f"{states.count('COMPLETED')}/{operation.shard_count} jobs completed"
     return {
         "operation_id": operation.operation_id,
         "kind": operation.kind,
@@ -1134,6 +1223,7 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
         "failed": len(errors),
         "total": operation.shard_count,
         "result": descriptor.get("result"),
+        "remote_directory": descriptor.get("remote_root"),
         "run_directory": str(operation.root),
         "errors": errors,
     }
@@ -1142,8 +1232,24 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
 def wait_operation(
     operation: ManualOperation, *, poll_interval: float = 10.0
 ) -> dict[str, Any]:
+    previous: tuple[Any, ...] | None = None
     while True:
         status = refresh_operation(operation)
+        snapshot = (
+            status["state"],
+            status["scheduler_state"],
+            status["completed"],
+            status["failed"],
+        )
+        if snapshot != previous:
+            scheduler = status["scheduler_state"] or "UNKNOWN"
+            _progress(
+                f"{operation.kind}: state={status['state']}, "
+                f"scheduler={scheduler}, "
+                f"completed={status['completed']}/{status['total']}, "
+                f"failed={status['failed']}"
+            )
+            previous = snapshot
         if status["state"] in {"complete", "failed", "cancelled"}:
             return status
         time.sleep(max(0.2, poll_interval))
@@ -1164,12 +1270,8 @@ def cancel_operation(operation: ManualOperation) -> dict[str, Any]:
     job_id = descriptor.get("job_id")
     if not job_id:
         raise ManualTaskError("operation has no submitted Slurm job")
-    command = ["scancel", str(job_id)]
-    if operation.target.host:
-        command = ["ssh", str(operation.target.host), *command]
-    completed = subprocess.run(
-        command, capture_output=True, text=True, check=False
-    )
+    _progress(f"{operation.kind}: cancelling Slurm job {job_id}")
+    completed = _run_on_target(operation, ["scancel", str(job_id)])
     if completed.returncode != 0:
         raise ManualTaskError((completed.stderr or completed.stdout).strip())
     descriptor["state"] = "cancelled"
@@ -1189,66 +1291,68 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
     ]
     if not failed:
         raise ManualTaskError(
-            "operation has no failed shards; fix the reported collection error "
+            "operation has no failed jobs; fix the reported collection error "
             "and run task status again"
         )
     descriptor = _read_json(operation.descriptor)
     remote = descriptor.get("remote_root") or str(operation.root)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    result_entry = (
+        "result"
+        if operation.jobs_directory == "shards"
+        else _result_filename(operation.kind)
+    )
+    retry_entries = ["execution.json", "result.json", result_entry]
+    if operation.jobs_directory == "jobs":
+        retry_entries.append("calculation")
     if operation.target.host:
+        transport = ExecutionTransport(operation.target)
+        _progress(
+            f"{operation.kind}: archiving {len(failed)} failed remote job(s)"
+        )
         commands = ["set -eo pipefail"]
         for index in failed:
-            shard = f"{remote}/shards/{index:06d}"
-            attempt = f"{shard}/attempts/{stamp}"
+            job = f"{remote}/{operation.jobs_directory}/{index:06d}"
+            attempt = f"{job}/attempts/{stamp}"
             commands.append(f"mkdir -p {shlex.quote(attempt)}")
-            for name in ("execution.json", "result.json", "result"):
-                source = f"{shard}/{name}"
+            for name in retry_entries:
+                source = f"{job}/{name}"
                 commands.append(
                     f"if test -e {shlex.quote(source)}; then "
                     f"mv {shlex.quote(source)} {shlex.quote(attempt + '/' + name)}; fi"
                 )
-        archived = subprocess.run(
-            [
-                "ssh",
-                str(operation.target.host),
-                "bash",
-                "-lc",
-                "\n".join(commands),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        archived = transport.run_script(
+            "\n".join(commands),
         )
         if archived.returncode != 0:
             raise ManualTaskError(
                 (archived.stderr or archived.stdout or "remote retry archival failed").strip()
             )
     for index in failed:
-        shard = operation.root / "shards" / f"{index:06d}"
-        attempt = shard / "attempts" / stamp
+        job = operation.jobs_root / f"{index:06d}"
+        attempt = job / "attempts" / stamp
         attempt.mkdir(parents=True)
-        for name in ("execution.json", "result.json", "result"):
-            path = shard / name
+        for name in retry_entries:
+            path = job / name
             if path.exists():
                 shutil.move(str(path), attempt / name)
     script = operation.root / "retry.sbatch"
     script.write_text(_slurm_script(operation, remote, failed), encoding="utf-8")
     if operation.target.host:
-        subprocess.run(
-            ["scp", str(script), f"{operation.target.host}:{remote}/retry.sbatch"],
+        _progress(f"{operation.kind}: uploading retry submission script")
+        transport.copy(
+            script,
+            f"{operation.target.host}:{remote}/retry.sbatch",
             check=True,
-            capture_output=True,
-            text=True,
         )
-        command = [
-            "ssh",
-            str(operation.target.host),
-            "bash",
-            "-lc",
-            f"cd {shlex.quote(remote)} && sbatch --parsable retry.sbatch",
-        ]
-        completed = subprocess.run(
-            command, capture_output=True, text=True, check=False
+        _progress(f"{operation.kind}: submitting failed jobs for retry")
+        completed = transport.run_script(
+            """set -eo pipefail
+cd "$1"
+sbatch --parsable "$2"
+""",
+            remote,
+            "retry.sbatch",
         )
     else:
         completed = subprocess.run(
@@ -1263,6 +1367,7 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
     job_id = completed.stdout.strip().split(";", 1)[0]
     if not job_id.isdigit():
         raise ManualTaskError(f"Slurm returned an invalid job id: {job_id}")
+    _progress(f"{operation.kind}: submitted retry job {job_id}")
     descriptor["state"] = "submitted"
     descriptor["job_id"] = job_id
     descriptor["attempts"].append(
@@ -1274,42 +1379,56 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
 
 def operation_logs(operation: ManualOperation) -> list[str]:
     descriptor = _read_json(operation.descriptor)
+    logs_root = operation.root / "logs"
+    logs_root.mkdir(exist_ok=True)
+    for legacy in operation.root.glob("scheduler-*.out"):
+        legacy.replace(logs_root / legacy.name)
+    local_logs = sorted(logs_root.glob("scheduler-*.out"))
+    if descriptor.get("state") == "complete":
+        expected_logs = {
+            f"scheduler-{attempt['job_id']}_{index}.out"
+            for attempt in descriptor.get("attempts", [])
+            if str(attempt.get("job_id", "")).isdigit()
+            for index in attempt.get("indices", [])
+        }
+        if expected_logs and expected_logs.issubset(
+            {path.name for path in local_logs}
+        ):
+            return [str(path) for path in local_logs]
     remote = descriptor.get("remote_root")
     if operation.target.host and remote:
-        listed = subprocess.run(
-            [
-                "ssh",
-                str(operation.target.host),
-                "bash",
-                "-lc",
-                f"find {shlex.quote(remote)} -maxdepth 1 -type f "
-                "-name 'scheduler-*.out' -print",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        transport = ExecutionTransport(operation.target)
+        _progress(f"{operation.kind}: listing remote scheduler logs")
+        remote_logs = (
+            f"{remote.rstrip('/')}/logs"
+            if operation.jobs_directory == "jobs"
+            else remote
+        )
+        listed = transport.run_script(
+            """find "$1" -maxdepth 1 -type f \
+-name 'scheduler-*.out' -print
+""",
+            remote_logs,
         )
         if listed.returncode != 0:
             raise ManualTaskError(
                 (listed.stderr or listed.stdout or "cannot list remote logs").strip()
             )
+        names = []
         for value in listed.stdout.splitlines():
             name = Path(value).name
             if not re.fullmatch(r"scheduler-[A-Za-z0-9_.-]+\.out", name):
                 continue
-            subprocess.run(
-                [
-                    "scp",
-                    f"{operation.target.host}:{value}",
-                    str(operation.root / name),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
+            names.append(name)
+        if names:
+            _progress(
+                f"{operation.kind}: synchronizing {len(names)} scheduler "
+                "log(s) in one archive"
             )
+            transport.fetch_paths(remote_logs, names, logs_root)
     return [
         str(path)
-        for path in sorted(operation.root.glob("scheduler-*.out"))
+        for path in sorted(logs_root.glob("scheduler-*.out"))
     ]
 
 

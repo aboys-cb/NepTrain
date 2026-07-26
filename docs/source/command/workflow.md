@@ -3,7 +3,11 @@
 ## 创建项目
 
 ```bash
-neptrain workflow init --profile slurm --directory fe-project
+neptrain workflow init \
+  --profile slurm \
+  --ensemble npt \
+  --dft-backend vasp \
+  --directory fe-project
 cd fe-project
 neptrain doctor --project project.yaml
 ```
@@ -15,20 +19,47 @@ neptrain doctor --project project.yaml
 当前配置职责如下：
 
 - `md`：选择 LAMMPS/GPUMD 和推理后端。
-- `sampling.routes`：每条采样路径显式绑定结构、模板、条件和递进策略。
-- `sampling.candidate_pool` / `sampling.selection`：轨迹健康检查和 FPS 抽样上限。
+- `sampling.routes`：每条采样路径显式绑定结构、模板和温度路径。
+- `sampling.candidate_pool` / `sampling.selection`：可选的高级覆盖项。
 - LAMMPS 模板：物理过程、`timestep`、阻尼、spin 积分参数和 dump 频率。
 - `execution.targets.*.setup_script`：module、Python 环境和 LAMMPS plugin。
 
-一个 workflow 可以配置多条 route：
+`workflow init` 默认只生成当前选择的 `lammps.in` 和 DFT 输入，不再生成四套
+LAMMPS 模板及两种 DFT 输入。Spin 流程使用
+`--spin --dft-backend abacus`。
+
+最小 route 只需要：
 
 ```yaml
-schema_version: 7
+sampling:
+  routes:
+    - id: default
+      structures: [./structures]
+      template_path: ./lammps.in
+      conditions:
+        temperature_path: [300, 600, 900]
+```
 
-md:
-  backend: lammps
-  spin: false
+省略项采用一套固定默认值：压强为 `0`，全部温度都是生产温度，FPS 每轮最多
+选择 `100` 个结构，炸前帧和坏尾帧分别为 `2` 和 `1`。默认递进策略为：
 
+```yaml
+progression:
+  steps:
+    smoke_passed: 10000
+    short_stable: 40000
+    long_stable: 160000
+    production_ready: 640000
+  replicas:
+    smoke_passed: 1
+    short_stable: 1
+    long_stable: 2
+    production_ready: 3
+```
+
+只有需要改变这些值时才写进项目。一个 workflow 也可以配置多条 route：
+
+```yaml
 sampling:
   routes:
     - id: route_a
@@ -36,50 +67,16 @@ sampling:
       template_path: ./templates/a.in
       conditions:
         temperature_path: [300, 600, 900]
-        production_temperatures: [300, 900]
-        pressure: 0.0
-      progression:
-        steps:
-          smoke_passed: 5000
-          short_stable: 25000
-          long_stable: 250000
-          production_ready: 1000000
-        replicas:
-          smoke_passed: 1
-          short_stable: 1
-          long_stable: 2
-          production_ready: 3
-
     - id: route_b
       structures: [./structures/b.xyz]
       template_path: ./templates/b.in
       conditions:
         temperature_path: [500, 1000, 1500]
-        production_temperatures: [500, 1500]
-        pressure: 0.0
-      progression:
-        steps:
-          smoke_passed: 5000
-          short_stable: 25000
-          long_stable: 250000
-          production_ready: 1000000
-        replicas:
-          smoke_passed: 1
-          short_stable: 1
-          long_stable: 2
-          production_ready: 3
-
-  candidate_pool:
-    pre_failure_frames: 2
-    bad_tail_frames: 1
-    health: {}
-  selection:
-    max_selected: 100
-    novelty: auto
 ```
 
 一个 workflow 会调度全部 route。同一个结构可以显式出现在多条 route 中；
-`route_id` 和内容指纹会隔离场景成熟度与恢复结果。
+`route_id` 和内容指纹会隔离场景成熟度与恢复结果。高级 route 可以显式覆盖
+`production_temperatures`、`pressure` 和整套 `progression`。
 
 默认情况下，全部 route 使用 `execution.stage_targets.sampling`。需要把某条
 route 送到另一台 Slurm 平台时，只写例外映射：
@@ -102,8 +99,8 @@ swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。
 
 每条 route 的 `conditions.temperature_path` 是有顺序的温度探路路径。例如
 `[300, 500, 700, 900]` 会先验证 300 K，只有通过后才解锁 500 K。
-`production_temperatures` 是必须跑到最长时长的工作温度；中间温度默认只做
-低成本 smoke 探路，避免把所有温度和所有时长做笛卡尔积。
+默认全部温度都会跑到最长时长。显式设置 `production_temperatures` 后，未列入
+其中的中间温度只做低成本 smoke 探路。
 
 场景通过后，Controller 会同时解锁下一个温度和当前生产温度的下一档时长。
 失败场景保留在原位置，采集稳定段和炸前帧，经 FPS、DFT 和重训后重试，不会
@@ -142,10 +139,18 @@ dft:
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
   kpoint_mode: auto
+  structures_per_job: 1
+  max_concurrent: 20
 ```
 
 `auto` 会优先保留 VASP INCAR 中的 `KSPACING`/`KGAMMA`，或 ABACUS INPUT
 中的 `kspacing`。输入中没有这些设置时，适配器才按默认参数生成网格。
+
+`structures_per_job` 决定每个 DFT 调度任务包含多少个 FPS 选中结构；
+`max_concurrent` 限制 workflow 同时运行的 DFT 任务数。默认值分别为 `1` 和
+`20`。例如 FPS 选中 100 个结构时，默认生成 100 个单结构任务，最多同时运行
+20 个。Controller 保留已完成结构，只重试失败或尚未提交的结构，最后按原始
+FPS 顺序校验并合并为 `selected-labels.xyz`。
 
 确实需要 NepTrain 接管时再显式配置：
 
@@ -172,8 +177,12 @@ dft:
 
 ```bash
 neptrain workflow run project.yaml --prepare-only
-neptrain workflow run project.yaml
+neptrain workflow run fe-workflow
 ```
+
+第一条命令只创建不可变输入快照，返回的 `next_action` 可以直接复制执行。
+不需要人工检查快照时，也可以直接运行
+`neptrain workflow run project.yaml`，一次完成创建和启动。
 
 输出目录默认使用 `workflow.id`。Controller 默认脱离终端，按 ledger 推进：
 
@@ -194,7 +203,9 @@ neptrain workflow extend fe-workflow 5
 ```
 
 Controller 不依赖 Slurm `afterok`。失败后只重跑 ledger 中未完成的阶段；已完成
-workflow 重复运行是安全 no-op。
+workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 workflow
+目录：对尚未启动的准备目录返回 `action: start`；`workflow resume` 用于暂停、
+失败或中断后的恢复。
 
 `workflow.max_model_generations` 是最大模型代数预算，不是成功条件。配置 `evaluation`
 时，所有生产温度、最长时长、replica、轨迹 DFT 诊断和独立 validation 同时通过
@@ -205,16 +216,56 @@ workflow 重复运行是安全 no-op。
 但 `validation_accepted` 保持为空，流程不会伪造 validation passed，也不会把
 该模型标成已完成独立验证。
 
-默认停止只退出 Controller，保留当前计算任务：
+默认停止 Controller，并取消当前 process 或 Slurm 作业：
 
 ```bash
 neptrain workflow stop fe-workflow
 ```
 
-确认整个流程已经作废时，可同时取消当前 process 或 Slurm 作业：
+如果只想暂时退出 Controller，并让当前计算任务继续运行：
 
 ```bash
-neptrain workflow stop fe-workflow --cancel-jobs
+neptrain workflow stop fe-workflow --keep-jobs
 ```
 
 取消动作会记录到 workflow 历史；后续恢复会创建新的 stage attempt。
+
+每代目录直接对应用户关心的阶段：
+
+```text
+generations/0001/
+├── train/
+├── md/
+├── select/
+├── dft/
+├── diagnose/
+├── dataset/
+├── retrain/
+└── evaluate/
+```
+
+训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；
+`calculation` 软链指向真实执行目录，便于直接排查。
+
+内部 job 也只保留一层输入和一层输出。job 名称已经包含代数、阶段、route、
+attempt 和任务指纹，因此输出目录不再重复这些信息：
+
+```text
+.neptrain/jobs/g0001-md-default-.../
+├── input/
+├── output/
+│   ├── log.lammps
+│   ├── trajectory.xyz
+│   ├── candidates.xyz
+│   └── md-attempts.json
+├── task.json
+├── execution.json
+└── result.json
+```
+
+训练的 `nep.txt`、`loss.out`、checkpoint 和训练日志同样直接位于该 job 的
+`output/`。默认的单结构 DFT job 也把 INCAR/POSCAR/OUTCAR、VASP 日志和
+`selected-labels.xyz` 直接放在 `output/`；只有发生真实重试时才出现
+`retry-0002/`。每代 `dft/` 直接发布 `000001-Ce8Fe16` 等软链及最终合并文件，
+不再增加 `teacher/`、`attempt-0001/` 或 `calculations/` 层。`input/` 也只携带当前阶段真正消费的文件：训练任务不再
+复制 MD route，MD 和 DFT 任务不再复制初始训练集及 validation 数据。

@@ -214,21 +214,28 @@ class WorkflowIterationAdapter:
         self,
         config: Mapping[str, Any],
         *,
-        initial_training: str | Path,
+        initial_training: str | Path | None,
         base_dir: str | Path = ".",
         runtime: WorkflowRuntime | None = None,
+        active_stage: str | None = None,
     ):
         self.config = dict(config)
         self.base_dir = Path(base_dir).expanduser().resolve()
-        self.initial_training = self._path(initial_training)
         self.runtime = runtime or WorkflowRuntime()
-        try:
-            self.routes = load_sampling_routes(
-                self.config.get("sampling", {}),
-                base_dir=self.base_dir,
-            )
-        except SamplingRouteError as error:
-            raise WorkflowIterationError(str(error)) from error
+        requires_routes = active_stage is None or active_stage in {
+            "explore",
+            "evaluate",
+        }
+        if requires_routes:
+            try:
+                self.routes = load_sampling_routes(
+                    self.config.get("sampling", {}),
+                    base_dir=self.base_dir,
+                )
+            except SamplingRouteError as error:
+                raise WorkflowIterationError(str(error)) from error
+        else:
+            self.routes = ()
         self.scenario_ladders = {
             route.route_id: ScenarioLadder.from_sampling(
                 {
@@ -238,7 +245,13 @@ class WorkflowIterationAdapter:
             )
             for route in self.routes
         }
-        if not self.initial_training.is_file():
+        requires_initial = active_stage is None or (
+            active_stage == "train" and initial_training is not None
+        )
+        self.initial_training = (
+            self._path(initial_training) if requires_initial else None
+        )
+        if requires_initial and not self.initial_training.is_file():
             raise WorkflowIterationError(
                 f"initial training set does not exist: {self.initial_training}"
             )
@@ -249,12 +262,19 @@ class WorkflowIterationAdapter:
             if self.evaluation_configured
             else None
         )
-        if self.evaluation_configured and not validation_value:
+        requires_validation = active_stage is None or active_stage == "evaluate"
+        if (
+            requires_validation
+            and self.evaluation_configured
+            and not validation_value
+        ):
             raise WorkflowIterationError(
                 "configured evaluation requires evaluation.validation_path"
             )
         self.validation = (
-            self._path(validation_value) if validation_value else None
+            self._path(validation_value)
+            if requires_validation and validation_value
+            else None
         )
         if self.validation is not None and not self.validation.is_file():
             raise WorkflowIterationError(
@@ -265,12 +285,28 @@ class WorkflowIterationAdapter:
         if self.config.get("md", {}).get("spin", False):
             required_thresholds.add("mforce_rmse")
         missing_thresholds = sorted(required_thresholds - set(thresholds or {}))
-        if self.evaluation_configured and missing_thresholds:
+        requires_thresholds = active_stage is None or active_stage in {
+            "diagnose",
+            "evaluate",
+        }
+        if (
+            requires_thresholds
+            and self.evaluation_configured
+            and missing_thresholds
+        ):
             raise WorkflowIterationError(
                 "post-retrain acceptance requires evaluation.max_rmse for "
                 + ", ".join(missing_thresholds)
             )
-        if self.config.get("md", {}).get("spin", False):
+        requires_training_config = (
+            active_stage is None
+            or active_stage == "retrain"
+            or (active_stage == "train" and initial_training is not None)
+        )
+        if (
+            requires_training_config
+            and self.config.get("md", {}).get("spin", False)
+        ):
             config_path = self._path(self.config.get("training", {}).get("config_path"))
             text = config_path.read_text(encoding="utf-8")
             if not re.search(r"^\s*spin_descriptor\s+spin_nep_lite\s*$", text, re.MULTILINE):
@@ -312,20 +348,25 @@ class WorkflowIterationAdapter:
         context: StageContext,
         *,
         training_input: Path,
-        output_name: str,
+        role: str,
         warm_start: Path | None,
     ) -> tuple[TrainingResult, int, Path]:
         options = self.config.get("training", {})
         backend = str(options.get("backend", "gpumd"))
         config_file = self._path(options.get("config_path"))
+        output_dir = (
+            context.work_dir
+            if context.flat_output
+            else context.work_dir / role
+        )
         if backend == "torchnep" and warm_start is not None:
             config_file = self._torchnep_finetune_config(
-                config_file, context.work_dir, output_name, options
+                config_file, output_dir, options
             )
         request = TrainingRequest(
             config_file=config_file,
             train_file=training_input,
-            output_dir=context.work_dir / output_name,
+            output_dir=output_dir,
             test_file=self._path(options["test_path"])
             if backend != "torchnep" and options.get("test_path")
             else None,
@@ -351,7 +392,6 @@ class WorkflowIterationAdapter:
     def _torchnep_finetune_config(
         source: Path,
         generation_dir: Path,
-        output_name: str,
         options: Mapping[str, Any],
     ) -> Path:
         """Lower only the incremental TorchNEP learning rate.
@@ -382,20 +422,10 @@ class WorkflowIterationAdapter:
             replaced = True
         if not replaced:
             return source
-        suffix = output_name.removeprefix("retraining")
-        path = generation_dir / f"torchnep-finetune{suffix}.in"
+        path = generation_dir / "torchnep-finetune.in"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(output), encoding="utf-8")
         return path
-
-    @staticmethod
-    def _attempt_output_name(generation_dir: Path, base: str) -> str:
-        if not (generation_dir / base).exists():
-            return base
-        attempt = 2
-        while (generation_dir / f"{base}-attempt-{attempt}").exists():
-            attempt += 1
-        return f"{base}-attempt-{attempt}"
 
     def _train(self, context: StageContext) -> StageOutcome:
         if context.generation > 1:
@@ -434,11 +464,15 @@ class WorkflowIterationAdapter:
                 },
             )
 
+        if self.initial_training is None:
+            raise WorkflowIterationError(
+                "train stage requires an initial training set"
+            )
         training_input = self.initial_training
         result, frame_count, _ = self._execute_training(
             context,
             training_input=training_input,
-            output_name="training",
+            role="training",
             warm_start=None,
         )
         artifacts: dict[str, Path] = {
@@ -449,6 +483,12 @@ class WorkflowIterationAdapter:
             artifacts["final_model"] = result.final_model
         if result.checkpoint is not None:
             artifacts["checkpoint"] = result.checkpoint
+        artifacts.update(
+            {
+                f"training_output_{name.replace('.', '_')}": path
+                for name, path in result.outputs.items()
+            }
+        )
         return StageOutcome(
             artifacts=artifacts,
             metrics={
@@ -634,7 +674,11 @@ class WorkflowIterationAdapter:
                     f"P{pressure:g}-r{attempt.replica}-"
                     f"{attempt.attempt_id[:8]}"
                 )
-                run_dir = context.work_dir / "md" / source
+                run_dir = (
+                    context.work_dir
+                    if context.flat_output and len(available_attempts) == 1
+                    else context.work_dir / "calculations" / source
+                )
                 request = MdRequest(
                     atoms=atoms.copy(),
                     model_file=context.artifacts["model"],
@@ -1304,12 +1348,23 @@ class WorkflowIterationAdapter:
         options = self.config.get("dft", {})
         backend = str(options.get("backend", "toy"))
         kpoint_mode = str(options.get("kpoint_mode", "auto"))
+        frame_indices = context.stage_input.get("frame_indices", ())
+        flat_single_case = (
+            context.flat_output
+            and isinstance(frame_indices, Sequence)
+            and not isinstance(frame_indices, str)
+            and len(frame_indices) == 1
+        )
         output = context.work_dir / "selected-labels.xyz"
         result = self.runtime.label(
             LabelRequest(
                 source=context.artifacts["selected_input"],
                 output_file=output,
-                work_dir=context.work_dir / "teacher",
+                work_dir=(
+                    context.work_dir
+                    if flat_single_case
+                    else context.work_dir / "calculation"
+                ),
                 input_file=self._optional_path(
                     options.get("input_path")
                 ),
@@ -1328,7 +1383,8 @@ class WorkflowIterationAdapter:
                         "spin"
                         if self.config.get("md", {}).get("spin", False)
                         else "ordinary"
-                    )
+                    ),
+                    "flat_single_case": flat_single_case,
                 },
             ),
             backend,
@@ -1337,6 +1393,56 @@ class WorkflowIterationAdapter:
         return StageOutcome(
             artifacts={"labeled": result.output_file},
             metrics={"backend": result.backend, "labeled_count": len(result.frames)},
+        )
+
+    def merge_label_outcomes(
+        self,
+        context: StageContext,
+        outcomes: Sequence[StageOutcome],
+    ) -> StageOutcome:
+        """Merge independently labeled batches in their original frame order."""
+
+        if not outcomes:
+            raise WorkflowIterationError("label stage produced no batch results")
+        expected = _read_frames(context.artifacts["selected_input"])
+        frames: list[Atoms] = []
+        backends = set()
+        for outcome in outcomes:
+            path = outcome.artifacts.get("labeled")
+            if path is None:
+                raise WorkflowIterationError(
+                    "label batch result is missing the labeled artifact"
+                )
+            frames.extend(_read_frames(path))
+            backend = outcome.metrics.get("backend")
+            if backend:
+                backends.add(str(backend))
+        if len(frames) != len(expected):
+            raise WorkflowIterationError(
+                f"label batches returned {len(frames)} structures for "
+                f"{len(expected)} selected structures"
+            )
+        expected_ids = [structure_id(frame) for frame in expected]
+        actual_ids = [structure_id(frame) for frame in frames]
+        if actual_ids != expected_ids:
+            raise WorkflowIterationError(
+                "label batch results do not match the selected structure order"
+            )
+        if len(backends) > 1:
+            raise WorkflowIterationError(
+                "label batches reported inconsistent DFT backends"
+            )
+        validate_spin_dataset(frames, require_mforce=True)
+        output = context.work_dir / "selected-labels.xyz"
+        ase_write(output, frames, format="extxyz")
+        backend = next(iter(backends), str(self.config.get("dft", {}).get("backend", "toy")))
+        return StageOutcome(
+            artifacts={"labeled": output},
+            metrics={
+                "backend": backend,
+                "labeled_count": len(frames),
+                "batch_count": len(outcomes),
+            },
         )
 
     def _diagnose(self, context: StageContext) -> StageOutcome:
@@ -1499,13 +1605,10 @@ class WorkflowIterationAdapter:
                 },
             )
 
-        output_name = self._attempt_output_name(
-            context.work_dir, "retraining"
-        )
         result, frame_count, config_file = self._execute_training(
             context,
             training_input=training_input,
-            output_name=output_name,
+            role="retraining",
             warm_start=context.artifacts.get("checkpoint"),
         )
         artifacts: dict[str, Path] = {"retrained_model": result.best_model}
@@ -1513,6 +1616,12 @@ class WorkflowIterationAdapter:
             artifacts["retrained_final_model"] = result.final_model
         if result.checkpoint is not None:
             artifacts["retrained_checkpoint"] = result.checkpoint
+        artifacts.update(
+            {
+                f"retraining_output_{name.replace('.', '_')}": path
+                for name, path in result.outputs.items()
+            }
+        )
         original_config = self._path(
             self.config.get("training", {}).get("config_path")
         )
