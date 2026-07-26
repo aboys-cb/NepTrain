@@ -8,11 +8,14 @@ import re
 from typing import Any, Mapping
 
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from .sampling_route import MATURITY_STAGES
 
 
 CURRENT_SCHEMA_VERSION = 7
+DEFAULT_MAX_CONCURRENT = 20
+DEFAULT_STRUCTURES_PER_DFT_JOB = 1
 
 
 class ConfigError(ValueError):
@@ -49,6 +52,8 @@ _FIELDS: dict[str, set[str]] = {
         "gamma_centered",
         "input_path",
         "resource_path",
+        "potcar_manifest_path",
+        "resource_manifest_path",
         "kpoint_mode",
         "kpoints",
         "kspacing",
@@ -429,6 +434,20 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
     if dft.get("backend", "vasp") not in {"vasp", "abacus", "toy"}:
         raise ConfigError("dft.backend must be vasp, abacus, or toy")
+    if dft.get("backend", "vasp") == "vasp":
+        manifest_path = dft.get("potcar_manifest_path")
+        if not isinstance(manifest_path, str) or not manifest_path.strip():
+            raise ConfigError(
+                "dft.potcar_manifest_path is required for VASP so POTCAR "
+                "versions and hashes are part of task identity"
+            )
+    if dft.get("backend") == "abacus":
+        manifest_path = dft.get("resource_manifest_path")
+        if not isinstance(manifest_path, str) or not manifest_path.strip():
+            raise ConfigError(
+                "dft.resource_manifest_path is required for ABACUS so "
+                "pseudopotential and orbital hashes are part of task identity"
+            )
     kpoint_mode = dft.get("kpoint_mode", "auto")
     if kpoint_mode not in {"auto", "kspacing", "kpoints"}:
         raise ConfigError(
@@ -437,8 +456,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if not isinstance(dft.get("gamma_centered", False), bool):
         raise ConfigError("dft.gamma_centered must be boolean")
     for field, default in (
-        ("structures_per_job", 1),
-        ("max_concurrent", 20),
+        ("structures_per_job", DEFAULT_STRUCTURES_PER_DFT_JOB),
+        ("max_concurrent", DEFAULT_MAX_CONCURRENT),
     ):
         value = dft.get(field, default)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -495,12 +514,23 @@ def validate_config(config: Mapping[str, Any]) -> None:
         if md.get("backend") != "lammps":
             raise ConfigError("spin MD currently requires md.backend=lammps")
         if dft.get("backend", "vasp") not in {"abacus", "toy"}:
-            raise ConfigError(
-                "spin workflows require dft.backend=abacus or toy; "
-                "VASP labeling is non-magnetic only"
-            )
+                raise ConfigError(
+                    "spin workflows require dft.backend=abacus or toy; "
+                    "VASP collinear ISPIN=2 produces ordinary energy/force "
+                    "labels, not spin/mforce labels"
+                )
 
     if workflow:
+        workflow_id = workflow.get("id")
+        if workflow_id is not None and (
+            not isinstance(workflow_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", workflow_id)
+            is None
+        ):
+            raise ConfigError(
+                "workflow.id must be 1-64 safe characters: letters, numbers, "
+                "dot, underscore, or hyphen, and must start with a letter or number"
+            )
         if int(workflow.get("max_model_generations", 0)) < 1:
             raise ConfigError("workflow.max_model_generations must be positive")
         if int(workflow.get("seed", 20260721)) < 0:
@@ -574,6 +604,26 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "execution.stage_targets refers to unknown targets: "
             + ", ".join(str(value) for value in unknown_targets)
         )
+    dft_backend = str(dft.get("backend", "vasp"))
+    if dft_backend in {"vasp", "abacus"}:
+        labeling_target = parsed_targets[str(routes["labeling"])]
+        if not (
+            labeling_target.dft_resource_path
+            or (
+                isinstance(dft.get("resource_path"), str)
+                and str(dft["resource_path"]).strip()
+            )
+        ):
+            raise ConfigError(
+                "real DFT requires dft.resource_path or "
+                "execution.targets.<labeling>.dft_resource_path"
+            )
+        if labeling_target.host and not labeling_target.dft_resource_path:
+            raise ConfigError(
+                "a remote labeling target requires its own absolute "
+                "dft_resource_path; a local project resource path is not "
+                "portable over SSH"
+            )
     route_targets = _mapping(execution, "sampling_route_targets")
     invalid_route_targets = sorted(
         str(key)
@@ -604,12 +654,27 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
 
 def load_config(path: str | Path) -> tuple[dict[str, Any], list[str]]:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        config = YAML(typ="safe").load(handle) or {}
+    config_path = Path(path)
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = YAML(typ="safe").load(handle) or {}
+    except OSError as error:
+        raise ConfigError(
+            f"cannot read project configuration {config_path}: {error}"
+        ) from error
+    except YAMLError as error:
+        raise ConfigError(
+            f"invalid YAML in project configuration {config_path}: {error}"
+        ) from error
     if not isinstance(config, Mapping):
         raise ConfigError("project file must contain a YAML mapping")
     value = dict(config)
-    validate_config(value)
+    try:
+        validate_config(value)
+    except ConfigError:
+        raise
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ConfigError(f"invalid project configuration value: {error}") from error
     return value, []
 
 

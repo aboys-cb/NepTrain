@@ -15,6 +15,7 @@ from NepTrain.core.iteration import (
     stratified_farthest_point_sampling,
 )
 from NepTrain.core.md import MdResult
+from NepTrain.core.scientific_data import bind_labeled_frames_to_inputs
 from NepTrain.core.toy_iteration import (
     ToyGenerationPlan,
     ToyIterationAdapter,
@@ -714,11 +715,21 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     )
     stable_duplicate = repeated.copy()
     stable_duplicate.info.update(
-        source_id="healthy", temperature=100.0, pressure=0.0, md_window="stable_prefix"
+        source_id="healthy",
+        temperature=100.0,
+        pressure=0.0,
+        md_window="stable_prefix",
+        route_id="stable-route",
+        route_fingerprint="e" * 64,
     )
     preferred_duplicate = repeated.copy()
     preferred_duplicate.info.update(
-        source_id="failed", temperature=100.0, pressure=0.0, md_window="pre_failure"
+        source_id="failed",
+        temperature=100.0,
+        pressure=0.0,
+        md_window="pre_failure",
+        route_id="failure-route",
+        route_fingerprint="d" * 64,
     )
     candidates_path = tmp_path / "candidates.xyz"
     ase_write(
@@ -761,6 +772,11 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     assert outcome.metrics["selected_count"] == 2
     assert outcome.metrics["configured_max_selected"] == 20
     assert "pre_failure" in {frame.info["md_window"] for frame in selected}
+    assert {
+        frame.info["route_id"]
+        for frame in selected
+        if frame.info["md_window"] == "pre_failure"
+    } == {"failure-route"}
 
 
 def test_workflow_selection_describes_every_unique_valid_dump_frame(
@@ -1438,10 +1454,12 @@ def test_workflow_label_routes_production_dft_through_label_interface(
     calls = []
 
     def fake_label(request, selected_backend):
+        inputs = ase_read(request.source, index=":")
         frames = [
             ToyTeacher("ordinary").label(frame)
-            for frame in ase_read(request.source, index=":")
+            for frame in inputs
         ]
+        bind_labeled_frames_to_inputs(inputs, frames)
         ase_write(request.output_file, frames, format="extxyz")
         calls.append((request, selected_backend))
         return LabelResult(selected_backend, request.output_file, tuple(frames))

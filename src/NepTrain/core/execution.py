@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import traceback
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -66,7 +67,11 @@ _STAGE_CONFIG_PATH_FIELDS = {
     "train": ("training.config_path", "training.test_path"),
     "explore": (),
     "select": (),
-    "label": ("dft.input_path", "dft.resource_path"),
+    "label": (
+        "dft.input_path",
+        "dft.potcar_manifest_path",
+        "dft.resource_manifest_path",
+    ),
     "diagnose": (),
     "merge": (),
     "retrain": ("training.config_path", "training.test_path"),
@@ -158,6 +163,17 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+
+
 def _tree_hash(path: Path) -> str:
     if path.is_file():
         return _sha256(path)
@@ -171,21 +187,13 @@ def _tree_hash(path: Path) -> str:
     ).hexdigest()
 
 
-def _link_or_copy(source: str, target: str) -> str:
-    try:
-        os.link(source, target)
-        return target
-    except OSError:
-        return shutil.copy2(source, target)
-
-
 def _copy_input(source: Path, target: Path) -> None:
     if source.is_file():
         target.parent.mkdir(parents=True, exist_ok=True)
-        _link_or_copy(str(source), str(target))
+        shutil.copy2(source, target)
         return
     if source.is_dir():
-        shutil.copytree(source, target, copy_function=_link_or_copy)
+        shutil.copytree(source, target, copy_function=shutil.copy2)
         return
     raise ExecutionError(f"task input does not exist: {source}")
 
@@ -488,6 +496,7 @@ def build_stage_task(
     initial_training: Path,
     context: StageContext,
     stage_input: Mapping[str, Any] | None = None,
+    workflow_instance_id: str | None = None,
 ) -> StageTask:
     """Build an immutable, self-contained task directory."""
 
@@ -513,6 +522,7 @@ def build_stage_task(
     )
     identity = {
         "workflow_id": workflow_id,
+        "workflow_instance_id": workflow_instance_id or workflow_id,
         "generation": generation,
         "stage": stage,
         "attempt": attempt,
@@ -521,30 +531,10 @@ def build_stage_task(
         "sampling_routes": route_identities,
         "stage_input": dict(stage_input or {}),
     }
-    task_id = hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:24]
-    directory_name = _task_directory_name(
-        generation=generation,
-        stage=stage,
-        attempt=attempt,
-        task_id=task_id,
-        stage_input=dict(stage_input or {}),
-    )
-    bundle = tasks_dir / directory_name
-    if bundle.exists():
-        descriptor = bundle / "task.json"
-        if not descriptor.is_file():
-            raise ExecutionError(f"incomplete existing task bundle: {bundle}")
-        existing = json.loads(descriptor.read_text(encoding="utf-8"))
-        if existing.get("identity") != identity:
-            raise ExecutionError(f"task id collision at {bundle}")
-        return StageTask(task_id, workflow_id, generation, stage, target.name, bundle)
-
     tasks_dir.mkdir(parents=True, exist_ok=True)
-    temporary = tasks_dir / f".{directory_name}.building"
-    if temporary.exists():
-        shutil.rmtree(temporary)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=".stage-task-building-", dir=tasks_dir)
+    )
     inputs = temporary / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     portable_config = json.loads(json.dumps(config))
@@ -562,6 +552,12 @@ def build_stage_task(
         portable_config.setdefault("dft", {})["resource_path"] = (
             target.dft_resource_path
         )
+    elif stage == "label":
+        resource_path = portable_config.get("dft", {}).get("resource_path")
+        if resource_path:
+            portable_config["dft"]["resource_path"] = str(
+                _resolve_path(resource_path, workflow_root)
+            )
 
     path_fields = set(_STAGE_CONFIG_PATH_FIELDS[stage])
     if stage == "train" and generation > 1:
@@ -578,8 +574,15 @@ def build_stage_task(
         dotted
         for fields in _STAGE_CONFIG_PATH_FIELDS.values()
         for dotted in fields
-    } | {"evaluation.validation_path", "training.initial_path"}
-    for dotted in sorted(all_path_fields - path_fields):
+    } | {
+        "dft.resource_path",
+        "evaluation.validation_path",
+        "training.initial_path",
+    }
+    retained_path_fields = set(path_fields)
+    if stage == "label":
+        retained_path_fields.add("dft.resource_path")
+    for dotted in sorted(all_path_fields - retained_path_fields):
         _delete_dotted(portable_config, dotted)
     if stage not in {"explore", "evaluate"}:
         portable_config.get("sampling", {}).pop("routes", None)
@@ -689,12 +692,18 @@ def build_stage_task(
             copied[name] = str(destination.relative_to(temporary))
         return copied
 
-    descriptor = {
-        "protocol": "neptrain.stage-task.v2",
-        "task_id": task_id,
+    descriptor: dict[str, Any] = {
+        "protocol": "neptrain.stage-task.v3",
         "identity": identity,
-        "created_at": _now(),
         "config": portable_config,
+        "target": {
+            **asdict(target),
+            "setup_script": (
+                "target-setup.sh"
+                if (temporary / "target-setup.sh").is_file()
+                else target.setup_script
+            ),
+        },
         "initial_training": initial_value,
         "plan": asdict(plan),
         "stage_input": dict(stage_input or {}),
@@ -717,23 +726,84 @@ def build_stage_task(
         if path.is_file() and path.name != "task.json"
     ]
     descriptor["files"] = records
+    spec_sha256 = _canonical_hash(_task_content_spec(descriptor))
+    task_id = spec_sha256[:24]
+    descriptor["task_id"] = task_id
+    descriptor["spec_sha256"] = spec_sha256
+    descriptor["created_at"] = _now()
+    directory_name = _task_directory_name(
+        generation=generation,
+        stage=stage,
+        attempt=attempt,
+        task_id=task_id,
+        stage_input=dict(stage_input or {}),
+    )
+    bundle = tasks_dir / directory_name
     _write_json(temporary / "task.json", descriptor)
+    if bundle.exists():
+        try:
+            existing = _verify_task_bundle(bundle)
+            if existing["spec_sha256"] != spec_sha256:
+                raise ExecutionError(f"task id collision at {bundle}")
+        finally:
+            shutil.rmtree(temporary)
+        return StageTask(
+            task_id, workflow_id, generation, stage, target.name, bundle
+        )
     temporary.replace(bundle)
     return StageTask(task_id, workflow_id, generation, stage, target.name, bundle)
+
+
+def _task_content_spec(descriptor: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: descriptor.get(key)
+        for key in (
+            "identity",
+            "config",
+            "target",
+            "initial_training",
+            "plan",
+            "stage_input",
+            "artifacts",
+            "previous_artifacts",
+            "files",
+        )
+    }
 
 
 def _verify_task_bundle(bundle: Path) -> dict[str, Any]:
     descriptor_path = bundle / "task.json"
     if not descriptor_path.is_file():
         raise ExecutionError("stage task is missing task.json")
-    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
-    if descriptor.get("protocol") != "neptrain.stage-task.v2":
-        raise ExecutionError("unsupported stage task descriptor")
+    try:
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ExecutionError(f"stage task descriptor is unreadable: {descriptor_path}") from error
+    if descriptor.get("protocol") != "neptrain.stage-task.v3":
+        raise ExecutionError(
+            "unsupported stage task descriptor; retry the stage to create a "
+            "content-addressed v3 task"
+        )
     for record in descriptor.get("files", []):
         path = _safe_relative(bundle, record["path"], "task manifest path")
-        if not path.is_file() or _sha256(path) != record["sha256"]:
+        if (
+            not path.is_file()
+            or path.stat().st_size != int(record["size"])
+            or _sha256(path) != record["sha256"]
+        ):
             raise ExecutionError(f"stage task input drifted: {path}")
+    expected = _canonical_hash(_task_content_spec(descriptor))
+    if descriptor.get("spec_sha256") != expected:
+        raise ExecutionError("stage task content identity does not match its manifest")
+    if descriptor.get("task_id") != expected[:24]:
+        raise ExecutionError("stage task id does not match its content identity")
     return descriptor
+
+
+def verify_stage_task(bundle_path: str | Path) -> None:
+    """Verify a complete stage bundle without executing it."""
+
+    _verify_task_bundle(Path(bundle_path).expanduser().resolve())
 
 
 def run_stage_worker(bundle_path: str | Path) -> int:
@@ -750,10 +820,28 @@ def run_stage_worker(bundle_path: str | Path) -> int:
         execution_path = bundle / "execution.json"
         try:
             descriptor = _verify_task_bundle(bundle)
+            try:
+                load_stage_result(bundle)
+            except ExecutionError:
+                pass
+            else:
+                _write_json(
+                    execution_path,
+                    {
+                        "task_id": descriptor["task_id"],
+                        "task_spec_sha256": descriptor["spec_sha256"],
+                        "state": "COMPLETED",
+                        "pid": os.getpid(),
+                        "completed_at": _now(),
+                        "recovered": True,
+                    },
+                )
+                return 0
             _write_json(
                 execution_path,
                 {
                     "task_id": descriptor["task_id"],
+                    "task_spec_sha256": descriptor["spec_sha256"],
                     "state": "RUNNING",
                     "pid": os.getpid(),
                     "started_at": _now(),
@@ -773,8 +861,10 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             }
             from .workflow_iteration import WorkflowIterationAdapter
 
-            work_dir = bundle / "output"
-            work_dir.mkdir(parents=True, exist_ok=True)
+            work_dir = bundle / f".output-building-{os.getpid()}"
+            if work_dir.exists():
+                shutil.rmtree(work_dir)
+            work_dir.mkdir()
             initial_value = descriptor.get("initial_training")
             adapter = WorkflowIterationAdapter(
                 config,
@@ -810,15 +900,34 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     destination = work_dir / f"{name}--{source.name}"
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, destination)
+                relative_output = destination.relative_to(work_dir)
                 result_artifacts[name] = {
-                    "path": str(destination.relative_to(bundle)),
+                    "path": str(Path("output") / relative_output),
                     "sha256": _sha256(destination),
                     "size": destination.stat().st_size,
                 }
+            published_output = bundle / "output"
+            if published_output.exists():
+                archive = (
+                    bundle
+                    / "attempts"
+                    / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+                )
+                archive.mkdir(parents=True)
+                published_output.replace(archive / "output")
+                for name in ("result.json", "execution.json"):
+                    previous = bundle / name
+                    if previous.exists():
+                        previous.replace(archive / name)
+            work_dir.replace(published_output)
             result = {
-                "protocol": "neptrain.stage-result.v2",
+                "protocol": "neptrain.stage-result.v3",
                 "task_id": descriptor["task_id"],
+                "task_spec_sha256": descriptor["spec_sha256"],
                 "workflow_id": descriptor["identity"]["workflow_id"],
+                "workflow_instance_id": descriptor["identity"][
+                    "workflow_instance_id"
+                ],
                 "generation": descriptor["identity"]["generation"],
                 "stage": descriptor["identity"]["stage"],
                 "plan_sha256": descriptor["identity"]["plan_sha256"],
@@ -831,6 +940,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                 execution_path,
                 {
                     "task_id": descriptor["task_id"],
+                    "task_spec_sha256": descriptor["spec_sha256"],
                     "state": "COMPLETED",
                     "pid": os.getpid(),
                     "completed_at": _now(),
@@ -851,22 +961,53 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             return 1
 
 
-def load_stage_result(bundle_path: str | Path) -> tuple[dict[str, Any], StageOutcome]:
-    bundle = Path(bundle_path).expanduser().resolve()
-    path = bundle / "result.json"
+def _load_stage_result_payload(
+    result_root: Path,
+    descriptor: Mapping[str, Any],
+) -> tuple[dict[str, Any], StageOutcome]:
+    path = result_root / "result.json"
     if not path.is_file():
         raise ExecutionError(f"stage result does not exist: {path}")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("protocol") != "neptrain.stage-result.v2":
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ExecutionError(f"stage result descriptor is unreadable: {path}") from error
+    if value.get("protocol") != "neptrain.stage-result.v3":
         raise ExecutionError("unsupported stage result protocol")
+    expected = {
+        "task_id": descriptor["task_id"],
+        "task_spec_sha256": descriptor["spec_sha256"],
+        "workflow_id": descriptor["identity"]["workflow_id"],
+        "workflow_instance_id": descriptor["identity"]["workflow_instance_id"],
+        "generation": descriptor["identity"]["generation"],
+        "stage": descriptor["identity"]["stage"],
+        "plan_sha256": descriptor["identity"]["plan_sha256"],
+    }
+    for name, expected_value in expected.items():
+        if value.get(name) != expected_value:
+            raise ExecutionError(
+                f"stage result {name} does not match the task descriptor"
+            )
     artifacts = {}
     for name, record in value.get("artifacts", {}).items():
         _validate_artifact_name(str(name))
-        artifact = _safe_relative(bundle, record["path"], "result artifact path")
-        if not artifact.is_file() or _sha256(artifact) != record["sha256"]:
+        artifact = _safe_relative(
+            result_root, record["path"], "result artifact path"
+        )
+        if (
+            not artifact.is_file()
+            or artifact.stat().st_size != int(record["size"])
+            or _sha256(artifact) != record["sha256"]
+        ):
             raise ExecutionError(f"stage result artifact drifted: {artifact}")
         artifacts[name] = artifact
     return value, StageOutcome(artifacts=artifacts, metrics=value.get("metrics", {}))
+
+
+def load_stage_result(bundle_path: str | Path) -> tuple[dict[str, Any], StageOutcome]:
+    bundle = Path(bundle_path).expanduser().resolve()
+    descriptor = _verify_task_bundle(bundle)
+    return _load_stage_result_payload(bundle, descriptor)
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -1109,44 +1250,76 @@ exec "$@"
     def deploy(self, task: StageTask) -> str:
         if not self.remote:
             return str(task.bundle)
+        descriptor = _verify_task_bundle(task.bundle)
+        if descriptor["task_id"] != task.task_id:
+            raise ExecutionError("stage task object does not match its bundle")
         root = str(self.target.work_root)
         remote_name = task.bundle.name
         remote_bundle = (
             f"{root.rstrip('/')}/{task.workflow_id}/jobs/{remote_name}"
         )
+        token = f"{os.getpid()}-{time.time_ns()}"
         remote_archive = (
-            f"{root.rstrip('/')}/{task.workflow_id}/incoming/{remote_name}.tar.gz"
+            f"{root.rstrip('/')}/{task.workflow_id}/incoming/"
+            f"{remote_name}-{token}.tar.gz"
         )
+        descriptor_sha256 = _sha256(task.descriptor)
+        verify_command = shlex.split(self.target.command)
         setup = """set -eo pipefail
 root=$1
 workflow=$2
 name=$3
+expected=$4
+shift 4
+command=("$@")
+verify_bundle() {
+  bundle=$1
+  if [ -f "$bundle/target-setup.sh" ]; then
+    (source "$bundle/target-setup.sh"; "${command[@]}" stage-verify "$bundle")
+  else
+    "${command[@]}" stage-verify "$bundle"
+  fi
+}
 case "$root" in
   '~/'*) root="$HOME/${root:2}" ;;
   /*) ;;
   *) exit 2 ;;
 esac
 mkdir -p "$root/$workflow/incoming" "$root/$workflow/jobs"
-if [ -f "$root/$workflow/jobs/$name/task.json" ]; then exit 0; fi
+destination="$root/$workflow/jobs/$name"
+if [ -e "$destination" ]; then
+  if [ ! -f "$destination/task.json" ]; then
+    printf '%s\\n' INCOMPLETE
+    exit 0
+  fi
+  actual=$(sha256sum "$destination/task.json" | cut -d' ' -f1)
+  if [ "$actual" = "$expected" ]; then
+    if verify_bundle "$destination" >/dev/null 2>&1; then
+      printf '%s\\n' READY
+    else
+      printf '%s\\n' INCOMPLETE
+    fi
+    exit 0
+  fi
+  echo "remote task descriptor conflicts with local content identity: $destination" >&2
+  exit 17
+fi
+printf '%s\\n' MISSING
 """
         completed = self.run_script(
             setup,
             root,
             task.workflow_id,
             remote_name,
+            descriptor_sha256,
+            *verify_command,
+            timeout=300,
         )
         if completed.returncode != 0:
             raise ExecutionError((completed.stderr or completed.stdout).strip())
-        remote_exists = (
-            self.run_script(
-                'test -f "$1"\n',
-                f"{remote_bundle}/task.json",
-            ).returncode
-            == 0
-        )
-        if remote_exists:
+        if completed.stdout.strip().splitlines()[-1:] == ["READY"]:
             return remote_bundle
-        archive = task.bundle.parent / f".{remote_name}.upload.tar.gz"
+        archive = task.bundle.parent / f".{remote_name}.{token}.upload.tar.gz"
         try:
             with tarfile.open(archive, "w:gz") as handle:
                 handle.add(task.bundle, arcname=remote_name)
@@ -1161,26 +1334,85 @@ if [ -f "$root/$workflow/jobs/$name/task.json" ]; then exit 0; fi
 root=$1
 workflow=$2
 name=$3
-expected=$4
+archive_path=$4
+expected_archive=$5
+expected_descriptor=$6
+token=$7
+shift 7
+command=("$@")
+verify_bundle() {
+  bundle=$1
+  if [ -f "$bundle/target-setup.sh" ]; then
+    (source "$bundle/target-setup.sh"; "${command[@]}" stage-verify "$bundle")
+  else
+    "${command[@]}" stage-verify "$bundle"
+  fi
+}
 case "$root" in
   '~/'*) root="$HOME/${root:2}" ;;
+  /*) ;;
+  *) exit 2 ;;
 esac
-archive="$root/$workflow/incoming/$name.tar.gz"
-actual=$(sha256sum "$archive" | cut -d' ' -f1)
-[ "$actual" = "$expected" ]
-temporary="$root/$workflow/jobs/.$name.extracting"
-rm -rf "$temporary"
+jobs="$root/$workflow/jobs"
+destination="$jobs/$name"
+lock="$jobs/.$name.deploy.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  if [ -f "$destination/task.json" ]; then
+    actual=$(sha256sum "$destination/task.json" | cut -d' ' -f1)
+    if [ "$actual" = "$expected_descriptor" ] &&
+       verify_bundle "$destination" >/dev/null 2>&1; then
+      exit 0
+    fi
+  fi
+  echo "another deployment owns $destination; retry later" >&2
+  exit 75
+fi
+temporary="$jobs/.$name.extracting-$token"
+cleanup() {
+  rm -f -- "$archive_path"
+  rm -rf -- "$temporary"
+  rmdir "$lock" 2>/dev/null || true
+}
+trap cleanup EXIT
+actual=$(sha256sum "$archive_path" | cut -d' ' -f1)
+[ "$actual" = "$expected_archive" ]
 mkdir -p "$temporary"
-tar -xzf "$archive" -C "$temporary" --strip-components=1
-mv "$temporary" "$root/$workflow/jobs/$name"
-rm -f "$archive"
+tar -xzf "$archive_path" -C "$temporary" --strip-components=1
+[ -f "$temporary/task.json" ]
+actual=$(sha256sum "$temporary/task.json" | cut -d' ' -f1)
+[ "$actual" = "$expected_descriptor" ]
+verify_bundle "$temporary"
+if [ -e "$destination" ]; then
+  if [ -f "$destination/task.json" ]; then
+    actual=$(sha256sum "$destination/task.json" | cut -d' ' -f1)
+    if [ "$actual" = "$expected_descriptor" ] &&
+       verify_bundle "$destination" >/dev/null 2>&1; then
+      exit 0
+    fi
+    if [ "$actual" != "$expected_descriptor" ]; then
+      echo "remote task descriptor conflicts with local content identity: $destination" >&2
+      exit 17
+    fi
+  fi
+  quarantine="$destination.incomplete.$(date +%Y%m%d-%H%M%S).$$"
+  mv -- "$destination" "$quarantine"
+fi
+mv -- "$temporary" "$destination"
+actual=$(sha256sum "$destination/task.json" | cut -d' ' -f1)
+[ "$actual" = "$expected_descriptor" ]
+verify_bundle "$destination"
 """
             completed = self.run_script(
                 extract,
                 root,
                 task.workflow_id,
                 remote_name,
+                remote_archive,
                 digest,
+                descriptor_sha256,
+                token,
+                *verify_command,
+                timeout=300,
             )
             if completed.returncode != 0:
                 raise ExecutionError((completed.stderr or completed.stdout).strip())
@@ -1193,25 +1425,70 @@ rm -f "$archive"
         if not self.remote:
             return local
         remote = str(handle.remote_bundle)
-        self.fetch_paths(
-            remote,
-            ("result.json", "execution.json", "result"),
-            local,
-        )
-        for name in ("result.json", "execution.json"):
-            if not (local / name).is_file():
-                raise ExecutionError(
-                    f"remote stage result is missing required file: {name}"
-                )
-        result = json.loads((local / "result.json").read_text(encoding="utf-8"))
-        for record in result.get("artifacts", {}).values():
-            destination = _safe_relative(
-                local, record["path"], "result artifact path"
+        descriptor = _verify_task_bundle(local)
+        if handle.task_id != descriptor["task_id"]:
+            raise ExecutionError(
+                "execution handle does not belong to the local task bundle"
             )
-            if not destination.is_file():
-                raise ExecutionError(
-                    f"remote stage result is missing artifact: {record['path']}"
+        temporary = Path(
+            tempfile.mkdtemp(
+                prefix=f".{local.name}.collecting-",
+                dir=local.parent,
+            )
+        )
+        try:
+            self.fetch_paths(
+                remote,
+                ("result.json", "execution.json", "output"),
+                temporary,
+            )
+            for name in ("result.json", "execution.json"):
+                if not (temporary / name).is_file():
+                    raise ExecutionError(
+                        f"remote stage result is missing required file: {name}"
+                    )
+            _load_stage_result_payload(temporary, descriptor)
+            try:
+                execution = json.loads(
+                    (temporary / "execution.json").read_text(encoding="utf-8")
                 )
+            except (OSError, json.JSONDecodeError) as error:
+                raise ExecutionError(
+                    "remote stage execution descriptor is unreadable"
+                ) from error
+            if (
+                execution.get("state") != "COMPLETED"
+                or execution.get("task_id") != descriptor["task_id"]
+                or execution.get("task_spec_sha256")
+                != descriptor["spec_sha256"]
+            ):
+                raise ExecutionError(
+                    "remote execution state does not belong to the requested task"
+                )
+
+            archive = (
+                local
+                / "attempts"
+                / (
+                    "remote-collection-"
+                    + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+                )
+            )
+            previous = [
+                local / name
+                for name in ("output", "result.json", "execution.json")
+                if (local / name).exists()
+            ]
+            if previous:
+                archive.mkdir(parents=True)
+                for path in previous:
+                    path.replace(archive / path.name)
+            (temporary / "output").replace(local / "output")
+            (temporary / "result.json").replace(local / "result.json")
+            (temporary / "execution.json").replace(local / "execution.json")
+            load_stage_result(local)
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
         return local
 
 
@@ -1276,8 +1553,16 @@ def _local_execution_status(path: Path) -> ExecutionStatus | None:
         return None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    except (OSError, json.JSONDecodeError) as error:
+        return ExecutionStatus(
+            "failed",
+            f"execution descriptor is unreadable: {error}",
+        )
+    if not isinstance(value, Mapping):
+        return ExecutionStatus(
+            "failed",
+            "execution descriptor must contain a JSON object",
+        )
     state = value.get("state")
     if state == "COMPLETED":
         return ExecutionStatus("completed")
@@ -1285,7 +1570,12 @@ def _local_execution_status(path: Path) -> ExecutionStatus | None:
         return ExecutionStatus(
             "failed", str(value.get("error", "worker failed"))
         )
-    return None
+    if state == "RUNNING":
+        return None
+    return ExecutionStatus(
+        "failed",
+        f"execution descriptor has unsupported state {state!r}",
+    )
 
 
 def _wait_for_local_execution_status(
@@ -1311,15 +1601,35 @@ class ProcessExecutor:
         bundle = self.transport.deploy(task)
         local_execution = task.bundle / "execution.json"
         if self.target.host is None and local_execution.is_file():
-            value = json.loads(local_execution.read_text(encoding="utf-8"))
-            if value.get("state") in {"RUNNING", "COMPLETED"}:
+            try:
+                value = json.loads(local_execution.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                value = {}
+            state = value.get("state") if isinstance(value, Mapping) else None
+            pid = str(value.get("pid", "")) if isinstance(value, Mapping) else ""
+            reusable = state == "COMPLETED" or (
+                state == "RUNNING"
+                and pid.isdigit()
+                and _pid_matches_bundle(int(pid), str(task.bundle))
+            )
+            if reusable:
                 return ExecutionHandle(
                     task.task_id,
                     self.target.name,
                     "process",
-                    str(value.get("pid", "unknown")),
+                    pid or "completed",
                     str(task.bundle),
                 )
+            archive = (
+                task.bundle
+                / "attempts"
+                / (
+                    "process-launch-"
+                    + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+                )
+            )
+            archive.mkdir(parents=True, exist_ok=False)
+            local_execution.replace(archive / "execution.json")
         lines = ["#!/bin/bash", "set -eo pipefail"]
         setup = _setup_line(self.target, bundle)
         if setup:
@@ -1445,12 +1755,29 @@ fi
         )
         if completed.returncode != 0:
             return ExecutionStatus("unknown", (completed.stderr or completed.stdout).strip())
-        value = json.loads(completed.stdout)
+        try:
+            value = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            return ExecutionStatus(
+                "failed",
+                f"remote execution descriptor is unreadable: {error}",
+            )
+        if not isinstance(value, Mapping):
+            return ExecutionStatus(
+                "failed",
+                "remote execution descriptor must contain a JSON object",
+            )
         if value.get("state") == "COMPLETED":
             return ExecutionStatus("completed")
         if value.get("state") == "FAILED":
             return ExecutionStatus("failed", str(value.get("error", "worker failed")))
-        return ExecutionStatus("running")
+        if value.get("state") == "RUNNING":
+            return ExecutionStatus("running")
+        return ExecutionStatus(
+            "failed",
+            "remote execution descriptor has unsupported state "
+            f"{value.get('state')!r}",
+        )
 
     def collect(self, handle: ExecutionHandle) -> Path:
         return self.transport.collect(handle)
@@ -1792,4 +2119,5 @@ __all__ = [
     "executor_for",
     "load_stage_result",
     "run_stage_worker",
+    "verify_stage_task",
 ]

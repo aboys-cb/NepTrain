@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from importlib.resources import files
+import json
 from pathlib import Path
 import shutil
 
 from ruamel.yaml import YAML
 
 from NepTrain import utils
+from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_DFT_JOB
 
 
 def _project(
@@ -84,9 +86,15 @@ def _project(
         "dft": {
             "backend": dft_backend,
             "input_path": "./INCAR" if dft_backend == "vasp" else "./INPUT",
+            "resource_path": "./resources",
+            **(
+                {"potcar_manifest_path": "./vasp-resources.json"}
+                if dft_backend == "vasp"
+                else {"resource_manifest_path": "./abacus-resources.json"}
+            ),
             "kpoint_mode": "auto",
-            "structures_per_job": 1,
-            "max_concurrent": 20,
+            "structures_per_job": DEFAULT_STRUCTURES_PER_DFT_JOB,
+            "max_concurrent": DEFAULT_MAX_CONCURRENT,
         },
         "workflow": {
             "id": "workflow",
@@ -142,6 +150,8 @@ def init_project(
             "lammps-spin-nvt.in",
             "lammps-spin-npt.in",
             "INCAR" if dft_backend == "abacus" else "INPUT",
+            "vasp-resources.json",
+            "abacus-resources.json",
         ):
             (root / obsolete).unlink(missing_ok=True)
     template_name = f"{'spin-' if spin else ''}{ensemble}.in"
@@ -152,11 +162,42 @@ def init_project(
             files("NepTrain.core.dft.vasp").joinpath("INCAR"),
             root / "INCAR",
         )
+        manifest = root / "vasp-resources.json"
+        if not manifest.exists() or force:
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "protocol": "neptrain.vasp-resources.v1",
+                        "family": "PAW_PBE",
+                        "release": "REPLACE_WITH_DISTRIBUTION_RELEASE",
+                        "elements": {},
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
     else:
         shutil.copyfile(
             files("NepTrain.core.dft.abacus").joinpath("INPUT"),
             root / "INPUT",
         )
+        manifest = root / "abacus-resources.json"
+        if not manifest.exists() or force:
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "protocol": "neptrain.abacus-resources.v1",
+                        "release": "REPLACE_WITH_RESOURCE_RELEASE",
+                        "elements": {},
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
     if profile == "slurm":
         scripts = {
             "env-training.sh": (

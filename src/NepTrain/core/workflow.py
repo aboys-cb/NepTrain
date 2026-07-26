@@ -9,8 +9,11 @@ import fcntl
 import hashlib
 import json
 from pathlib import Path
+import re
 import shlex
+import shutil
 from typing import Any, Mapping
+import uuid
 
 from .workflow_workspace import WorkflowWorkspace
 from .sampling_route import load_sampling_routes
@@ -92,6 +95,60 @@ def _canonical_hash(value: Any) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _read_json(path: Path, *, role: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkflowError(
+            f"cannot read {role} JSON at {path}: {error}"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise WorkflowError(f"{role} JSON at {path} must contain an object")
+    return dict(value)
+
+
+def _manifest_instance_id(
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+) -> str:
+    value = str(manifest.get("instance_id", "")).strip()
+    if value:
+        return value
+    # One release of read compatibility for v5 workflows.  The path prevents a
+    # historical task from another workflow directory being treated as the
+    # same instance, while all newly prepared workflows receive a random id.
+    legacy = f"{manifest_path.resolve()}:{manifest.get('spec_sha256', '')}"
+    return "legacy-" + hashlib.sha256(legacy.encode()).hexdigest()[:32]
+
+
+def _normalise_manifest(
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+) -> dict[str, Any]:
+    value = dict(manifest)
+    if value.get("version") not in {5, 6}:
+        raise WorkflowError(
+            "unsupported workflow manifest; create a new workflow with the "
+            "current NepTrain"
+        )
+    required_records = ("config", "initial_training")
+    if (
+        value.get("orchestration") != "controller"
+        or not isinstance(value.get("workflow_id"), str)
+        or not value["workflow_id"]
+        or any(not isinstance(value.get(name), Mapping) for name in required_records)
+        or not isinstance(value.get("plans"), list)
+        or not value["plans"]
+        or any(not isinstance(item, Mapping) for item in value["plans"])
+        or not isinstance(value.get("dependencies", []), list)
+    ):
+        raise WorkflowError(
+            f"workflow manifest is incomplete or malformed: {manifest_path}"
+        )
+    value["instance_id"] = _manifest_instance_id(value, manifest_path)
+    return value
+
+
 def _path_record(role: str, path: Path) -> dict[str, Any]:
     if path.is_file():
         return {
@@ -164,7 +221,12 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
                 route["template_path"], base_dir
             )
     dft = resolved.get("dft", {})
-    for key in ("input_path", "resource_path"):
+    for key in (
+        "input_path",
+        "resource_path",
+        "potcar_manifest_path",
+        "resource_manifest_path",
+    ):
         if dft.get(key):
             dft[key] = _absolute_path(dft[key], base_dir)
     evaluation = resolved.get("evaluation", {})
@@ -203,6 +265,183 @@ def _plans(
     return plans
 
 
+def _sampling_frames(config: Mapping[str, Any]) -> list[Any]:
+    from ase.io import read as ase_read
+
+    frames = []
+    for route in config["sampling"]["routes"]:
+        for raw_source in route["structures"]:
+            source = Path(raw_source)
+            paths = [source]
+            if source.is_dir():
+                paths = sorted(
+                    {
+                        path
+                        for pattern in ("*.xyz", "*.extxyz", "*.vasp", "POSCAR*")
+                        for path in source.glob(pattern)
+                        if path.is_file()
+                    }
+                )
+            for path in paths:
+                try:
+                    loaded = ase_read(path, index=":")
+                except Exception as error:
+                    raise WorkflowError(
+                        f"cannot read sampling structure while validating DFT "
+                        f"resources: {path}: {error}"
+                    ) from error
+                frames.extend(loaded if isinstance(loaded, list) else [loaded])
+    if not frames:
+        raise WorkflowError(
+            "DFT resource validation found no sampling structures"
+        )
+    return frames
+
+
+def _sampling_frames_by_order(
+    frames: list[Any],
+    order_for,
+) -> dict[tuple[str, ...], Any]:
+    frames_by_order: dict[tuple[str, ...], Any] = {}
+    for frame in frames:
+        frames_by_order.setdefault(order_for(frame), frame)
+    return frames_by_order
+
+
+def _validate_labeled_dataset_for_preparation(
+    path: Path,
+    *,
+    role: str,
+    expect_spin: bool,
+) -> None:
+    from ase.io import read as ase_read
+
+    from .scientific_data import ScientificDataError, validate_labeled_frames
+    from .spin import SpinDataError, validate_spin_dataset
+
+    try:
+        loaded = ase_read(path, index=":")
+        frames = loaded if isinstance(loaded, list) else [loaded]
+        validate_labeled_frames(frames)
+        total, spin_frames = validate_spin_dataset(
+            frames,
+            require_mforce=True,
+        )
+    except (OSError, ScientificDataError, SpinDataError, ValueError) as error:
+        raise WorkflowError(f"{role} dataset is invalid at {path}: {error}") from error
+    if (spin_frames == total) != expect_spin:
+        expected = "spin/mforce" if expect_spin else "ordinary"
+        raise WorkflowError(
+            f"{role} dataset must contain {expected} labels to match md.spin"
+        )
+
+
+def _validate_vasp_preparation(
+    config: Mapping[str, Any],
+    *,
+    labeling_target: Mapping[str, Any],
+    sampling_frames: list[Any],
+) -> None:
+    if config.get("dft", {}).get("backend") != "vasp":
+        return
+    from .dft.vasp.resources import (
+        VaspResourceError,
+        validate_vasp_manifest_elements,
+        validate_vasp_resources,
+        vasp_element_order,
+    )
+    from .dft.vasp.native import (
+        NativeVaspError,
+        validate_vasp_input_file,
+        validate_vasp_structure,
+    )
+
+    dft = config["dft"]
+    manifest_path = Path(str(dft["potcar_manifest_path"]))
+    frames_by_order = _sampling_frames_by_order(
+        sampling_frames,
+        vasp_element_order,
+    )
+    try:
+        input_path = dft.get("input_path")
+        electronic_mode = (
+            validate_vasp_input_file(input_path)
+            if input_path
+            else "non_spin_polarized"
+        )
+        for frame in frames_by_order.values():
+            validate_vasp_structure(
+                frame,
+                electronic_mode=electronic_mode,
+            )
+        validate_vasp_manifest_elements(manifest_path, frames_by_order)
+        if not labeling_target.get("host"):
+            resource_root = (
+                labeling_target.get("dft_resource_path")
+                or dft.get("resource_path")
+            )
+            for frame in frames_by_order.values():
+                validate_vasp_resources(
+                    str(resource_root),
+                    manifest_path,
+                    frame,
+                )
+    except (NativeVaspError, VaspResourceError) as error:
+        raise WorkflowError(str(error)) from error
+
+
+def _validate_abacus_preparation(
+    config: Mapping[str, Any],
+    *,
+    labeling_target: Mapping[str, Any],
+    sampling_frames: list[Any],
+) -> None:
+    if config.get("dft", {}).get("backend") != "abacus":
+        return
+    from .dft.abacus.io import read_input_file
+    from .dft.abacus.native import (
+        NativeAbacusError,
+        validate_abacus_spin_contract,
+    )
+    from .dft.abacus.resources import (
+        AbacusResourceError,
+        validate_abacus_manifest_elements,
+        validate_abacus_resources,
+    )
+
+    dft = config["dft"]
+    manifest_path = Path(str(dft["resource_manifest_path"]))
+    frames_by_order = _sampling_frames_by_order(
+        sampling_frames,
+        lambda frame: tuple(dict.fromkeys(frame.get_chemical_symbols())),
+    )
+    input_path = dft.get("input_path")
+    parameters = read_input_file(str(input_path)) if input_path else {}
+    require_orbitals = (
+        str(parameters.get("basis_type", "pw")).strip().lower() == "lcao"
+    )
+    try:
+        validate_abacus_spin_contract(
+            dict(parameters),
+            spin_frame=bool(config.get("md", {}).get("spin", False)),
+        )
+        validate_abacus_manifest_elements(manifest_path, frames_by_order)
+        if not labeling_target.get("host"):
+            resource_root = (
+                labeling_target.get("dft_resource_path")
+                or dft.get("resource_path")
+            )
+            for frame in frames_by_order.values():
+                validate_abacus_resources(
+                    str(resource_root),
+                    manifest_path,
+                    frame,
+                    require_orbitals=require_orbitals,
+                )
+    except (AbacusResourceError, NativeAbacusError) as error:
+        raise WorkflowError(str(error)) from error
+
+
 def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     paths: list[tuple[str, Path]] = []
     training = config.get("training", {})
@@ -213,7 +452,8 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
         ("training_config", training.get("config_path")),
         ("training_test", training.get("test_path")),
         ("dft_input", dft.get("input_path")),
-        ("dft_resources", dft.get("resource_path")),
+        ("dft_potcar_manifest", dft.get("potcar_manifest_path")),
+        ("dft_resource_manifest", dft.get("resource_manifest_path")),
         ("evaluation_validation", evaluation.get("validation_path")),
     ):
         if value and value != "auto":
@@ -241,7 +481,7 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _preparation_from_manifest(path: Path) -> WorkflowPreparation:
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = _read_json(path, role="workflow manifest")
     workspace = WorkflowWorkspace.locate(path)
     return WorkflowPreparation(
         workflow_id=manifest["workflow_id"],
@@ -289,6 +529,22 @@ def prepare_workflow(
     except ConfigError as error:
         raise WorkflowError(f"invalid project configuration: {error}") from error
     config = _resolved_config(config, source_config.parent)
+    expect_spin = bool(config.get("md", {}).get("spin", False))
+    _validate_labeled_dataset_for_preparation(
+        initial,
+        role="initial training",
+        expect_spin=expect_spin,
+    )
+    for role, raw_path in (
+        ("training test", config.get("training", {}).get("test_path")),
+        ("evaluation validation", config.get("evaluation", {}).get("validation_path")),
+    ):
+        if raw_path:
+            _validate_labeled_dataset_for_preparation(
+                Path(str(raw_path)),
+                role=role,
+                expect_spin=expect_spin,
+            )
     labeling_target_name = config["execution"]["stage_targets"]["labeling"]
     labeling_target = config["execution"]["targets"][labeling_target_name]
     dft_backend = config["dft"]["backend"]
@@ -300,10 +556,41 @@ def prepare_workflow(
             f"{dft_backend} workflows require dft.resource_path or "
             "execution.targets.<labeling>.dft_resource_path"
         )
+    sampling_frames = _sampling_frames(config)
+    from .spin import SpinDataError, validate_spin_dataset
+
+    try:
+        total_frames, spin_frames = validate_spin_dataset(
+            sampling_frames,
+            require_mforce=False,
+        )
+    except SpinDataError as error:
+        raise WorkflowError(
+            f"sampling structure spin contract is invalid: {error}"
+        ) from error
+    expected_spin = expect_spin
+    if (spin_frames == total_frames) != expected_spin:
+        expected = "canonical spin:R:3" if expected_spin else "ordinary"
+        raise WorkflowError(
+            f"sampling structures must all be {expected} frames to match md.spin"
+        )
+    _validate_vasp_preparation(
+        config,
+        labeling_target=labeling_target,
+        sampling_frames=sampling_frames,
+    )
+    _validate_abacus_preparation(
+        config,
+        labeling_target=labeling_target,
+        sampling_frames=sampling_frames,
+    )
     settings = config.get("workflow", {})
     selected_id = workflow_id or str(settings.get("id", output.name))
-    if not selected_id.strip():
-        raise WorkflowError("workflow id cannot be empty")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", selected_id):
+        raise WorkflowError(
+            "workflow id must be 1-64 safe characters: letters, numbers, "
+            "dot, underscore, or hyphen, and must start with a letter or number"
+        )
     plans = _plans(settings, config["sampling"])
     command = "neptrain"
     source_dependencies = _dependencies(config)
@@ -328,10 +615,12 @@ def prepare_workflow(
             raise WorkflowError(str(error)) from error
     manifest_path = workspace.manifest
     if manifest_path.exists():
-        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        existing = _normalise_manifest(
+            _read_json(manifest_path, role="workflow manifest"),
+            manifest_path,
+        )
         if (
-            existing.get("version") != 5
-            or existing.get("orchestration") != "controller"
+            existing.get("orchestration") != "controller"
         ):
             raise WorkflowError(
                 "existing workflow uses an unsupported test-phase manifest; "
@@ -352,6 +641,9 @@ def prepare_workflow(
                 raise WorkflowError(
                     f"prepared workflow artifact drifted: {record['path']}"
                 )
+        if existing.get("version") == 5:
+            existing["version"] = 6
+            _write_json(manifest_path, existing)
         return _preparation_from_manifest(manifest_path)
 
     resolved_config = workspace.project_file
@@ -378,10 +670,11 @@ def prepare_workflow(
         _write_json(plan_path, asdict(plan))
         plan_paths.append(plan_path)
     manifest = {
-        "version": 5,
+        "version": 6,
         "layout_version": workspace.version,
         "orchestration": "controller",
         "workflow_id": selected_id,
+        "instance_id": uuid.uuid4().hex,
         "spec_sha256": spec_sha256,
         "config": {"path": str(resolved_config), "sha256": _sha256(resolved_config)},
         "initial_training": {
@@ -431,7 +724,7 @@ def extend_workflow(
         settings = dict(config.get("workflow", {}))
         all_plans = _plans(settings, config["sampling"])
         existing_values = [
-            json.loads(path.read_text(encoding="utf-8"))
+            _read_json(path, role="generation plan")
             for path in preparation.plans
         ]
         if [
@@ -460,8 +753,9 @@ def extend_workflow(
         manifest["config"]["sha256"] = _sha256(preparation.config_file)
         _write_json(preparation.manifest, manifest)
         if workspace.controller_file.is_file():
-            controller_state = json.loads(
-                workspace.controller_file.read_text(encoding="utf-8")
+            controller_state = _read_json(
+                workspace.controller_file,
+                role="controller state",
             )
             if controller_state.get("state") == "budget_exhausted":
                 controller_state["state"] = "idle"
@@ -472,8 +766,11 @@ def extend_workflow(
 
 
 def _validated_manifest(preparation: WorkflowPreparation) -> dict[str, Any]:
-    manifest = json.loads(preparation.manifest.read_text(encoding="utf-8"))
-    if manifest.get("version") != 5 or manifest.get("orchestration") != "controller":
+    manifest = _normalise_manifest(
+        _read_json(preparation.manifest, role="workflow manifest"),
+        preparation.manifest,
+    )
+    if manifest.get("orchestration") != "controller":
         raise WorkflowError(
             "unsupported workflow manifest; create a new workflow with the current NepTrain"
         )
@@ -505,7 +802,7 @@ def _read_workflow_ledger(
     ledger_path = WorkflowWorkspace.locate(preparation.output_dir).ledger
     if not ledger_path.exists():
         return None
-    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger = _read_json(ledger_path, role="scientific ledger")
     if ledger.get("workflow_id") != preparation.workflow_id:
         raise WorkflowError("workflow_id does not match the existing ledger")
     if not isinstance(ledger.get("generations", {}), Mapping):
@@ -520,7 +817,7 @@ def _workflow_progress(
     ledger: Mapping[str, Any] | None | object = _LEDGER_UNSET,
 ) -> _WorkflowProgress:
     plans = [
-        json.loads(Path(record["path"]).read_text(encoding="utf-8"))
+        _read_json(Path(record["path"]), role="generation plan")
         for record in manifest["plans"]
     ]
     if ledger is _LEDGER_UNSET:
@@ -531,6 +828,42 @@ def _workflow_progress(
         )
     assert isinstance(ledger, Mapping)
     generations = ledger.get("generations", {})
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    latest_accepted: tuple[int, Mapping[str, Any]] | None = None
+
+    def damaged(
+        generation: int,
+        stage: str | None,
+        reason: str,
+    ) -> _WorkflowProgress:
+        return _WorkflowProgress(
+            "damaged",
+            max(0, generation - 1),
+            generation,
+            stage,
+            reason,
+        )
+
+    def projection_damage() -> _WorkflowProgress | None:
+        if latest_accepted is None:
+            return None
+        generation, record = latest_accepted
+        publication = record.get("publication")
+        if not isinstance(publication, Mapping):
+            return damaged(
+                generation,
+                None,
+                f"accepted generation {generation} uses the legacy result "
+                "projection and must be migrated by resume",
+            )
+        issues = workspace.publication_issues(
+            publication,
+            check_projection=True,
+        )
+        if issues:
+            return damaged(generation, None, "; ".join(issues))
+        return None
+
     for plan in plans:
         generation = int(plan["generation"])
         record = generations.get(str(generation))
@@ -558,12 +891,54 @@ def _workflow_progress(
                 )
             else:
                 completed.append(stage)
+                stage_record = stages[stage]
+                if not isinstance(stage_record, Mapping):
+                    return damaged(
+                        generation,
+                        stage,
+                        f"generation {generation} stage {stage} metadata is invalid",
+                    )
+                artifacts = stage_record.get("artifacts", {})
+                if not isinstance(artifacts, Mapping):
+                    return damaged(
+                        generation,
+                        stage,
+                        f"generation {generation} stage {stage} artifacts are invalid",
+                    )
+                for name, artifact_record in artifacts.items():
+                    if not isinstance(artifact_record, Mapping):
+                        return damaged(
+                            generation,
+                            stage,
+                            f"artifact {name} has invalid ledger metadata",
+                        )
+                    path = Path(str(artifact_record.get("path", "")))
+                    try:
+                        path.resolve().relative_to(workspace.root)
+                    except ValueError:
+                        return damaged(
+                            generation,
+                            stage,
+                            f"committed artifact path escapes the workflow: {path}",
+                        )
+                    if (
+                        not path.is_file()
+                        or _sha256(path) != artifact_record.get("sha256")
+                    ):
+                        return damaged(
+                            generation,
+                            stage,
+                            f"committed artifact drifted or is missing: {path}",
+                        )
         if len(completed) < len(_STAGES):
             if record.get("complete"):
                 raise WorkflowError(
                     "generation is marked complete before all stages finished"
                 )
             stage = _STAGES[len(completed)]
+            issue = projection_damage()
+            if issue is not None:
+                return issue
             return _WorkflowProgress(
                 "incomplete",
                 generation - 1,
@@ -576,6 +951,9 @@ def _workflow_progress(
                 f"generation {generation} has all stages but is not marked complete"
             )
         if record.get("accepted") is False:
+            issue = projection_damage()
+            if issue is not None:
+                return issue
             return _WorkflowProgress(
                 "rejected",
                 generation - 1,
@@ -587,6 +965,18 @@ def _workflow_progress(
             raise WorkflowError(
                 f"generation {generation} completion is missing accepted=true/false"
             )
+        publication = record.get("publication")
+        if isinstance(publication, Mapping):
+            issues = workspace.publication_issues(
+                publication,
+                check_projection=False,
+            )
+            if issues:
+                return damaged(generation, None, "; ".join(issues))
+        latest_accepted = (generation, record)
+    issue = projection_damage()
+    if issue is not None:
+        return issue
     return _WorkflowProgress(
         "complete",
         len(plans),
@@ -709,7 +1099,7 @@ def _scientific_progress(
     ledger: Mapping[str, Any] | None | object = _LEDGER_UNSET,
 ) -> tuple[Mapping[str, Any], ...]:
     plans = [
-        json.loads(Path(record["path"]).read_text(encoding="utf-8"))
+        _read_json(Path(record["path"]), role="generation plan")
         for record in manifest["plans"]
     ]
     generations: Mapping[str, Any] = {}
@@ -736,15 +1126,42 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
 
     workspace = WorkflowWorkspace.locate(preparation.output_dir)
     controller = (
-        json.loads(workspace.controller_file.read_text(encoding="utf-8"))
+        _read_json(workspace.controller_file, role="controller state")
         if workspace.controller_file.is_file()
         else {}
     )
+    history = controller.get("history", [])
+    current = controller.get("current")
+    if (
+        not isinstance(history, list)
+        or any(not isinstance(item, Mapping) for item in history)
+        or (current is not None and not isinstance(current, Mapping))
+        or not isinstance(controller.get("state", "prepared"), str)
+    ):
+        raise WorkflowError(
+            f"controller state is malformed: {workspace.controller_file}"
+        )
+    if ledger is None:
+        generation_evidence = any(
+            item.is_file() or item.is_symlink()
+            for item in workspace.generations_dir.rglob("*")
+        )
+        accepted_evidence = any(
+            (workspace.results_dir / "accepted").iterdir()
+        )
+        if history or generation_evidence or accepted_evidence:
+            progress = _WorkflowProgress(
+                "damaged",
+                0,
+                1,
+                None,
+                "scientific ledger is missing while workflow result or "
+                "execution evidence still exists",
+            )
     active = controller_running(workspace.root)
     controller_state = str(controller.get("state", "prepared"))
-    current = controller.get("current")
     jobs = []
-    for item in controller.get("history", []):
+    for item in history:
         if item.get("completed_at"):
             execution_state = "COMPLETED"
         elif item.get("cancelled_at"):
@@ -779,9 +1196,23 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         )
         for task_record in task_records:
             handle = task_record.get("handle") or {}
-            observed = str(
-                task_record.get("observed_state", controller_state)
-            ).upper()
+            cancellation = task_record.get("cancellation") or {}
+            if task_record.get("collected_bundle"):
+                observed = "COMPLETED"
+            elif cancellation.get("action") in {
+                "cancelled",
+                "failed",
+                "cancelled_before_launch",
+            }:
+                observed = "CANCELLED"
+            elif cancellation:
+                observed = "CANCELLING"
+            elif task_record.get("terminal_failure"):
+                observed = "FAILED"
+            else:
+                observed = str(
+                    task_record.get("observed_state", controller_state)
+                ).upper()
             jobs.append(
                 {
                     "attempt": f"attempt-{current.get('attempt', 1)}",
@@ -793,7 +1224,8 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                     "dependency": None,
                     "state": observed,
                     "current": True,
-                    "detail": task_record.get("detail"),
+                    "detail": task_record.get("detail")
+                    or cancellation.get("detail"),
                 }
             )
 
@@ -801,9 +1233,23 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
     state = progress.state
     reason = progress.reason
     workflow_path = shlex.quote(str(preparation.output_dir))
-    if controller_state == "complete":
-        state = "complete"
-        reason = str(controller.get("reason", "workflow trust envelope converged"))
+    if progress.state == "damaged":
+        state = "damaged"
+        reason = progress.reason
+        next_action = f"neptrain workflow resume {workflow_path}"
+    elif controller_state == "complete":
+        if progress.state != "complete":
+            state = "damaged"
+            reason = (
+                "controller says complete but the scientific ledger is "
+                f"{progress.state}: {progress.reason}"
+            )
+            next_action = f"neptrain workflow resume {workflow_path}"
+        else:
+            state = "complete"
+            reason = str(
+                controller.get("reason", "workflow trust envelope converged")
+            )
     elif controller_state == "budget_exhausted":
         state = "budget_exhausted"
         reason = str(
@@ -862,13 +1308,142 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
     )
 
 
+def _repair_damaged_workflow(preparation: WorkflowPreparation) -> tuple[str, ...]:
+    """Restore hash-identical committed files and rebuild derived projections."""
+
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    ledger = _read_workflow_ledger(preparation)
+    if ledger is None:
+        return ()
+
+    candidates: dict[str, list[Path]] = {}
+
+    def add_candidate(path: Path, expected: Any) -> None:
+        sha256 = str(expected)
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(workspace.root)
+        except (OSError, ValueError):
+            return
+        if resolved.is_file():
+            candidates.setdefault(sha256, []).append(resolved)
+
+    for result_path in workspace.tasks_dir.glob("*/result.json"):
+        try:
+            result = _read_json(result_path, role="stage result")
+        except WorkflowError:
+            continue
+        artifacts = result.get("artifacts", {})
+        if not isinstance(artifacts, Mapping):
+            continue
+        for record in artifacts.values():
+            if not isinstance(record, Mapping):
+                continue
+            relative = Path(str(record.get("path", "")))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            add_candidate(result_path.parent / relative, record.get("sha256"))
+
+    accepted_root = workspace.results_dir / "accepted"
+    for publication_path in accepted_root.glob("*/publication.json"):
+        try:
+            publication = _read_json(
+                publication_path,
+                role="accepted publication",
+            )
+        except WorkflowError:
+            continue
+        files = publication.get("files", {})
+        if not isinstance(files, Mapping):
+            continue
+        for record in files.values():
+            if not isinstance(record, Mapping):
+                continue
+            relative = Path(str(record.get("path", "")))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            add_candidate(
+                publication_path.parent / relative,
+                record.get("sha256"),
+            )
+
+    repaired = []
+    damaged_root = (
+        workspace.internal_dir
+        / "damaged"
+        / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    )
+    generations = ledger.get("generations", {})
+    for generation in generations.values():
+        if not isinstance(generation, Mapping):
+            continue
+        stages = generation.get("stages", {})
+        if not isinstance(stages, Mapping):
+            continue
+        for stage in stages.values():
+            if not isinstance(stage, Mapping):
+                continue
+            artifacts = stage.get("artifacts", {})
+            if not isinstance(artifacts, Mapping):
+                continue
+            for record in artifacts.values():
+                if not isinstance(record, Mapping):
+                    continue
+                destination = Path(str(record.get("path", "")))
+                expected = str(record.get("sha256", ""))
+                try:
+                    destination.parent.resolve().relative_to(workspace.root)
+                    relative_destination = destination.absolute().relative_to(
+                        workspace.root
+                    )
+                except (OSError, ValueError):
+                    continue
+                if destination.is_file() and _sha256(destination) == expected:
+                    continue
+                source = next(
+                    (
+                        item
+                        for item in candidates.get(expected, [])
+                        if item.is_file() and _sha256(item) == expected
+                    ),
+                    None,
+                )
+                if source is None:
+                    continue
+                if destination.exists() or destination.is_symlink():
+                    quarantine = damaged_root / relative_destination
+                    quarantine.parent.mkdir(parents=True, exist_ok=True)
+                    destination.replace(quarantine)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary = destination.with_suffix(destination.suffix + ".repair")
+                shutil.copy2(source, temporary)
+                temporary.replace(destination)
+                if _sha256(destination) != expected:
+                    raise WorkflowError(
+                        f"restored artifact failed its ledger hash: {destination}"
+                    )
+                repaired.append(str(destination))
+
+    # GenerationController owns the ledger lock and the publication protocol.
+    # Calling next_stage on completed generations is an idempotent projection
+    # repair; it cannot accept a new scientific result.
+    from .controller import PersistentController
+
+    controller = PersistentController(preparation.output_dir)
+    for plan in controller.plans:
+        record = ledger.get("generations", {}).get(str(plan.generation), {})
+        if isinstance(record, Mapping) and record.get("complete"):
+            controller.generation_controller.next_stage(plan)
+    return tuple(repaired)
+
+
 def resume_workflow(
     output_dir: str | Path,
     *,
     foreground: bool = False,
     poll_interval: float | None = None,
 ) -> WorkflowResume:
-    """Resume one prepared controller workflow."""
+    """Recover one workflow that has already been started."""
 
     output = Path(output_dir).expanduser().resolve()
     preparation = _coerce_preparation(output)
@@ -885,16 +1460,59 @@ def resume_workflow(
             "complete",
             preparation.manifest,
         )
+    if status.state == "prepared":
+        raise WorkflowError(
+            "workflow has not been started; use "
+            f"neptrain workflow run {shlex.quote(str(output))}"
+        )
+    if status.state == "budget_exhausted":
+        raise WorkflowError(
+            "workflow exhausted its model-generation budget; use "
+            f"neptrain workflow extend {shlex.quote(str(output))} "
+            f"{len(preparation.plans) + 1}"
+        )
+    if status.state == "stalled":
+        raise WorkflowError(
+            "workflow is scientifically stalled; unchanged execution cannot "
+            "make progress. Inspect the accepted generation and revise the "
+            "sampling or evaluation policy before creating a new workflow"
+        )
     if controller_running(output):
         raise WorkflowError("workflow is already running")
+    if status.state == "damaged":
+        repair_error = None
+        try:
+            _repair_damaged_workflow(preparation)
+        except Exception as error:
+            repair_error = str(error)
+        repaired_status = workflow_status(output)
+        if repaired_status.state == "damaged":
+            detail = repaired_status.reason
+            if repair_error:
+                detail += f"; repair attempt failed: {repair_error}"
+            raise WorkflowError(
+                "workflow has authoritative damage and resume was refused "
+                f"before launching work: {detail}. Restore the missing files "
+                "from backup or create a new workflow"
+            )
+        status = repaired_status
+        if status.state == "complete":
+            return WorkflowResume(
+                preparation.workflow_id,
+                "repair",
+                preparation.manifest,
+            )
     controller = PersistentController(output)
-    action = "start" if status.state == "prepared" else "resume"
+    action = "resume"
     if status.state == "failed":
         controller.retry()
         action = "retry"
     elif status.state == "rejected":
         controller.retry(recover_rejected=True)
         action = "recover_rejected"
+    elif status.state == "paused":
+        controller.resume_stopped()
+        action = "resume"
     try:
         controller_result = start_controller(
             output,
@@ -912,6 +1530,52 @@ def resume_workflow(
     )
 
 
+def start_workflow(
+    output_dir: str | Path,
+    *,
+    foreground: bool = False,
+    poll_interval: float | None = None,
+) -> WorkflowResume:
+    """Start exactly one prepared workflow and reject recovery states."""
+
+    output = Path(output_dir).expanduser().resolve()
+    preparation = _coerce_preparation(output)
+    status = workflow_status(output)
+    if status.state != "prepared":
+        if status.state == "complete":
+            next_action = f"neptrain workflow status {shlex.quote(str(output))}"
+        elif status.state == "budget_exhausted":
+            next_action = (
+                f"neptrain workflow extend {shlex.quote(str(output))} "
+                f"{len(preparation.plans) + 1}"
+            )
+        else:
+            next_action = f"neptrain workflow resume {shlex.quote(str(output))}"
+        raise WorkflowError(
+            f"workflow run only starts a prepared workflow; current state is "
+            f"{status.state}. Use {next_action}"
+        )
+    from .controller import controller_running, start_controller
+
+    if controller_running(output):
+        raise WorkflowError("workflow is already running")
+    try:
+        controller_result = start_controller(
+            output,
+            foreground=foreground,
+            poll_interval=poll_interval,
+        )
+    except Exception as error:
+        raise WorkflowError(str(error)) from error
+    return WorkflowResume(
+        preparation.workflow_id,
+        "start",
+        preparation.manifest,
+        controller_pid=None if foreground else controller_result,
+        controller_exit_code=controller_result if foreground else None,
+    )
+
+
 __all__ = [
     "WorkflowError",
     "WorkflowPreparation",
@@ -921,4 +1585,5 @@ __all__ = [
     "extend_workflow",
     "prepare_workflow",
     "resume_workflow",
+    "start_workflow",
 ]

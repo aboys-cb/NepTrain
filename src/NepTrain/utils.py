@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Generator, Union
 
 from ase.io import read as ase_read
-from rich import get_console
+from rich.console import Console
 from rich.progress import track
+
+_diagnostic_console = Console(stderr=True)
 
 #前面几个0是为了让元素编号和索引对的上 避免了见一
 radius_table = {'H': 0.31, 'He': 0.28, 'Li': 1.28, 'Be': 0.96,
@@ -52,7 +54,7 @@ radius_table = {'H': 0.31, 'He': 0.28, 'Li': 1.28, 'Be': 0.96,
 
 def print(*msg, **kwargs):
 
-    get_console().print(f"[{datetime.datetime.now().strftime( '%Y-%m-%d %H:%M:%S' )}] -- ",*msg, **kwargs)
+    _diagnostic_console.print(f"[{datetime.datetime.now().strftime( '%Y-%m-%d %H:%M:%S' )}] -- ",*msg, **kwargs)
 
 
 def print_warning(*msg):
@@ -184,6 +186,7 @@ def iter_path_to_atoms(glob_strs: list,show_progress=True,fail_fast=False,**kkwa
                 print_warning(f"Structure file not found: {path}")
                 return result
             if show_progress:
+                kkwargs.setdefault("console", _diagnostic_console)
                 iter_obj=track(filter_path_list,
                               **kkwargs
                               )

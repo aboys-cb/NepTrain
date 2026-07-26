@@ -5,7 +5,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.io import write as ase_write
 
 from NepTrain.cli.cli import (
     run_project_command,
@@ -19,6 +23,7 @@ from NepTrain.core.workflow import (
     extend_workflow,
     prepare_workflow,
     resume_workflow,
+    start_workflow,
 )
 from NepTrain.core.workflow_workspace import WorkflowWorkspace
 
@@ -29,12 +34,33 @@ def _write(path: Path, text: str = "fixture\n") -> Path:
     return path
 
 
+def _write_labeled(path: Path) -> Path:
+    atoms = Atoms(
+        "Fe",
+        positions=[[0.0, 0.0, 0.0]],
+        cell=[4.0, 4.0, 4.0],
+        pbc=True,
+    )
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=-1.0,
+        forces=np.zeros((1, 3)),
+    )
+    atoms.info["virial"] = np.zeros((3, 3))
+    ase_write(path, atoms, format="extxyz")
+    return path
+
+
 def _inputs(tmp_path: Path) -> tuple[Path, Path]:
-    initial = _write(tmp_path / "initial.xyz")
+    initial = _write_labeled(tmp_path / "initial.xyz")
     _write(tmp_path / "nep.in")
-    _write(tmp_path / "structure.xyz")
+    ase_write(
+        tmp_path / "structure.xyz",
+        Atoms("Fe", positions=[[0.0, 0.0, 0.0]]),
+        format="extxyz",
+    )
     _write(tmp_path / "lammps.in", "run {{ steps }}\n")
-    _write(tmp_path / "validation.xyz")
+    _write_labeled(tmp_path / "validation.xyz")
     _write(tmp_path / "gpu-env.sh", "module load cuda\n")
     _write(tmp_path / "cpu-env.sh", "module load lammps\n")
     _write(tmp_path / "dft-env.sh", "module load vasp\n")
@@ -137,7 +163,8 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert all(path.parent == workspace.plans_dir for path in result.plans)
     assert workspace.tasks_dir.is_dir()
     manifest = json.loads(result.manifest.read_text())
-    assert manifest["version"] == 5
+    assert manifest["version"] == 6
+    assert len(manifest["instance_id"]) == 32
     assert manifest["orchestration"] == "controller"
     assert "scripts" not in manifest
 
@@ -168,10 +195,48 @@ def test_prepare_only_cli_does_not_start_controller(tmp_path: Path, capsys):
         )
     )
     payload = json.loads(capsys.readouterr().out)
+    assert payload["protocol"] == "neptrain.workflow-control.v1"
     assert payload["project"] == str(output)
-    assert payload["started"] is False
+    assert payload["action"] == "prepare"
+    assert "started" not in payload
     assert payload["next_action"] == f"neptrain workflow run {output}"
     assert not (output / ".neptrain/controller.pid").exists()
+
+
+def test_project_run_uses_the_same_control_schema_as_directory_run(
+    tmp_path: Path, monkeypatch, capsys
+):
+    config, _ = _inputs(tmp_path)
+    output = tmp_path / "project"
+
+    def fake_start(path, *, foreground=False, poll_interval=None):
+        assert Path(path) == output
+        assert foreground is False
+        assert poll_interval is None
+        return 123
+
+    monkeypatch.setattr("NepTrain.core.controller.start_controller", fake_start)
+    run_project_command(
+        SimpleNamespace(
+            project=str(config),
+            initial_training=str(tmp_path / "initial.xyz"),
+            output=str(output),
+            workflow_id=None,
+            prepare_only=False,
+            foreground=False,
+            poll_interval=None,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "action": "start",
+        "controller_pid": 123,
+        "manifest": str(output / ".neptrain/manifest.json"),
+        "project": str(output),
+        "protocol": "neptrain.workflow-control.v1",
+        "workflow_id": "controller-smoke",
+    }
 
 
 def test_status_reports_prepared_controller_without_mutation(tmp_path: Path):
@@ -249,17 +314,51 @@ def test_completed_workflow_extends_plans(tmp_path: Path):
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     original = [path.read_bytes() for path in preparation.plans]
     generations = {}
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
     for path in preparation.plans:
         plan = json.loads(path.read_text())
-        generations[str(plan["generation"])] = {
+        generation = int(plan["generation"])
+        artifacts = {}
+        for name in ("activated_model", "training_set", "signals"):
+            artifact = (
+                workspace.generation_dir(generation) / "fixture" / f"{name}.dat"
+            )
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text(
+                f"generation {generation} {name}\n",
+                encoding="utf-8",
+            )
+            artifacts[name] = {
+                "path": str(artifact),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+        record = {
             "plan_sha256": _hash(plan),
-            "stages": {stage: {} for stage in (
-                "train", "explore", "select", "label", "diagnose", "merge", "retrain", "evaluate"
-            )},
+            "stages": {
+                "train": {},
+                "explore": {},
+                "select": {},
+                "label": {},
+                "diagnose": {},
+                "merge": {"artifacts": {"training_set": artifacts["training_set"]}},
+                "retrain": {},
+                "evaluate": {
+                    "artifacts": {
+                        "signals": artifacts["signals"],
+                        "activated_model": artifacts["activated_model"],
+                    },
+                    "metrics": {"accepted": True},
+                },
+            },
             "complete": True,
             "accepted": True,
         }
-    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+        record["publication"] = workspace.prepare_generation_publication(
+            generation,
+            record,
+        )
+        workspace.activate_generation(generation, record)
+        generations[str(generation)] = record
     workspace.ledger.write_text(
         json.dumps({"version": 1, "workflow_id": preparation.workflow_id, "generations": generations}),
         encoding="utf-8",
@@ -289,6 +388,49 @@ def test_workflow_rejects_prepared_input_drift(tmp_path: Path):
         workflow_status(preparation.output_dir)
 
 
+def test_prepare_rejects_invalid_training_labels_before_any_task_exists(tmp_path):
+    config, initial = _inputs(tmp_path)
+    initial.write_text("not extxyz\n", encoding="utf-8")
+
+    with pytest.raises(WorkflowError, match="initial training dataset is invalid"):
+        prepare_workflow(config, initial, tmp_path / "workflow")
+    assert not (tmp_path / "workflow").exists()
+
+
+def test_prepare_rejects_sampling_spin_mode_mismatch(tmp_path):
+    config, initial = _inputs(tmp_path)
+    spin_frame = Atoms(
+        "Fe",
+        positions=[[0.0, 0.0, 0.0]],
+        cell=[4.0, 4.0, 4.0],
+        pbc=True,
+    )
+    spin_frame.set_array("spin", np.asarray([[1.0, 0.0, 0.0]]))
+    ase_write(tmp_path / "structure.xyz", spin_frame, format="extxyz")
+
+    with pytest.raises(WorkflowError, match="must all be ordinary.*md.spin"):
+        prepare_workflow(config, initial, tmp_path / "workflow")
+
+
+def test_status_reports_corrupt_controller_metadata_without_traceback(
+    tmp_path: Path,
+):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    workspace.controller_file.write_text(
+        '{"state": "idle", "history": "not-a-list"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowError, match="controller state is malformed"):
+        workflow_status(preparation.output_dir)
+
+    workspace.controller_file.write_text("{", encoding="utf-8")
+    with pytest.raises(WorkflowError, match="cannot read controller state JSON"):
+        workflow_status(preparation.output_dir)
+
+
 def test_run_starts_existing_prepared_workflow_directory(
     tmp_path: Path, monkeypatch, capsys
 ):
@@ -301,13 +443,13 @@ def test_run_starts_existing_prepared_workflow_directory(
         controller_pid=123,
     )
 
-    def fake_resume(path, *, foreground=False, poll_interval=None):
+    def fake_start(path, *, foreground=False, poll_interval=None):
         assert Path(path) == preparation.output_dir
         assert foreground is False
         assert poll_interval is None
         return expected
 
-    monkeypatch.setattr("NepTrain.core.workflow.resume_workflow", fake_resume)
+    monkeypatch.setattr("NepTrain.core.workflow.start_workflow", fake_start)
     run_project_command(
         SimpleNamespace(
             project=str(preparation.output_dir),
@@ -321,7 +463,9 @@ def test_run_starts_existing_prepared_workflow_directory(
     )
 
     payload = json.loads(capsys.readouterr().out)
+    assert payload["protocol"] == "neptrain.workflow-control.v1"
     assert payload["action"] == "start"
+    assert payload["project"] == str(preparation.output_dir)
     assert payload["controller_pid"] == 123
     assert payload["manifest"] == str(preparation.manifest)
 
@@ -364,7 +508,9 @@ def test_resume_command_uses_existing_workflow_interface(
     run_resume_command(SimpleNamespace(project=str(preparation.output_dir)))
 
     payload = json.loads(capsys.readouterr().out)
+    assert payload["protocol"] == "neptrain.workflow-control.v1"
     assert payload["action"] == "resume"
+    assert payload["project"] == str(preparation.output_dir)
     assert payload["controller_pid"] == 123
     assert "job_ids" not in payload
 
@@ -385,17 +531,27 @@ def test_resume_completed_workflow_is_an_idempotent_noop(
     assert result.controller_pid is None
 
 
-def test_resume_prepared_workflow_reports_start_action(
+def test_resume_prepared_workflow_requires_run(
+    tmp_path: Path, monkeypatch
+):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    with pytest.raises(WorkflowError, match="has not been started.*workflow run"):
+        resume_workflow(preparation.output_dir)
+
+
+def test_run_rejects_a_recovery_state_and_points_to_resume(
     tmp_path: Path, monkeypatch
 ):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     monkeypatch.setattr(
-        "NepTrain.core.controller.start_controller",
-        lambda *_args, **_kwargs: 123,
+        "NepTrain.core.workflow.workflow_status",
+        lambda _path: SimpleNamespace(state="failed"),
     )
 
-    result = resume_workflow(preparation.output_dir)
-
-    assert result.action == "start"
-    assert result.controller_pid == 123
+    with pytest.raises(
+        WorkflowError,
+        match=r"run only starts a prepared workflow.*workflow resume",
+    ):
+        start_workflow(preparation.output_dir)

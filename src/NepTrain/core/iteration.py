@@ -396,13 +396,43 @@ class GenerationController:
         accepted = metrics["evaluate"].get("accepted")
         if not isinstance(accepted, bool):
             raise IterationError("evaluate stage must report an accepted boolean")
+        changed = False
         if generation_record.get("complete"):
             if generation_record.get("accepted") is not accepted:
                 raise IterationError("generation acceptance does not match evaluate stage")
-            return None
-        generation_record["accepted"] = accepted
-        generation_record["complete"] = True
-        self._write(self._ledger)
+        else:
+            generation_record["accepted"] = accepted
+            generation_record["complete"] = True
+            changed = True
+        if self.workspace is not None and accepted:
+            try:
+                publication = (
+                    self.workspace.prepare_generation_publication(
+                        plan.generation,
+                        generation_record,
+                    )
+                )
+            except (OSError, ValueError) as error:
+                raise IterationError(
+                    f"cannot prepare generation {plan.generation} publication: "
+                    f"{error}"
+                ) from error
+            if generation_record.get("publication") != publication:
+                generation_record["publication"] = publication
+                changed = True
+        if changed:
+            self._write(self._ledger)
+        if self.workspace is not None:
+            try:
+                self.workspace.activate_generation(
+                    plan.generation,
+                    generation_record,
+                )
+            except (OSError, ValueError) as error:
+                raise IterationError(
+                    f"generation {plan.generation} is committed but its results "
+                    f"projection needs repair: {error}"
+                ) from error
         return None
 
     def next_stage(self, plan: GenerationPlan) -> str | None:
@@ -456,6 +486,88 @@ class GenerationController:
             context.work_dir.mkdir(parents=True, exist_ok=True)
             return requested, context
 
+    def _commit_outcome(
+        self,
+        plan: GenerationPlan,
+        stage: str,
+        outcome: StageOutcome,
+    ) -> StageSummary:
+        expected = self._next_stage(plan)
+        if expected is None:
+            raise IterationError(f"generation {plan.generation} is already complete")
+        if stage != expected:
+            raise IterationError(
+                f"generation {plan.generation} expects stage {expected}, not {stage}"
+            )
+        generation_record, _, artifacts, _, _ = self._generation_state(plan)
+        overlap = set(artifacts).intersection(outcome.artifacts)
+        if overlap:
+            raise IterationError(f"duplicate artifact names: {sorted(overlap)}")
+        artifact_records = {}
+        resolved_artifacts = {}
+        for name, raw_path in outcome.artifacts.items():
+            path = Path(raw_path).expanduser().resolve()
+            if not path.is_file():
+                raise IterationError(
+                    f"stage {stage} did not produce artifact {path}"
+                )
+            artifact_records[name] = {
+                "path": str(path),
+                "sha256": _file_hash(path),
+            }
+            resolved_artifacts[name] = path
+        stage_record = {
+            "artifacts": artifact_records,
+            "metrics": dict(outcome.metrics),
+        }
+        generation_record["stages"][stage] = stage_record
+        complete = stage == STAGES[-1]
+        accepted = None
+        if complete:
+            accepted = stage_record["metrics"].get("accepted")
+            if not isinstance(accepted, bool):
+                raise IterationError(
+                    "evaluate stage must report an accepted boolean"
+                )
+            generation_record["accepted"] = accepted
+            generation_record["complete"] = True
+            if self.workspace is not None and accepted:
+                try:
+                    generation_record["publication"] = (
+                        self.workspace.prepare_generation_publication(
+                            plan.generation,
+                            generation_record,
+                        )
+                    )
+                except (OSError, ValueError) as error:
+                    raise IterationError(
+                        f"cannot prepare generation {plan.generation} "
+                        f"publication: {error}"
+                    ) from error
+
+        # The ledger is the commit point.  Human-facing links are derived
+        # projections and are switched only after this atomic write.
+        self._write(self._ledger)
+        if complete and self.workspace is not None:
+            try:
+                self.workspace.activate_generation(
+                    plan.generation,
+                    generation_record,
+                )
+            except (OSError, ValueError) as error:
+                raise IterationError(
+                    f"generation {plan.generation} is committed but its results "
+                    f"projection needs repair: {error}"
+                ) from error
+        return StageSummary(
+            generation=plan.generation,
+            stage=stage,
+            artifacts=resolved_artifacts,
+            metrics=stage_record["metrics"],
+            generation_complete=complete,
+            accepted=accepted,
+        )
+
     def commit_stage(
         self, plan: GenerationPlan, stage: str, outcome: StageOutcome
     ) -> StageSummary:
@@ -463,66 +575,7 @@ class GenerationController:
 
         with self._lock():
             self._ledger = self._load()
-            expected = self._next_stage(plan)
-            if expected is None:
-                raise IterationError(f"generation {plan.generation} is already complete")
-            if stage != expected:
-                raise IterationError(
-                    f"generation {plan.generation} expects stage {expected}, not {stage}"
-                )
-            generation_record, _, artifacts, _, _ = self._generation_state(plan)
-            overlap = set(artifacts).intersection(outcome.artifacts)
-            if overlap:
-                raise IterationError(f"duplicate artifact names: {sorted(overlap)}")
-            artifact_records = {}
-            resolved_artifacts = {}
-            for name, raw_path in outcome.artifacts.items():
-                path = Path(raw_path).expanduser().resolve()
-                if not path.is_file():
-                    raise IterationError(
-                        f"stage {stage} did not produce artifact {path}"
-                    )
-                artifact_records[name] = {
-                    "path": str(path),
-                    "sha256": _file_hash(path),
-                }
-                resolved_artifacts[name] = path
-            stage_record = {
-                "artifacts": artifact_records,
-                "metrics": dict(outcome.metrics),
-            }
-            generation_record["stages"][stage] = stage_record
-            complete = stage == STAGES[-1]
-            accepted = None
-            if complete:
-                accepted = stage_record["metrics"].get("accepted")
-                if not isinstance(accepted, bool):
-                    raise IterationError(
-                        "evaluate stage must report an accepted boolean"
-                    )
-                generation_record["accepted"] = accepted
-                generation_record["complete"] = True
-                if self.workspace is not None:
-                    try:
-                        self.workspace.publish_generation(
-                            plan.generation, generation_record
-                        )
-                    except (OSError, ValueError) as error:
-                        generation_record.pop("complete", None)
-                        generation_record.pop("accepted", None)
-                        generation_record["stages"].pop(stage, None)
-                        raise IterationError(
-                            f"cannot publish generation {plan.generation}: {error}"
-                        ) from error
-            self._write(self._ledger)
-            return StageSummary(
-                generation=plan.generation,
-                stage=stage,
-                artifacts=resolved_artifacts,
-                metrics=stage_record["metrics"],
-                generation_complete=complete,
-                accepted=accepted,
-            )
+            return self._commit_outcome(plan, stage, outcome)
 
     def run_stage(
         self,
@@ -571,57 +624,10 @@ class GenerationController:
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
             outcome = adapter.run_stage(requested, context)
-            # Direct execution keeps the lock for its whole stage, preserving
-            # the historical single-process contract.  External controllers
-            # use ``stage_context`` + ``commit_stage`` instead.
-            overlap = set(artifacts).intersection(outcome.artifacts)
-            if overlap:
-                raise IterationError(f"duplicate artifact names: {sorted(overlap)}")
-            artifact_records = {}
-            resolved_artifacts = {}
-            for name, raw_path in outcome.artifacts.items():
-                path = Path(raw_path).expanduser().resolve()
-                if not path.is_file():
-                    raise IterationError(
-                        f"stage {requested} did not produce artifact {path}"
-                    )
-                artifact_records[name] = {
-                    "path": str(path),
-                    "sha256": _file_hash(path),
-                }
-                resolved_artifacts[name] = path
-            stage_record = {
-                "artifacts": artifact_records,
-                "metrics": dict(outcome.metrics),
-            }
-            generation_record["stages"][requested] = stage_record
-            complete = requested == STAGES[-1]
-            accepted = None
-            if complete:
-                accepted = stage_record["metrics"].get("accepted")
-                if not isinstance(accepted, bool):
-                    raise IterationError("evaluate stage must report an accepted boolean")
-                generation_record["accepted"] = accepted
-                generation_record["complete"] = True
-                if self.workspace is not None:
-                    try:
-                        self.workspace.publish_generation(plan.generation, generation_record)
-                    except (OSError, ValueError) as error:
-                        generation_record.pop("complete", None)
-                        generation_record.pop("accepted", None)
-                        generation_record["stages"].pop(requested, None)
-                        raise IterationError(
-                            f"cannot publish generation {plan.generation}: {error}"
-                        ) from error
-            self._write(self._ledger)
-            return StageSummary(
-                generation=plan.generation,
-                stage=requested,
-                artifacts=resolved_artifacts,
-                metrics=stage_record["metrics"],
-                generation_complete=complete,
-                accepted=accepted,
-            )
+            # Direct execution keeps the lock for its whole stage.  External
+            # controllers use ``stage_context`` + ``commit_stage`` and share
+            # the same commit primitive below.
+            return self._commit_outcome(plan, requested, outcome)
 
     def reopen_rejected(
         self, plan: GenerationPlan, *, from_stage: str = "retrain"

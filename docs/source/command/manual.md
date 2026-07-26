@@ -50,12 +50,42 @@ neptrain dft candidates.xyz \
   --backend vasp \
   --input-file INCAR \
   --resources /shared/potpaw_PBE \
+  --potcar-manifest vasp-resources.json \
   --project project.yaml \
   --target dft \
   --structures-per-job 1 \
   --max-concurrent 20 \
   -o labeled.xyz
 ```
+
+`--resources` 只给出资源根目录，不足以锁定赝势版本。VASP 还必须提供
+`--potcar-manifest`；ABACUS 必须提供 `--resource-manifest`。manifest 逐文件记录
+相对路径和 SHA256，VASP 还记录精确 `TITEL`、family 和 release。例如：
+
+```json
+{
+  "protocol": "neptrain.vasp-resources.v1",
+  "family": "PBE",
+  "release": "2025-01",
+  "elements": {
+    "Fe": {
+      "path": "Fe_pv/POTCAR",
+      "sha256": "<64 hex characters>",
+      "titel": "PAW_PBE Fe_pv 02Aug2007"
+    }
+  }
+}
+```
+
+本地 target 在 prepare 时校验真实文件；远程 target 必须在
+`execution.targets.<name>.dft_resource_path` 写目标机绝对路径，并先运行
+`neptrain doctor --project project.yaml`。worker 在真正启动 DFT 前会再校验一次。
+VASP 路径只接受 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这样的单层 setup 目录，并由
+NepTrain 显式写入 ASE `setups`；不会校验 manifest 中的一个文件，却让 ASE
+按默认规则读取另一个文件。
+VASP 的 `ISPIN=2` 只表示共线自旋极化电子计算，结果仍是普通
+energy/force/virial 标签并记录 `dft_electronic_mode`；它不会生成
+`spin/mforce`。非共线、SOC 或真正的 spin-force 标注必须使用 ABACUS DeltaSpin。
 
 任务提交后通过统一 task 命令管理：
 
@@ -66,6 +96,18 @@ neptrain task wait runs/dft-...
 neptrain task retry runs/dft-...
 neptrain task cancel runs/dft-...
 ```
+
+- `status` 只做一次有界查询和收集，不会永久等待。
+- `wait` 持续轮询到终态，并在状态变化时把进度写到 stderr。
+- `cancel` 取消当前 Slurm attempt，不删除已完成且校验通过的 shard。
+- `retry` 归档旧 metadata，创建新 attempt，只提交失败、取消、缺失或损坏的
+  shard。
+- `logs` 获取日志，不改变 operation 或 scheduler 状态。
+
+作业从 `prepared/submitted/running/cancelling` 进入
+`complete/failed/cancelled/damaged`。作业已从 `squeue` 消失时会继续查询
+`sacct`；在有界 accounting grace 之后仍不可见才标记 `LOST` 并允许 retry，
+不会无限显示 RUNNING。
 
 手动任务目录只保留两层用户可见结构：
 
@@ -99,6 +141,11 @@ neptrain dft candidates.xyz --project project.yaml --target dft --json
 neptrain task status runs/dft-... --json
 ```
 
+上传、提交、排队、运行、收集和合并进度只写 stderr。`--json` 的 stdout 只有
+一个对象；状态使用 `neptrain.manual-status.v1`，日志使用
+`neptrain.manual-logs.v1`。字段 `state`、`completed`、`failed`、`total`、
+`jobs`、`errors`、`result` 和 `next_action` 是面向脚本的接口。
+
 只有全部 shard 成功后才会发布最终输出；已有输出默认拒绝覆盖，确认替换时使用
 `--force`。
 同一集群共享文件系统上的 array 会自动完成发布；跨平台任务由 `task status` 或
@@ -111,3 +158,9 @@ neptrain task status runs/dft-... --json
 `NEPTRAIN_VASP_COMMAND`（或对应的 `NEPTRAIN_ABACUS_COMMAND`、
 `NEPTRAIN_NEP_COMMAND`、`NEPTRAIN_GPUMD_COMMAND`）写入 target 的
 `environment`。
+
+`operation.json` 是手动任务身份、输入 manifest、shard 顺序和 attempt 列表的
+权威；`jobs/<index>/execution.json` 只记录运行态，`result.json` 固定所属
+operation、结构顺序和 artifact hash。最终文件只在全部 shard 均通过该契约后
+原子发布。损坏 `execution.json`、缺少 `result.json` 或顺序不一致都会显示为
+可诊断失败，不会把部分 `labeled.xyz` 当成完整结果。

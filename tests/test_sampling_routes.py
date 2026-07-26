@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
@@ -268,7 +270,19 @@ def test_preparation_reuses_identical_routes_and_rejects_template_drift(
     structure = tmp_path / "structure.xyz"
     template = tmp_path / "route.in"
     training_config = tmp_path / "nep.in"
-    ase_write(initial, Atoms("Fe", positions=[[0, 0, 0]]))
+    initial_frame = Atoms(
+        "Fe",
+        positions=[[0, 0, 0]],
+        cell=[4, 4, 4],
+        pbc=True,
+    )
+    initial_frame.calc = SinglePointCalculator(
+        initial_frame,
+        energy=-1.0,
+        forces=np.zeros((1, 3)),
+    )
+    initial_frame.info["virial"] = np.zeros((3, 3))
+    ase_write(initial, initial_frame, format="extxyz")
     ase_write(structure, Atoms("Fe", positions=[[0, 0, 0]]))
     template.write_text("run {{ steps }}\n", encoding="utf-8")
     training_config.write_text("type 1 Fe\n", encoding="utf-8")

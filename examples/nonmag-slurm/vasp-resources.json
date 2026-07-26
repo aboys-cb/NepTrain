@@ -1,0 +1,12 @@
+{
+  "elements": {
+    "Fe": {
+      "path": "Fe/POTCAR",
+      "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS",
+      "titel": "REPLACE_WITH_EXACT_TITEL_VALUE"
+    }
+  },
+  "family": "PAW_PBE",
+  "protocol": "neptrain.vasp-resources.v1",
+  "release": "REPLACE_WITH_DISTRIBUTION_RELEASE"
+}

@@ -12,8 +12,10 @@ import ase
 import numpy as np
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.calculators.vasp import Vasp
 
 from .io import VaspInput
+from .resources import validate_vasp_resources
 
 
 class NativeVaspError(RuntimeError):
@@ -24,6 +26,7 @@ class NativeVaspError(RuntimeError):
 class NativeVaspRequest:
     work_dir: Path
     resource_dir: Path
+    resource_manifest: Path
     command: str
     input_file: Path
     use_gamma: bool
@@ -38,23 +41,32 @@ def run_native_vasp(
 ) -> Atoms:
     """Run one fresh VASP single-point attempt and return a portable frame."""
 
-    if "spin" in atoms.arrays:
-        raise NativeVaspError(
-            "VASP production labeling currently supports non-magnetic structures only"
-        )
+    electronic_mode = None
     case_dir = _new_attempt_directory(
         request.work_dir,
         case_index,
         atoms.get_chemical_formula(),
         flat_single_case=request.flat_single_case,
     )
+    resource_provenance = None
     try:
+        resource_provenance = validate_vasp_resources(
+            request.resource_dir,
+            request.resource_manifest,
+            atoms,
+        )
         calculator = VaspInput(pp_path=request.resource_dir)
         calculator.read_incar(request.input_file)
-        _validate_single_point_input(calculator)
+        electronic_mode = _validate_single_point_input(calculator)
+        validate_vasp_structure(atoms, electronic_mode=electronic_mode)
         settings = {
             "directory": str(case_dir),
             "command": request.command,
+            "pp": "",
+            "setups": {
+                "base": "minimal",
+                **resource_provenance["ase_setups"],
+            },
         }
         template_kspacing = calculator.float_params.get("kspacing")
         active_kspacing = (
@@ -96,12 +108,15 @@ def run_native_vasp(
             command=request.command,
             status="failed",
             error=str(error),
+            electronic_mode=electronic_mode,
+            resources=resource_provenance,
         )
         raise
 
     frame = atoms.copy()
     frame.calc = SinglePointCalculator(frame, energy=energy, forces=forces)
     frame.info["virial"] = _stress_to_virial(stress, frame.get_volume())
+    frame.info["dft_electronic_mode"] = electronic_mode
     frame.info.setdefault("Config_type", "NepTrain scf ")
     frame.info["Weight"] = 1.0
     _write_manifest(
@@ -110,11 +125,13 @@ def run_native_vasp(
         status="completed",
         energy=energy,
         atom_count=len(frame),
+        electronic_mode=electronic_mode,
+        resources=resource_provenance,
     )
     return frame
 
 
-def _validate_single_point_input(calculator: VaspInput) -> None:
+def _validate_single_point_input(calculator: VaspInput) -> str:
     ibrion = calculator.int_params.get("ibrion")
     nsw = calculator.int_params.get("nsw")
     ispin = calculator.int_params.get("ispin")
@@ -124,7 +141,8 @@ def _validate_single_point_input(calculator: VaspInput) -> None:
         )
     if ispin not in {None, 1, 2}:
         raise NativeVaspError(
-            "VASP labeling supports ISPIN=1 or collinear ISPIN=2"
+            "VASP labeling supports non-spin-polarized ISPIN=1 or collinear "
+            "ISPIN=2 ordinary energy/force labels"
         )
     if calculator.bool_params.get("lnoncollinear"):
         raise NativeVaspError("VASP labeling forbids LNONCOLLINEAR")
@@ -136,7 +154,50 @@ def _validate_single_point_input(calculator: VaspInput) -> None:
         and magmom is not None
         and any(abs(float(value)) > 0.0 for value in magmom)
     ):
-        raise NativeVaspError("nonzero MAGMOM requires collinear ISPIN=2")
+        raise NativeVaspError(
+            "nonzero MAGMOM requires collinear ISPIN=2"
+        )
+    return "collinear_spin_polarized" if ispin == 2 else "non_spin_polarized"
+
+
+def validate_vasp_input_file(input_file: str | Path) -> str:
+    """Validate the VASP physics contract without launching VASP."""
+
+    calculator = Vasp()
+    try:
+        calculator.read_incar(str(Path(input_file).expanduser().resolve()))
+    except Exception as error:
+        raise NativeVaspError(f"cannot parse VASP INCAR {input_file}: {error}") from error
+    return _validate_single_point_input(calculator)
+
+
+def validate_vasp_structure(
+    atoms: Atoms,
+    *,
+    electronic_mode: str | None = None,
+) -> None:
+    """Reject magnetic structure inputs that VASP cannot label faithfully."""
+
+    if "spin" in atoms.arrays:
+        raise NativeVaspError(
+            "VASP production labeling does not produce spin/mforce labels; "
+            "use ABACUS DeltaSpin"
+        )
+    initial = atoms.arrays.get("initial_magmoms")
+    if initial is None:
+        return
+    values = np.asarray(initial, dtype=float)
+    if values.ndim != 1 and np.any(np.abs(values) > 0.0):
+        raise NativeVaspError(
+            "VASP labeling forbids noncollinear initial magnetic moments"
+        )
+    if (
+        np.any(np.abs(values) > 0.0)
+        and electronic_mode not in {None, "collinear_spin_polarized"}
+    ):
+        raise NativeVaspError(
+            "nonzero initial magnetic moments require collinear ISPIN=2"
+        )
 
 
 def _validated_results(
@@ -209,6 +270,8 @@ def _write_manifest(
     error: str | None = None,
     energy: float | None = None,
     atom_count: int | None = None,
+    electronic_mode: str | None = None,
+    resources: dict | None = None,
 ) -> None:
     inputs = {}
     for name in ("INCAR", "POSCAR", "KPOINTS", "POTCAR"):
@@ -222,6 +285,8 @@ def _write_manifest(
         "parser": "ase.calculators.vasp",
         "ase_version": ase.__version__,
         "input_sha256": inputs,
+        "electronic_mode": electronic_mode,
+        "spin_force_labels": False,
     }
     outputs = {}
     for name in ("vasprun.xml", "OUTCAR"):
@@ -230,6 +295,8 @@ def _write_manifest(
             outputs[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     if outputs:
         payload["output_sha256"] = outputs
+    if resources is not None:
+        payload["pseudopotentials"] = resources
     if error is not None:
         payload["error"] = error
     if energy is not None:
@@ -243,4 +310,6 @@ __all__: Sequence[str] = (
     "NativeVaspError",
     "NativeVaspRequest",
     "run_native_vasp",
+    "validate_vasp_input_file",
+    "validate_vasp_structure",
 )

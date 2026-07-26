@@ -58,6 +58,7 @@ dft:
   backend: vasp
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
+  potcar_manifest_path: ./vasp-resources.json
   # Prefer KSPACING/KGAMMA already written in INCAR.
   kpoint_mode: auto
 

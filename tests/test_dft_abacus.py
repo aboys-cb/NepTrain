@@ -14,8 +14,17 @@ from ase.io import read, write
 
 from NepTrain.core.dft import LabelRequest, label
 from NepTrain.core.dft.abacus.io import StructureVar, read_input_file
-from NepTrain.core.dft.abacus.native import NativeAbacusError, parse_running_scf
+from NepTrain.core.dft.abacus.native import (
+    NativeAbacusError,
+    parse_running_scf,
+    validate_abacus_spin_contract,
+)
+from NepTrain.core.dft.abacus.resources import AbacusResourceError
 from NepTrain.core.dft.interface import LabelingError
+from NepTrain.core.scientific_data import (
+    INPUT_STRUCTURE_ID_KEY,
+    structure_id,
+)
 
 
 def _arguments(tmp_path: Path, source: Path, resources: Path) -> SimpleNamespace:
@@ -46,13 +55,36 @@ smearing_method gau
 
 def _resource_files(path: Path, elements=("Al",)) -> None:
     path.mkdir()
+    records = {}
     for element in elements:
-        (path / f"{element}.UPF").write_text(
+        pseudo = path / f"{element}.UPF"
+        orbital = path / f"{element}.ORB"
+        pseudo.write_text(
             f'<PP_HEADER element="{element}"/>\n', encoding="utf-8"
         )
-        (path / f"{element}.ORB").write_text(
+        orbital.write_text(
             f"Element {element}\n", encoding="utf-8"
         )
+        records[element] = {
+            "pseudopotential": {
+                "path": pseudo.name,
+                "sha256": hashlib.sha256(pseudo.read_bytes()).hexdigest(),
+            },
+            "orbital": {
+                "path": orbital.name,
+                "sha256": hashlib.sha256(orbital.read_bytes()).hexdigest(),
+            },
+        }
+    (path / "abacus-resources.json").write_text(
+        json.dumps(
+            {
+                "protocol": "neptrain.abacus-resources.v1",
+                "release": "test",
+                "elements": records,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _fake_command(tmp_path: Path, log_text: str) -> str:
@@ -122,6 +154,20 @@ def test_abacus_input_header_can_include_a_description(tmp_path: Path):
     assert read_input_file(path) == {"suffix": "FeNi", "nspin": "4"}
 
 
+def test_abacus_deltaspin_switch_requires_canonical_spin_input():
+    with pytest.raises(NativeAbacusError, match="magnetic forces would be discarded"):
+        validate_abacus_spin_contract(
+            {"nspin": "4", "sc_mag_switch": "1"},
+            spin_frame=False,
+        )
+
+    parameters = {"nspin": "2"}
+    assert (
+        validate_abacus_spin_contract(parameters, spin_frame=False)
+        == "collinear_spin_polarized"
+    )
+
+
 def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
     module = importlib.import_module("NepTrain.core.dft.abacus.run")
     monkeypatch.setattr(module, "atoms_index", 1)
@@ -151,6 +197,8 @@ def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
     manifest = (case / "abacus-result.json").read_text(encoding="utf-8")
     assert '"status": "completed"' in manifest
     assert '"parser_version": "neptrain-abacus-running-scf-v2"' in manifest
+    assert '"electronic_mode": "non_spin_polarized"' in manifest
+    assert '"spin_force_labels": false' in manifest
     input_manifest = json.loads((case / "abacus-input.json").read_text())
     resource_record = input_manifest["resources"]["Al"]
     assert resource_record["pseudopotential_sha256"] == hashlib.sha256(
@@ -201,6 +249,7 @@ def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
         [[0.1, 0.2, 0.3], [0.7, 0.8, 0.9], [0.4, 0.5, 0.6]],
     )
     assert frame.info["spin_constraint_rms_uB"] == pytest.approx(0.0)
+    assert frame.info["dft_electronic_mode"] == "constrained_vector_spin_force"
     reread = read(result.output_file)
     np.testing.assert_allclose(reread.arrays["spin"], spin)
     np.testing.assert_allclose(reread.arrays["mforce"], frame.arrays["mforce"])
@@ -255,6 +304,8 @@ def test_native_abacus_spin_reports_vector_rms_per_atom(tmp_path: Path, monkeypa
     assert result.frames[0].info["spin_constraint_rms_uB"] == pytest.approx(
         1.0 / np.sqrt(3.0)
     )
+    assert result.frames[0].info[INPUT_STRUCTURE_ID_KEY] == structure_id(atoms)
+    assert structure_id(result.frames[0]) != structure_id(atoms)
 
 
 def test_abacus_parser_keeps_mforce_available_for_future_spin_adapter(tmp_path: Path):
@@ -305,7 +356,7 @@ def test_vasp_production_adapter_still_rejects_spin(tmp_path: Path):
     atoms.set_array("spin", np.asarray([[1.0, 0.0, 0.0]]))
     write(source, atoms, format="extxyz")
 
-    with pytest.raises(LabelingError, match="non-magnetic"):
+    with pytest.raises(LabelingError, match="does not produce spin/mforce"):
         label(
             LabelRequest(
                 source=source,
@@ -400,12 +451,38 @@ def test_abacus_fails_before_launch_when_pseudopotential_is_missing(
         Atoms("Fe", positions=[[0.0, 0.0, 0.0]], cell=[3.0, 3.0, 3.0], pbc=True),
     )
     resources = tmp_path / "resources"
-    resources.mkdir()
+    _resource_files(resources, elements=("Al",))
     marker = tmp_path / "launched"
     monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", f"touch {shlex.quote(str(marker))}")
 
-    with pytest.raises(FileNotFoundError, match="Fe"):
+    with pytest.raises(RuntimeError, match="missing elements: Fe"):
         module.run_abacus(_arguments(tmp_path, source, resources))
+    assert not marker.exists()
+
+
+def test_abacus_resource_hash_drift_fails_before_launch(tmp_path, monkeypatch):
+    source = tmp_path / "selected.xyz"
+    write(
+        source,
+        Atoms("Al", positions=[[0, 0, 0]], cell=[4, 4, 4], pbc=True),
+        format="extxyz",
+    )
+    resources = tmp_path / "resources"
+    _resource_files(resources)
+    (resources / "Al.UPF").write_text(
+        '<PP_HEADER element="Al"/> changed\n',
+        encoding="utf-8",
+    )
+    marker = tmp_path / "launched"
+    monkeypatch.setenv(
+        "NEPTRAIN_ABACUS_COMMAND",
+        f"touch {shlex.quote(str(marker))}",
+    )
+
+    with pytest.raises(AbacusResourceError, match="hash mismatch for Al"):
+        importlib.import_module("NepTrain.core.dft.abacus.run").run_abacus(
+            _arguments(tmp_path, source, resources)
+        )
     assert not marker.exists()
 
 

@@ -26,8 +26,8 @@ from .iteration import (
 )
 from .spin import validate_spin_dataset
 from .scenario import ScenarioLadder
+from .scientific_data import structure_id
 from .toy_workflow import (
-    structure_id,
     toy_base_frame,
     toy_candidate_frames,
     toy_raw_features,

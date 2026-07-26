@@ -71,6 +71,7 @@ neptrain dft candidates.xyz \
   --backend vasp \
   --input-file INCAR \
   --resources /shared/potpaw_PBE \
+  --potcar-manifest vasp-resources.json \
   --structures-per-job 1 \
   --max-concurrent 20 \
   -o labeled.xyz
@@ -79,6 +80,15 @@ neptrain dft candidates.xyz \
 所有 shard 成功后才会按原输入顺序发布最终 `labeled.xyz`。失败时保留成功结果，但
 不会把部分结果伪装成完整输出。已有结果默认不会被覆盖；确认替换时显式加
 `--force`。
+
+VASP 必须同时提供 `--potcar-manifest`，其中逐元素固定相对 `POTCAR` 路径、
+SHA256、精确 `TITEL`、势函数族和发行版本。ABACUS 使用
+`--resource-manifest` 固定 UPF 和可选 orbital。NepTrain 在本地准备阶段校验
+元素覆盖、文件身份和 hash；远端资源不上传，由 `doctor` 在目标机预检，worker
+启动 DFT 前再次校验。资源不匹配时不会启动 VASP/ABACUS。
+VASP manifest 的路径必须是 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这一层形式；
+NepTrain 会把该路径反向写入 ASE `setups`，保证“校验的 POTCAR”就是实际拼接
+进计算的 POTCAR。
 
 ### Slurm target
 
@@ -111,6 +121,20 @@ neptrain task cancel runs/dft-...
 加 `--wait` 可以在提交后等待并自动收集结果。
 同一平台的共享文件系统会由最后完成的 array task 自动发布结果；跨平台 target
 需要运行 `task status` 或 `task wait` 将远端结果同步回来。
+
+这些命令的边界是：
+
+- `status`：进行一次有超时的 scheduler/SSH 查询，并同步已经原子发布的结果；
+  不持续等待。
+- `wait`：重复执行 `status`，直到 `complete`、`failed`、`cancelled` 或
+  `damaged`。
+- `cancel`：请求取消当前 Slurm job；已校验完成的 shard 保留。
+- `retry`：创建新 attempt，只提交失败、取消、缺失或损坏的 shard。
+- `logs`：同步并列出 scheduler 日志，不改变科学结果。
+
+普通进度和诊断只写 stderr。`--json` 的 stdout 只包含一个 JSON 对象；手动状态
+协议为 `neptrain.manual-status.v1`，可稳定读取 `state`、`jobs`、`errors` 和
+`next_action`。
 
 ## 自动 workflow
 
@@ -205,6 +229,7 @@ dft:
   backend: vasp
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
+  potcar_manifest_path: ./vasp-resources.json
   kpoint_mode: auto
 
 evaluation:
@@ -259,6 +284,10 @@ execution:
 或 ABACUS INPUT 中的 `kspacing`；生成的默认输入已给出可直接修改的
 `0.2`。只有显式选择 `kspacing` 或 `kpoints` 模式时，NepTrain 才接管
 k 点设置。
+
+远程 SSH labeling target 必须设置该目标机自己的绝对
+`dft_resource_path`；本地 `dft.resource_path` 不会被假定为远端同一路径。
+大型资源库不进入 task archive，只有小型内容寻址 manifest 会进入任务身份。
 
 `temperature_path` 是严格有序的温度探路路径，只有前一个温度通过才解锁下一个。
 默认全部温度都会继续跑 short、long 和 production。显式设置
@@ -329,7 +358,8 @@ Properties=species:S:1:pos:R:3:spin:R:3:mforce:R:3
 - `spin` 是完整磁矩向量，方向和模长都可演化。
 - `mforce` 是参考磁力 `-dE/dspin`。
 - Spin 结构必须得到 `mforce`，否则标注失败。
-- VASP 当前只支持非磁标注。
+- VASP 允许 `ISPIN=1` 或共线 `ISPIN=2`，但两者都只发布普通
+  energy/force/virial 标签；不会把共线磁计算伪装成 `spin/mforce` 数据。
 - ABACUS DeltaSpin 支持全矢量约束并读取最终 magnetization 和 mforce。
 - LAMMPS DynSpin dump 根据 `compute property/atom` 定义解析，不写死
   `c_spin[n]` 的意义。
@@ -347,6 +377,13 @@ neptrain md spin.xyz \
   -o spin-trajectory.xyz
 ```
 
+旧数据若使用 `spins`/`mforces` 等别名，不会在正常训练或合并时静默猜测。
+显式迁移并保留原文件：
+
+```bash
+neptrain data migrate-spin legacy.xyz canonical.xyz --json
+```
+
 ## Workflow 产物
 
 ```text
@@ -362,6 +399,23 @@ workflow/
 `results/` 只发布最新通过验收的 `nep.txt`、`train.xyz` 和指标。
 `generations/` 保存每代科学证据，内部任务、锁、manifest 和 ledger 放在
 `.neptrain/`。
+
+状态权威只有一条链：
+
+- `.neptrain/manifest.json`：prepare 时固定的 workflow 实例、输入和计划身份，
+  不记录运行态。
+- `.neptrain/ledger.json`：已提交科学阶段和代的唯一权威；写入它才算 commit。
+- `.neptrain/controller.json`：当前执行 intent、job handle、attempt 和取消历史，
+  不能覆盖 ledger 的科学事实。
+- 每个 job 的 `task.json` 是不可变输入契约，`execution.json` 是运行观察，
+  `result.json` 是待校验结果；只有通过内容、身份和 artifact 校验后才进入 ledger。
+- `results/accepted/` 是不可变发布，`results/current` 和根部链接只是可重建投影。
+
+删除可见结果链接后，`workflow resume` 可从 hash 一致的已提交副本修复；删除或
+篡改 ledger、唯一的已提交 artifact 或不可变 publication 会得到 `damaged`，
+且 resume 在启动任何新任务前 fail closed。不要把删除 `.neptrain` 当作“重置”；
+需要重新开始时创建新的 workflow 目录，它会得到新的随机 instance id，不会复用
+旧 task/result。
 
 每代目录直接是 `train/`、`md/`、`select/`、`dft/`、`diagnose/`、
 `dataset/`、`retrain/` 和 `evaluate/`。训练输出、loss 和模型发布到对应阶段

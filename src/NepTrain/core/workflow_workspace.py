@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import tempfile
 from typing import Any, Mapping
 
 
@@ -20,6 +23,13 @@ _STAGE_DIRECTORIES = {
     "retrain": "retrain",
     "evaluate": "evaluate",
 }
+_PUBLICATION_FILENAMES = (
+    "nep.txt",
+    "train.xyz",
+    "metrics.json",
+    "summary.json",
+    "summary.md",
+)
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -53,6 +63,29 @@ def _copy_path(source: Path, target: Path) -> None:
     temporary.replace(target)
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+
+
+def _atomic_symlink(target: str, link: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.with_name(f".{link.name}.link-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(target)
+    temporary.replace(link)
+
+
 @dataclass(frozen=True)
 class WorkflowWorkspace:
     """Own every durable path in one workflow directory.
@@ -82,6 +115,15 @@ class WorkflowWorkspace:
             workspace.tasks_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+        (workspace.results_dir / "accepted").mkdir()
+        for name in (
+            "nep.txt",
+            "train.xyz",
+            "metrics.json",
+            "summary.json",
+            "summary.md",
+        ):
+            _atomic_symlink(f"current/{name}", workspace.results_dir / name)
         _write_json(
             workspace.layout_file,
             {
@@ -159,10 +201,6 @@ class WorkflowWorkspace:
         return self.internal_dir / "plans"
 
     @property
-    def jobs_dir(self) -> Path:
-        return self.internal_dir / "scheduler"
-
-    @property
     def tasks_dir(self) -> Path:
         return self.internal_dir / "jobs"
 
@@ -197,10 +235,6 @@ class WorkflowWorkspace:
     @property
     def controller_log(self) -> Path:
         return self.logs_dir / "controller.log"
-
-    @property
-    def controller_root(self) -> Path:
-        return self.root
 
     def generation_dir(self, generation: int) -> Path:
         return self.generations_dir / f"{generation:04d}"
@@ -258,6 +292,16 @@ class WorkflowWorkspace:
                 )
             route["structures"] = copied_structures
         copy_path("dft", "input_path", "dft/input")
+        copy_path(
+            "dft",
+            "potcar_manifest_path",
+            "dft/vasp-resources",
+        )
+        copy_path(
+            "dft",
+            "resource_manifest_path",
+            "dft/abacus-resources",
+        )
         copy_path("evaluation", "validation_path", "validation/validation")
         for name, profile in snapshot.get("execution", {}).get(
             "targets", {}
@@ -276,13 +320,13 @@ class WorkflowWorkspace:
         )
         return snapshot, initial_snapshot
 
-    def publish_generation(
-        self, generation: int, generation_record: Mapping[str, Any]
-    ) -> None:
-        """Publish a stable human-facing summary and latest accepted results."""
-
+    @staticmethod
+    def _generation_summary(
+        generation: int,
+        generation_record: Mapping[str, Any],
+    ) -> dict[str, Any]:
         stages = generation_record.get("stages", {})
-        summary = {
+        return {
             "generation": generation,
             "accepted": generation_record.get("accepted"),
             "complete": bool(generation_record.get("complete")),
@@ -291,34 +335,12 @@ class WorkflowWorkspace:
                 for stage, record in stages.items()
             },
         }
-        accepted = generation_record.get("accepted") is True
-        artifacts = {}
-        required = {}
-        if accepted:
-            artifacts = {
-                name: Path(record["path"])
-                for stage in stages.values()
-                for name, record in stage.get("artifacts", {}).items()
-            }
-            required = {
-                "activated_model": self.results_dir / "nep.txt",
-                "training_set": self.results_dir / "train.xyz",
-                "signals": self.results_dir / "metrics.json",
-            }
-            missing = [name for name in required if name not in artifacts]
-            if missing:
-                raise ValueError(
-                    "accepted workflow generation is missing publishable artifacts: "
-                    + ", ".join(missing)
-                )
-        _write_json(self.generation_dir(generation) / "summary.json", summary)
-        if not accepted:
-            return
-        for name, target in required.items():
-            _copy_file(artifacts[name], target)
-        _write_json(self.results_dir / "summary.json", summary)
+
+    @staticmethod
+    def _summary_markdown(summary: Mapping[str, Any]) -> str:
+        generation = int(summary["generation"])
         evaluation = summary["metrics"].get("evaluate", {})
-        lines = [f"# NepTrain workflow 结果\n"]
+        lines = ["# NepTrain workflow 结果", ""]
         if evaluation.get("evaluation_configured") is False:
             lines.extend(
                 [
@@ -344,9 +366,261 @@ class WorkflowWorkspace:
                 "",
             ]
         )
-        (self.results_dir / "summary.md").write_text(
-            "\n".join(lines), encoding="utf-8"
+        return "\n".join(lines)
+
+    def prepare_generation_publication(
+        self, generation: int, generation_record: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Prepare an immutable accepted result without changing ``current``."""
+
+        stages = generation_record.get("stages", {})
+        summary = self._generation_summary(generation, generation_record)
+        accepted = generation_record.get("accepted") is True
+        if not accepted:
+            return None
+
+        artifacts = {
+            name: record
+            for stage in stages.values()
+            for name, record in stage.get("artifacts", {}).items()
+        }
+        required = {
+            "activated_model": "nep.txt",
+            "training_set": "train.xyz",
+            "signals": "metrics.json",
+        }
+        missing = [name for name in required if name not in artifacts]
+        if missing:
+            raise ValueError(
+                "accepted workflow generation is missing publishable artifacts: "
+                + ", ".join(missing)
+            )
+        sources = {}
+        for name in required:
+            record = artifacts[name]
+            source = Path(record["path"])
+            if not source.is_file() or _sha256(source) != record["sha256"]:
+                raise ValueError(
+                    f"accepted workflow artifact drifted before publication: {source}"
+                )
+            sources[name] = {
+                "path": str(source),
+                "sha256": record["sha256"],
+            }
+        content_sha256 = _canonical_hash(
+            {
+                "generation": generation,
+                "sources": sources,
+                "summary": summary,
+            }
         )
+        accepted_root = self.results_dir / "accepted"
+        accepted_root.mkdir(exist_ok=True)
+        final = accepted_root / f"g{generation:04d}-{content_sha256[:12]}"
+        if final.exists():
+            valid = False
+            try:
+                existing = json.loads(
+                    (final / "publication.json").read_text(encoding="utf-8")
+                )
+                valid = (
+                    existing.get("protocol") == "neptrain.accepted-result.v1"
+                    and int(existing.get("generation", -1)) == generation
+                    and existing.get("content_sha256") == content_sha256
+                    and set(existing.get("files", {}))
+                    == set(_PUBLICATION_FILENAMES)
+                    and all(
+                        record.get("path") == name
+                        and (final / name).is_file()
+                        and (final / name).stat().st_size
+                        == int(record["size"])
+                        and _sha256(final / name)
+                        == record["sha256"]
+                        for name, record in existing.get("files", {}).items()
+                    )
+                )
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                valid = False
+            if not valid:
+                damaged_root = self.results_dir / "damaged"
+                damaged_root.mkdir(exist_ok=True)
+                quarantine = damaged_root / f"{final.name}-{os.getpid()}"
+                suffix = 1
+                while quarantine.exists():
+                    quarantine = damaged_root / (
+                        f"{final.name}-{os.getpid()}-{suffix}"
+                    )
+                    suffix += 1
+                final.replace(quarantine)
+        if not final.exists():
+            temporary = Path(
+                tempfile.mkdtemp(
+                    prefix=f".g{generation:04d}-building-",
+                    dir=accepted_root,
+                )
+            )
+            try:
+                for artifact_name, filename in required.items():
+                    _copy_file(
+                        Path(sources[artifact_name]["path"]),
+                        temporary / filename,
+                    )
+                _write_json(temporary / "summary.json", summary)
+                (temporary / "summary.md").write_text(
+                    self._summary_markdown(summary),
+                    encoding="utf-8",
+                )
+                files = {
+                    filename: {
+                        "path": filename,
+                        "sha256": _sha256(temporary / filename),
+                        "size": (temporary / filename).stat().st_size,
+                    }
+                    for filename in _PUBLICATION_FILENAMES
+                }
+                _write_json(
+                    temporary / "publication.json",
+                    {
+                        "protocol": "neptrain.accepted-result.v1",
+                        "generation": generation,
+                        "content_sha256": content_sha256,
+                        "sources": sources,
+                        "files": files,
+                    },
+                )
+                temporary.replace(final)
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+        manifest = final / "publication.json"
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        if value.get("content_sha256") != content_sha256:
+            raise ValueError(f"accepted publication collision: {final}")
+        record = {
+            "protocol": "neptrain.accepted-result.v1",
+            "generation": generation,
+            "content_sha256": content_sha256,
+            "directory": str(final),
+            "manifest": {
+                "path": str(manifest),
+                "sha256": _sha256(manifest),
+            },
+            "files": {
+                name: {
+                    **file_record,
+                    "path": str(final / file_record["path"]),
+                }
+                for name, file_record in value["files"].items()
+            },
+        }
+        issues = self.publication_issues(record, check_projection=False)
+        if issues:
+            raise ValueError("; ".join(issues))
+        return record
+
+    def activate_generation(
+        self,
+        generation: int,
+        generation_record: Mapping[str, Any],
+    ) -> None:
+        """Repair human projections and atomically activate one publication."""
+
+        summary = self._generation_summary(generation, generation_record)
+        _write_json(self.generation_dir(generation) / "summary.json", summary)
+        if generation_record.get("accepted") is not True:
+            return
+        publication = generation_record.get("publication")
+        if not isinstance(publication, Mapping):
+            raise ValueError(
+                f"accepted generation {generation} has no publication record"
+            )
+        issues = self.publication_issues(publication, check_projection=False)
+        if issues:
+            raise ValueError("; ".join(issues))
+        directory = Path(publication["directory"])
+        current = self.results_dir / "current"
+        if not current.is_symlink() or current.resolve() != directory.resolve():
+            if not current.is_symlink() and current.exists():
+                raise ValueError("results/current exists but is not a symlink")
+            # On a new or legacy workspace, establish the pointer first.  Fixed
+            # links either do not exist yet or still contain the same accepted
+            # generation that is being migrated.
+            if not current.exists() and not current.is_symlink():
+                _atomic_symlink(
+                    os.path.relpath(directory, self.results_dir),
+                    current,
+                )
+        for name in publication["files"]:
+            _atomic_symlink(f"current/{name}", self.results_dir / name)
+        if current.resolve() != directory.resolve():
+            _atomic_symlink(
+                os.path.relpath(directory, self.results_dir),
+                current,
+            )
+        issues = self.publication_issues(publication, check_projection=True)
+        if issues:
+            raise ValueError("; ".join(issues))
+
+    def publication_issues(
+        self,
+        publication: Mapping[str, Any],
+        *,
+        check_projection: bool,
+    ) -> list[str]:
+        issues: list[str] = []
+        directory = Path(str(publication.get("directory", "")))
+        manifest_record = publication.get("manifest", {})
+        manifest = Path(str(manifest_record.get("path", "")))
+        if (
+            not directory.is_dir()
+            or not manifest.is_file()
+            or _sha256(manifest) != manifest_record.get("sha256")
+        ):
+            issues.append(f"accepted publication metadata drifted: {directory}")
+            return issues
+        try:
+            manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            issues.append(f"accepted publication metadata is unreadable: {manifest}")
+            return issues
+        publication_files = publication.get("files", {})
+        manifest_files = manifest_value.get("files", {})
+        if (
+            manifest_value.get("protocol") != "neptrain.accepted-result.v1"
+            or manifest_value.get("content_sha256")
+            != publication.get("content_sha256")
+            or set(publication_files) != set(_PUBLICATION_FILENAMES)
+            or set(manifest_files) != set(_PUBLICATION_FILENAMES)
+        ):
+            issues.append(
+                f"accepted publication file contract drifted: {directory}"
+            )
+            return issues
+        for name in _PUBLICATION_FILENAMES:
+            record = publication_files[name]
+            manifest_file = manifest_files[name]
+            path = Path(str(record.get("path", "")))
+            if (
+                manifest_file.get("path") != name
+                or manifest_file.get("sha256") != record.get("sha256")
+                or int(manifest_file.get("size", -1))
+                != int(record.get("size", -1))
+                or not path.is_file()
+                or path.stat().st_size != int(record.get("size", -1))
+                or _sha256(path) != record.get("sha256")
+            ):
+                issues.append(f"accepted result drifted: {name} ({path})")
+        if not check_projection:
+            return issues
+        current = self.results_dir / "current"
+        if not current.is_symlink() or current.resolve() != directory.resolve():
+            issues.append("results/current does not select the ledger publication")
+            return issues
+        for name in publication.get("files", {}):
+            visible = self.results_dir / name
+            if not visible.is_symlink() or visible.resolve() != directory / name:
+                issues.append(f"results/{name} is not the current publication")
+        return issues
 
 
 __all__ = ["WorkflowWorkspace"]

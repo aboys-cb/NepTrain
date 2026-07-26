@@ -9,6 +9,25 @@ import os
 from pathlib import Path
 import shlex
 from NepTrain import __version__
+from NepTrain.core.config import (
+    DEFAULT_MAX_CONCURRENT,
+    DEFAULT_STRUCTURES_PER_DFT_JOB,
+)
+
+
+def _print_json(value):
+    try:
+        payload = json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise SystemExit(
+            f"NepTrain: error: cannot serialize stable JSON output: {error}"
+        ) from error
+    print(payload)
 
 
 def init_template(args):
@@ -28,7 +47,6 @@ def run_select(args):
 
 def run_smoke_command(args):
     from dataclasses import asdict
-    import json
 
     from NepTrain.core.smoke import run_smoke
 
@@ -39,7 +57,7 @@ def run_smoke_command(args):
         max_selected=args.max_selected,
         force=args.force,
     )
-    print(json.dumps(asdict(report), indent=2, sort_keys=True))
+    result = {"protocol": "neptrain.smoke.v1", "smoke": asdict(report)}
     if args.iterations:
         from NepTrain.core.toy_iteration import run_toy_iteration_smoke
 
@@ -51,7 +69,8 @@ def run_smoke_command(args):
             max_selected=args.max_selected,
             force=args.force,
         )
-        print(json.dumps(asdict(iteration), indent=2, sort_keys=True))
+        result["iteration"] = asdict(iteration)
+    _print_json(result)
 
 
 def _science_value(value):
@@ -193,7 +212,7 @@ def run_project_command(args):
     from NepTrain.core.workflow import (
         WorkflowError,
         prepare_workflow,
-        resume_workflow,
+        start_workflow,
     )
     from NepTrain.core.controller import start_controller
 
@@ -215,7 +234,7 @@ def run_project_command(args):
                     f"{', '.join(invalid)} can only be used with a project "
                     "YAML file"
                 )
-            result = resume_workflow(
+            result = start_workflow(
                 project,
                 foreground=getattr(args, "foreground", False),
                 poll_interval=getattr(args, "poll_interval", None),
@@ -260,10 +279,11 @@ def run_project_command(args):
                 workflow_id=args.workflow_id,
             )
             payload = {
+                "protocol": "neptrain.workflow-control.v1",
                 "workflow_id": preparation.workflow_id,
+                "action": "prepare" if args.prepare_only else "start",
                 "project": str(preparation.output_dir),
                 "manifest": str(preparation.manifest),
-                "started": not args.prepare_only,
             }
             if args.prepare_only:
                 payload["next_action"] = (
@@ -285,7 +305,7 @@ def run_project_command(args):
                     payload["controller_pid"] = controller_result
     except WorkflowError:
         raise
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    _print_json(payload)
 
 
 def run_status_command(args):
@@ -297,7 +317,12 @@ def run_status_command(args):
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     if args.json:
-        print(json.dumps(asdict(status), indent=2, sort_keys=True))
+        _print_json(
+            {
+                "protocol": "neptrain.workflow-status.v1",
+                **asdict(status),
+            }
+        )
     else:
         _print_workflow_status(status, show_jobs=args.jobs)
 
@@ -310,14 +335,17 @@ def run_resume_command(args):
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     payload = _workflow_resume_payload(result)
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    _print_json(payload)
 
 
 def _workflow_resume_payload(result):
     from dataclasses import asdict
+    from NepTrain.core.workflow_workspace import WorkflowWorkspace
 
     payload = asdict(result)
+    payload["protocol"] = "neptrain.workflow-control.v1"
     payload["manifest"] = str(result.manifest)
+    payload["project"] = str(WorkflowWorkspace.locate(result.manifest).root)
     if result.controller_pid is not None:
         payload.pop("controller_exit_code", None)
     elif result.controller_exit_code is not None:
@@ -335,16 +363,13 @@ def run_extend_command(args):
         preparation = extend_workflow(args.project, args.generations)
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
-    print(
-        json.dumps(
-            {
-                "workflow_id": preparation.workflow_id,
-                "total_model_generations": len(preparation.plans),
-                "project": str(preparation.output_dir),
-            },
-            indent=2,
-            sort_keys=True,
-        )
+    _print_json(
+        {
+            "protocol": "neptrain.workflow-extend.v1",
+            "workflow_id": preparation.workflow_id,
+            "total_model_generations": len(preparation.plans),
+            "project": str(preparation.output_dir),
+        }
     )
 
 
@@ -357,7 +382,12 @@ def run_stop_command(args):
         )
     except ControllerError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
-    print(json.dumps(result, indent=2, sort_keys=True))
+    _print_json(
+        {
+            "protocol": "neptrain.workflow-stop.v1",
+            **result,
+        }
+    )
 
 
 def run_controller_command(args):
@@ -370,6 +400,84 @@ def run_stage_worker_command(args):
     from NepTrain.core.execution import run_stage_worker
 
     return run_stage_worker(args.bundle)
+
+
+def run_stage_verify_command(args):
+    from NepTrain.core.execution import verify_stage_task
+
+    verify_stage_task(args.bundle)
+    return 0
+
+
+def _doctor_resource_contract(config, project):
+    """Resolve the one authoritative DFT resource contract for doctor."""
+
+    backend = str(config.get("dft", {}).get("backend", "vasp"))
+    if backend == "toy":
+        return None
+    dft = config["dft"]
+    execution = config["execution"]
+    target_name = str(execution["stage_targets"]["labeling"])
+    target = execution["targets"][target_name]
+    resource_root = target.get("dft_resource_path") or dft.get("resource_path")
+    if not resource_root:
+        raise ValueError("real DFT has no configured resource root")
+    if not target.get("dft_resource_path"):
+        candidate = Path(str(resource_root)).expanduser()
+        if not candidate.is_absolute():
+            resource_root = str((project.parent / candidate).resolve())
+    if backend == "vasp":
+        from NepTrain.core.dft.vasp.resources import vasp_resource_files
+
+        manifest = Path(str(dft["potcar_manifest_path"])).expanduser()
+        label = "VASP POTCAR"
+        records = vasp_resource_files(
+            manifest if manifest.is_absolute() else project.parent / manifest
+        )
+    elif backend == "abacus":
+        from NepTrain.core.dft.abacus.resources import abacus_resource_files
+
+        manifest = Path(str(dft["resource_manifest_path"])).expanduser()
+        label = "ABACUS pseudopotential/orbital"
+        records = abacus_resource_files(
+            manifest if manifest.is_absolute() else project.parent / manifest
+        )
+    else:  # validated schema owns this invariant
+        raise ValueError(f"unsupported DFT backend: {backend}")
+    return target_name, str(resource_root), label, records
+
+
+def _doctor_resource_probe(resource_root, records):
+    lines = [
+        "set -eo pipefail",
+        f"resource_root={shlex.quote(str(resource_root))}",
+        'case "$resource_root" in "~/"*) '
+        'resource_root="$HOME/${resource_root#~/}";; esac',
+        'test -d "$resource_root" || { '
+        'echo "resource root is missing: $resource_root" >&2; exit 3; }',
+        "if command -v sha256sum >/dev/null; then",
+        "  file_sha256() { sha256sum \"$1\" | awk '{print $1}'; }",
+        "elif command -v shasum >/dev/null; then",
+        "  file_sha256() { shasum -a 256 \"$1\" | awk '{print $1}'; }",
+        "else",
+        '  echo "sha256sum or shasum is required" >&2',
+        "  exit 4",
+        "fi",
+    ]
+    for record in records:
+        relative = str(record["path"])
+        expected = str(record["sha256"])
+        lines.extend(
+            [
+                f"resource_path=\"$resource_root\"/{shlex.quote(relative)}",
+                'test -f "$resource_path" || { '
+                'echo "resource file is missing: $resource_path" >&2; exit 5; }',
+                'actual=$(file_sha256 "$resource_path")',
+                f'test "$actual" = {shlex.quote(expected)} || {{ '
+                'echo "resource hash mismatch: $resource_path" >&2; exit 6; }',
+            ]
+        )
+    return "\n".join(lines) + "\n"
 
 
 def run_doctor(args):
@@ -403,6 +511,13 @@ def run_doctor(args):
             config, _ = load_config(project)
         except ConfigError as error:
             raise SystemExit(f"NepTrain: error: invalid project configuration: {error}") from error
+        try:
+            resource_contract = _doctor_resource_contract(config, project)
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            raise SystemExit(
+                f"NepTrain: error: invalid DFT resource contract: {error}"
+            ) from error
+        resolved_targets = {}
         for name, raw_target in config.get("execution", {}).get("targets", {}).items():
             value = dict(raw_target)
             setup = value.get("setup_script")
@@ -414,6 +529,7 @@ def run_doctor(args):
                     value["setup_script"] = str(local)
                     setup_is_local = True
             target = ExecutionTarget.from_mapping(str(name), value)
+            resolved_targets[str(name)] = target
             required = []
             if target.executor == "slurm":
                 required.extend(["sbatch", "squeue", "sacct"])
@@ -474,6 +590,53 @@ def run_doctor(args):
             )
             if not available:
                 failures.append(f"execution target {name}")
+                detail = (completed.stderr or completed.stdout).strip()
+                if detail:
+                    print(f"  {detail}")
+        if resource_contract is not None:
+            target_name, resource_root, label, records = resource_contract
+            target = resolved_targets[target_name]
+            command = (
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    target.host,
+                    "bash",
+                    "-s",
+                ]
+                if target.host
+                else ["bash", "-s"]
+            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    input=_doctor_resource_probe(resource_root, records),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                completed = subprocess.CompletedProcess(
+                    command,
+                    124,
+                    stdout="",
+                    stderr="resource probe timed out after 30s",
+                )
+            available = completed.returncode == 0
+            location = target.host or "local"
+            print(
+                f"{'OK' if available else 'FAIL'} {label} resources "
+                f"on {target_name} ({location})"
+            )
+            if not available:
+                failures.append(f"{label} resources on {target_name}")
+                detail = (completed.stderr or completed.stdout).strip()
+                if detail:
+                    print(f"  {detail}")
     if args.model and package_status["nep_adapters"]:
         from nep_adapters import inspect_model
         from NepTrain.core.nep.calculator import resolve_backend
@@ -677,7 +840,7 @@ def build_select(subparsers):
 
 def _print_manual_status(value, *, json_output=False):
     if json_output:
-        print(json.dumps(value, indent=2, sort_keys=True))
+        _print_json(value)
         return
     kind = value.get("kind")
     operation_id = value.get("operation_id")
@@ -707,7 +870,12 @@ def _print_manual_status(value, *, json_output=False):
     if errors:
         print("Errors:")
         for error in errors:
-            print(f"- {error}")
+            if isinstance(error, dict):
+                index = error.get("index")
+                prefix = "collection" if index is None else f"job {index}"
+                print(f"- {prefix}: {error.get('error', '')}")
+            else:
+                print(f"- {error}")
     logs = value.get("logs")
     if logs:
         print("Logs:")
@@ -715,10 +883,11 @@ def _print_manual_status(value, *, json_output=False):
             print(f"- {log}")
     run_directory = value.get("run_directory")
     state = str(value.get("state", "")).lower()
-    if run_directory and state in {"prepared", "submitted", "running", "unknown"}:
+    next_action = value.get("next_action")
+    if next_action:
+        print(f"Next: {next_action}")
+    elif run_directory and state in {"prepared", "submitted", "running", "unknown"}:
         print(f"Next: neptrain task wait {shlex.quote(str(run_directory))}")
-    elif run_directory and state == "failed":
-        print(f"Next: neptrain task retry {shlex.quote(str(run_directory))}")
 
 
 def _manual_project(project):
@@ -736,6 +905,32 @@ def _project_path(base, value):
         return None
     path = Path(value).expanduser()
     return str(path if path.is_absolute() else (base / path).resolve())
+
+
+def _manual_sampling_route(project, base, route_id):
+    from NepTrain.core.manual import ManualTaskError
+
+    if not project:
+        if route_id:
+            raise ManualTaskError("--route requires --project")
+        return None
+    routes = list(project.get("sampling", {}).get("routes") or [])
+    if route_id:
+        matches = [route for route in routes if route.get("id") == route_id]
+        if not matches:
+            available = ", ".join(str(route.get("id")) for route in routes)
+            raise ManualTaskError(
+                f"unknown sampling route {route_id!r}; available routes: {available}"
+            )
+        selected = dict(matches[0])
+    elif len(routes) == 1:
+        selected = dict(routes[0])
+    else:
+        raise ManualTaskError(
+            "project defines multiple sampling routes; select one with --route"
+        )
+    selected["template_path"] = _project_path(base, selected["template_path"])
+    return selected
 
 
 def run_manual_train_command(args):
@@ -786,28 +981,46 @@ def run_manual_md_command(args):
         target_from_project,
     )
 
-    project, _ = _manual_project(args.project)
+    project, base = _manual_project(args.project)
     settings = project.get("md", {})
     sampling = project.get("sampling", {})
     candidate_pool = sampling.get("candidate_pool", {})
-    target = target_from_project(args.project, args.target, route="sampling")
+    route = _manual_sampling_route(project, base, args.route)
+    route_id = None if route is None else str(route["id"])
+    target = target_from_project(
+        args.project,
+        args.target,
+        route="sampling",
+        sampling_route_id=route_id,
+    )
+    conditions = dict((route or {}).get("conditions") or {})
+    from NepTrain.core.sampling_route import normalized_progression
+
+    progression = normalized_progression((route or {}).get("progression"))
     operation = prepare_md(
         args.input,
         backend=args.backend or settings.get("backend", "lammps"),
         model_file=args.model,
-        temperatures=args.temperature
-        or [300.0],
+        temperatures=(
+            args.temperature
+            if args.temperature is not None
+            else conditions.get("temperature_path", [300.0])
+        ),
         output=args.output,
         workdir=args.workdir,
         target=target,
-        steps=args.steps
-        if args.steps is not None
-        else 10000,
-        pressure=args.pressure
-        if args.pressure is not None
-        else 0.0,
+        steps=(
+            args.steps
+            if args.steps is not None
+            else progression["steps"][args.maturity]
+        ),
+        pressure=(
+            args.pressure
+            if args.pressure is not None
+            else float(conditions.get("pressure", 0.0))
+        ),
         ensemble=args.ensemble or "nvt",
-        template_path=args.template,
+        template_path=args.template or (route or {}).get("template_path"),
         spin=args.spin
         if args.spin is not None
         else bool(settings.get("spin", False)),
@@ -816,11 +1029,11 @@ def run_manual_md_command(args):
         else None,
         inference_backend=args.inference_backend
         or settings.get("inference_backend", "auto"),
-        lmp=args.lmp or settings.get("lmp", "lmp"),
-        mpiexec=args.mpiexec or settings.get("mpiexec", "mpirun"),
+        lmp=args.lmp or "lmp",
+        mpiexec=args.mpiexec or "mpirun",
         mpi_ranks=args.mpi_ranks
         if args.mpi_ranks is not None
-        else int(settings.get("mpi_ranks", 1)),
+        else 1,
         pre_failure_frames=(
             args.pre_failure_frames
             if args.pre_failure_frames is not None
@@ -832,7 +1045,11 @@ def run_manual_md_command(args):
             else int(candidate_pool.get("bad_tail_frames", 1))
         ),
         health=dict(candidate_pool.get("health") or {}),
-        max_concurrent=args.max_concurrent,
+        max_concurrent=(
+            args.max_concurrent
+            if args.max_concurrent is not None
+            else DEFAULT_MAX_CONCURRENT
+        ),
         force=args.force,
     )
     _print_manual_status(
@@ -853,6 +1070,12 @@ def run_manual_dft_command(args):
     project, base = _manual_project(args.project)
     settings = project.get("dft", {})
     target = target_from_project(args.project, args.target, route="labeling")
+    if args.resources is not None:
+        resource_dir = args.resources
+    elif target.dft_resource_path:
+        resource_dir = None
+    else:
+        resource_dir = _project_path(base, settings.get("resource_path"))
     if args.kspacing is not None:
         kpoint_mode = "kspacing"
         kspacing = args.kspacing
@@ -866,6 +1089,13 @@ def run_manual_dft_command(args):
             if kpoint_mode == "kspacing"
             else None
         )
+    raw_ka = args.ka if args.ka is not None else settings.get("kpoints", [1, 1, 1])
+    if isinstance(raw_ka, int):
+        ka = [raw_ka, raw_ka, raw_ka]
+    else:
+        ka = list(raw_ka)
+        if len(ka) == 1:
+            ka *= 3
     operation = prepare_dft(
         args.input,
         backend=args.backend or settings.get("backend", "vasp"),
@@ -874,8 +1104,18 @@ def run_manual_dft_command(args):
         target=target,
         input_file=args.dft_input
         or _project_path(base, settings.get("input_path")),
-        resource_dir=args.resources
-        or _project_path(base, settings.get("resource_path")),
+        resource_dir=resource_dir,
+        resource_manifest=(
+            (
+                args.potcar_manifest
+                or _project_path(base, settings.get("potcar_manifest_path"))
+            )
+            if (args.backend or settings.get("backend", "vasp")) == "vasp"
+            else (
+                args.resource_manifest
+                or _project_path(base, settings.get("resource_manifest_path"))
+            )
+        ),
         n_cpu=args.cpus,
         use_gamma=(
             args.gamma
@@ -884,9 +1124,24 @@ def run_manual_dft_command(args):
         ),
         kpoint_mode=kpoint_mode,
         kspacing=kspacing,
-        ka=args.ka or settings.get("kpoints", [1, 1, 1]),
-        structures_per_job=args.structures_per_job,
-        max_concurrent=args.max_concurrent,
+        ka=ka,
+        structures_per_job=(
+            args.structures_per_job
+            if args.structures_per_job is not None
+            else int(
+                settings.get(
+                    "structures_per_job",
+                    DEFAULT_STRUCTURES_PER_DFT_JOB,
+                )
+            )
+        ),
+        max_concurrent=(
+            args.max_concurrent
+            if args.max_concurrent is not None
+            else int(
+                settings.get("max_concurrent", DEFAULT_MAX_CONCURRENT)
+            )
+        ),
         teacher_profile=args.teacher_profile or "ordinary",
         force=args.force,
     )
@@ -918,7 +1173,13 @@ def run_task_command(args):
     elif args.task_action == "cancel":
         value = cancel_operation(operation)
     elif args.task_action == "logs":
-        value = {"run_directory": str(operation.root), "logs": operation_logs(operation)}
+        value = {
+            "protocol": "neptrain.manual-logs.v1",
+            "operation_id": operation.operation_id,
+            "kind": operation.kind,
+            "run_directory": str(operation.root),
+            "logs": operation_logs(operation),
+        }
     else:  # pragma: no cover - argparse owns this invariant
         raise ValueError(args.task_action)
     _print_manual_status(value, json_output=args.json)
@@ -928,6 +1189,24 @@ def run_manual_worker_command(args):
     from NepTrain.core.manual import run_manual_worker
 
     return run_manual_worker(args.run, args.index)
+
+
+def run_spin_migration_command(args):
+    from NepTrain.core.spin import migrate_spin_dataset
+
+    result = migrate_spin_dataset(
+        args.input,
+        args.output,
+        force=args.force,
+    )
+    if args.json:
+        _print_json(result)
+    else:
+        print(
+            f"Migrated {result['spin_frames']}/{result['frames']} spin frames "
+            f"to {result['output']}"
+        )
+        print(f"Removed legacy fields: {result['legacy_fields_removed']}")
 
 
 def _add_execution_options(parser):
@@ -998,6 +1277,24 @@ def build_manual_md(subparsers):
     parser.add_argument("--ensemble", choices=["nvt", "npt"])
     parser.add_argument("--template")
     parser.add_argument(
+        "--route",
+        help=(
+            "Sampling route whose template, conditions, progression, and "
+            "route-specific target provide defaults."
+        ),
+    )
+    parser.add_argument(
+        "--maturity",
+        choices=[
+            "smoke_passed",
+            "short_stable",
+            "long_stable",
+            "production_ready",
+        ],
+        default="smoke_passed",
+        help="Route progression level used when --steps is omitted.",
+    )
+    parser.add_argument(
         "--spin", action=argparse.BooleanOptionalAction, default=None
     )
     parser.add_argument("--spin-temperature", type=float)
@@ -1007,7 +1304,7 @@ def build_manual_md(subparsers):
     parser.add_argument("--mpi-ranks", type=int)
     parser.add_argument("--pre-failure-frames", type=int)
     parser.add_argument("--bad-tail-frames", type=int)
-    parser.add_argument("--max-concurrent", type=int, default=20)
+    parser.add_argument("--max-concurrent", type=int)
     parser.add_argument("--output", "-o", default="./trajectory.xyz")
     parser.add_argument("--force", action="store_true")
     _add_execution_options(parser)
@@ -1023,6 +1320,20 @@ def build_manual_dft(subparsers):
     parser.add_argument("--teacher-profile", choices=["ordinary", "spin"])
     parser.add_argument("--input-file", dest="dft_input")
     parser.add_argument("--resources")
+    parser.add_argument(
+        "--potcar-manifest",
+        help=(
+            "Local JSON manifest pinning each VASP POTCAR path, SHA256, "
+            "TITEL, family, and release."
+        ),
+    )
+    parser.add_argument(
+        "--resource-manifest",
+        help=(
+            "Local JSON manifest pinning ABACUS pseudopotential and orbital "
+            "paths and SHA256 values."
+        ),
+    )
     parser.add_argument("--cpus", type=int)
     parser.add_argument(
         "--gamma", action=argparse.BooleanOptionalAction, default=None
@@ -1030,8 +1341,8 @@ def build_manual_dft(subparsers):
     kpoints = parser.add_mutually_exclusive_group()
     kpoints.add_argument("--kspacing", type=float)
     kpoints.add_argument("--ka", type=_parse_ka)
-    parser.add_argument("--structures-per-job", type=int, default=1)
-    parser.add_argument("--max-concurrent", type=int, default=20)
+    parser.add_argument("--structures-per-job", type=int)
+    parser.add_argument("--max-concurrent", type=int)
     parser.add_argument("--output", "-o", default="./labeled.xyz")
     parser.add_argument("--force", action="store_true")
     _add_execution_options(parser)
@@ -1060,6 +1371,23 @@ def build_task_commands(subparsers):
     wait.add_argument("run", help="Manual run directory.")
     wait.add_argument("--poll-interval", type=float, default=10.0)
     wait.add_argument("--json", action="store_true")
+
+
+def build_data_commands(subparsers):
+    parser = subparsers.add_parser(
+        "data",
+        help="Validate or explicitly migrate scientific dataset contracts.",
+    )
+    actions = parser.add_subparsers(dest="data_action", required=True)
+    migrate = actions.add_parser(
+        "migrate-spin",
+        help="Rewrite legacy spins/mforces aliases to spin/mforce atomically.",
+    )
+    migrate.set_defaults(func=run_spin_migration_command)
+    migrate.add_argument("input")
+    migrate.add_argument("output")
+    migrate.add_argument("--force", action="store_true")
+    migrate.add_argument("--json", action="store_true")
 
 
 def build_workflow_commands(subparsers):
@@ -1144,6 +1472,11 @@ def build_internal_commands(subparsers):
     worker.set_defaults(func=run_stage_worker_command)
     worker.add_argument("bundle")
 
+    verifier = subparsers.add_parser("stage-verify", help=argparse.SUPPRESS)
+    subparsers._choices_actions.pop()
+    verifier.set_defaults(func=run_stage_verify_command)
+    verifier.add_argument("bundle")
+
     manual = subparsers.add_parser("manual-worker", help=argparse.SUPPRESS)
     subparsers._choices_actions.pop()
     manual.set_defaults(func=run_manual_worker_command)
@@ -1163,7 +1496,7 @@ def main():
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{train,md,dft,select,perturb,workflow,task,doctor,smoke}",
+        metavar="{train,md,dft,select,perturb,workflow,task,data,doctor,smoke}",
     )
     build_manual_train(subparsers)
     build_manual_md(subparsers)
@@ -1172,6 +1505,7 @@ def main():
     build_perturb(subparsers)
     build_workflow_commands(subparsers)
     build_task_commands(subparsers)
+    build_data_commands(subparsers)
     build_doctor(subparsers)
     build_smoke(subparsers)
     build_internal_commands(subparsers)

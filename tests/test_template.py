@@ -29,6 +29,8 @@ def test_init_project_writes_a_valid_narrow_schema_v7(tmp_path):
     assert "template_path" not in config["md"]
     assert "plugin_path" not in config["md"]
     assert config["dft"]["kpoint_mode"] == "auto"
+    assert config["dft"]["resource_path"] == "./resources"
+    assert config["dft"]["potcar_manifest_path"] == "./vasp-resources.json"
     assert config["dft"]["structures_per_job"] == 1
     assert config["dft"]["max_concurrent"] == 20
     assert "kspacing" not in config["dft"]
@@ -42,6 +44,7 @@ def test_init_project_writes_a_valid_narrow_schema_v7(tmp_path):
     assert "duration_ps_every_generation" not in config["md"]
     assert (tmp_path / "lammps.in").is_file()
     assert (tmp_path / "INCAR").is_file()
+    assert (tmp_path / "vasp-resources.json").is_file()
     assert not (tmp_path / "INPUT").exists()
     assert "KSPACING = 0.2" in (tmp_path / "INCAR").read_text(encoding="utf-8")
 
@@ -59,8 +62,10 @@ def test_init_selects_only_the_requested_spin_abacus_templates(tmp_path):
     assert config["md"]["spin"] is True
     assert config["dft"]["backend"] == "abacus"
     assert config["dft"]["input_path"] == "./INPUT"
+    assert config["dft"]["resource_manifest_path"] == "./abacus-resources.json"
     assert (tmp_path / "lammps.in").is_file()
     assert (tmp_path / "INPUT").is_file()
+    assert (tmp_path / "abacus-resources.json").is_file()
     assert not (tmp_path / "INCAR").exists()
     assert "fix integrator all dynspin/glsd/nvt" in (
         tmp_path / "lammps.in"

@@ -7,6 +7,7 @@ from ase.io import read, write
 
 from NepTrain.core.spin import (
     SpinDataError,
+    canonicalize_spin_arrays,
     collect_mforce_from_results,
     prepare_spin_for_dft,
     spin_from_lammps,
@@ -59,15 +60,18 @@ def test_spin_labels_are_mandatory_for_training():
         "magnetic_forces",
     ],
 )
-def test_mforce_aliases_are_canonicalized_for_training(alias: str):
+def test_mforce_aliases_require_explicit_migration(alias: str):
     atoms = Atoms("Fe", positions=[[0, 0, 0]])
     spin = np.asarray([[1.0, 0.0, 0.0]])
     mforce = np.asarray([[0.1, 0.2, 0.3]])
     atoms.set_array("spin", spin)
     atoms.set_array(alias, mforce)
 
-    validate_spin_dataset([atoms], require_mforce=True)
+    with pytest.raises(SpinDataError, match="require explicit migration"):
+        validate_spin_dataset([atoms], require_mforce=True)
 
+    canonicalize_spin_arrays(atoms)
+    validate_spin_dataset([atoms], require_mforce=True)
     assert alias not in atoms.arrays
     np.testing.assert_allclose(atoms.arrays["mforce"], mforce)
 
@@ -81,7 +85,7 @@ def test_conflicting_mforce_alias_is_rejected():
     with pytest.raises(
         SpinDataError, match="ambiguous mforce: mforce and force_mag differ"
     ):
-        validate_spin_dataset([atoms], require_mforce=True)
+        canonicalize_spin_arrays(atoms)
 
 
 def test_spin_is_forwarded_to_dft_and_mforce_is_collected():

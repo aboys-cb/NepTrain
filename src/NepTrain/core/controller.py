@@ -20,7 +20,12 @@ from typing import Any, Callable, Mapping
 from ase.io import read as ase_read
 
 from .workflow_workspace import WorkflowWorkspace
-from .config import ConfigError, load_config
+from .config import (
+    ConfigError,
+    DEFAULT_MAX_CONCURRENT,
+    DEFAULT_STRUCTURES_PER_DFT_JOB,
+    load_config,
+)
 from .execution import (
     ExecutionError,
     ExecutionHandle,
@@ -49,6 +54,7 @@ _RESOURCE_FOR_STAGE = {
 }
 _STOP = False
 _STOP_EVENT = threading.Event()
+_EXECUTION_UNKNOWN_GRACE_SECONDS = 300.0
 
 
 def _now() -> str:
@@ -65,10 +71,27 @@ def _write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def _read_json(path: Path, default: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _read_json(
+    path: Path,
+    default: Mapping[str, Any] | None = None,
+    *,
+    role: str = "controller state",
+) -> dict[str, Any]:
     if not path.is_file():
-        return dict(default or {})
-    return json.loads(path.read_text(encoding="utf-8"))
+        if default is not None:
+            return dict(default)
+        raise ControllerError(f"required controller state file is missing: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ControllerError(
+            f"cannot read {role} JSON at {path}: {error}"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise ControllerError(
+            f"{role} JSON at {path} must contain an object"
+        )
+    return dict(value)
 
 
 def _sha256(path: Path) -> str:
@@ -99,7 +122,7 @@ def _record_matches(record: Mapping[str, Any]) -> bool:
 
 
 def _plan(path: Path) -> GenerationPlan:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = _read_json(path, role="generation plan")
     return GenerationPlan(**value)
 
 
@@ -169,7 +192,15 @@ class PersistentController:
             raise ControllerError(
                 "persistent controllers require workflow layout v3"
             )
-        self.manifest = _read_json(self.workspace.manifest)
+        from .workflow import WorkflowError, _normalise_manifest
+
+        try:
+            self.manifest = _normalise_manifest(
+                _read_json(self.workspace.manifest, role="workflow manifest"),
+                self.workspace.manifest,
+            )
+        except WorkflowError as error:
+            raise ControllerError(str(error)) from error
         if self.manifest.get("orchestration") != "controller":
             raise ControllerError(
                 "workflow was not prepared for the current controller"
@@ -266,6 +297,7 @@ class PersistentController:
         return _read_json(
             self.workspace.ledger,
             {"version": 1, "workflow_id": self.workflow_id, "generations": {}},
+            role="scientific ledger",
         )
 
     def _next(self) -> tuple[GenerationPlan, str, Any] | None:
@@ -332,22 +364,9 @@ class PersistentController:
         bundle: Path,
     ) -> Any:
         try:
-            value, outcome = load_stage_result(bundle)
+            _, outcome = load_stage_result(bundle)
         except ExecutionError as error:
             raise ControllerError(f"completed stage returned an invalid result: {error}") from error
-        current = self.state["current"]
-        expected = {
-            "task_id": current["task_id"],
-            "workflow_id": self.workflow_id,
-            "generation": plan.generation,
-            "stage": stage,
-            "plan_sha256": plan.sha256,
-        }
-        for key, expected_value in expected.items():
-            if value.get(key) != expected_value:
-                raise ControllerError(
-                    f"stage result {key} does not match controller intent"
-                )
         return self._install_outcome(
             plan=plan,
             stage=stage,
@@ -466,6 +485,29 @@ class PersistentController:
         temporary.replace(link)
         return link
 
+    @staticmethod
+    def _unknown_became_lost(
+        record: dict[str, Any],
+        state: str,
+    ) -> bool:
+        if state != "unknown":
+            record.pop("unknown_since", None)
+            record.pop("unknown_observations", None)
+            return False
+        since = record.get("unknown_since")
+        if since is None:
+            since = time.time()
+            record["unknown_since"] = since
+            record["unknown_observations"] = 1
+        else:
+            record["unknown_observations"] = int(
+                record.get("unknown_observations", 0)
+            ) + 1
+        return (
+            time.time() - float(since)
+            >= _EXECUTION_UNKNOWN_GRACE_SECONDS
+        )
+
     def _tick_task_group(self, current: dict[str, Any]) -> ControllerTick:
         from .execution import StageTask
 
@@ -510,11 +552,18 @@ class PersistentController:
             item["observed_state"] = status.state
             item["observed_at"] = _now()
             item["detail"] = status.detail
-            if status.state == "failed":
+            lost = self._unknown_became_lost(item, status.state)
+            if status.state in {"failed", "cancelled"} or lost:
                 item["terminal_failure"] = True
                 group_failed = True
                 item["failure"] = (
-                    status.detail or f"{stage} task {item['task_id']} failed"
+                    (
+                        "execution remained unknown beyond the recovery grace "
+                        f"period: {status.detail}"
+                        if lost
+                        else status.detail
+                    )
+                    or f"{stage} task {item['task_id']} failed"
                 )
                 self._save()
                 continue
@@ -584,21 +633,7 @@ class PersistentController:
         _, context = self.generation_controller.stage_context(plan, stage)
         outcomes: list[StageOutcome] = []
         for item in current["tasks"]:
-            value, outcome = load_stage_result(item["collected_bundle"])
-            expected = {
-                "task_id": item["task_id"],
-                "workflow_id": self.workflow_id,
-                "generation": plan.generation,
-                "stage": stage,
-                "plan_sha256": plan.sha256,
-            }
-            if any(
-                value.get(key) != expected_value
-                for key, expected_value in expected.items()
-            ):
-                raise ControllerError(
-                    f"MD task result identity does not match {item['task_id']}"
-                )
+            _, outcome = load_stage_result(item["collected_bundle"])
             outcomes.append(outcome)
         from .workflow_iteration import WorkflowIterationAdapter
 
@@ -649,7 +684,6 @@ class PersistentController:
             bundle = Path(current["bundle"])
             handle_value = current.get("handle")
             if handle_value is None:
-                task_value = json.loads((bundle / "task.json").read_text(encoding="utf-8"))
                 from .execution import StageTask
 
                 task = StageTask(
@@ -679,6 +713,13 @@ class PersistentController:
             current["observed_state"] = status.state
             current["observed_at"] = _now()
             current["detail"] = status.detail
+            lost = self._unknown_became_lost(current, status.state)
+            if lost:
+                status = type(status)(
+                    "failed",
+                    "execution remained unknown beyond the recovery grace "
+                    f"period: {status.detail}",
+                )
             if status.state in {"running", "unknown"}:
                 self.state["state"] = (
                     "degraded" if status.state == "unknown" else "running"
@@ -696,7 +737,7 @@ class PersistentController:
                     handle.execution_id,
                     status.detail,
                 )
-            if status.state == "failed":
+            if status.state in {"failed", "cancelled"}:
                 self.state["state"] = "failed"
                 self.state["reason"] = status.detail or "stage execution failed"
                 self._save()
@@ -777,6 +818,7 @@ class PersistentController:
                     config=self.config,
                     initial_training=self.initial_training,
                     context=context,
+                    workflow_instance_id=self.manifest["instance_id"],
                     stage_input={
                         "route_id": spec["route_id"],
                         "attempt_ids": [spec["attempt_id"]],
@@ -815,10 +857,16 @@ class PersistentController:
             if not isinstance(frames, list):
                 frames = [frames]
             structures_per_job = int(
-                self.config.get("dft", {}).get("structures_per_job", 1)
+                self.config.get("dft", {}).get(
+                    "structures_per_job",
+                    DEFAULT_STRUCTURES_PER_DFT_JOB,
+                )
             )
             maximum = int(
-                self.config.get("dft", {}).get("max_concurrent", 20)
+                self.config.get("dft", {}).get(
+                    "max_concurrent",
+                    DEFAULT_MAX_CONCURRENT,
+                )
             )
             target_name = self.stage_targets["labeling"]
             target = self.targets[target_name]
@@ -839,6 +887,7 @@ class PersistentController:
                     config=self.config,
                     initial_training=self.initial_training,
                     context=context,
+                    workflow_instance_id=self.manifest["instance_id"],
                     stage_input={
                         "batch_index": batch_index,
                         "frame_indices": list(range(start, stop)),
@@ -889,6 +938,7 @@ class PersistentController:
             config=self.config,
             initial_training=self.initial_training,
             context=context,
+            workflow_instance_id=self.manifest["instance_id"],
         )
         self.state["current"] = {
             "task_id": task.task_id,
@@ -928,32 +978,84 @@ class PersistentController:
         current = self.state.get("current")
         if current is not None:
             if current.get("kind") == "task_group":
+                plan = next(
+                    plan
+                    for plan in self.plans
+                    if plan.generation == int(current["generation"])
+                )
+                _, context = self.generation_controller.stage_context(
+                    plan,
+                    str(current["stage"]),
+                )
+                new_attempt = int(current.get("attempt", 1)) + 1
                 retried = 0
                 for item in current["tasks"]:
                     if item.get("collected_bundle"):
                         continue
                     handle = item.get("handle")
-                    if handle is not None:
-                        item.setdefault("retry_history", []).append(
-                            {
-                                "handle": handle,
-                                "failed_at": _now(),
-                                "failure": item.get("detail")
-                                or self.state.get("reason", "manual retry"),
-                            }
+                    item.setdefault("retry_history", []).append(
+                        {
+                            "task_id": item["task_id"],
+                            "bundle": item["bundle"],
+                            "handle": handle,
+                            "failed_at": _now(),
+                            "failure": item.get("detail")
+                            or self.state.get("reason", "manual retry"),
+                        }
+                    )
+                    target_name = str(item["target"])
+                    target = self.targets[target_name]
+                    if current["stage"] == "explore":
+                        stage_input = {
+                            "route_id": item["route_id"],
+                            "attempt_ids": [
+                                item["scenario_attempt_id"]
+                            ],
+                            "allow_empty": True,
+                        }
+                    elif current["stage"] == "label":
+                        stage_input = {
+                            "batch_index": item["batch_index"],
+                            "frame_indices": list(item["frame_indices"]),
+                        }
+                    else:
+                        raise ControllerError(
+                            f"unsupported grouped retry stage: "
+                            f"{current['stage']}"
                         )
+                    task = build_stage_task(
+                        self.workspace.tasks_dir,
+                        workflow_root=self.workspace.root,
+                        workflow_id=self.workflow_id,
+                        workflow_instance_id=self.manifest["instance_id"],
+                        generation=plan.generation,
+                        stage=str(current["stage"]),
+                        attempt=new_attempt,
+                        target=target,
+                        plan=plan,
+                        config=self.config,
+                        initial_training=self.initial_training,
+                        context=context,
+                        stage_input=stage_input,
+                    )
+                    item["task_id"] = task.task_id
+                    item["bundle"] = str(task.bundle)
                     item["handle"] = None
                     item.pop("terminal_failure", None)
                     item.pop("failure", None)
                     item.pop("observed_state", None)
                     item.pop("observed_at", None)
                     item.pop("detail", None)
+                    item.pop("cancellation", None)
+                    item.pop("cancellation_requested_at", None)
                     retried += 1
                 if not retried:
                     raise ControllerError(
                         f"{current['stage']} task group has no failed or "
                         "unfinished tasks to retry"
                     )
+                current["attempt"] = new_attempt
+                current.pop("cancellations", None)
                 self.state["state"] = "launching"
                 self.state.pop("reason", None)
                 self._save()
@@ -966,6 +1068,117 @@ class PersistentController:
         self.state["state"] = "idle"
         self.state.pop("reason", None)
         self._save()
+
+    def resume_stopped(self) -> None:
+        """Reconcile stop/cancel state before a controller is restarted."""
+
+        if self.state.get("state") != "stopped":
+            return
+        current = self.state.get("current")
+        if current is None:
+            self.state["state"] = "idle"
+            self.state.pop("reason", None)
+            self._save()
+            return
+        if current.get("kind") == "task_group":
+            cancellation_seen = False
+            for item in current["tasks"]:
+                if item.get("collected_bundle"):
+                    continue
+                cancellation = item.get("cancellation")
+                if cancellation is None:
+                    continue
+                cancellation_seen = True
+                handle_value = item.get("handle")
+                if handle_value is None:
+                    item["terminal_failure"] = True
+                    item["failure"] = "task was stopped before launch"
+                    continue
+                executor = self.executor_factory(
+                    self.targets[str(item["target"])]
+                )
+                handle = ExecutionHandle.from_mapping(handle_value)
+                status = executor.inspect(handle)
+                item["observed_state"] = status.state
+                item["observed_at"] = _now()
+                item["detail"] = status.detail
+                if status.state == "completed":
+                    collected = executor.collect(handle)
+                    item["collected_bundle"] = str(collected)
+                    item["completed_at"] = _now()
+                    self._publish_calculation_link(
+                        generation=int(current["generation"]),
+                        stage=str(current["stage"]),
+                        bundle=Path(collected),
+                        grouped=True,
+                        link_name_override=item.get("display_name"),
+                    )
+                elif status.state in {"failed", "cancelled"}:
+                    item["terminal_failure"] = True
+                    item["failure"] = (
+                        status.detail or "cancelled execution is terminal"
+                    )
+                else:
+                    self._save()
+                    raise ControllerError(
+                        "workflow cancellation is not terminal yet; run resume "
+                        "again after the scheduler finishes cancelling current jobs"
+                    )
+            if cancellation_seen and any(
+                item.get("terminal_failure") for item in current["tasks"]
+            ):
+                self.state["state"] = "failed"
+                self.state["reason"] = (
+                    "stopped task group is terminal; retrying only unfinished "
+                    "tasks with a new attempt"
+                )
+                self._save()
+                self.retry()
+                return
+            self.state["state"] = "launching"
+            self.state.pop("reason", None)
+            self._save()
+            return
+
+        cancellation = current.get("cancellation")
+        if cancellation is None:
+            self.state["state"] = "running"
+            self.state.pop("reason", None)
+            self._save()
+            return
+        handle_value = current.get("handle")
+        if handle_value is None:
+            self.state["state"] = "failed"
+            self.state["reason"] = "stopped task has no execution handle"
+            self._save()
+            self.retry()
+            return
+        executor = self.executor_factory(
+            self.targets[str(current["target"])]
+        )
+        handle = ExecutionHandle.from_mapping(handle_value)
+        status = executor.inspect(handle)
+        current["observed_state"] = status.state
+        current["observed_at"] = _now()
+        current["detail"] = status.detail
+        if status.state == "completed":
+            self.state["state"] = "running"
+            self.state.pop("reason", None)
+            self._save()
+            return
+        if status.state in {"failed", "cancelled"}:
+            self.state["state"] = "failed"
+            self.state["reason"] = (
+                status.detail or "cancelled execution is terminal"
+            )
+            self._save()
+            self.retry()
+            return
+        self._save()
+        raise ControllerError(
+            "workflow cancellation is not terminal yet; run resume again after "
+            "the scheduler finishes cancelling the current job"
+        )
 
 
 def _signal_stop(_signum, _frame) -> None:
@@ -1090,7 +1303,7 @@ def start_controller(
         if workspace.controller_pid.is_file() and controller_running(workspace.root):
             try:
                 state = _read_json(workspace.controller_file)
-            except (FileNotFoundError, json.JSONDecodeError):
+            except ControllerError:
                 state = {}
             if (
                 int(state.get("pid", -1)) == process.pid
@@ -1125,6 +1338,47 @@ def stop_controller(project: str | Path) -> None:
     raise ControllerError("controller did not stop within 5 seconds")
 
 
+def _append_execution_event(
+    workspace: WorkflowWorkspace,
+    event: Mapping[str, Any],
+) -> None:
+    manifest = _read_json(
+        workspace.manifest,
+        role="workflow manifest",
+    )
+    workflow_id = str(manifest.get("workflow_id", ""))
+    if not workflow_id:
+        raise ControllerError("workflow manifest has no workflow_id")
+    with workspace.ledger_lock.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        ledger = _read_json(
+            workspace.ledger,
+            {
+                "version": 1,
+                "workflow_id": workflow_id,
+                "generations": {},
+            },
+            role="scientific ledger",
+        )
+        if ledger.get("workflow_id") != workflow_id:
+            raise ControllerError(
+                "cannot record stop: scientific ledger belongs to another workflow"
+            )
+        records = ledger.setdefault("execution_events", [])
+        if not isinstance(records, list):
+            raise ControllerError(
+                "scientific ledger execution_events must be a list"
+            )
+        records.append(
+            {
+                "sequence": len(records) + 1,
+                "recorded_at": _now(),
+                **dict(event),
+            }
+        )
+        _write_json(workspace.ledger, ledger)
+
+
 def stop_workflow(
     project: str | Path,
     *,
@@ -1142,16 +1396,64 @@ def stop_workflow(
     was_running = controller_running(workspace.root)
     if was_running:
         stop_controller(workspace.root)
-    elif not cancel_jobs:
-        raise ControllerError("workflow controller is not running")
 
     result: dict[str, Any] = {
         "project": str(workspace.root),
         "controller": "stopped" if was_running else "already_stopped",
         "current_execution": None,
     }
-    if not cancel_jobs:
+
+    if not was_running:
+        prior_state = (
+            _read_json(workspace.controller_file, role="controller state")
+            if workspace.controller_file.is_file()
+            else {}
+        )
+        prior_current = prior_state.get("current")
+        prior_name = str(prior_state.get("state", "prepared"))
+        no_op_states = {
+            "prepared",
+            "idle",
+            "stopped",
+            "complete",
+            "failed",
+            "rejected",
+            "stalled",
+            "budget_exhausted",
+        }
+        if prior_current is None and prior_name in no_op_states:
+            result["current_execution"] = {
+                "action": "none",
+                "detail": (
+                    "workflow has no active execution; its existing state "
+                    f"{prior_name!r} was left unchanged"
+                ),
+            }
+            return result
+        if not cancel_jobs:
+            result["current_execution"] = {
+                "action": "preserved",
+                "detail": (
+                    "controller was already stopped; the recorded current "
+                    "execution was left unchanged"
+                ),
+            }
+            return result
+
+    def finish() -> dict[str, Any]:
+        _append_execution_event(
+            workspace,
+            {
+                "event": "workflow_stop",
+                "cancel_jobs": bool(cancel_jobs),
+                "controller": result["controller"],
+                "current_execution": result["current_execution"],
+            },
+        )
         return result
+
+    if not cancel_jobs:
+        return finish()
 
     with workspace.controller_lock.open("a+", encoding="utf-8") as lock:
         try:
@@ -1171,28 +1473,61 @@ def stop_workflow(
             )
             controller._save()
             result["current_execution"] = {"action": "none"}
-            return result
+            return finish()
         if current.get("kind") == "task_group":
             records = []
             for item in current["tasks"]:
                 handle_value = item.get("handle")
-                if handle_value is None or item.get("collected_bundle"):
+                if item.get("collected_bundle"):
+                    records.append(
+                        {
+                            "target": item["target"],
+                            "execution_id": (
+                                (handle_value or {}).get("execution_id")
+                            ),
+                            "action": "completed",
+                            "detail": "result was already collected and preserved",
+                        }
+                    )
+                    continue
+                if handle_value is None:
+                    record = {
+                        "target": item["target"],
+                        "execution_id": None,
+                        "action": "cancelled_before_launch",
+                        "detail": "task had not been submitted",
+                    }
+                    item["cancellation"] = record
+                    item["cancellation_requested_at"] = _now()
+                    item["terminal_failure"] = True
+                    item["failure"] = record["detail"]
+                    records.append(record)
                     continue
                 target_name = str(item["target"])
                 handle = ExecutionHandle.from_mapping(handle_value)
                 executor = controller.executor_factory(
                     controller.targets[target_name]
                 )
-                status = executor.cancel(handle)
-                records.append(
-                    {
-                        "target": target_name,
-                        "executor": handle.executor,
-                        "execution_id": handle.execution_id,
-                        "action": status.state,
-                        "detail": status.detail,
-                    }
-                )
+                try:
+                    status = executor.cancel(handle)
+                except ExecutionError as error:
+                    raise ControllerError(
+                        f"failed to cancel {target_name} execution "
+                        f"{handle.execution_id}: {error}"
+                    ) from error
+                record = {
+                    "target": target_name,
+                    "executor": handle.executor,
+                    "execution_id": handle.execution_id,
+                    "action": status.state,
+                    "detail": status.detail,
+                }
+                item["cancellation"] = record
+                item["cancellation_requested_at"] = _now()
+                item["observed_state"] = status.state
+                item["observed_at"] = _now()
+                item["detail"] = status.detail
+                records.append(record)
                 if status.state not in {
                     "cancelled",
                     "failed",
@@ -1203,22 +1538,26 @@ def stop_workflow(
                         f"{current['stage']} task cancellation returned unsafe state "
                         f"{status.state}"
                     )
-            archived = dict(current)
-            archived["cancelled_at"] = _now()
-            archived["cancellations"] = records
-            controller.state.setdefault("history", []).append(archived)
-            controller.state["current"] = None
+                if status.state in {"cancelled", "failed"}:
+                    item["terminal_failure"] = True
+                    item["failure"] = (
+                        status.detail or "execution cancelled by user"
+                    )
+                elif status.state == "completed":
+                    item.pop("cancellation_requested_at", None)
+            current["cancellations"] = records
+            current["stopped_at"] = _now()
             controller.state["state"] = "stopped"
             controller.state["reason"] = (
-                f"controller stopped and current {current['stage']} "
-                "task group was cancelled"
+                f"controller stopped; cancellation state for current "
+                f"{current['stage']} task group is preserved"
             )
             controller._save()
             result["current_execution"] = {
-                "action": "group_cancelled",
+                "action": "group_cancellation_requested",
                 "tasks": records,
             }
-            return result
+            return finish()
         handle_value = current.get("handle")
         if handle_value is None:
             raise ControllerError(
@@ -1252,7 +1591,7 @@ def stop_workflow(
                 "before cancellation and remains available for collection"
             )
             controller._save()
-            return result
+            return finish()
         if status.state == "cancelling":
             current["cancellation_requested_at"] = _now()
             current["cancellation"] = record
@@ -1262,7 +1601,7 @@ def stop_workflow(
                 "accepted but is not terminal yet"
             )
             controller._save()
-            return result
+            return finish()
         if status.state not in {"cancelled", "failed"}:
             raise ControllerError(
                 f"execution cancellation returned unsafe state {status.state}"
@@ -1279,7 +1618,7 @@ def stop_workflow(
             else "controller stopped; current execution had already failed"
         )
         controller._save()
-        return result
+        return finish()
 
 
 __all__ = [

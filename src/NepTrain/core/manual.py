@@ -27,7 +27,15 @@ from typing import Any, Mapping, Sequence
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
-from .execution import ExecutionTarget, ExecutionTransport
+from .execution import ExecutionError, ExecutionTarget, ExecutionTransport
+from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_DFT_JOB
+from .scientific_data import (
+    ScientificDataError,
+    labeled_input_structure_ids,
+    structure_id,
+    validate_labeled_frames,
+)
+from .spin import SpinDataError, validate_spin_dataset
 
 
 class ManualTaskError(RuntimeError):
@@ -56,6 +64,7 @@ _SLURM_FAILURE = {
     "SPECIAL_EXIT",
     "TIMEOUT",
 }
+_SCHEDULER_MISSING_GRACE_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -65,7 +74,6 @@ class ManualOperation:
     kind: str
     target: ExecutionTarget
     shard_count: int
-    jobs_directory: str = "jobs"
 
     @property
     def descriptor(self) -> Path:
@@ -73,7 +81,7 @@ class ManualOperation:
 
     @property
     def jobs_root(self) -> Path:
-        return self.root / self.jobs_directory
+        return self.root / "jobs"
 
 
 def _now() -> str:
@@ -96,9 +104,88 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise ManualTaskError(f"cannot read task metadata: {path}") from error
+        raise ManualTaskError(
+            f"cannot read task metadata {path}: {error}"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise ManualTaskError(f"task metadata {path} must contain an object")
+    return dict(value)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+
+
+def _manual_spec(descriptor: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: descriptor.get(key)
+        for key in (
+            "operation_id",
+            "kind",
+            "target",
+            "output",
+            "max_concurrent",
+            "jobs",
+            "scientific_input",
+            "files",
+            "input_manifest",
+        )
+    }
+
+
+def _verify_operation_bundle(root: Path) -> dict[str, Any]:
+    descriptor = _read_json(root / "operation.json")
+    protocol = descriptor.get("protocol")
+    if protocol != "neptrain.manual-operation.v3":
+        if protocol in {
+            "neptrain.manual-operation.v1",
+            "neptrain.manual-operation.v2",
+        }:
+            raise ManualTaskError(
+                "manual run uses an unsafe legacy protocol and cannot be "
+                "collected or retried automatically; keep its raw job outputs "
+                "and prepare a new v3 run"
+            )
+        raise ManualTaskError(f"not a NepTrain manual run: {root}")
+    for record in descriptor.get("files", []):
+        relative = Path(str(record.get("path", "")))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ManualTaskError("manual input manifest escapes the run directory")
+        path = root / relative
+        if (
+            not path.is_file()
+            or path.stat().st_size != int(record.get("size", -1))
+            or _sha256(path) != record.get("sha256")
+        ):
+            raise ManualTaskError(f"manual task input drifted: {path}")
+    input_manifest = descriptor.get("input_manifest", {})
+    manifest_path = root / str(input_manifest.get("path", ""))
+    if (
+        not manifest_path.is_file()
+        or _sha256(manifest_path) != input_manifest.get("sha256")
+    ):
+        raise ManualTaskError("manual input checksum manifest drifted or is missing")
+    expected = _canonical_hash(_manual_spec(descriptor))
+    if descriptor.get("spec_sha256") != expected:
+        raise ManualTaskError("manual operation content identity is invalid")
+    return descriptor
 
 
 def _copy(source: Path, destination: Path) -> str:
@@ -136,6 +223,7 @@ def target_from_project(
     target_name: str | None,
     *,
     route: str,
+    sampling_route_id: str | None = None,
 ) -> ExecutionTarget:
     if project is None:
         if target_name not in {None, "local"}:
@@ -146,7 +234,12 @@ def target_from_project(
     project_path = Path(project).expanduser().resolve()
     config, _ = load_config(project_path)
     execution = config["execution"]
-    name = target_name or execution["stage_targets"][route]
+    route_target = None
+    if route == "sampling" and sampling_route_id is not None:
+        route_target = dict(execution.get("sampling_route_targets") or {}).get(
+            sampling_route_id
+        )
+    name = target_name or route_target or execution["stage_targets"][route]
     try:
         raw = dict(execution["targets"][name])
     except KeyError as error:
@@ -205,6 +298,7 @@ def _write_operation(
     output: Path,
     jobs: Sequence[Mapping[str, Any]],
     max_concurrent: int,
+    scientific_input: Mapping[str, Any] | None = None,
 ) -> ManualOperation:
     if max_concurrent < 1:
         raise ManualTaskError("max_concurrent must be at least 1")
@@ -214,7 +308,7 @@ def _write_operation(
         _copy(setup, packaged)
         target = replace(target, setup_script="./inputs/setup.sh")
     value = {
-        "protocol": "neptrain.manual-operation.v2",
+        "protocol": "neptrain.manual-operation.v3",
         "operation_id": operation_id,
         "kind": kind,
         "created_at": _now(),
@@ -223,8 +317,34 @@ def _write_operation(
         "output": str(output.expanduser().resolve()),
         "max_concurrent": int(max_concurrent),
         "jobs": [dict(item) for item in jobs],
+        "scientific_input": dict(scientific_input or {}),
         "attempts": [],
     }
+    value["files"] = [
+        {
+            "path": str(path.relative_to(root)),
+            "sha256": _sha256(path),
+            "size": path.stat().st_size,
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and path.name != "operation.json"
+        and "calculation" not in path.parts
+        and "logs" not in path.parts
+    ]
+    checksum_manifest = root / "input-manifest.sha256"
+    checksum_manifest.write_text(
+        "".join(
+            f"{record['sha256']}  {record['path']}\n"
+            for record in value["files"]
+        ),
+        encoding="utf-8",
+    )
+    value["input_manifest"] = {
+        "path": checksum_manifest.name,
+        "sha256": _sha256(checksum_manifest),
+    }
+    value["spec_sha256"] = _canonical_hash(_manual_spec(value))
     _write_json(root / "operation.json", value)
     _progress(
         f"{kind}: prepared {len(jobs)} job(s) in {root}"
@@ -301,26 +421,33 @@ def prepare_dft(
     target: ExecutionTarget,
     input_file: str | Path | None = None,
     resource_dir: str | Path | None = None,
+    resource_manifest: str | Path | None = None,
     n_cpu: int | None = None,
     use_gamma: bool = False,
     kpoint_mode: str = "auto",
     kspacing: float | None = None,
     ka: Sequence[int] = (1, 1, 1),
-    structures_per_job: int = 1,
-    max_concurrent: int = 20,
+    structures_per_job: int = DEFAULT_STRUCTURES_PER_DFT_JOB,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     teacher_profile: str = "ordinary",
     force: bool = False,
 ) -> ManualOperation:
     if structures_per_job < 1:
         raise ManualTaskError("structures_per_job must be at least 1")
-    effective_resource = (
-        target.dft_resource_path
-        or (
-            str(Path(resource_dir).expanduser().resolve())
-            if resource_dir
-            else None
-        )
+    selected_resource = (
+        resource_dir if resource_dir is not None else target.dft_resource_path
     )
+    effective_resource = None
+    if selected_resource is not None:
+        resource_path = Path(selected_resource).expanduser()
+        if target.host:
+            if not resource_path.is_absolute():
+                raise ManualTaskError(
+                    "remote DFT resource paths must be absolute on the target"
+                )
+            effective_resource = str(resource_path)
+        else:
+            effective_resource = str(resource_path.resolve())
     if backend in {"vasp", "abacus"} and not effective_resource:
         raise ManualTaskError(
             f"{backend} labeling requires --resources, dft.resource_path, "
@@ -339,14 +466,139 @@ def prepare_dft(
         if n_cpu is not None
         else target.cpus_per_task or 1
     )
-    if target.host and resource_dir and not target.dft_resource_path:
-        raise ManualTaskError(
-            "remote DFT targets require dft_resource_path; "
-            "large resource directories are not copied"
-        )
     _progress(f"dft: reading structures from {Path(source).expanduser()}")
     output_path = _output_path(output, force=force)
     frames = _frames(Path(source))
+    try:
+        _, spin_frames = validate_spin_dataset(
+            frames,
+            require_mforce=False,
+        )
+    except SpinDataError as error:
+        raise ManualTaskError(f"DFT input spin contract is invalid: {error}") from error
+    frame_ids = [structure_id(frame) for frame in frames]
+    resource_provenance = None
+    resource_manifest_source = None
+    if backend == "vasp":
+        from .dft.vasp.native import (
+            NativeVaspError,
+            validate_vasp_input_file,
+            validate_vasp_structure,
+        )
+        from .dft.vasp.resources import (
+            VaspResourceError,
+            validate_vasp_manifest_elements,
+            validate_vasp_resources,
+            vasp_element_order,
+        )
+
+        if resource_manifest is None:
+            raise ManualTaskError(
+                "VASP labeling requires --potcar-manifest or "
+                "dft.potcar_manifest_path"
+            )
+        resource_manifest_source = Path(resource_manifest).expanduser().resolve()
+        orders = sorted({vasp_element_order(frame) for frame in frames})
+        try:
+            electronic_mode = (
+                validate_vasp_input_file(input_file)
+                if input_file is not None
+                else "non_spin_polarized"
+            )
+            for frame in frames:
+                validate_vasp_structure(
+                    frame,
+                    electronic_mode=electronic_mode,
+                )
+            resource_provenance = validate_vasp_manifest_elements(
+                resource_manifest_source,
+                orders,
+            )
+            if target.host is None:
+                resource_provenance["validated_orders"] = [
+                    validate_vasp_resources(
+                        str(effective_resource),
+                        resource_manifest_source,
+                        next(
+                            frame
+                            for frame in frames
+                            if vasp_element_order(frame) == order
+                        ),
+                    )
+                    for order in orders
+                ]
+        except (NativeVaspError, VaspResourceError) as error:
+            raise ManualTaskError(str(error)) from error
+    elif backend == "abacus":
+        from .dft.abacus.io import read_input_file
+        from .dft.abacus.native import (
+            NativeAbacusError,
+            validate_abacus_spin_contract,
+        )
+        from .dft.abacus.resources import (
+            AbacusResourceError,
+            validate_abacus_manifest_elements,
+            validate_abacus_resources,
+        )
+
+        if resource_manifest is None:
+            raise ManualTaskError(
+                "ABACUS labeling requires --resource-manifest or "
+                "dft.resource_manifest_path"
+            )
+        resource_manifest_source = Path(resource_manifest).expanduser().resolve()
+        orders = sorted(
+            {tuple(dict.fromkeys(frame.get_chemical_symbols())) for frame in frames}
+        )
+        parameters = (
+            read_input_file(str(input_file))
+            if input_file is not None
+            else {}
+        )
+        require_orbitals = (
+            str(parameters.get("basis_type", "pw")).strip().lower() == "lcao"
+        )
+        try:
+            validate_abacus_spin_contract(
+                dict(parameters),
+                spin_frame=bool(spin_frames),
+            )
+            resource_provenance = validate_abacus_manifest_elements(
+                resource_manifest_source,
+                orders,
+            )
+            if target.host is None:
+                resource_provenance["validated_orders"] = [
+                    validate_abacus_resources(
+                        str(effective_resource),
+                        resource_manifest_source,
+                        next(
+                            frame
+                            for frame in frames
+                            if tuple(
+                                dict.fromkeys(frame.get_chemical_symbols())
+                            )
+                            == order
+                        ),
+                        require_orbitals=require_orbitals,
+                    )[0]
+                    for order in orders
+                ]
+        except (AbacusResourceError, NativeAbacusError) as error:
+            raise ManualTaskError(str(error)) from error
+    first_by_id: dict[str, int] = {}
+    duplicates = []
+    for index, identifier in enumerate(frame_ids):
+        if identifier in first_by_id:
+            duplicates.append((first_by_id[identifier], index))
+        else:
+            first_by_id[identifier] = index
+    if duplicates:
+        first, duplicate = duplicates[0]
+        raise ManualTaskError(
+            "DFT input contains duplicate physical structures at indices "
+            f"{first} and {duplicate}; deduplicate before submission"
+        )
     _progress(
         f"dft: read {len(frames)} structure(s); "
         f"{structures_per_job} structure(s) per Slurm task"
@@ -364,6 +616,18 @@ def prepare_dft(
         if input_file
         else None
     )
+    copied_resource_manifest = (
+        str(
+            Path(
+                _copy(
+                    resource_manifest_source,
+                    common / f"{backend}-resources.json",
+                )
+            ).relative_to(root)
+        )
+        if resource_manifest_source is not None
+        else None
+    )
     jobs = []
     for index, start in enumerate(range(0, len(frames), structures_per_job)):
         job = root / "jobs" / f"{index:06d}"
@@ -378,6 +642,7 @@ def prepare_dft(
             "source": str((job / "input.xyz").relative_to(root)),
             "input_file": copied_input,
             "resource_dir": effective_resource,
+            "resource_manifest": copied_resource_manifest,
             "n_cpu": effective_n_cpu,
             "use_gamma": bool(use_gamma),
             "kpoint_mode": kpoint_mode,
@@ -391,6 +656,9 @@ def prepare_dft(
                 "index": index,
                 "first_frame": start,
                 "frame_count": min(structures_per_job, len(frames) - start),
+                "frame_ids": frame_ids[
+                    start : start + structures_per_job
+                ],
                 "request": str((job / "request.json").relative_to(root)),
             }
         )
@@ -402,6 +670,12 @@ def prepare_dft(
         output=output_path,
         jobs=jobs,
         max_concurrent=max_concurrent,
+        scientific_input={
+            "structure_id_version": "neptrain.structure-id.v2",
+            "frame_count": len(frame_ids),
+            "frame_ids": frame_ids,
+            "dft_resources": resource_provenance,
+        },
     )
 
 
@@ -427,7 +701,7 @@ def prepare_md(
     pre_failure_frames: int = 2,
     bad_tail_frames: int = 1,
     health: Mapping[str, Any] | None = None,
-    max_concurrent: int = 20,
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     force: bool = False,
 ) -> ManualOperation:
     _progress(f"md: reading structures from {Path(source).expanduser()}")
@@ -491,6 +765,7 @@ def prepare_md(
                 {
                     "index": index,
                     "frame": frame_index,
+                    "input_structure_id": structure_id(frame),
                     "temperature": float(temperature),
                     "request": str((job / "request.json").relative_to(root)),
                 }
@@ -509,19 +784,8 @@ def prepare_md(
 
 def load_operation(path: str | Path) -> ManualOperation:
     root = Path(path).expanduser().resolve()
-    descriptor = _read_json(root / "operation.json")
-    protocol = descriptor.get("protocol")
-    if protocol not in {
-        "neptrain.manual-operation.v1",
-        "neptrain.manual-operation.v2",
-    }:
-        raise ManualTaskError(f"not a NepTrain manual run: {root}")
-    jobs_directory = (
-        "jobs"
-        if protocol == "neptrain.manual-operation.v2"
-        else "shards"
-    )
-    jobs = descriptor.get("jobs", descriptor.get("shards", []))
+    descriptor = _verify_operation_bundle(root)
+    jobs = descriptor.get("jobs", [])
     return ManualOperation(
         root=root,
         operation_id=str(descriptor["operation_id"]),
@@ -530,7 +794,6 @@ def load_operation(path: str | Path) -> ManualOperation:
             str(descriptor["target"]["name"]), descriptor["target"]
         ),
         shard_count=len(jobs),
-        jobs_directory=jobs_directory,
     )
 
 
@@ -541,10 +804,33 @@ def _resolve(root: Path, value: str | None) -> Path | None:
     return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
+def _archive_worker_state(job: Path, result_file: Path) -> None:
+    existing = [
+        path
+        for path in (
+            job / "execution.json",
+            job / "result.json",
+            result_file,
+            job / "calculation",
+        )
+        if path.exists()
+    ]
+    if not existing:
+        return
+    archive = (
+        job
+        / "attempts"
+        / datetime.now().strftime("worker-%Y%m%d-%H%M%S-%f")
+    )
+    archive.mkdir(parents=True)
+    for path in existing:
+        shutil.move(str(path), archive / path.name)
+
+
 def run_manual_worker(root_path: str | Path, index: int) -> int:
     operation = load_operation(root_path)
-    descriptor = _read_json(operation.descriptor)
-    jobs = descriptor.get("jobs", descriptor.get("shards", []))
+    descriptor = _verify_operation_bundle(operation.root)
+    jobs = descriptor["jobs"]
     if index < 0 or index >= len(jobs):
         raise ManualTaskError(f"job index out of range: {index}")
     job_meta = jobs[index]
@@ -558,15 +844,29 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
         except BlockingIOError:
             return 75
         try:
+            descriptor = _verify_operation_bundle(operation.root)
+            try:
+                _validate_job_result(operation, index, descriptor)
+            except (ManualTaskError, OSError, ValueError):
+                pass
+            else:
+                if operation.target.host is None:
+                    _publish_if_ready(operation)
+                return 0
+            result_file = _expected_job_result(operation, job)
+            _archive_worker_state(job, result_file)
             _write_json(
                 execution,
-                {"state": "RUNNING", "pid": os.getpid(), "started_at": _now()},
+                {
+                    "state": "RUNNING",
+                    "operation_id": operation.operation_id,
+                    "operation_spec_sha256": descriptor["spec_sha256"],
+                    "job_index": index,
+                    "pid": os.getpid(),
+                    "started_at": _now(),
+                },
             )
-            result_file = _expected_job_result(operation, job)
-            result_file.unlink(missing_ok=True)
             calculation_dir = job / "calculation"
-            if calculation_dir.exists():
-                shutil.rmtree(calculation_dir)
             calculation_dir.mkdir()
             if operation.kind == "train":
                 from .training import TrainingRequest, train
@@ -604,6 +904,9 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                         resource_dir=_resolve(
                             operation.root, request.get("resource_dir")
                         ),
+                        resource_manifest=_resolve(
+                            operation.root, request.get("resource_manifest")
+                        ),
                         n_cpu=int(request["n_cpu"]),
                         use_gamma=bool(request["use_gamma"]),
                         kpoint_mode=request["kpoint_mode"],
@@ -613,7 +916,27 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                     ),
                     request["backend"],
                 )
-                metrics = {"backend": result.backend, "frames": len(result.frames)}
+                written = ase_read(result_file, index=":")
+                written_frames = (
+                    written if isinstance(written, list) else [written]
+                )
+                try:
+                    validate_labeled_frames(written_frames)
+                    frame_ids = labeled_input_structure_ids(written_frames)
+                except ScientificDataError as error:
+                    raise ManualTaskError(
+                        f"DFT job {index} produced invalid labels: {error}"
+                    ) from error
+                expected_ids = [str(value) for value in job_meta["frame_ids"]]
+                if frame_ids != expected_ids:
+                    raise ManualTaskError(
+                        f"DFT job {index} result structures do not match its "
+                        "input frame identities and order"
+                    )
+                metrics = {
+                    "backend": result.backend,
+                    "frames": len(written_frames),
+                }
             elif operation.kind == "md":
                 from .md import MdRequest, run_md
 
@@ -653,13 +976,45 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 }
             else:
                 raise ManualTaskError(f"unsupported manual task: {operation.kind}")
-            _write_json(
-                job / "result.json",
-                {"completed_at": _now(), "metrics": metrics},
-            )
+            artifact = {
+                "path": str(result_file.relative_to(job)),
+                "sha256": _sha256(result_file),
+                "size": result_file.stat().st_size,
+            }
+            result_descriptor = {
+                "protocol": "neptrain.manual-job-result.v1",
+                "operation_id": operation.operation_id,
+                "operation_spec_sha256": descriptor["spec_sha256"],
+                "job_index": index,
+                "kind": operation.kind,
+                "completed_at": _now(),
+                "artifact": artifact,
+                "metrics": metrics,
+            }
+            if operation.kind == "dft":
+                result_descriptor["frame_ids"] = frame_ids
+                result_descriptor["frame_count"] = len(frame_ids)
+            elif operation.kind == "md":
+                trajectory = ase_read(result_file, index=":")
+                trajectory_frames = (
+                    trajectory if isinstance(trajectory, list) else [trajectory]
+                )
+                if not trajectory_frames:
+                    raise ManualTaskError(
+                        f"MD job {index} produced an empty trajectory"
+                    )
+                result_descriptor["frame_count"] = len(trajectory_frames)
+            _write_json(job / "result.json", result_descriptor)
             _write_json(
                 execution,
-                {"state": "COMPLETED", "pid": os.getpid(), "completed_at": _now()},
+                {
+                    "state": "COMPLETED",
+                    "operation_id": operation.operation_id,
+                    "operation_spec_sha256": descriptor["spec_sha256"],
+                    "job_index": index,
+                    "pid": os.getpid(),
+                    "completed_at": _now(),
+                },
             )
             if operation.target.host is None:
                 try:
@@ -674,6 +1029,9 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 execution,
                 {
                     "state": "FAILED",
+                    "operation_id": operation.operation_id,
+                    "operation_spec_sha256": descriptor.get("spec_sha256"),
+                    "job_index": index,
                     "pid": os.getpid(),
                     "failed_at": _now(),
                     "error": str(error),
@@ -705,7 +1063,11 @@ def _deploy_remote(operation: ManualOperation) -> str:
     target = operation.target
     transport = ExecutionTransport(target)
     remote = _remote_root(operation)
-    archive = operation.root.parent / f".{operation.operation_id}.tar.gz"
+    descriptor = _verify_operation_bundle(operation.root)
+    token = f"{os.getpid()}-{time.time_ns()}"
+    archive = operation.root.parent / (
+        f".{operation.operation_id}-{token}.tar.gz"
+    )
     try:
         if remote.startswith("~/"):
             _progress(f"{operation.kind}: resolving remote home on {target.name}")
@@ -723,31 +1085,116 @@ def _deploy_remote(operation: ManualOperation) -> str:
         with tarfile.open(archive, "w:gz") as handle:
             handle.add(operation.root, arcname=operation.operation_id)
         remote_parent = remote.rsplit("/", 1)[0]
+        remote_archive = f"{remote_parent}/.incoming/{archive.name}"
+        descriptor_sha256 = _sha256(operation.descriptor)
         _progress(f"{operation.kind}: creating remote run directory on {target.name}")
-        transport.run_script(
-            'mkdir -p -- "$1"',
+        prepared = transport.run_script(
+            """set -eo pipefail
+parent=$1
+destination=$2
+expected=$3
+mkdir -p -- "$parent/.incoming"
+if [ -e "$destination" ]; then
+  if [ ! -f "$destination/operation.json" ]; then
+    printf '%s\\n' INCOMPLETE
+    exit 0
+  fi
+  actual=$(sha256sum "$destination/operation.json" | cut -d' ' -f1)
+  if [ "$actual" != "$expected" ]; then
+    echo "remote manual task conflicts with local operation identity: $destination" >&2
+    exit 17
+  fi
+  if (cd "$destination" && sha256sum -c input-manifest.sha256 >/dev/null); then
+    printf '%s\\n' READY
+  else
+    printf '%s\\n' INCOMPLETE
+  fi
+  exit 0
+fi
+printf '%s\\n' MISSING
+""",
             remote_parent,
-            check=True,
+            remote,
+            descriptor_sha256,
         )
+        if prepared.returncode != 0:
+            raise ManualTaskError(
+                (prepared.stderr or prepared.stdout).strip()
+            )
+        if prepared.stdout.strip().splitlines()[-1:] == ["READY"]:
+            _progress(f"{operation.kind}: remote task already verified at {remote}")
+            return remote
         _progress(
             f"{operation.kind}: uploading {archive.stat().st_size} bytes to {target.name}"
         )
         transport.copy(
             archive,
-            f"{target.host}:{remote_parent}/",
+            f"{target.host}:{remote_archive}",
             check=True,
         )
         _progress(f"{operation.kind}: extracting remote task bundle")
-        transport.run_script(
+        published = transport.run_script(
             """set -eo pipefail
-cd "$1"
-tar -xzf "$2"
-rm -f -- "$2"
+parent=$1
+destination=$2
+archive=$3
+expected_archive=$4
+expected_descriptor=$5
+token=$6
+name=$7
+lock="$parent/.$name.deploy.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  if [ -f "$destination/operation.json" ]; then
+    actual=$(sha256sum "$destination/operation.json" | cut -d' ' -f1)
+    if [ "$actual" = "$expected_descriptor" ] && \
+       (cd "$destination" && sha256sum -c input-manifest.sha256 >/dev/null); then
+      exit 0
+    fi
+  fi
+  echo "another deployment owns $destination; retry later" >&2
+  exit 75
+fi
+temporary="$parent/.$name.extracting-$token"
+cleanup() {
+  rm -f -- "$archive"
+  rm -rf -- "$temporary"
+  rmdir "$lock" 2>/dev/null || true
+}
+trap cleanup EXIT
+actual=$(sha256sum "$archive" | cut -d' ' -f1)
+[ "$actual" = "$expected_archive" ]
+mkdir -p "$temporary"
+tar -xzf "$archive" -C "$temporary" --strip-components=1
+[ -f "$temporary/operation.json" ]
+actual=$(sha256sum "$temporary/operation.json" | cut -d' ' -f1)
+[ "$actual" = "$expected_descriptor" ]
+(cd "$temporary" && sha256sum -c input-manifest.sha256 >/dev/null)
+if [ -e "$destination" ]; then
+  if [ -f "$destination/operation.json" ]; then
+    actual=$(sha256sum "$destination/operation.json" | cut -d' ' -f1)
+    if [ "$actual" != "$expected_descriptor" ]; then
+      echo "remote manual task conflicts with local operation identity: $destination" >&2
+      exit 17
+    fi
+  fi
+  quarantine="$destination.incomplete.$(date +%Y%m%d-%H%M%S).$$"
+  mv -- "$destination" "$quarantine"
+fi
+mv -- "$temporary" "$destination"
+(cd "$destination" && sha256sum -c input-manifest.sha256 >/dev/null)
 """,
             remote_parent,
-            archive.name,
-            check=True,
+            remote,
+            remote_archive,
+            _sha256(archive),
+            descriptor_sha256,
+            token,
+            operation.operation_id,
         )
+        if published.returncode != 0:
+            raise ManualTaskError(
+                (published.stderr or published.stdout).strip()
+            )
     finally:
         archive.unlink(missing_ok=True)
     _progress(f"{operation.kind}: remote task ready at {remote}")
@@ -902,21 +1349,84 @@ def _result_filename(kind: str) -> str:
 
 
 def _expected_job_result(operation: ManualOperation, job: Path) -> Path:
-    if operation.jobs_directory == "shards":
-        return job / "result" / _result_filename(operation.kind)
     return job / _result_filename(operation.kind)
 
 
-def _completed_job_is_collectable(
-    operation: ManualOperation, job: Path
-) -> bool:
-    execution = job / "execution.json"
-    return (
-        execution.is_file()
-        and _read_json(execution).get("state") == "COMPLETED"
-        and (job / "result.json").is_file()
-        and _expected_job_result(operation, job).is_file()
+def _validate_job_result(
+    operation: ManualOperation,
+    index: int,
+    descriptor: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    descriptor = (
+        dict(descriptor)
+        if descriptor is not None
+        else _verify_operation_bundle(operation.root)
     )
+    job_meta = descriptor["jobs"][index]
+    job = operation.jobs_root / f"{index:06d}"
+    execution = _read_json(job / "execution.json")
+    if (
+        execution.get("state") != "COMPLETED"
+        or execution.get("operation_id") != operation.operation_id
+        or execution.get("operation_spec_sha256")
+        != descriptor["spec_sha256"]
+        or int(execution.get("job_index", -1)) != index
+    ):
+        raise ManualTaskError(f"job {index} execution is not a matching completion")
+    result = _read_json(job / "result.json")
+    if (
+        result.get("protocol") != "neptrain.manual-job-result.v1"
+        or result.get("operation_id") != operation.operation_id
+        or result.get("operation_spec_sha256") != descriptor["spec_sha256"]
+        or int(result.get("job_index", -1)) != index
+        or result.get("kind") != operation.kind
+    ):
+        raise ManualTaskError(f"job {index} result metadata does not match its task")
+    record = result.get("artifact")
+    if not isinstance(record, Mapping):
+        raise ManualTaskError(f"job {index} result has no artifact manifest")
+    relative = Path(str(record.get("path", "")))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ManualTaskError(f"job {index} result path escapes its job directory")
+    artifact = (job / relative).resolve()
+    if (
+        not artifact.is_file()
+        or artifact != _expected_job_result(operation, job).resolve()
+        or artifact.stat().st_size != int(record.get("size", -1))
+        or _sha256(artifact) != record.get("sha256")
+    ):
+        raise ManualTaskError(f"job {index} result artifact drifted or is missing")
+    if operation.kind == "dft":
+        loaded = ase_read(artifact, index=":")
+        frames = loaded if isinstance(loaded, list) else [loaded]
+        try:
+            validate_labeled_frames(frames)
+            actual_ids = labeled_input_structure_ids(frames)
+        except ScientificDataError as error:
+            raise ManualTaskError(f"job {index} labels are invalid: {error}") from error
+        expected_ids = [str(value) for value in job_meta.get("frame_ids", [])]
+        if (
+            int(result.get("frame_count", -1)) != len(expected_ids)
+            or list(result.get("frame_ids", [])) != expected_ids
+            or actual_ids != expected_ids
+        ):
+            raise ManualTaskError(
+                f"job {index} has missing, duplicate, or reordered DFT frames"
+            )
+    return result
+
+
+def _completed_job_is_collectable(
+    operation: ManualOperation,
+    job: Path,
+    descriptor: Mapping[str, Any] | None = None,
+) -> bool:
+    try:
+        index = int(job.name)
+        _validate_job_result(operation, index, descriptor)
+    except (ManualTaskError, OSError, ValueError):
+        return False
+    return True
 
 
 def _sync_remote_results(operation: ManualOperation) -> None:
@@ -933,14 +1443,17 @@ def _sync_remote_results(operation: ManualOperation) -> None:
             relative = f"{index:06d}"
             job = operation.jobs_root / relative
             execution = job / "execution.json"
-            state = (
-                _read_json(execution).get("state")
-                if execution.is_file()
-                else None
-            )
+            try:
+                state = (
+                    _read_json(execution).get("state")
+                    if execution.is_file()
+                    else None
+                )
+            except ManualTaskError:
+                state = None
             synchronized = state == "FAILED" or (
                 state == "COMPLETED"
-                and _completed_job_is_collectable(operation, job)
+                and _completed_job_is_collectable(operation, job, descriptor)
             )
             if synchronized:
                 continue
@@ -949,11 +1462,7 @@ def _sync_remote_results(operation: ManualOperation) -> None:
                 (
                     f"{relative}/execution.json",
                     f"{relative}/result.json",
-                    (
-                        f"{relative}/result"
-                        if operation.jobs_directory == "shards"
-                        else f"{relative}/{_result_filename(operation.kind)}"
-                    ),
+                    f"{relative}/{_result_filename(operation.kind)}",
                 )
             )
         if not incomplete:
@@ -964,7 +1473,7 @@ def _sync_remote_results(operation: ManualOperation) -> None:
         )
         transport = ExecutionTransport(operation.target)
         archived = transport.fetch_paths(
-            f"{remote.rstrip('/')}/{operation.jobs_directory}",
+            f"{remote.rstrip('/')}/jobs",
             members,
             operation.jobs_root,
         )
@@ -975,9 +1484,10 @@ def _sync_remote_results(operation: ManualOperation) -> None:
 
 
 def _all_jobs_completed(operation: ManualOperation) -> bool:
+    descriptor = _verify_operation_bundle(operation.root)
     for index in range(operation.shard_count):
         job = operation.jobs_root / f"{index:06d}"
-        if not _completed_job_is_collectable(operation, job):
+        if not _completed_job_is_collectable(operation, job, descriptor):
             return False
     return True
 
@@ -1005,13 +1515,49 @@ def _ensure_remote_pointer(
         pointer.write_text(value, encoding="utf-8")
 
 
+def _final_result_error(
+    operation: ManualOperation,
+    descriptor: Mapping[str, Any],
+) -> str | None:
+    record = descriptor.get("result")
+    if not isinstance(record, Mapping):
+        return "completed operation has no final result manifest"
+    output = Path(str(record.get("path", "")))
+    if (
+        not output.is_file()
+        or output.stat().st_size != int(record.get("size", -1))
+        or _sha256(output) != record.get("sha256")
+    ):
+        return f"final result drifted or is missing: {output}"
+    if operation.kind == "dft":
+        try:
+            loaded = ase_read(output, index=":")
+            frames = loaded if isinstance(loaded, list) else [loaded]
+            validate_labeled_frames(frames)
+            actual_ids = labeled_input_structure_ids(frames)
+        except (OSError, ScientificDataError, ValueError) as error:
+            return f"final DFT result is invalid: {error}"
+        expected_ids = list(
+            descriptor.get("scientific_input", {}).get("frame_ids", [])
+        )
+        if (
+            actual_ids != expected_ids
+            or list(record.get("frame_ids", [])) != expected_ids
+            or int(record.get("frame_count", -1)) != len(expected_ids)
+        ):
+            return "final DFT result has missing, duplicate, or reordered frames"
+    return None
+
+
 def _collect_unlocked(operation: ManualOperation) -> Path:
-    descriptor = _read_json(operation.descriptor)
+    descriptor = _verify_operation_bundle(operation.root)
     _ensure_remote_pointer(operation, descriptor.get("remote_root"))
     output = Path(descriptor["output"])
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary = output.with_suffix(output.suffix + f".tmp-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
     if operation.kind == "train":
+        _validate_job_result(operation, 0, descriptor)
         shutil.copy2(
             _expected_job_result(
                 operation,
@@ -1022,18 +1568,63 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
     else:
         frames = []
         for index in range(operation.shard_count):
+            _validate_job_result(operation, index, descriptor)
             path = _expected_job_result(
                 operation,
                 operation.jobs_root / f"{index:06d}",
             )
             loaded = ase_read(path, index=":")
             frames.extend(loaded if isinstance(loaded, list) else [loaded])
+        if operation.kind == "dft":
+            try:
+                validate_labeled_frames(frames)
+                actual_ids = labeled_input_structure_ids(frames)
+            except ScientificDataError as error:
+                raise ManualTaskError(
+                    f"cannot merge invalid DFT labels: {error}"
+                ) from error
+            expected_ids = list(
+                descriptor.get("scientific_input", {}).get("frame_ids", [])
+            )
+            if actual_ids != expected_ids:
+                raise ManualTaskError(
+                    "DFT merge detected missing, duplicate, or reordered frames"
+                )
+        elif not frames:
+            raise ManualTaskError("cannot merge an empty MD trajectory")
         ase_write(temporary, frames, format="extxyz")
+        if operation.kind == "dft":
+            restored = ase_read(temporary, index=":", format="extxyz")
+            restored_frames = (
+                restored if isinstance(restored, list) else [restored]
+            )
+            validate_labeled_frames(restored_frames)
+            restored_ids = labeled_input_structure_ids(restored_frames)
+            if restored_ids != expected_ids:
+                raise ManualTaskError(
+                    "DFT merge did not survive the final extxyz round trip"
+                )
+    if output.exists() or output.is_symlink():
+        archive = (
+            operation.root
+            / "repairs"
+            / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        )
+        archive.mkdir(parents=True)
+        shutil.move(str(output), archive / output.name)
     temporary.replace(output)
     _ensure_visible_result(operation, output)
     descriptor["state"] = "complete"
     descriptor["completed_at"] = _now()
-    descriptor["result"] = str(output)
+    descriptor["result"] = {
+        "path": str(output),
+        "sha256": _sha256(output),
+        "size": output.stat().st_size,
+    }
+    if operation.kind == "dft":
+        descriptor["result"]["frame_count"] = len(expected_ids)
+        descriptor["result"]["frame_ids"] = expected_ids
+    descriptor.pop("collection_error", None)
     _write_json(operation.descriptor, descriptor)
     return output
 
@@ -1044,9 +1635,13 @@ def _collect(operation: ManualOperation) -> Path:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         descriptor = _read_json(operation.descriptor)
         if descriptor.get("state") == "complete":
-            return Path(descriptor["result"])
+            error = _final_result_error(operation, descriptor)
+            if error is None:
+                return Path(descriptor["result"]["path"])
         if not _all_jobs_completed(operation):
-            raise ManualTaskError("cannot publish an incomplete manual operation")
+            raise ManualTaskError(
+                "cannot publish or repair an incomplete manual operation"
+            )
         return _collect_unlocked(operation)
 
 
@@ -1081,16 +1676,34 @@ def _run_on_target(
     operation: ManualOperation, command: Sequence[str]
 ) -> subprocess.CompletedProcess:
     if operation.target.host:
-        return ExecutionTransport(operation.target).run_script(
-            'exec "$@"',
-            *command,
+        try:
+            return ExecutionTransport(operation.target).run_script(
+                'exec "$@"',
+                *command,
+                timeout=20,
+            )
+        except ExecutionError as error:
+            return subprocess.CompletedProcess(
+                list(command),
+                124,
+                stdout="",
+                stderr=str(error),
+            )
+    try:
+        return subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
         )
-    return subprocess.run(
-        list(command),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            list(command),
+            124,
+            stdout="",
+            stderr="scheduler command timed out after 20s",
+        )
 
 
 def _slurm_job_state(
@@ -1131,34 +1744,92 @@ def _slurm_job_state(
 
 def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
     _sync_remote_results(operation)
-    descriptor = _read_json(operation.descriptor)
+    descriptor = _verify_operation_bundle(operation.root)
     _ensure_remote_pointer(operation, descriptor.get("remote_root"))
+    repair_error = None
     if descriptor.get("state") == "complete" and descriptor.get("result"):
-        output = Path(descriptor["result"])
-        if output.is_file():
+        result_record = descriptor["result"]
+        output = Path(str(result_record.get("path", "")))
+        final_error = _final_result_error(operation, descriptor)
+        if final_error is None:
             _ensure_visible_result(operation, output)
+        else:
+            try:
+                _collect(operation)
+                descriptor = _verify_operation_bundle(operation.root)
+            except Exception as error:
+                repair_error = f"{final_error}; automatic repair failed: {error}"
     scheduler_state = None
     scheduler_error = None
     if (
         operation.target.executor == "slurm"
-        and descriptor.get("state") not in {"complete", "cancelled"}
+        and descriptor.get("state") not in {"complete", "cancelled", "failed"}
     ):
         scheduler_state, scheduler_error = _slurm_job_state(
             operation, descriptor.get("job_id")
         )
+    changed = False
+    if (
+        operation.target.executor == "slurm"
+        and descriptor.get("state") in {"submitted", "cancelling"}
+        and scheduler_state is None
+    ):
+        missing_since = descriptor.get("scheduler_missing_since")
+        if missing_since is None:
+            missing_since = time.time()
+            descriptor["scheduler_missing_since"] = missing_since
+            descriptor["scheduler_missing_observations"] = 1
+            changed = True
+        else:
+            descriptor["scheduler_missing_observations"] = int(
+                descriptor.get("scheduler_missing_observations", 0)
+            ) + 1
+            changed = True
+        if time.time() - float(missing_since) >= _SCHEDULER_MISSING_GRACE_SECONDS:
+            scheduler_state = "LOST"
+            scheduler_error = (
+                scheduler_error
+                or "job remained absent from squeue and sacct beyond the "
+                "scheduler accounting grace period"
+            )
+    elif scheduler_state is not None:
+        if descriptor.pop("scheduler_missing_since", None) is not None:
+            changed = True
+        if descriptor.pop("scheduler_missing_observations", None) is not None:
+            changed = True
+
     states = []
     errors = []
+    if repair_error:
+        errors.append({"index": None, "error": repair_error})
     for index in range(operation.shard_count):
         path = operation.jobs_root / f"{index:06d}" / "execution.json"
         if not path.is_file():
             states.append("PENDING")
             continue
-        value = _read_json(path)
+        try:
+            value = _read_json(path)
+        except ManualTaskError as error:
+            states.append("INVALID")
+            errors.append({"index": index, "error": str(error)})
+            continue
         state = str(value.get("state", "UNKNOWN"))
+        if state == "COMPLETED":
+            try:
+                _validate_job_result(operation, index, descriptor)
+            except (ManualTaskError, OSError, ValueError) as error:
+                state = "INVALID"
+                errors.append({"index": index, "error": str(error)})
         states.append(state)
         if state == "FAILED":
             errors.append({"index": index, "error": value.get("error", "")})
-    terminal_scheduler_failure = scheduler_state in _SLURM_FAILURE
+    terminal_scheduler_failure = (
+        (
+            scheduler_state in _SLURM_FAILURE
+            and scheduler_state != "CANCELLED"
+        )
+        or scheduler_state == "LOST"
+    )
     if terminal_scheduler_failure:
         failed_indices = {item["index"] for item in errors}
         for index, shard_state in enumerate(states):
@@ -1166,12 +1837,49 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
                 errors.append(
                     {
                         "index": index,
-                        "error": f"Slurm job ended in {scheduler_state}",
+                        "error": (
+                            f"Slurm job ended in {scheduler_state}"
+                            if scheduler_state != "LOST"
+                            else "Slurm job disappeared from queue and accounting"
+                        ),
                     }
                 )
-    if descriptor.get("state") == "cancelled" or scheduler_state == "CANCELLED":
+    cancellation_requested = descriptor.get("state") == "cancelling"
+    if scheduler_state == "CANCELLED":
+        failed_indices = {item["index"] for item in errors}
+        for index, shard_state in enumerate(states):
+            if shard_state != "COMPLETED" and index not in failed_indices:
+                errors.append(
+                    {
+                        "index": index,
+                        "error": "job was cancelled before producing a valid result",
+                    }
+                )
+        descriptor["state"] = "cancelled"
+        descriptor["cancelled_at"] = _now()
+        changed = True
+    elif descriptor.get("state") == "cancelled":
+        failed_indices = {item["index"] for item in errors}
+        for index, shard_state in enumerate(states):
+            if shard_state != "COMPLETED" and index not in failed_indices:
+                errors.append(
+                    {
+                        "index": index,
+                        "error": "job was cancelled before producing a valid result",
+                    }
+                )
+    if descriptor.get("state") == "cancelled":
         state = "cancelled"
         reason = f"{states.count('COMPLETED')}/{operation.shard_count} jobs completed before cancellation"
+    elif cancellation_requested:
+        state = "cancelling"
+        reason = (
+            f"cancellation requested; {states.count('COMPLETED')}/"
+            f"{operation.shard_count} jobs completed"
+        )
+    elif repair_error:
+        state = "damaged"
+        reason = repair_error
     elif errors:
         state = "failed"
         reason = f"{len(errors)} of {operation.shard_count} jobs failed"
@@ -1179,11 +1887,11 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
         if descriptor.get("state") != "complete":
             try:
                 _collect(operation)
-                descriptor = _read_json(operation.descriptor)
+                descriptor = _verify_operation_bundle(operation.root)
             except Exception as error:
                 descriptor["collection_error"] = str(error)
                 descriptor["state"] = "failed"
-                _write_json(operation.descriptor, descriptor)
+                changed = True
                 errors.append({"index": None, "error": str(error)})
         if errors:
             state = "failed"
@@ -1211,7 +1919,18 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
     else:
         state = descriptor.get("state", "prepared")
         reason = f"{states.count('COMPLETED')}/{operation.shard_count} jobs completed"
+    if state in {"failed", "cancelled"} and descriptor.get("state") != state:
+        descriptor["state"] = state
+        changed = True
+    if changed:
+        _write_json(operation.descriptor, descriptor)
+    next_action = None
+    if state in {"prepared", "submitted", "running", "cancelling"}:
+        next_action = f"neptrain task wait {shlex.quote(str(operation.root))}"
+    elif state in {"failed", "cancelled", "damaged"}:
+        next_action = f"neptrain task retry {shlex.quote(str(operation.root))}"
     return {
+        "protocol": "neptrain.manual-status.v1",
         "operation_id": operation.operation_id,
         "kind": operation.kind,
         "state": state,
@@ -1222,9 +1941,18 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
         "completed": states.count("COMPLETED"),
         "failed": len(errors),
         "total": operation.shard_count,
-        "result": descriptor.get("result"),
+        "result": (
+            descriptor.get("result", {}).get("path")
+            if isinstance(descriptor.get("result"), Mapping)
+            else None
+        ),
         "remote_directory": descriptor.get("remote_root"),
         "run_directory": str(operation.root),
+        "next_action": next_action,
+        "jobs": [
+            {"index": index, "state": shard_state}
+            for index, shard_state in enumerate(states)
+        ],
         "errors": errors,
     }
 
@@ -1250,7 +1978,12 @@ def wait_operation(
                 f"failed={status['failed']}"
             )
             previous = snapshot
-        if status["state"] in {"complete", "failed", "cancelled"}:
+        if status["state"] in {
+            "complete",
+            "failed",
+            "cancelled",
+            "damaged",
+        }:
             return status
         time.sleep(max(0.2, poll_interval))
 
@@ -1273,9 +2006,22 @@ def cancel_operation(operation: ManualOperation) -> dict[str, Any]:
     _progress(f"{operation.kind}: cancelling Slurm job {job_id}")
     completed = _run_on_target(operation, ["scancel", str(job_id)])
     if completed.returncode != 0:
-        raise ManualTaskError((completed.stderr or completed.stdout).strip())
-    descriptor["state"] = "cancelled"
-    descriptor["cancelled_at"] = _now()
+        refreshed = refresh_operation(operation)
+        if refreshed["state"] in {"complete", "failed", "cancelled"}:
+            return refreshed
+        if refreshed.get("scheduler_state") is not None:
+            raise ManualTaskError((completed.stderr or completed.stdout).strip())
+    descriptor["state"] = "cancelling"
+    cancellation = {
+        "requested_at": _now(),
+        "job_id": str(job_id),
+        "completed_jobs": status["completed"],
+    }
+    if completed.returncode != 0:
+        cancellation["scheduler_response"] = (
+            completed.stderr or completed.stdout
+        ).strip()
+    descriptor.setdefault("cancellations", []).append(cancellation)
     _write_json(operation.descriptor, descriptor)
     return refresh_operation(operation)
 
@@ -1284,27 +2030,31 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
     if operation.target.executor != "slurm":
         raise ManualTaskError("retry is only needed for submitted Slurm operations")
     status = refresh_operation(operation)
+    if status["state"] == "cancelling":
+        raise ManualTaskError(
+            "cancellation is not terminal yet; wait for task status to report "
+            "cancelled before retrying"
+        )
+    descriptor = _verify_operation_bundle(operation.root)
     failed = [
-        int(item["index"])
-        for item in status["errors"]
-        if isinstance(item.get("index"), int)
+        index
+        for index in range(operation.shard_count)
+        if not _completed_job_is_collectable(
+            operation,
+            operation.jobs_root / f"{index:06d}",
+            descriptor,
+        )
     ]
     if not failed:
         raise ManualTaskError(
             "operation has no failed jobs; fix the reported collection error "
             "and run task status again"
         )
-    descriptor = _read_json(operation.descriptor)
     remote = descriptor.get("remote_root") or str(operation.root)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_entry = (
-        "result"
-        if operation.jobs_directory == "shards"
-        else _result_filename(operation.kind)
-    )
+    result_entry = _result_filename(operation.kind)
     retry_entries = ["execution.json", "result.json", result_entry]
-    if operation.jobs_directory == "jobs":
-        retry_entries.append("calculation")
+    retry_entries.append("calculation")
     if operation.target.host:
         transport = ExecutionTransport(operation.target)
         _progress(
@@ -1312,7 +2062,7 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
         )
         commands = ["set -eo pipefail"]
         for index in failed:
-            job = f"{remote}/{operation.jobs_directory}/{index:06d}"
+            job = f"{remote}/jobs/{index:06d}"
             attempt = f"{job}/attempts/{stamp}"
             commands.append(f"mkdir -p {shlex.quote(attempt)}")
             for name in retry_entries:
@@ -1370,6 +2120,10 @@ sbatch --parsable "$2"
     _progress(f"{operation.kind}: submitted retry job {job_id}")
     descriptor["state"] = "submitted"
     descriptor["job_id"] = job_id
+    descriptor.pop("cancelled_at", None)
+    descriptor.pop("scheduler_missing_since", None)
+    descriptor.pop("scheduler_missing_observations", None)
+    descriptor.pop("collection_error", None)
     descriptor["attempts"].append(
         {"submitted_at": _now(), "job_id": job_id, "indices": failed}
     )
@@ -1380,9 +2134,6 @@ sbatch --parsable "$2"
 def operation_logs(operation: ManualOperation) -> list[str]:
     descriptor = _read_json(operation.descriptor)
     logs_root = operation.root / "logs"
-    logs_root.mkdir(exist_ok=True)
-    for legacy in operation.root.glob("scheduler-*.out"):
-        legacy.replace(logs_root / legacy.name)
     local_logs = sorted(logs_root.glob("scheduler-*.out"))
     if descriptor.get("state") == "complete":
         expected_logs = {
@@ -1399,11 +2150,7 @@ def operation_logs(operation: ManualOperation) -> list[str]:
     if operation.target.host and remote:
         transport = ExecutionTransport(operation.target)
         _progress(f"{operation.kind}: listing remote scheduler logs")
-        remote_logs = (
-            f"{remote.rstrip('/')}/logs"
-            if operation.jobs_directory == "jobs"
-            else remote
-        )
+        remote_logs = f"{remote.rstrip('/')}/logs"
         listed = transport.run_script(
             """find "$1" -maxdepth 1 -type f \
 -name 'scheduler-*.out' -print

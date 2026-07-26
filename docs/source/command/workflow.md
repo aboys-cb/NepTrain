@@ -138,6 +138,7 @@ dft:
   backend: vasp
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
+  potcar_manifest_path: ./vasp-resources.json
   kpoint_mode: auto
   structures_per_job: 1
   max_concurrent: 20
@@ -151,6 +152,14 @@ dft:
 `20`。例如 FPS 选中 100 个结构时，默认生成 100 个单结构任务，最多同时运行
 20 个。Controller 保留已完成结构，只重试失败或尚未提交的结构，最后按原始
 FPS 顺序校验并合并为 `selected-labels.xyz`。
+
+VASP 的 `potcar_manifest_path` 和 ABACUS 的 `resource_manifest_path` 是
+必填 provenance。它们固定逐元素资源相对路径与 SHA256；VASP 还固定精确
+`TITEL`、family 和 release。prepare 会先验证所有 sampling route 的元素覆盖，
+本地 target 同时验证真实文件。远程资源库不打包上传，远程 labeling target
+必须给出自己的绝对 `dft_resource_path`，并用 `doctor` 在提交前逐文件验证。
+manifest 中 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 的 setup 目录会直接驱动 ASE 的
+POTCAR 选择，校验路径和计算路径是同一个文件。
 
 确实需要 NepTrain 接管时再显式配置：
 
@@ -192,6 +201,11 @@ train → explore → select → label → diagnose → merge → retrain → ev
 
 训练、MD 和 DFT stage 使用与独立命令相同的 Adapter 和 execution target。
 
+`workflow run <目录>` 只允许状态为 `prepared` 的目录第一次启动。
+`workflow resume <目录>` 只用于已经启动过的暂停、失败、中断或可修复损坏状态；
+对 prepared 目录会明确要求使用 `run`。失败目录再次执行 `run` 也会被拒绝并指向
+`resume`，因此“首次启动”和“恢复”不会共享一条含糊路径。
+
 ## 状态与恢复
 
 ```bash
@@ -202,10 +216,32 @@ neptrain workflow stop fe-workflow
 neptrain workflow extend fe-workflow 5
 ```
 
+`workflow status --json` 的 stdout 使用
+`neptrain.workflow-status.v1`；run/resume、stop 和 extend 分别使用稳定的
+`workflow-control.v1`、`workflow-stop.v1` 和 `workflow-extend.v1`。诊断不混入
+JSON stdout。`workflow-control.v1` 始终包含 `workflow_id`、`project`、
+`manifest` 和 `action`；`action` 明确区分 `prepare`、`start`、`resume`、
+`repair` 与 `noop`，不再另写一份重复的 `started` 布尔状态。
+
 Controller 不依赖 Slurm `afterok`。失败后只重跑 ledger 中未完成的阶段；已完成
 workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 workflow
 目录：对尚未启动的准备目录返回 `action: start`；`workflow resume` 用于暂停、
 失败或中断后的恢复。
+
+状态语义如下：
+
+- `prepared`：只有不可变输入快照，下一步是 `workflow run`。
+- `running`：Controller lock 存在且当前任务可观察。
+- `degraded`：临时 SSH/scheduler 查询失败，Controller 仍保留原 handle 并重试。
+- `paused`：Controller 已停止或 PID/lock 不在，但远端工作和 current intent 保留。
+- `failed` / `rejected`：执行失败或科学验收失败，可按记录创建新 attempt 恢复。
+- `damaged`：已提交 artifact、ledger 或 publication 不满足 hash/身份契约。
+  resume 只修复 hash 一致的冗余副本和可见投影；无法证明来源时在提交新任务前
+  fail closed。
+- `budget_exhausted`：模型代数预算耗尽，先 `workflow extend`，不是成功。
+- `stalled`：相同模型与策略继续运行不会增加证据；必须修改科学策略并新建
+  workflow，不能原样 retry。
+- `complete`：完整 stage 链和（若配置）独立 validation 已验收。
 
 `workflow.max_model_generations` 是最大模型代数预算，不是成功条件。配置 `evaluation`
 时，所有生产温度、最长时长、replica、轨迹 DFT 诊断和独立 validation 同时通过
@@ -229,6 +265,10 @@ neptrain workflow stop fe-workflow --keep-jobs
 ```
 
 取消动作会记录到 workflow 历史；后续恢复会创建新的 stage attempt。
+对 task group，已完成且通过校验的 shard 保留原 task id；只有未完成、取消或
+缺失 shard 生成新 attempt。`--keep-jobs` 仅停止 Controller，下一次 resume
+先重新观察原 job handle，不重复提交。作业已离开 `squeue` 时还会查询 accounting；
+超过有界 grace 仍不存在才按 LOST 处理。
 
 每代目录直接对应用户关心的阶段：
 
@@ -269,3 +309,27 @@ attempt 和任务指纹，因此输出目录不再重复这些信息：
 `retry-0002/`。每代 `dft/` 直接发布 `000001-Ce8Fe16` 等软链及最终合并文件，
 不再增加 `teacher/`、`attempt-0001/` 或 `calculations/` 层。`input/` 也只携带当前阶段真正消费的文件：训练任务不再
 复制 MD route，MD 和 DFT 任务不再复制初始训练集及 validation 数据。
+
+远端 task 使用内容寻址协议：本地先在临时目录完整生成 `task.json` 和全部输入，
+校验 manifest 后打包；远端在独占 lock 下解包、复核 hash，再用一次 rename
+发布，worker 不会看到半上传 bundle。结果先写到临时 `output`，完成后原子切换并
+发布绑定 task id/spec hash 的 `result.json`；收集端只接受属于当前 workflow
+instance 的完整结果。旧 workflow 目录删除后重新创建会得到新的随机
+`instance_id`，即使配置相同也不能复用旧远端结果。
+
+## 状态权威与目录恢复
+
+- `.neptrain/manifest.json` 只固定 prepare 输入、计划和 workflow instance。
+- `.neptrain/ledger.json` 是已提交科学阶段的唯一权威和 commit point。
+- `.neptrain/controller.json` 只保存 attempt、current execution、job handle、
+  取消与恢复 intent。
+- job 内 `task.json` 是不可变输入；`execution.json` 是运行观察；
+  `result.json` 是通过收集校验前的候选结果。
+- `results/accepted/` 保存不可变发布；`results/current`、根部结果链接和
+  `generations/*/calculation` 是相对链接投影，可由权威记录重建。
+
+因此，删除可见链接不会丢失科学状态，`resume` 可修复。删除一个有 hash 冗余副本
+的 stage artifact 时，resume 只会复制完全相同的已验证内容；找不到一致副本、
+ledger 缺失、publication 唯一副本损坏或 artifact 路径逃出 workflow 时，状态保持
+`damaged`，不会自动回退成 prepared 或启动下游阶段。要彻底重跑请创建新目录，
+不要删除 `.neptrain` 或手工编辑 JSON 来“重置”。

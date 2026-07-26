@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 from ase import Atoms
 from ase.io import read as ase_read
+from ase.io import write as ase_write
+
+from ..scientific_data import (
+    ScientificDataError,
+    bind_labeled_frames_to_inputs,
+    labeled_input_structure_ids,
+    structure_id,
+    validate_labeled_frames,
+)
 
 
 class LabelingError(RuntimeError):
@@ -23,6 +33,7 @@ class LabelRequest:
     append: bool = False
     input_file: Path | None = None
     resource_dir: Path | None = None
+    resource_manifest: Path | None = None
     n_cpu: int = 1
     use_gamma: bool = False
     kpoint_mode: str = "auto"
@@ -57,6 +68,9 @@ def _namespace(request: LabelRequest) -> SimpleNamespace:
         append=request.append,
         incar=str(request.input_file) if request.input_file else None,
         resource_dir=str(request.resource_dir) if request.resource_dir else None,
+        resource_manifest=(
+            str(request.resource_manifest) if request.resource_manifest else None
+        ),
         n_cpu=request.n_cpu,
         use_gamma=request.use_gamma,
         kpoint_mode=request.kpoint_mode,
@@ -94,7 +108,7 @@ _ADAPTERS: dict[str, _AdapterSpec] = {
 }
 
 
-def _source_contains_spin(source: Path) -> bool:
+def _source_frames(source: Path) -> list[Atoms]:
     paths = [source]
     if source.is_dir():
         paths = sorted(
@@ -105,13 +119,13 @@ def _source_contains_spin(source: Path) -> bool:
                 if path.is_file()
             }
         )
+    loaded_frames = []
     for path in paths:
-        frames = ase_read(path, index=":")
-        if not isinstance(frames, list):
-            frames = [frames]
-        if any("spin" in frame.arrays for frame in frames):
-            return True
-    return False
+        loaded = ase_read(path, index=":")
+        if not isinstance(loaded, list):
+            loaded = [loaded]
+        loaded_frames.extend(loaded)
+    return loaded_frames
 
 
 def label(request: LabelRequest, backend: str) -> LabelResult:
@@ -127,17 +141,100 @@ def label(request: LabelRequest, backend: str) -> LabelResult:
         raise LabelingError("n_cpu must be at least 1")
     if request.kpoint_mode not in {"auto", "kspacing", "kpoints"}:
         raise LabelingError("kpoint_mode must be auto, kspacing, or kpoints")
-    if not spec.supports_spin and _source_contains_spin(request.source):
+    input_frames = _source_frames(request.source)
+    if not input_frames:
+        raise LabelingError(f"label source contains no readable structures: {request.source}")
+    if not spec.supports_spin and any(
+        "spin" in frame.arrays for frame in input_frames
+    ):
         raise LabelingError(
-            f"{backend} production labeling currently supports non-magnetic "
-            "structures only; use the ABACUS Adapter for spin labeling"
+            f"{backend} does not produce spin/mforce labels; use the ABACUS "
+            "Adapter for canonical spin:R:3 input"
         )
-    result = spec.label(request)
-    if not result.frames:
-        raise LabelingError(f"{backend} produced no labeled structures")
-    if not result.output_file.is_file():
-        raise LabelingError(f"{backend} did not produce {result.output_file}")
-    return result
+    previous_frames = []
+    if request.append and request.output_file.is_file():
+        previous = ase_read(request.output_file, index=":")
+        previous_frames = previous if isinstance(previous, list) else [previous]
+        try:
+            validate_labeled_frames(previous_frames)
+            previous_ids = labeled_input_structure_ids(previous_frames)
+        except ScientificDataError as error:
+            raise LabelingError(
+                f"existing append target violates the scientific data "
+                f"contract: {error}"
+            ) from error
+    else:
+        previous_ids = []
+    input_ids = [structure_id(frame) for frame in input_frames]
+    duplicates = sorted(set(previous_ids).intersection(input_ids))
+    if duplicates:
+        raise LabelingError(
+            "append would label an input structure already present in the "
+            f"output ({duplicates[0]})"
+        )
+    if len(input_ids) != len(set(input_ids)):
+        raise LabelingError("label source contains duplicate physical structures")
+
+    request.output_file.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{request.output_file.name}.",
+        suffix=".extxyz.tmp",
+        dir=request.output_file.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        adapter_request = replace(
+            request,
+            output_file=temporary,
+            append=False,
+        )
+        result = spec.label(adapter_request)
+        if not result.frames:
+            raise LabelingError(f"{backend} produced no labeled structures")
+        if Path(result.output_file).resolve() != temporary.resolve():
+            raise LabelingError(
+                f"{backend} wrote outside its unpublished result path"
+            )
+        if not temporary.is_file():
+            raise LabelingError(f"{backend} did not produce {temporary}")
+        persisted = ase_read(temporary, index=":", format="extxyz")
+        output_frames = persisted if isinstance(persisted, list) else [persisted]
+        if len(output_frames) != len(result.frames):
+            raise LabelingError(
+                f"{backend} returned {len(result.frames)} frames but persisted "
+                f"{len(output_frames)}"
+            )
+        try:
+            bound_ids = bind_labeled_frames_to_inputs(input_frames, output_frames)
+            validate_labeled_frames(output_frames)
+        except ScientificDataError as error:
+            raise LabelingError(
+                f"{backend} result violates the scientific data contract: {error}"
+            ) from error
+        expected_ids = [*previous_ids, *bound_ids]
+        ase_write(
+            temporary,
+            [*previous_frames, *output_frames],
+            format="extxyz",
+        )
+        restored = ase_read(temporary, index=":", format="extxyz")
+        restored_frames = restored if isinstance(restored, list) else [restored]
+        try:
+            validate_labeled_frames(restored_frames)
+            restored_ids = labeled_input_structure_ids(restored_frames)
+        except ScientificDataError as error:
+            raise LabelingError(
+                f"{backend} result failed its publication roundtrip: {error}"
+            ) from error
+        if restored_ids != expected_ids:
+            raise LabelingError(
+                f"{backend} result publication changed input ownership or order"
+            )
+        temporary.replace(request.output_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return LabelResult(result.backend, request.output_file, tuple(output_frames))
 
 
 __all__ = ["LabelRequest", "LabelResult", "LabelingError", "label"]

@@ -18,7 +18,7 @@ from ase.data import atomic_masses, atomic_numbers
 from ase.units import Bohr
 
 from ...spin import prepare_spin_for_dft
-from .io import StructureVar
+from .resources import validate_abacus_resources
 
 
 PARSER_VERSION = "neptrain-abacus-running-scf-v2"
@@ -34,6 +34,7 @@ class NativeAbacusError(RuntimeError):
 class NativeAbacusRequest:
     work_dir: Path
     resource_dir: Path
+    resource_manifest: Path
     command: str
     input_parameters: Mapping[str, str]
     use_gamma: bool
@@ -61,11 +62,16 @@ def run_native_abacus(
     input_frame = atoms.copy()
     spin_frame = prepare_spin_for_dft(input_frame)
     parameters = dict(request.input_parameters)
-    if spin_frame:
-        _configure_spin_parameters(parameters)
+    electronic_mode = validate_abacus_spin_contract(
+        parameters,
+        spin_frame=spin_frame,
+    )
     basis_type = str(parameters.get("basis_type", "pw")).strip().lower()
-    pp_files, orb_files = StructureVar.completion_abacus(
-        atoms=input_frame, require_orbitals=basis_type == "lcao"
+    resource_provenance, pp_files, orb_files = validate_abacus_resources(
+        request.resource_dir,
+        request.resource_manifest,
+        input_frame,
+        require_orbitals=basis_type == "lcao",
     )
     case_dir = _new_attempt_directory(
         request.work_dir,
@@ -84,6 +90,7 @@ def run_native_abacus(
         kpoint_mode=request.kpoint_mode,
         kspacing=request.kspacing,
         ka=request.ka,
+        resource_provenance=resource_provenance,
     )
     completed = subprocess.run(
         request.command,
@@ -103,6 +110,7 @@ def run_native_abacus(
             command=request.command,
             returncode=completed.returncode,
             status="process_failed",
+            electronic_mode=electronic_mode,
         )
         detail = _tail(completed.stderr or completed.stdout)
         raise NativeAbacusError(
@@ -129,6 +137,7 @@ def run_native_abacus(
             returncode=completed.returncode,
             status="result_invalid",
             log_path=log_path,
+            electronic_mode=electronic_mode,
         )
         raise
     forces = _restore_atom_order(parsed.forces, ordered_indices)
@@ -144,6 +153,7 @@ def run_native_abacus(
     )
     frame.info.setdefault("Config_type", "NepTrain scf ")
     frame.info["Weight"] = 1.0
+    frame.info["dft_electronic_mode"] = electronic_mode
     if spin_frame:
         magnetization = _restore_atom_order(
             parsed.magnetization, ordered_indices
@@ -165,6 +175,7 @@ def run_native_abacus(
         status="completed",
         log_path=log_path,
         parsed=parsed,
+        electronic_mode=electronic_mode,
     )
     return frame
 
@@ -222,6 +233,41 @@ def _configure_spin_parameters(parameters: dict[str, str]) -> None:
     )
 
 
+def _parameter_enabled(value: object) -> bool:
+    return str(value or "0").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "f",
+        "no",
+        "off",
+    }
+
+
+def validate_abacus_spin_contract(
+    parameters: dict[str, str],
+    *,
+    spin_frame: bool,
+) -> str:
+    """Separate electronic spin polarization from spin-force labeling."""
+
+    if spin_frame:
+        _configure_spin_parameters(parameters)
+        return "constrained_vector_spin_force"
+    if _parameter_enabled(parameters.get("sc_mag_switch")):
+        raise NativeAbacusError(
+            "ABACUS sc_mag_switch requires canonical spin:R:3 input; "
+            "otherwise magnetic forces would be discarded"
+        )
+    nspin = str(parameters.get("nspin", "1")).strip()
+    noncollinear = _parameter_enabled(parameters.get("noncolin"))
+    if noncollinear or nspin == "4":
+        return "noncollinear_spin_polarized"
+    if nspin == "2":
+        return "collinear_spin_polarized"
+    return "non_spin_polarized"
+
+
 def _render_case(
     case_dir: Path,
     atoms: Atoms,
@@ -234,6 +280,7 @@ def _render_case(
     kpoint_mode: str,
     kspacing: float | None,
     ka: tuple[int, int, int],
+    resource_provenance: Mapping[str, object],
 ) -> tuple[int, ...]:
     if str(parameters.get("smearing_method", "")).strip().lower() == "gau":
         parameters["smearing_method"] = "gaussian"
@@ -271,7 +318,13 @@ def _render_case(
             max(1, int(np.ceil(ka[2] / c))),
         )
         _write_kpt(case_dir / "KPT", grid, gamma=use_gamma)
-    _write_input_manifest(case_dir, resource_dir, pp_files, active_orb_files)
+    _write_input_manifest(
+        case_dir,
+        resource_dir,
+        pp_files,
+        active_orb_files,
+        resource_provenance=resource_provenance,
+    )
     return ordered_indices
 
 
@@ -334,6 +387,8 @@ def _write_input_manifest(
     resource_dir: Path,
     pp_files: Mapping[str, str],
     orb_files: Mapping[str, str],
+    *,
+    resource_provenance: Mapping[str, object],
 ) -> None:
     resources = {}
     for element, filename in pp_files.items():
@@ -356,6 +411,7 @@ def _write_input_manifest(
             {
                 "backend": "abacus",
                 "resource_dir": str(resource_dir),
+                "manifest": dict(resource_provenance),
                 "resources": resources,
             },
             indent=2,
@@ -545,6 +601,7 @@ def _write_result_manifest(
     status: str,
     log_path: Path | None = None,
     parsed: ParsedAbacusResult | None = None,
+    electronic_mode: str | None = None,
 ) -> None:
     inputs = {}
     for name in ("INPUT", "STRU", "KPT", "abacus-input.json"):
@@ -558,6 +615,8 @@ def _write_result_manifest(
         "status": status,
         "parser_version": PARSER_VERSION,
         "input_sha256": inputs,
+        "electronic_mode": electronic_mode,
+        "spin_force_labels": electronic_mode == "constrained_vector_spin_force",
     }
     if log_path is not None:
         payload["running_scf_log"] = str(log_path)
@@ -598,4 +657,5 @@ __all__ = [
     "ParsedAbacusResult",
     "parse_running_scf",
     "run_native_abacus",
+    "validate_abacus_spin_contract",
 ]

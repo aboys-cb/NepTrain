@@ -5,16 +5,25 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
 
+import numpy as np
 import pytest
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
-from NepTrain.core.workflow import extend_workflow, workflow_status, prepare_workflow
+from NepTrain.core.workflow import (
+    WorkflowError,
+    extend_workflow,
+    prepare_workflow,
+    resume_workflow,
+    workflow_status,
+)
 from NepTrain.core.controller import (
     ControllerError,
     PersistentController,
@@ -28,6 +37,7 @@ from NepTrain.core.execution import (
     ExecutionHandle,
     ExecutionStatus,
     ExecutionTarget,
+    ExecutionTransport,
     ProcessExecutor,
     SlurmExecutor,
     StageTask,
@@ -36,12 +46,64 @@ from NepTrain.core.execution import (
     run_stage_worker,
 )
 from NepTrain.core.iteration import GenerationPlan, StageContext, StageOutcome
+from NepTrain.core.scientific_data import (
+    INPUT_STRUCTURE_ID_KEY,
+    structure_id,
+)
+from NepTrain.core.workflow_workspace import WorkflowWorkspace
+import NepTrain.core.controller as controller_module
 
 
 def _write(path: Path, text: str = "fixture\n") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _write_labeled(path: Path) -> Path:
+    atoms = Atoms(
+        "Fe",
+        positions=[[0.0, 0.0, 0.0]],
+        cell=[4.0, 4.0, 4.0],
+        pbc=True,
+    )
+    atoms.info["virial"] = np.zeros((3, 3))
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=-1.0,
+        forces=np.zeros((1, 3)),
+    )
+    ase_write(path, atoms, format="extxyz")
+    return path
+
+
+def _write_vasp_resources(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "potpaw"
+    potcar = _write(
+        root / "Fe" / "POTCAR",
+        "TITEL = PAW_PBE Fe 06Sep2000\nVRHFIN =Fe: s2d6\n",
+    )
+    manifest = tmp_path / "vasp-resources.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "protocol": "neptrain.vasp-resources.v1",
+                "family": "PAW_PBE",
+                "release": "test",
+                "elements": {
+                    "Fe": {
+                        "path": "Fe/POTCAR",
+                        "sha256": hashlib.sha256(
+                            potcar.read_bytes()
+                        ).hexdigest(),
+                        "titel": "PAW_PBE Fe 06Sep2000",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return root, manifest
 
 
 def _sha256(path: Path) -> str:
@@ -89,7 +151,8 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
         ),
     )
     descriptor = json.loads(task.descriptor.read_text())
-    assert descriptor["protocol"] == "neptrain.stage-task.v2"
+    assert descriptor["protocol"] == "neptrain.stage-task.v3"
+    assert descriptor["task_id"] == descriptor["spec_sha256"][:24]
     assert task.bundle.name.startswith("g0001-md-a1-")
     assert (task.bundle / "input").is_dir()
     assert not (task.bundle / "inputs").exists()
@@ -113,12 +176,245 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
     assert run_stage_worker(task.bundle) == 0
     value, outcome = load_stage_result(task.bundle)
     assert value["task_id"] == task.task_id
-    assert value["protocol"] == "neptrain.stage-result.v2"
+    assert value["protocol"] == "neptrain.stage-result.v3"
     assert outcome.metrics == {"candidate_count": 1}
     assert outcome.artifacts["candidates"].read_text() == "candidate\n"
     assert outcome.artifacts["candidates"] == task.bundle / "output" / "candidates.xyz"
     assert not (task.bundle / "work").exists()
     assert not (task.bundle / "result").exists()
+
+
+def test_stage_task_identity_covers_bundle_content_and_workflow_instance(tmp_path):
+    initial = _write(tmp_path / "initial.xyz")
+    model = _write(tmp_path / "model.txt", "model-one\n")
+    config = {
+        "training": {},
+        "evaluation": {},
+        "md": {"spin": False},
+        "dft": {},
+        "workflow": {},
+        "execution": {},
+    }
+    context = StageContext(
+        generation=1,
+        generation_dir=tmp_path / "generation",
+        plan=_plan(),
+        artifacts={"model": model},
+        previous_artifacts={},
+    )
+
+    first = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="content-addressed",
+        workflow_instance_id="instance-one",
+        generation=1,
+        stage="explore",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=context,
+    )
+    model.write_text("model-two\n", encoding="utf-8")
+    second = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="content-addressed",
+        workflow_instance_id="instance-one",
+        generation=1,
+        stage="explore",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=context,
+    )
+    third = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="content-addressed",
+        workflow_instance_id="instance-two",
+        generation=1,
+        stage="explore",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=context,
+    )
+
+    assert len({first.task_id, second.task_id, third.task_id}) == 3
+    assert (
+        first.bundle / json.loads(first.descriptor.read_text())["artifacts"]["model"]
+    ).read_text(encoding="utf-8") == "model-one\n"
+
+
+def test_label_task_identity_includes_the_resource_manifest_content(tmp_path):
+    initial = _write(tmp_path / "initial.xyz")
+    selected = _write(tmp_path / "selected.xyz")
+    manifest = _write(tmp_path / "vasp-resources.json", '{"release":"one"}\n')
+    context = StageContext(
+        generation=1,
+        generation_dir=tmp_path / "generation",
+        plan=_plan(),
+        artifacts={"selected_input": selected},
+        previous_artifacts={},
+    )
+    config = {
+        "training": {},
+        "evaluation": {},
+        "md": {"spin": False},
+        "dft": {
+            "backend": "vasp",
+            "resource_path": "/remote/potpaw",
+            "potcar_manifest_path": str(manifest),
+        },
+        "workflow": {},
+        "execution": {},
+    }
+    target = ExecutionTarget(
+        "dft",
+        "slurm",
+        host="fixture",
+        work_root="/remote/work",
+        partition="cpu",
+        dft_resource_path="/remote/potpaw",
+    )
+    first = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="resource-identity",
+        workflow_instance_id="instance",
+        generation=1,
+        stage="label",
+        attempt=1,
+        target=target,
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=context,
+    )
+    manifest.write_text('{"release":"two"}\n', encoding="utf-8")
+    second = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="resource-identity",
+        workflow_instance_id="instance",
+        generation=1,
+        stage="label",
+        attempt=1,
+        target=target,
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=context,
+    )
+
+    assert first.task_id != second.task_id
+    first_descriptor = json.loads(first.descriptor.read_text())
+    bundled_manifest = (
+        first.bundle
+        / first_descriptor["config"]["dft"]["potcar_manifest_path"]
+    )
+    assert bundled_manifest.read_text(encoding="utf-8") == '{"release":"one"}\n'
+
+
+def test_remote_deploy_atomically_replaces_only_an_incomplete_exact_task(
+    tmp_path,
+):
+    initial = _write(tmp_path / "initial.xyz")
+    model = _write(tmp_path / "model.txt")
+    remote_root = tmp_path / "remote"
+    target = ExecutionTarget(
+        "remote",
+        "slurm",
+        host="fixture",
+        work_root=str(remote_root),
+        partition="cpu",
+        command=(
+            f"env PYTHONPATH={Path(__file__).resolve().parents[1] / 'src'} "
+            f"{sys.executable} -m NepTrain.cli.cli"
+        ),
+    )
+    task = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="atomic-deploy",
+        workflow_instance_id="instance",
+        generation=1,
+        stage="explore",
+        attempt=1,
+        target=target,
+        plan=_plan(),
+        config={
+            "training": {},
+            "evaluation": {},
+            "md": {"spin": False},
+            "dft": {},
+            "workflow": {},
+            "execution": {},
+        },
+        initial_training=initial,
+        context=StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation",
+            plan=_plan(),
+            artifacts={"model": model},
+            previous_artifacts={},
+        ),
+    )
+
+    class LocalRemoteTransport(ExecutionTransport):
+        def run_script(self, script, *arguments, check=False, timeout=60):
+            completed = subprocess.run(
+                ["bash", "-s", "--", *(str(value) for value in arguments)],
+                input=script,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            if check and completed.returncode:
+                raise ExecutionError(completed.stderr)
+            return completed
+
+        def copy(self, source, destination, **_kwargs):
+            remote_path = Path(str(destination).split(":", 1)[1])
+            remote_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, remote_path)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    destination = (
+        remote_root / task.workflow_id / "jobs" / task.bundle.name
+    )
+    destination.mkdir(parents=True)
+    (destination / "partial-upload").write_text("incomplete\n")
+    transport = LocalRemoteTransport(target)
+
+    assert transport.deploy(task) == str(destination)
+    assert (destination / "task.json").read_bytes() == task.descriptor.read_bytes()
+    quarantined = list(destination.parent.glob(destination.name + ".incomplete.*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "partial-upload").is_file()
+
+    # A complete identical bundle is reused without another upload.
+    assert transport.deploy(task) == str(destination)
+
+    descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+    missing = descriptor["files"][0]
+    (destination / missing["path"]).unlink()
+    assert transport.deploy(task) == str(destination)
+    assert _sha256(destination / missing["path"]) == missing["sha256"]
+    quarantined = list(destination.parent.glob(destination.name + ".incomplete.*"))
+    assert len(quarantined) == 2
+
+    (destination / "task.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ExecutionError, match="conflicts with local"):
+        transport.deploy(task)
 
 
 def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
@@ -346,12 +642,47 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
 
 def test_stage_result_rejects_paths_outside_the_bundle(tmp_path):
     outside = _write(tmp_path / "outside.dat")
-    bundle = tmp_path / "task"
-    bundle.mkdir()
-    (bundle / "result.json").write_text(
+    model = _write(tmp_path / "model.dat")
+    task = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="path-safety",
+        generation=1,
+        stage="explore",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config={
+            "training": {},
+            "evaluation": {},
+            "md": {"spin": False},
+            "dft": {},
+            "workflow": {},
+            "execution": {},
+        },
+        initial_training=_write(tmp_path / "initial.xyz"),
+        context=StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation",
+            plan=_plan(),
+            artifacts={"model": model},
+            previous_artifacts={},
+        ),
+    )
+    descriptor = json.loads(task.descriptor.read_text())
+    (task.bundle / "result.json").write_text(
         json.dumps(
             {
-                "protocol": "neptrain.stage-result.v2",
+                "protocol": "neptrain.stage-result.v3",
+                "task_id": task.task_id,
+                "task_spec_sha256": descriptor["spec_sha256"],
+                "workflow_id": task.workflow_id,
+                "workflow_instance_id": descriptor["identity"][
+                    "workflow_instance_id"
+                ],
+                "generation": task.generation,
+                "stage": task.stage,
+                "plan_sha256": descriptor["identity"]["plan_sha256"],
                 "artifacts": {
                     "model": {
                         "path": "../outside.dat",
@@ -365,7 +696,7 @@ def test_stage_result_rejects_paths_outside_the_bundle(tmp_path):
     )
 
     with pytest.raises(ExecutionError, match="inside the task bundle"):
-        load_stage_result(bundle)
+        load_stage_result(task.bundle)
 
 
 _STAGE_ARTIFACTS = {
@@ -387,7 +718,7 @@ class ImmediateExecutor:
 
     def launch(self, task):
         self.launches.append((task.stage, task.target))
-        result_root = task.bundle / "result" / "artifacts"
+        result_root = task.bundle / "output" / "artifacts"
         artifacts = {}
         descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
         names = _STAGE_ARTIFACTS[task.stage]
@@ -399,11 +730,7 @@ class ImmediateExecutor:
                 if name in {"candidates", "selected_input", "labeled"}
                 else f"{name}.json"
             )
-            path = (
-                task.bundle / "output" / filename
-                if task.stage == "label"
-                else result_root / name / filename
-            )
+            path = result_root / name / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             if name == "candidates":
                 route = descriptor["identity"]["sampling_routes"][0]
@@ -424,9 +751,18 @@ class ImmediateExecutor:
                 )
             elif name == "labeled":
                 source = task.bundle / descriptor["artifacts"]["selected_input"]
+                frames = ase_read(source, index=":")
+                for frame in frames:
+                    frame.info[INPUT_STRUCTURE_ID_KEY] = structure_id(frame)
+                    frame.info["virial"] = np.zeros((3, 3))
+                    frame.calc = SinglePointCalculator(
+                        frame,
+                        energy=-1.0,
+                        forces=[[0.0, 0.0, 0.0]],
+                    )
                 ase_write(
                     path,
-                    ase_read(source, index=":"),
+                    frames,
                     format="extxyz",
                 )
             elif name == "md_attempts":
@@ -478,9 +814,13 @@ class ImmediateExecutor:
         (task.bundle / "result.json").write_text(
             json.dumps(
                 {
-                    "protocol": "neptrain.stage-result.v2",
+                    "protocol": "neptrain.stage-result.v3",
                     "task_id": task.task_id,
+                    "task_spec_sha256": descriptor["spec_sha256"],
                     "workflow_id": task.workflow_id,
+                    "workflow_instance_id": descriptor["identity"][
+                        "workflow_instance_id"
+                    ],
                     "generation": task.generation,
                     "stage": task.stage,
                     "plan_sha256": descriptor["identity"]["plan_sha256"],
@@ -506,7 +846,7 @@ class ImmediateExecutor:
 
 
 def _controller_inputs(tmp_path: Path):
-    initial = _write(tmp_path / "initial.xyz")
+    initial = _write_labeled(tmp_path / "initial.xyz")
     _write(tmp_path / "nep.in")
     ase_write(
         tmp_path / "structures.xyz",
@@ -514,7 +854,7 @@ def _controller_inputs(tmp_path: Path):
         format="extxyz",
     )
     _write(tmp_path / "lammps.in", "run {{ steps }}\n")
-    _write(tmp_path / "validation.xyz")
+    _write_labeled(tmp_path / "validation.xyz")
     config = _write(
         tmp_path / "project.yaml",
         """
@@ -612,6 +952,118 @@ def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     manifest = json.loads(preparation.manifest.read_text())
     assert manifest["orchestration"] == "controller"
     assert "scripts" not in manifest
+
+
+def test_status_audits_and_resume_repairs_committed_result_projection(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, []),
+    )
+    for _ in range(20):
+        if controller.tick().state == "complete":
+            break
+    else:
+        raise AssertionError("controller did not complete")
+
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    visible_model = workspace.results_dir / "nep.txt"
+    visible_model.unlink()
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "damaged"
+    assert "results/nep.txt" in status.reason
+
+    assert controller.generation_controller.next_stage(controller.plans[0]) is None
+    assert visible_model.is_symlink()
+    assert workflow_status(preparation.output_dir).state == "complete"
+
+    publication_model = visible_model.resolve()
+    publication_model.unlink()
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "damaged"
+    assert "accepted result drifted" in status.reason
+
+    # Repair uses the still hash-checked stage artifact, never an unverified
+    # visible result.
+    assert controller.generation_controller.next_stage(controller.plans[0]) is None
+    assert publication_model.is_file()
+    assert workflow_status(preparation.output_dir).state == "complete"
+
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    committed_model = Path(
+        ledger["generations"]["1"]["stages"]["evaluate"]["artifacts"][
+            "activated_model"
+        ]["path"]
+    )
+    committed_model.unlink()
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "damaged"
+    assert "committed artifact drifted or is missing" in status.reason
+
+    repaired = resume_workflow(preparation.output_dir)
+    assert repaired.action == "repair"
+    assert committed_model.is_file()
+    assert workflow_status(preparation.output_dir).state == "complete"
+
+
+def test_resume_refuses_irrecoverable_committed_artifact_damage(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, []),
+    )
+    for _ in range(20):
+        if controller.tick().state == "complete":
+            break
+    else:
+        raise AssertionError("controller did not complete")
+
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    label_record = ledger["generations"]["1"]["stages"]["label"]["artifacts"][
+        "labeled"
+    ]
+    expected = label_record["sha256"]
+    committed = Path(label_record["path"])
+    committed.unlink()
+    for result_path in workspace.tasks_dir.glob("*/result.json"):
+        value = json.loads(result_path.read_text(encoding="utf-8"))
+        for artifact in value.get("artifacts", {}).values():
+            candidate = result_path.parent / artifact["path"]
+            if artifact.get("sha256") == expected and candidate.is_file():
+                candidate.unlink()
+
+    with pytest.raises(
+        WorkflowError,
+        match="authoritative damage.*resume was refused",
+    ):
+        resume_workflow(preparation.output_dir)
+    assert workflow_status(preparation.output_dir).state == "damaged"
+
+
+def test_missing_scientific_ledger_is_not_treated_as_a_fresh_workflow(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, []),
+    )
+    for _ in range(20):
+        if controller.tick().state == "complete":
+            break
+    else:
+        raise AssertionError("controller did not complete")
+
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    workspace.ledger.unlink()
+
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "damaged"
+    assert "scientific ledger is missing" in status.reason
+    with pytest.raises(WorkflowError, match="authoritative damage"):
+        resume_workflow(preparation.output_dir)
 
 
 def test_controller_publishes_flat_outputs_and_real_calculation_link(tmp_path):
@@ -754,8 +1206,8 @@ def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
 
 def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
     config, initial = _controller_inputs(tmp_path)
-    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 2\n")
-    (tmp_path / "potpaw").mkdir()
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
     text = config.read_text(encoding="utf-8").replace(
         "dft:\n  backend: toy\n",
         (
@@ -763,6 +1215,7 @@ def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
             "  backend: vasp\n"
             "  input_path: ./INCAR\n"
             "  resource_path: ./potpaw\n"
+            "  potcar_manifest_path: ./vasp-resources.json\n"
             "  structures_per_job: 1\n"
             "  max_concurrent: 2\n"
         ),
@@ -1052,6 +1505,7 @@ def test_controller_refuses_drifted_workflow_inputs(tmp_path):
 def test_process_executor_detaches_and_reports_completion(tmp_path):
     bundle = tmp_path / "task"
     bundle.mkdir()
+    (bundle / "execution.json").write_text("{", encoding="utf-8")
     script = _write(
         tmp_path / "dummy_worker.py",
         """
@@ -1083,6 +1537,50 @@ bundle = pathlib.Path(sys.argv[-1])
 
     assert status.state == "completed"
     assert executor.collect(handle) == bundle
+
+
+def test_process_executor_reports_corrupt_execution_metadata_as_failed(
+    tmp_path, monkeypatch
+):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    (bundle / "execution.json").write_text("{", encoding="utf-8")
+    local = ProcessExecutor(ExecutionTarget("local", "process"))
+    handle = ExecutionHandle("abc", "local", "process", "999999", str(bundle))
+
+    local_status = local.inspect(handle)
+
+    assert local_status.state == "failed"
+    assert "execution descriptor is unreadable" in local_status.detail
+
+    remote = ProcessExecutor(
+        ExecutionTarget(
+            "remote",
+            "process",
+            host="fixture",
+            work_root="/remote/work",
+        )
+    )
+    monkeypatch.setattr(
+        remote.transport,
+        "run_script",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "{", ""
+        ),
+    )
+    remote_handle = ExecutionHandle(
+        "abc",
+        "remote",
+        "process",
+        "123",
+        str(bundle),
+        remote_bundle="/remote/work/task",
+    )
+
+    remote_status = remote.inspect(remote_handle)
+
+    assert remote_status.state == "failed"
+    assert "remote execution descriptor is unreadable" in remote_status.detail
 
 
 def test_process_executor_cancels_its_own_process_group(tmp_path):
@@ -1341,6 +1839,44 @@ class CancellableExecutor:
         return ExecutionStatus("cancelled", "test cancellation accepted")
 
 
+def test_stop_prepared_workflow_is_an_idempotent_no_op(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+
+    result = stop_workflow(preparation.output_dir)
+
+    assert result["controller"] == "already_stopped"
+    assert result["current_execution"]["action"] == "none"
+    assert not workspace.controller_file.exists()
+    assert not workspace.ledger.exists()
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "prepared"
+    assert "workflow run" in status.next_action
+
+
+def test_stop_complete_workflow_does_not_rewrite_it_as_paused(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, []),
+    )
+    for _ in range(20):
+        if controller.tick().state == "complete":
+            break
+    else:
+        raise AssertionError("controller did not complete")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    ledger_before = workspace.ledger.read_bytes()
+
+    result = stop_workflow(preparation.output_dir)
+
+    assert result["current_execution"]["action"] == "none"
+    assert workspace.ledger.read_bytes() == ledger_before
+    assert workflow_status(preparation.output_dir).state == "complete"
+
+
 def test_stop_workflow_cancels_and_archives_current_execution_by_default(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -1434,6 +1970,112 @@ def test_stop_workflow_preserves_current_until_cancellation_is_terminal(
     assert state["current"]["handle"]["execution_id"] == "123"
     assert state["current"]["cancellation_requested_at"]
     assert state["history"] == []
+    ledger = json.loads(
+        (preparation.output_dir / ".neptrain/ledger.json").read_text()
+    )
+    stop_event = ledger["execution_events"][-1]
+    assert stop_event["event"] == "workflow_stop"
+    assert stop_event["cancel_jobs"] is True
+    assert stop_event["current_execution"]["action"] == "cancelling"
+
+
+def test_group_stop_preserves_completed_shards_and_rebuilds_only_cancelled_shard(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "dft:\n  backend: toy\n",
+            (
+                "dft:\n"
+                "  backend: vasp\n"
+                "  input_path: ./INCAR\n"
+                "  resource_path: ./potpaw\n"
+                "  potcar_manifest_path: ./vasp-resources.json\n"
+                "  structures_per_job: 1\n"
+                "  max_concurrent: 2\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    cancelled_ids = set()
+
+    class StopAwareExecutor(ImmediateExecutor):
+        def inspect(self, handle):
+            if handle.execution_id in cancelled_ids:
+                return ExecutionStatus("cancelled", "fixture cancellation")
+            return ExecutionStatus("completed")
+
+        def cancel(self, handle):
+            cancelled_ids.add(handle.execution_id)
+            return ExecutionStatus("cancelled", "fixture cancellation")
+
+    factory = lambda target: StopAwareExecutor(target, launches)
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=factory,
+    )
+    for _ in range(30):
+        controller.tick()
+        current = controller.state.get("current") or {}
+        if (
+            current.get("stage") == "label"
+            and sum(
+                bool(item.get("collected_bundle"))
+                for item in current.get("tasks", [])
+            )
+            == 2
+            and sum(
+                bool(item.get("handle"))
+                and not item.get("collected_bundle")
+                for item in current.get("tasks", [])
+            )
+            == 1
+        ):
+            break
+    else:
+        raise AssertionError("controller did not reach a partially collected label group")
+
+    original_ids = [item["task_id"] for item in current["tasks"]]
+    result = stop_workflow(
+        preparation.output_dir,
+        executor_factory=factory,
+    )
+
+    assert result["current_execution"]["action"] == "group_cancellation_requested"
+    stopped = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert stopped["current"] is not None
+    assert sum(
+        bool(item.get("collected_bundle"))
+        for item in stopped["current"]["tasks"]
+    ) == 2
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "paused"
+    assert [job["state"] for job in status.jobs[-3:]] == [
+        "COMPLETED",
+        "COMPLETED",
+        "CANCELLED",
+    ]
+
+    resumed = PersistentController(
+        preparation.output_dir,
+        executor_factory=factory,
+    )
+    resumed.resume_stopped()
+    current = resumed.state["current"]
+    assert current["attempt"] == 2
+    assert [item["task_id"] for item in current["tasks"][:2]] == original_ids[:2]
+    assert current["tasks"][2]["task_id"] != original_ids[2]
+    assert current["tasks"][2]["handle"] is None
+    assert all(
+        item.get("collected_bundle") for item in current["tasks"][:2]
+    )
 
 
 class FailingExecutor:
@@ -1481,6 +2123,51 @@ def test_controller_retry_creates_a_new_traceable_attempt(tmp_path):
     assert state["history"][0]["failure"] == "intentional failure"
 
 
+def test_controller_turns_persistently_unknown_execution_into_retryable_failure(
+    tmp_path,
+    monkeypatch,
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+
+    class UnknownExecutor:
+        def __init__(self, target):
+            self.target = target
+
+        def launch(self, task):
+            return ExecutionHandle(
+                task.task_id,
+                task.target,
+                "slurm",
+                "701234",
+                str(task.bundle),
+            )
+
+        def inspect(self, _handle):
+            return ExecutionStatus(
+                "unknown",
+                "Slurm has no accounting record yet",
+            )
+
+    monkeypatch.setattr(
+        controller_module,
+        "_EXECUTION_UNKNOWN_GRACE_SECONDS",
+        0.0,
+    )
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=UnknownExecutor,
+    )
+
+    assert controller.tick().state == "running"
+    failed = controller.tick()
+
+    assert failed.state == "failed"
+    assert "recovery grace period" in failed.detail
+    controller.retry()
+    assert controller.state["current"] is None
+
+
 def test_detached_controller_completes_a_real_multi_process_workflow(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     worker = _write(
@@ -1508,7 +2195,7 @@ names = {
 artifacts = {}
 for name in names:
     suffix = '.xyz' if name == 'candidates' else '.dat'
-    path = bundle / 'result' / 'artifacts' / name / f'{name}{suffix}'
+    path = bundle / 'output' / 'artifacts' / name / f'{name}{suffix}'
     path.parent.mkdir(parents=True, exist_ok=True)
     if stage == 'explore' and name == 'candidates':
         route = task['identity']['sampling_routes'][0]
@@ -1536,9 +2223,11 @@ for name in names:
         'size': path.stat().st_size,
     }
 result = {
-    'protocol': 'neptrain.stage-result.v2',
+    'protocol': 'neptrain.stage-result.v3',
     'task_id': task['task_id'],
+    'task_spec_sha256': task['spec_sha256'],
     'workflow_id': task['identity']['workflow_id'],
+    'workflow_instance_id': task['identity']['workflow_instance_id'],
     'generation': task['identity']['generation'],
     'stage': stage,
     'plan_sha256': task['identity']['plan_sha256'],
@@ -1549,7 +2238,8 @@ result = {
 }
 (bundle / 'result.json').write_text(json.dumps(result))
 (bundle / 'execution.json').write_text(json.dumps({
-    'task_id': task['task_id'], 'state': 'COMPLETED', 'pid': os.getpid()
+    'task_id': task['task_id'], 'task_spec_sha256': task['spec_sha256'],
+    'state': 'COMPLETED', 'pid': os.getpid()
 }))
 """,
     )
@@ -1613,7 +2303,7 @@ names = {
 artifacts = {}
 for name in names:
     suffix = '.xyz' if name == 'candidates' else '.dat'
-    path = bundle / 'result' / 'artifacts' / name / f'{name}{suffix}'
+    path = bundle / 'output' / 'artifacts' / name / f'{name}{suffix}'
     path.parent.mkdir(parents=True, exist_ok=True)
     if stage == 'explore' and name == 'candidates':
         route = task['identity']['sampling_routes'][0]
@@ -1641,9 +2331,11 @@ for name in names:
         'size': path.stat().st_size,
     }
 (bundle / 'result.json').write_text(json.dumps({
-    'protocol': 'neptrain.stage-result.v2',
+    'protocol': 'neptrain.stage-result.v3',
     'task_id': task['task_id'],
+    'task_spec_sha256': task['spec_sha256'],
     'workflow_id': task['identity']['workflow_id'],
+    'workflow_instance_id': task['identity']['workflow_instance_id'],
     'generation': task['identity']['generation'],
     'stage': stage,
     'plan_sha256': task['identity']['plan_sha256'],
@@ -1653,7 +2345,8 @@ for name in names:
     } if stage == 'evaluate' else {},
 }))
 (bundle / 'execution.json').write_text(json.dumps({
-    'task_id': task['task_id'], 'state': 'COMPLETED', 'pid': os.getpid()
+    'task_id': task['task_id'], 'task_spec_sha256': task['spec_sha256'],
+    'state': 'COMPLETED', 'pid': os.getpid()
 }))
 """,
     )

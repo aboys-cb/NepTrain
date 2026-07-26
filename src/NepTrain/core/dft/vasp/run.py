@@ -29,6 +29,12 @@ def calculate_vasp(atoms: Atoms, args):
             "VASP labeling requires dft.resource_path or --resources"
         )
     resource_dir = Path(args.resource_dir).expanduser().resolve()
+    raw_manifest = getattr(args, "resource_manifest", None)
+    if not raw_manifest:
+        raise FileNotFoundError(
+            "VASP labeling requires a content-addressed POTCAR manifest"
+        )
+    resource_manifest = Path(raw_manifest).expanduser().resolve()
     input_file = (
         Path(args.incar)
         if args.incar is not None and os.path.exists(args.incar)
@@ -43,6 +49,7 @@ def calculate_vasp(atoms: Atoms, args):
         NativeVaspRequest(
             work_dir=Path(args.directory).resolve(),
             resource_dir=resource_dir,
+            resource_manifest=resource_manifest,
             command=command,
             input_file=input_file.resolve(),
             use_gamma=bool(args.use_gamma),
@@ -71,6 +78,12 @@ def run_vasp(args):
     if not resource.is_dir():
         raise FileNotFoundError(
             f"VASP pseudopotential root does not exist: {resource}"
+        )
+    manifest = getattr(args, "resource_manifest", None)
+    if not manifest or not Path(manifest).expanduser().is_file():
+        raise FileNotFoundError(
+            "VASP POTCAR manifest does not exist: "
+            f"{manifest or '<not configured>'}"
         )
     result = calculate_vasp(args.model_path, args)
     output = Path(args.out_file_path)

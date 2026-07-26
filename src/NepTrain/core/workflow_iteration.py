@@ -35,8 +35,14 @@ from .sampling_route import (
     SamplingRouteError,
     load_sampling_routes,
 )
+from .scientific_data import (
+    ScientificDataError,
+    labeled_input_structure_ids,
+    reference_forces,
+    structure_id,
+    validate_labeled_frames,
+)
 from .spin import validate_spin_dataset
-from .toy_workflow import structure_id
 from .training import TrainingRequest, TrainingResult, train
 
 
@@ -149,7 +155,7 @@ def _nep_prediction_metrics(
             np.asarray([frame.get_potential_energy() for frame in frames]), energy
         ),
         "force_rmse": _rmse(
-            np.concatenate([frame.get_forces() for frame in frames]),
+            np.concatenate([reference_forces(frame) for frame in frames]),
             np.concatenate(forces),
         ),
         "virial_rmse": _rmse(
@@ -1205,7 +1211,18 @@ class WorkflowIterationAdapter:
                 "all MD candidates already exist in the training set; "
                 "increase MD steps or temperature"
             )
-        unique_candidates: dict[tuple[str, str], Atoms] = {}
+        def preference(frame: Atoms) -> tuple[str, ...]:
+            return (
+                "0" if frame.info.get("md_window") == "pre_failure" else "1",
+                str(frame.info.get("route_fingerprint", "")),
+                str(frame.info.get("route_id", "")),
+                str(frame.info.get("temperature", "")),
+                str(frame.info.get("pressure", "")),
+                str(frame.info.get("source_id", "")),
+                str(frame.info.get("scenario_attempt_id", "")),
+            )
+
+        unique_candidates: dict[str, Atoms] = {}
         for frame in candidates:
             identifier = structure_id(frame)
             route_fingerprint = str(frame.info.get("route_fingerprint", ""))
@@ -1213,13 +1230,13 @@ class WorkflowIterationAdapter:
                 raise WorkflowIterationError(
                     "candidate is missing its sampling route fingerprint"
                 )
-            identity = (route_fingerprint, identifier)
-            current = unique_candidates.get(identity)
-            if current is None or (
-                frame.info.get("md_window") == "pre_failure"
-                and current.info.get("md_window") != "pre_failure"
-            ):
-                unique_candidates[identity] = frame
+            current = unique_candidates.get(identifier)
+            if current is None or preference(frame) < preference(current):
+                # DFT labels depend on the physical input state, not on which
+                # sampling route happened to encounter it.  Keep one stable
+                # provenance representative so the label stage never receives
+                # duplicate structures.
+                unique_candidates[identifier] = frame
         duplicate_candidate_count = len(candidates) - len(unique_candidates)
         candidates = list(unique_candidates.values())
         candidate_ids = [
@@ -1369,6 +1386,10 @@ class WorkflowIterationAdapter:
                     options.get("input_path")
                 ),
                 resource_dir=self._optional_path(options.get("resource_path")),
+                resource_manifest=self._optional_path(
+                    options.get("potcar_manifest_path")
+                    or options.get("resource_manifest_path")
+                ),
                 n_cpu=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
                 use_gamma=bool(options.get("gamma_centered", False)),
                 kpoint_mode=kpoint_mode,
@@ -1389,7 +1410,21 @@ class WorkflowIterationAdapter:
             ),
             backend,
         )
-        validate_spin_dataset(result.frames, require_mforce=True)
+        expected_ids = [
+            structure_id(frame)
+            for frame in _read_frames(context.artifacts["selected_input"])
+        ]
+        try:
+            validate_labeled_frames(result.frames)
+            actual_ids = labeled_input_structure_ids(result.frames)
+        except ScientificDataError as error:
+            raise WorkflowIterationError(
+                f"DFT backend produced invalid scientific labels: {error}"
+            ) from error
+        if actual_ids != expected_ids:
+            raise WorkflowIterationError(
+                "DFT backend changed or reordered selected structures"
+            )
         return StageOutcome(
             artifacts={"labeled": result.output_file},
             metrics={"backend": result.backend, "labeled_count": len(result.frames)},
@@ -1423,7 +1458,13 @@ class WorkflowIterationAdapter:
                 f"{len(expected)} selected structures"
             )
         expected_ids = [structure_id(frame) for frame in expected]
-        actual_ids = [structure_id(frame) for frame in frames]
+        try:
+            validate_labeled_frames(frames)
+            actual_ids = labeled_input_structure_ids(frames)
+        except ScientificDataError as error:
+            raise WorkflowIterationError(
+                f"label batch result violates the scientific data contract: {error}"
+            ) from error
         if actual_ids != expected_ids:
             raise WorkflowIterationError(
                 "label batch results do not match the selected structure order"
@@ -1432,7 +1473,6 @@ class WorkflowIterationAdapter:
             raise WorkflowIterationError(
                 "label batches reported inconsistent DFT backends"
             )
-        validate_spin_dataset(frames, require_mforce=True)
         output = context.work_dir / "selected-labels.xyz"
         ase_write(output, frames, format="extxyz")
         backend = next(iter(backends), str(self.config.get("dft", {}).get("backend", "toy")))
@@ -1506,25 +1546,43 @@ class WorkflowIterationAdapter:
     def _merge(self, context: StageContext) -> StageOutcome:
         original = _read_frames(context.artifacts["training_input"])
         labeled = _read_frames(context.artifacts["labeled"])
-        merged = []
-        seen = set()
-        for frame in [
-            *original,
-            *labeled,
-        ]:
-            identifier = structure_id(frame)
-            if identifier not in seen:
-                seen.add(identifier)
-                merged.append(frame)
-        validate_spin_dataset(merged, require_mforce=True)
+        try:
+            original_ids = validate_labeled_frames(original)
+            labeled_ids = validate_labeled_frames(labeled)
+        except ScientificDataError as error:
+            raise WorkflowIterationError(
+                f"training merge input violates the scientific data contract: {error}"
+            ) from error
+        if len(set(original_ids)) != len(original_ids):
+            raise WorkflowIterationError(
+                "training input contains duplicate physical structures; "
+                "deduplicate it explicitly before recovery"
+            )
+        if len(set(labeled_ids)) != len(labeled_ids):
+            raise WorkflowIterationError(
+                "new DFT labels contain duplicate physical structures"
+            )
+        overlap = set(original_ids) & set(labeled_ids)
+        if overlap:
+            raise WorkflowIterationError(
+                "new DFT labels overlap the existing training set; refusing "
+                "to silently keep one of two labels"
+            )
+        merged = [*original, *labeled]
+        try:
+            validate_labeled_frames(merged)
+        except ScientificDataError as error:
+            raise WorkflowIterationError(
+                f"merged training set violates the scientific data contract: {error}"
+            ) from error
         output = context.work_dir / "train.xyz"
         ase_write(output, merged, format="extxyz")
         return StageOutcome(
             artifacts={"training_set": output},
             metrics={
                 "training_count": len(merged),
-                "added_count": len(merged) - len(original),
-                "duplicate_labeled_count": len(original) + len(labeled) - len(merged),
+                "added_count": len(labeled),
+                "duplicate_labeled_count": 0,
             },
         )
 

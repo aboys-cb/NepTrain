@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import NepTrain.core.workflow_workspace as workspace_module
 from NepTrain.core.workflow_workspace import WorkflowWorkspace
 from NepTrain.core.iteration import (
     GenerationController,
@@ -79,6 +80,87 @@ def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):
     assert "complete" not in generation
     assert "evaluate" not in generation["stages"]
     assert not (workspace.generation_dir(1) / "summary.json").exists()
+
+
+def test_publication_copy_failure_keeps_previous_results_coherent(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = WorkflowWorkspace.create(tmp_path / "atomic")
+    controller = GenerationController(workspace.root, "atomic")
+    controller.run_generation(
+        GenerationPlan(1, 7, 2),
+        _PublishingAdapter(),
+    )
+    previous = (workspace.results_dir / "current").resolve()
+    original_copy = workspace_module._copy_file
+    copies = 0
+
+    def fail_second_copy(source, target):
+        nonlocal copies
+        if ".g0002-building-" in str(target):
+            copies += 1
+            if copies == 2:
+                raise OSError("injected publication copy failure")
+        return original_copy(source, target)
+
+    monkeypatch.setattr(workspace_module, "_copy_file", fail_second_copy)
+
+    with pytest.raises(IterationError, match="injected publication copy failure"):
+        controller.run_generation(
+            GenerationPlan(2, 8, 2),
+            _PublishingAdapter(),
+        )
+
+    assert (workspace.results_dir / "current").resolve() == previous
+    assert {
+        (workspace.results_dir / name).resolve().parent
+        for name in ("nep.txt", "train.xyz", "metrics.json", "summary.json")
+    } == {previous}
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    assert "evaluate" not in ledger["generations"]["2"]["stages"]
+    assert not (workspace.generation_dir(2) / "summary.json").exists()
+
+
+def test_committed_publication_projection_is_repaired_without_rerunning_stage(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = WorkflowWorkspace.create(tmp_path / "repair")
+    controller = GenerationController(workspace.root, "repair")
+    controller.run_generation(
+        GenerationPlan(1, 7, 2),
+        _PublishingAdapter(),
+    )
+    previous = (workspace.results_dir / "current").resolve()
+    original_symlink = workspace_module._atomic_symlink
+
+    def fail_current_switch(target, link):
+        if link.name == "current":
+            raise OSError("injected current switch failure")
+        return original_symlink(target, link)
+
+    monkeypatch.setattr(workspace_module, "_atomic_symlink", fail_current_switch)
+    plan = GenerationPlan(2, 8, 2)
+    with pytest.raises(IterationError, match="committed.*needs repair"):
+        controller.run_generation(plan, _PublishingAdapter())
+
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    generation = ledger["generations"]["2"]
+    assert generation["complete"] is True
+    assert generation["accepted"] is True
+    assert generation["publication"]["generation"] == 2
+    assert (workspace.results_dir / "current").resolve() == previous
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_atomic_symlink",
+        original_symlink,
+    )
+    assert controller.next_stage(plan) is None
+    assert (workspace.results_dir / "current").resolve() == Path(
+        generation["publication"]["directory"]
+    )
 
 
 def test_workspace_rejects_legacy_layout(tmp_path: Path):

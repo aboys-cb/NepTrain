@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 
 import numpy as np
 from ase import Atoms
 
+from .scientific_data import structure_id
 
 def toy_base_frame(spin: bool) -> Atoms:
     atoms = Atoms(
@@ -108,16 +108,6 @@ def toy_features(frames: Sequence[Atoms], profile: str) -> np.ndarray:
     scale = features.std(axis=0)
     scale[scale < 1.0e-12] = 1.0
     return (features - features.mean(axis=0)) / scale
-
-
-def structure_id(atoms: Atoms) -> str:
-    digest = hashlib.sha256()
-    digest.update(" ".join(atoms.get_chemical_symbols()).encode())
-    digest.update(np.asarray(atoms.cell, dtype=np.float64).tobytes())
-    digest.update(np.asarray(atoms.positions, dtype=np.float64).tobytes())
-    if "spin" in atoms.arrays:
-        digest.update(np.asarray(atoms.arrays["spin"], dtype=np.float64).tobytes())
-    return digest.hexdigest()
 
 
 __all__ = [

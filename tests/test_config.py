@@ -74,6 +74,18 @@ def _project(**overrides):
     }
     for section, replacement in overrides.items():
         value[section].update(replacement)
+    if value["dft"].get("backend") == "vasp":
+        value["dft"].setdefault("resource_path", "./potpaw")
+        value["dft"].setdefault(
+            "potcar_manifest_path",
+            "./vasp-resources.json",
+        )
+    if value["dft"].get("backend") == "abacus":
+        value["dft"].setdefault("resource_path", "./abacus-resources")
+        value["dft"].setdefault(
+            "resource_manifest_path",
+            "./abacus-resources.json",
+        )
     return value
 
 
@@ -108,6 +120,20 @@ def test_sampling_defaults_do_not_need_to_be_repeated_in_project_yaml(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "workflow_id",
+    ["../escaped", "/absolute", "with space", ".hidden", "", "a" * 65, 7],
+)
+def test_workflow_id_is_a_safe_directory_component(tmp_path, workflow_id):
+    with pytest.raises(ConfigError, match=r"workflow\.id must be 1-64 safe"):
+        load_config(
+            _write(
+                tmp_path,
+                _project(workflow={"id": workflow_id}),
+            )
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("structures_per_job", 0),
@@ -124,6 +150,43 @@ def test_dft_parallelism_requires_positive_integers(tmp_path, field, value):
                 _project(dft={field: value}),
             )
         )
+
+
+def test_vasp_requires_content_addressed_potcar_manifest(tmp_path):
+    value = _project(dft={"backend": "vasp"})
+    value["dft"].pop("potcar_manifest_path")
+    with pytest.raises(ConfigError, match=r"dft\.potcar_manifest_path"):
+        load_config(_write(tmp_path, value))
+
+
+def test_abacus_requires_content_addressed_resource_manifest(tmp_path):
+    value = _project(dft={"backend": "abacus"})
+    value["dft"].pop("resource_manifest_path")
+    with pytest.raises(ConfigError, match=r"dft\.resource_manifest_path"):
+        load_config(_write(tmp_path, value))
+
+
+def test_remote_labeling_requires_a_remote_resource_root(tmp_path):
+    value = _project(dft={"backend": "vasp"})
+    value["execution"]["stage_targets"]["labeling"] = "remote-dft"
+    value["execution"]["targets"]["remote-dft"] = {
+        "executor": "slurm",
+        "host": "cluster",
+        "work_root": "/scratch/work",
+        "partition": "cpu",
+    }
+
+    with pytest.raises(ConfigError, match="remote labeling target.*dft_resource_path"):
+        load_config(_write(tmp_path, value))
+
+    value["execution"]["targets"]["remote-dft"][
+        "dft_resource_path"
+    ] = "/shared/potpaw"
+    config, _ = load_config(_write(tmp_path, value))
+    assert (
+        config["execution"]["targets"]["remote-dft"]["dft_resource_path"]
+        == "/shared/potpaw"
+    )
 
 
 @pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8])
@@ -249,7 +312,7 @@ def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
 
 def test_spin_workflow_rejects_vasp(tmp_path):
     value = _project(md={"spin": True}, dft={"backend": "vasp"})
-    with pytest.raises(ConfigError, match="VASP labeling"):
+    with pytest.raises(ConfigError, match=r"VASP.*spin/mforce"):
         load_config(_write(tmp_path, value))
 
 

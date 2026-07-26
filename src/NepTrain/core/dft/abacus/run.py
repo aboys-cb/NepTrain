@@ -8,7 +8,7 @@ from ase.io import write as ase_write
 
 from NepTrain import utils
 
-from .io import StructureVar, read_input_file
+from .io import read_input_file
 from .native import NativeAbacusRequest, run_native_abacus
 
 atoms_index = 1
@@ -22,7 +22,17 @@ atoms_index = 1
 )
 def calculate_abacus(atoms: Atoms, args):
     global atoms_index
-    StructureVar.init(getattr(args, "resource_dir", None) or "./")
+    resource_dir = Path(getattr(args, "resource_dir", None) or "./").resolve()
+    raw_manifest = getattr(args, "resource_manifest", None)
+    resource_manifest = (
+        Path(raw_manifest).expanduser().resolve()
+        if raw_manifest
+        else resource_dir / "abacus-resources.json"
+    )
+    if not resource_manifest.is_file():
+        raise FileNotFoundError(
+            f"ABACUS resource manifest does not exist: {resource_manifest}"
+        )
 
     if args.incar is not None and os.path.exists(args.incar):
         input_dict = read_input_file(args.incar)
@@ -36,7 +46,8 @@ def calculate_abacus(atoms: Atoms, args):
         atoms,
         NativeAbacusRequest(
             work_dir=Path(args.directory).resolve(),
-            resource_dir=Path(getattr(args, "resource_dir", None) or "./").resolve(),
+            resource_dir=resource_dir,
+            resource_manifest=resource_manifest,
             command=command,
             input_parameters=input_dict,
             use_gamma=bool(args.use_gamma),
