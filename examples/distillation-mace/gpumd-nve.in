@@ -1,0 +1,7 @@
+# Minimal sampling template for the small tutorial crystal.
+potential nep.txt
+velocity 50
+ensemble nve
+time_step 0.1
+dump_exyz 1 0 1
+run 2

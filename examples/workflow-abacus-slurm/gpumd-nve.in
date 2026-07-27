@@ -1,0 +1,6 @@
+potential nep.txt
+velocity 300
+ensemble nve
+time_step 0.5
+dump_exyz 1 0 1
+run 10

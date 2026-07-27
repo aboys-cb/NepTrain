@@ -1,0 +1,13 @@
+{
+  "elements": {
+    "Al": {
+      "orbital": null,
+      "pseudopotential": {
+        "path": "Al_ONCV_PBE.upf",
+        "sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS"
+      }
+    }
+  },
+  "protocol": "neptrain.abacus-resources.v1",
+  "release": "REPLACE_WITH_RESOURCE_RELEASE"
+}

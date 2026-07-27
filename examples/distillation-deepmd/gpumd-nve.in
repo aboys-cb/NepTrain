@@ -1,0 +1,7 @@
+# Minimal stable sampling template for the three-atom tutorial system.
+potential nep.txt
+velocity 50
+ensemble nve
+time_step 0.1
+dump_exyz 1 0 1
+run 2

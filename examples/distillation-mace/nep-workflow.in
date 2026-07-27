@@ -1,0 +1,14 @@
+version 4
+type 1 Al
+cutoff 3.5 3.5
+n_max 2 2
+basis_size 2 2
+l_max 2 1 0
+neuron 8
+
+epoch 500
+batch 3
+lr 0.01
+lambda_e 1.0
+lambda_f 1.0
+lambda_v 0.1

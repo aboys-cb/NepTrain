@@ -1,0 +1,6 @@
+mace-mp-0-small.model
+candidates.xyz
+labeled.xyz
+student-nep.txt
+student-train/
+mace-distillation-workflow/

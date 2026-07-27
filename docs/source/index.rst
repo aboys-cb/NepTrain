@@ -9,4 +9,5 @@ NepTrain 同时提供可组合的训练、MD、结构标注、采样命令和可
    :caption: 使用文档
 
    安装 <install/index>
+   教程与示例 <tutorials/index>
    命令行 <command/index>

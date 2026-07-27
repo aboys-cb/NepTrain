@@ -244,8 +244,15 @@ def _run_gpumd(
 
 
 def run_md(request: MdRequest, backend: str) -> MdResult:
-    if request.template_path is None and request.ensemble not in {"nvt", "npt"}:
-        raise MdError("ensemble must be nvt or npt")
+    allowed_ensembles = {"nvt", "npt"}
+    if backend == "gpumd":
+        allowed_ensembles.add("nve")
+    if (
+        request.template_path is None
+        and request.ensemble not in allowed_ensembles
+    ):
+        choices = ", ".join(sorted(allowed_ensembles))
+        raise MdError(f"ensemble must be one of: {choices}")
     if (
         request.steps <= 0
         or request.timestep <= 0

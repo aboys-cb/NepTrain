@@ -1,0 +1,93 @@
+schema_version: 8
+
+training:
+  backend: torchnep
+  initial_path: ./train.xyz
+  test_path: ./validation.xyz
+  config_path: ./nep.in
+  device: cuda
+  torch_backend: bmm
+  precision: float32
+  use_compile: false
+
+md:
+  backend: gpumd
+  inference_backend: auto
+  spin: false
+
+sampling:
+  routes:
+    - id: aluminum-nve
+      structures:
+        - ./structures
+      template_path: ./gpumd-nve.in
+      conditions:
+        temperature_path:
+          - 300
+      progression:
+        steps:
+          smoke_passed: 10
+          short_stable: 20
+          long_stable: 40
+          production_ready: 80
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 1
+          production_ready: 1
+  selection:
+    max_selected: 2
+    novelty: auto
+
+labeling:
+  backend: abacus
+  input_path: ./INPUT
+  resource_path: /REPLACE/WITH/YOUR/abacus-resources
+  resource_manifest_path: ./abacus-resources.json
+  kpoint_mode: auto
+  structures_per_job: 1
+  max_concurrent: 2
+
+evaluation:
+  validation_path: ./validation.xyz
+  inference_backend: auto
+  max_rmse:
+    energy_rmse: 0.2
+    force_rmse: 0.5
+
+workflow:
+  id: abacus-tutorial-workflow
+  max_model_generations: 1
+  seed: 20260727
+
+execution:
+  poll_interval: 10
+  stage_targets:
+    training: train-gpu
+    sampling: md-gpu
+    labeling: abacus
+    analysis: local
+  targets:
+    train-gpu:
+      executor: slurm
+      partition: REPLACE_GPU_PARTITION
+      time: 00:30:00
+      gpus_per_node: 1
+      setup_script: ./env-training.sh
+    md-gpu:
+      executor: slurm
+      partition: REPLACE_GPU_PARTITION
+      time: 00:10:00
+      gpus_per_node: 1
+      setup_script: ./env-gpumd.sh
+    abacus:
+      executor: slurm
+      partition: REPLACE_CPU_PARTITION
+      time: 01:00:00
+      cpus_per_task: 32
+      setup_script: ./env-abacus.sh
+      labeling_resource_path: /REPLACE/WITH/YOUR/abacus-resources
+      environment:
+        NEPTRAIN_ABACUS_COMMAND: srun abacus
+    local:
+      executor: process

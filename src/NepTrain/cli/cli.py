@@ -1354,7 +1354,7 @@ def build_manual_md(subparsers):
     parser.add_argument("--pressure", type=float)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--ensemble", choices=["nvt", "npt"])
+    parser.add_argument("--ensemble", choices=["nve", "nvt", "npt"])
     parser.add_argument("--template")
     parser.add_argument(
         "--route",

@@ -13,6 +13,30 @@ pip install torch
 pip install 'NepTrain[torchnep]'
 ```
 
+MACE Teacher 蒸馏标注：
+
+```bash
+pip install 'NepTrain[mace]'
+```
+
+该 extra 提供 `neptrain-label-mace` 所需的 MACE 运行时。请先按机器 CUDA
+版本安装 PyTorch，再安装此 extra。
+
+DeepMD / DPA Teacher 蒸馏标注：
+
+```bash
+pip install 'NepTrain[deepmd]'
+```
+
+该 extra 安装稳定版 DeePMD-kit PyTorch 后端并提供
+`neptrain-label-deepmd`。它支持 DPA-3 和其它稳定版 DeepMD 模型。DPA-4
+从 DeePMD-kit 3.2 开始提供；在 3.2 仍为预发布版时需显式安装：
+
+```bash
+pip install --pre 'deepmd-kit[torch]>=3.2.0b0,<4'
+pip install NepTrain
+```
+
 手动采样不提供 NEP 模型、需要 SOAP 描述符时：
 
 ```bash

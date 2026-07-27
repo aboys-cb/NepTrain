@@ -71,6 +71,54 @@ def test_default_gpumd_nvt_input_uses_temperature_steps_and_seed(
     assert frames[0].info["md_window"] == "stable_prefix"
 
 
+def test_default_gpumd_nve_input_keeps_velocity_initialisation(
+    tmp_path: Path, monkeypatch
+):
+    captured = {}
+
+    def fake_run(command, *, stdout, stderr, cwd, check):
+        del stdout, stderr, check
+        captured["input"] = (Path(cwd) / "run.in").read_text(encoding="utf-8")
+        _write_dump(Path(cwd), [_atoms()], [25.0])
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", fake_run)
+    result = run_md(_request(tmp_path, ensemble="nve"), "gpumd")
+
+    assert "velocity 500.0 seed 9" in captured["input"]
+    assert "ensemble nve" in captured["input"]
+    assert result.completed is True
+
+
+def test_custom_gpumd_nve_template_is_adapted_without_temperature_parameters(
+    tmp_path: Path, monkeypatch
+):
+    template = tmp_path / "route.in"
+    template.write_text(
+        "ensemble nve\nrun 100000\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, *, stdout, stderr, cwd, check):
+        del stdout, stderr, check
+        captured["input"] = (Path(cwd) / "run.in").read_text(encoding="utf-8")
+        _write_dump(Path(cwd), [_atoms()], [25.0])
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", fake_run)
+    result = run_md(
+        _request(tmp_path, template_path=template),
+        "gpumd",
+    )
+
+    assert "potential nep.txt" in captured["input"]
+    assert "velocity 500.0 seed 9" in captured["input"]
+    assert "ensemble nve" in captured["input"]
+    assert "dump_exyz 1 0 1" in captured["input"]
+    assert result.completed is True
+
+
 def test_custom_gpumd_npt_template_receives_scalar_pressure(
     tmp_path: Path, monkeypatch
 ):

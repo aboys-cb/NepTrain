@@ -1,0 +1,6 @@
+train.xyz
+validation.xyz
+structures/
+vasp-resources.json
+vasp-check.xyz
+vasp-tutorial-workflow/

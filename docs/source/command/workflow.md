@@ -1,5 +1,12 @@
 # 自动迭代
 
+第一次运行建议先从标注后端对应的完整教程开始：
+
+- [VASP + Slurm](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-vasp-slurm)
+- [ABACUS + Slurm](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-abacus-slurm)
+- [DeepMD / DPA 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-deepmd)
+- [MACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-mace)
+
 ## 创建项目
 
 ```bash
@@ -99,8 +106,9 @@ NepTrain 只向 LAMMPS 模板注入 `temperature`、`pressure`、`steps`、`seed
 swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。
 
 选择 `md.backend: gpumd` 时，route 的 `template_path` 指向 GPUMD `run.in`。
-NepTrain 保留模板选择的 `nvt_*`/`npt_*` 方法、耦合常数、`time_step` 和 dump
-间隔，更新本轮模型、温度、步数与确定性 velocity seed；对 `npt_ber` 和
+NepTrain 支持模板中的 `nve`，并保留模板选择的 `nvt_*`/`npt_*` 方法、耦合
+常数、`time_step` 和 dump 间隔，更新本轮模型、初始温度、步数与确定性
+velocity seed；对 `npt_ber` 和
 `npt_scr` 还会按模板的 isotropic、orthorhombic 或 triclinic 形式写入目标压强
 （GPa）。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。Spin workflow
 仍明确使用 LAMMPS DynSpin。
@@ -192,14 +200,15 @@ labeling:
 
 ## 等变 Teacher 模型
 
-当微调后的大模型直接替代 DFT 时，workflow stage 不变，只切换 Label Adapter：
+当预训练或微调后的大模型直接替代 DFT 时，workflow stage 不变，只切换
+Label Adapter：
 
 ```yaml
 labeling:
   backend: model
-  model_path: ./teacher.model
-  model_name: mace-foundation-finetune
-  runner: mace-neptrain-label
+  model_path: ./mace-small.model
+  model_name: mace-mp-0-small
+  runner: neptrain-label-mace
   device: cuda
   precision: float32
 ```
@@ -209,6 +218,27 @@ runner、device 和 precision 会写入 `label-provenance.json`；extxyz 帧本�
 标签来源、后端、模型名称和模型 SHA256。runner 在
 `execution.stage_targets.labeling` 指定的环境执行，因此 Teacher 框架的
 PyTorch/CUDA 依赖不需要安装到 Controller 环境。
+
+MACE runner 由 `NepTrain[mace]` 提供，要求本地 checkpoint 文件和正体积周期
+晶胞；它输出 energy、forces 和按 `-stress × volume` 转换的 virial。MACE
+不输出磁力，所以这个 runner 不支持 spin workflow。
+
+DeepMD runner 由 `NepTrain[deepmd]` 提供。DPA-3 多任务模型可写成：
+
+```yaml
+labeling:
+  backend: model
+  model_path: ./DPA-3.2-5M.pt
+  model_name: dpa-3.2-5m-omol25
+  runner: neptrain-label-deepmd --head OMol25
+  device: cuda
+  precision: float32
+```
+
+DPA-4 使用相同 runner 和本地 `.pt2` 模型；不新增 workflow backend。模型格式、
+head 和推理后端由 DeePMD-kit 处理，NepTrain 仍按本地文件内容记录 SHA256。
+当前 DPA-4 要求 DeePMD-kit 3.2 或更新版本。DeepMD runner 同样不生成
+`mforce`，因此不支持 spin workflow。
 
 这一路径在调度上完全替代 DFT，但报告会保留 `teacher_model` 来源，避免把蒸馏
 标签误称为 DFT 标签。若配置独立 `evaluation.validation_path`，最终验收仍以该

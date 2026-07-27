@@ -1076,7 +1076,9 @@ def _generation_science(
             "merged_count": merge.get("training_count"),
             "after_count": retrain.get("training_count"),
             "added_count": evaluate.get("added_training_count", merge.get("added_count")),
-            "model_updated": retrain.get("model_updated"),
+            "model_updated": evaluate.get(
+                "model_updated", retrain.get("model_updated")
+            ),
             "active_model_sha256": evaluate.get("active_model_sha256"),
         },
         "quality": {

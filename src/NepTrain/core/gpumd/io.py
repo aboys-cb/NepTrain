@@ -28,6 +28,7 @@ class GpumdProcessResult:
 class RunInput:
     """A narrow adapter for the subset of ``run.in`` owned by NepTrain."""
 
+    _NVE_ENSEMBLES = {"nve"}
     _NVT_ENSEMBLES = {"nvt_ber", "nvt_nhc", "nvt_bdp", "nvt_lan", "nvt_bao"}
     _NPT_ENSEMBLES = {"npt_ber", "npt_scr"}
 
@@ -60,7 +61,9 @@ class RunInput:
         timestep_fs: float,
         seed: int,
     ) -> None:
-        if ensemble == "nvt":
+        if ensemble == "nve":
+            ensemble_values = ["nve"]
+        elif ensemble == "nvt":
             ensemble_values = ["nvt_nhc", temperature, temperature, 100]
         elif ensemble == "npt":
             ensemble_values = [
@@ -83,7 +86,7 @@ class RunInput:
                 1000,
             ]
         else:
-            raise GpumdInputError("GPUMD ensemble must be nvt or npt")
+            raise GpumdInputError("GPUMD ensemble must be nve, nvt, or npt")
         dump_interval = self._default_dump_interval(steps)
         self.run_in = [
             ["potential", ["nep.txt"]],
@@ -115,10 +118,21 @@ class RunInput:
             raise GpumdInputError("GPUMD template must define an ensemble")
         for values in ensembles:
             method = str(values[0])
-            if method not in self._NVT_ENSEMBLES | self._NPT_ENSEMBLES:
+            supported = (
+                self._NVE_ENSEMBLES
+                | self._NVT_ENSEMBLES
+                | self._NPT_ENSEMBLES
+            )
+            if method not in supported:
                 raise GpumdInputError(
                     f"cannot safely adapt unsupported GPUMD ensemble {method!r}"
                 )
+            if method in self._NVE_ENSEMBLES:
+                if len(values) != 1:
+                    raise GpumdInputError(
+                        "GPUMD ensemble 'nve' does not accept parameters"
+                    )
+                continue
             if len(values) < 4:
                 raise GpumdInputError(
                     f"GPUMD ensemble {method!r} is missing temperature parameters"

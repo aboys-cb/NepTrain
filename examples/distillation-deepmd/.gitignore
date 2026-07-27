@@ -1,0 +1,7 @@
+.teacher-cache/
+DPA-3.2-5M.pt
+candidates.xyz
+labeled.xyz
+student-nep.txt
+student-train/
+deepmd-distillation-workflow/

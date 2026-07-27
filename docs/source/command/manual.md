@@ -57,9 +57,10 @@ neptrain md structures/ \
   -o trajectories.xyz
 ```
 
-不提供模板时会生成可直接运行的 NVT/NPT 输入。提供 `--template run.in` 时，
-thermostat/barostat 类型、耦合常数、`time_step` 和 dump 间隔来自模板；
-NepTrain 更新模型、温度、NPT 目标压强、步数和种子。GPUMD 压强单位为 GPa。
+不提供模板时会生成可直接运行的 NVE/NVT/NPT 输入。提供 `--template run.in` 时，
+ensemble、thermostat/barostat 类型、耦合常数、`time_step` 和 dump 间隔来自
+模板；NepTrain 更新模型、初始温度、NPT 目标压强、步数和种子。GPUMD 压强单位
+为 GPa。NVE 仍使用 `--temperature` 初始化速度，但不在运行中控温。
 两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧；
 GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS
 DynSpin。
@@ -132,14 +133,14 @@ VASP 的 `ISPIN=2` 只表示共线自旋极化电子计算，结果仍是普通
 energy/force/virial 标签并记录 `dft_electronic_mode`；它不会生成
 `spin/mforce`。非共线、SOC 或真正的 spin-force 标注必须使用 ABACUS DeltaSpin。
 
-微调后的等变模型可以作为与 VASP/ABACUS 平级的 Label Adapter：
+预训练或微调后的等变模型可以作为与 VASP/ABACUS 平级的 Label Adapter：
 
 ```bash
 neptrain label candidates.xyz \
   --backend model \
-  --model teacher.model \
-  --model-name mace-foundation-finetune \
-  --runner mace-neptrain-label \
+  --model mace-small.model \
+  --model-name mace-mp-0-small \
+  --runner neptrain-label-mace \
   --device cuda \
   --precision float32 \
   --project project.yaml \
@@ -147,9 +148,34 @@ neptrain label candidates.xyz \
   -o labeled.xyz
 ```
 
-runner 必须实现固定的五参数协议，并输出顺序不变的规范 extxyz。NepTrain 负责模型
-hash、结构身份、energy/forces/virial、可选 spin/mforce 和最终原子发布；runner
-失败或标签不完整时不会产生部分结果。
+`neptrain-label-mace` 由 `NepTrain[mace]` 提供，读取本地 MACE checkpoint。
+它复用一个 ASE calculator 批量计算结构，将 ASE stress 转成
+`virial = -stress × volume`，并保持结构顺序、晶胞和 PBC 不变。当前 MACE
+runner 不输出磁力，所以明确拒绝含 `spin` 的输入。
+
+DeepMD 使用同一个 runner 覆盖 DPA-3、DPA-4 和其它 DeepMD 模型：
+
+```bash
+neptrain label candidates.xyz \
+  --backend model \
+  --model DPA-3.2-5M.pt \
+  --model-name dpa-3.2-5m-omol25 \
+  --runner 'neptrain-label-deepmd --head OMol25' \
+  --device cuda \
+  --precision float32 \
+  -o labeled.xyz
+```
+
+模型格式和后端由 DeePMD-kit 识别。多任务模型通过 runner 的 `--head` 选择
+分支；DPA-4 仍使用这个 runner，只需把 `--model` 换成本地 `.pt2` 文件。
+`neptrain-label-deepmd` 由 `NepTrain[deepmd]` 提供；DPA-4 需要支持该格式的
+DeePMD-kit 3.2 或更新版本。
+
+所有模型 runner 都遵守五参数协议：`--model`、`--input`、`--output`、
+`--device` 和 `--precision`。runner 必须输出顺序不变的规范 extxyz。
+NepTrain 负责模型 hash、结构身份、energy/forces/virial、可选 spin/mforce
+和最终原子发布；runner 失败或标签不完整时不会产生部分结果。完整示例见仓库的
+`examples/distillation-mace/` 和 `examples/distillation-deepmd/`。
 
 任务提交后通过统一 task 命令管理：
 

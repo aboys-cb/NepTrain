@@ -4,7 +4,9 @@ import json
 import hashlib
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
+import sys
 import tarfile
 import numpy as np
 import pytest
@@ -85,6 +87,76 @@ def test_local_manual_dft_splits_and_publishes_in_input_order(tmp_path):
     assert (operation.root / "jobs" / "000000" / "labeled.xyz").is_file()
     assert not (operation.root / "jobs" / "000000" / "result").exists()
     assert not (operation.root / "shards").exists()
+
+
+def test_local_manual_model_labeling_runs_all_shards_and_keeps_provenance(
+    tmp_path,
+):
+    source = _structures(tmp_path / "input.xyz")
+    output = tmp_path / "labeled.xyz"
+    model = tmp_path / "teacher.model"
+    model.write_bytes(b"teacher-checkpoint")
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        """
+import argparse
+import numpy as np
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.io import read, write
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--input", required=True)
+parser.add_argument("--output", required=True)
+parser.add_argument("--device", required=True)
+parser.add_argument("--precision", required=True)
+args = parser.parse_args()
+frames = read(args.input, index=":")
+for index, frame in enumerate(frames):
+    frame.info["virial"] = np.eye(3) * (index + 1)
+    frame.calc = SinglePointCalculator(
+        frame,
+        energy=-float(index + 1),
+        forces=np.zeros((len(frame), 3)),
+    )
+write(args.output, frames, format="extxyz")
+""".lstrip(),
+        encoding="utf-8",
+    )
+    operation = prepare_labeling(
+        source,
+        backend="model",
+        output=output,
+        workdir=tmp_path / "run",
+        target=ExecutionTarget("local", "process"),
+        structures_per_job=2,
+        max_concurrent=2,
+        model_file=model,
+        model_name="test-teacher",
+        runner=shlex.join([sys.executable, str(runner)]),
+        device="cpu",
+        precision="float64",
+    )
+
+    status = submit_operation(operation)
+
+    assert status["state"] == "complete"
+    frames = read(output, index=":")
+    assert len(frames) == 3
+    assert [frame.info["neptrain_label_origin"] for frame in frames] == [
+        "teacher_model"
+    ] * 3
+    assert [frame.info["neptrain_label_engine"] for frame in frames] == [
+        "test-teacher"
+    ] * 3
+    expected_hash = hashlib.sha256(model.read_bytes()).hexdigest()
+    assert {
+        frame.info["neptrain_teacher_model_sha256"] for frame in frames
+    } == {expected_hash}
+    assert labeled_input_structure_ids(frames) == [
+        structure_id(frame)
+        for frame in read(source, index=":")
+    ]
 
 
 def test_manual_spin_dft_uses_input_ownership_when_final_spin_relaxes(

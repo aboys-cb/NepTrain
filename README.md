@@ -11,6 +11,16 @@ train → md → select → label → merge → retrain → evaluate
 workflow 只负责计划、状态推进和验收，不复制科学计算逻辑。Label Adapter 可以
 是 VASP、ABACUS，也可以是已经微调并用于替代 DFT 的等变 Teacher 模型。
 
+第一次使用可直接选择完整教程：
+
+- [VASP + Slurm workflow](examples/workflow-vasp-slurm/README.md)
+- [ABACUS + Slurm workflow](examples/workflow-abacus-slurm/README.md)
+- [DeepMD / DPA 蒸馏](examples/distillation-deepmd/README.md)
+- [MACE 蒸馏](examples/distillation-mace/README.md)
+
+四个教程都从环境检查和独立标注开始，再进入一代完整 workflow，并说明跑完看
+哪些日志、标签、provenance 和 PNG 图。
+
 ## 安装
 
 ```bash
@@ -22,6 +32,18 @@ TorchNEP 训练需要安装与机器 CUDA 匹配的 PyTorch：
 ```bash
 pip install torch
 pip install 'NepTrain[torchnep]'
+```
+
+MACE Teacher 蒸馏标注需要安装：
+
+```bash
+pip install 'NepTrain[mace]'
+```
+
+DeepMD / DPA Teacher 蒸馏标注需要安装：
+
+```bash
+pip install 'NepTrain[deepmd]'
 ```
 
 不提供 `--nep`、需要用 SOAP 做手动采样时安装：
@@ -71,12 +93,13 @@ neptrain md structures/ \
 输入会按“结构 × 温度”展开成独立任务。使用 Slurm target 时，它们会成为一个带并发
 上限的 job array，而不是在登录终端串行运行。
 
-将 `--backend` 改为 `gpumd` 即可使用 GPUMD。无模板时 NepTrain 会生成 NVT/NPT
-输入；`--seed` 控制初速度随机种子，`--pressure` 的 GPUMD 单位为 GPa。提供
-`run.in` 模板时，模板仍负责 thermostat/barostat 类型、耦合常数、`time_step`
-和 dump 间隔；NepTrain 只写入本轮模型、温度、NPT 目标压强、步数和种子，并确保
-dump 包含力。GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留
-稳定段和炸前帧。Spin MD 仍只支持 LAMMPS DynSpin。
+将 `--backend` 改为 `gpumd` 即可使用 GPUMD。无模板时 NepTrain 会生成
+NVE/NVT/NPT 输入；`--seed` 控制初速度随机种子，`--pressure` 的 GPUMD 单位为
+GPa。提供 `run.in` 模板时，模板仍负责 ensemble、thermostat/barostat 类型、
+耦合常数、`time_step` 和 dump 间隔；NepTrain 只写入本轮模型、初始温度、NPT
+目标压强、步数和种子，并确保 dump 包含力。NVE 用初始温度生成速度但不控温。
+GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留稳定段和炸前
+帧。Spin MD 仍只支持 LAMMPS DynSpin。
 
 ### 批量标注
 
@@ -104,23 +127,44 @@ VASP manifest 的路径必须是 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这一层形式�
 NepTrain 会把该路径反向写入 ASE `setups`，保证“校验的 POTCAR”就是实际拼接
 进计算的 POTCAR。
 
-微调后的等变模型使用 `model` Adapter。runner 是安装在 labeling target 环境中的
-小型命令，接收 `--model`、`--input`、`--output`、`--device` 和
-`--precision`，并输出具有 energy、forces、virial 的 extxyz：
+预训练或微调后的等变模型使用 `model` Adapter。NepTrain 自带
+`neptrain-label-mace` runner；它读取本地 MACE checkpoint，输出具有
+energy、forces、virial 的 extxyz：
 
 ```bash
 neptrain label candidates.xyz \
   --backend model \
-  --model teacher.model \
-  --model-name mace-foundation-finetune \
-  --runner mace-neptrain-label \
+  --model mace-small.model \
+  --model-name mace-mp-0-small \
+  --runner neptrain-label-mace \
   --device cuda \
   --structures-per-job 64 \
   -o labeled.xyz
 ```
 
 NepTrain 会记录 Teacher 模型 SHA256 和运行配置，并在发布前校验结构身份、顺序和
-标签完整性。Spin 输入还必须由 runner 真实输出 `mforce`，不会自动补零。
+标签完整性。MACE runner 按 ASE 约定写入
+`virial = -stress × volume`。它不生成 `mforce`，因此只接受普通非 spin
+结构；任何 spin Teacher runner 都必须真实输出 `mforce`，NepTrain 不会自动补零。
+可直接运行的模型下载和候选结构见
+[`examples/distillation-mace`](examples/distillation-mace/README.md)。
+
+DeepMD 使用一个统一 runner 覆盖 DPA-3、DPA-4 和其它 DeepMD 模型。多任务
+DPA-3 模型可把 head 写在 runner 字符串中：
+
+```bash
+neptrain label candidates.xyz \
+  --backend model \
+  --model DPA-3.2-5M.pt \
+  --model-name dpa-3.2-5m-omol25 \
+  --runner 'neptrain-label-deepmd --head OMol25' \
+  --device cuda \
+  -o labeled.xyz
+```
+
+DPA-4 使用同一个 runner 和本地 `.pt2` 文件，不增加 workflow backend。当前
+DPA-4 需要 DeePMD-kit 3.2 预发布版；完整下载、标注、Student 冒烟训练和版本边界见
+[`examples/distillation-deepmd`](examples/distillation-deepmd/README.md)。
 
 ### 手动采样
 

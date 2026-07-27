@@ -19,6 +19,7 @@ from NepTrain.cli.cli import (
 from NepTrain.core.workflow import (
     WorkflowError,
     WorkflowResume,
+    _generation_science,
     workflow_status,
     extend_workflow,
     prepare_workflow,
@@ -308,6 +309,40 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     assert "Ledger: generation 1, stage train" in output
     assert "G1 not started: FPS selects up to 100" in output
     assert "Executor: 0/0 stages completed" in output
+
+
+def test_generation_status_reports_activation_result_not_retrain_candidate():
+    summary = _generation_science(
+        {
+            "generation": 1,
+            "max_selected": 1,
+            "selection_novelty_threshold": 0.0,
+            "completion_coverage_threshold": 0.0,
+        },
+        {
+            "complete": True,
+            "accepted": True,
+            "stages": {
+                "retrain": {
+                    "metrics": {
+                        "training_count": 97,
+                        "model_updated": True,
+                    }
+                },
+                "evaluate": {
+                    "metrics": {
+                        "accepted": True,
+                        "active_model_sha256": "parent-model",
+                        "model_updated": False,
+                    }
+                },
+            },
+        },
+    )
+
+    assert summary["training"]["after_count"] == 97
+    assert summary["training"]["active_model_sha256"] == "parent-model"
+    assert summary["training"]["model_updated"] is False
 
 
 def test_completed_workflow_extends_plans(tmp_path: Path):
