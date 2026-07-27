@@ -469,10 +469,10 @@ workflow/
 每代目录直接是 `train/`、`md/`、`select/`、`label/`、`diagnose/`、
 `dataset/`、`retrain/` 和 `evaluate/`。训练输出、loss 和模型发布到对应阶段
 目录，`calculation` 软链指向真实执行目录。训练阶段会用 Matplotlib 发布
-`training-convergence.svg` 和 `training-report.json`；配置独立验证集时，
-evaluate 阶段还会发布按阈值归一化的 `evaluation-metrics.svg`，以及 Energy、
+`training-convergence.png` 和 `training-report.json`；配置独立验证集时，
+evaluate 阶段还会发布按阈值归一化的 `evaluation-metrics.png`，以及 Energy、
 Force、Virial（spin 模型另含 magnetic force）的 reference/prediction parity 图
-`evaluation-parity.svg`。每张图都有对应的 JSON 报告记录数据来源、点数和 RMSE。
+`evaluation-parity.png`。每张图都有对应的 JSON 报告记录数据来源、点数和 RMSE。
 
 开发阶段的确定性工作流 smoke：
 

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -25,9 +26,11 @@ from NepTrain.core.workflow import (
     workflow_status,
 )
 from NepTrain.core.controller import (
+    ControllerTick,
     ControllerError,
     PersistentController,
     controller_running,
+    run_controller,
     start_controller,
     stop_controller,
     stop_workflow,
@@ -966,6 +969,60 @@ execution:
 """,
     )
     return config, initial
+
+
+def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
+    tmp_path: Path, monkeypatch
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    previous_handlers = {
+        signal.SIGTERM: object(),
+        signal.SIGINT: object(),
+    }
+    installed_handlers = {}
+    signal_calls = []
+
+    monkeypatch.setattr(
+        controller_module.signal,
+        "getsignal",
+        lambda signum: previous_handlers[signum],
+    )
+
+    def record_signal(signum, handler):
+        signal_calls.append((signum, handler))
+        if callable(handler):
+            installed_handlers[signum] = handler
+        return previous_handlers[signum]
+
+    monkeypatch.setattr(controller_module.signal, "signal", record_signal)
+
+    def request_stop_on_first_tick(_controller):
+        installed_handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return ControllerTick("running")
+
+    monkeypatch.setattr(
+        PersistentController,
+        "tick",
+        request_stop_on_first_tick,
+    )
+
+    assert run_controller(preparation.output_dir, poll_interval=0.2) == 0
+
+    state = json.loads(
+        WorkflowWorkspace.locate(
+            preparation.output_dir
+        ).controller_file.read_text(encoding="utf-8")
+    )
+    assert state["state"] == "stopped"
+    assert state["reason"] == "controller stopped by user"
+    assert signal_calls[-2:] == [
+        (signal.SIGTERM, previous_handlers[signal.SIGTERM]),
+        (signal.SIGINT, previous_handlers[signal.SIGINT]),
+    ]
+    assert not WorkflowWorkspace.locate(
+        preparation.output_dir
+    ).controller_pid.exists()
 
 
 def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):

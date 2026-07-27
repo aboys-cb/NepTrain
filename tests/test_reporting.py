@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import matplotlib.image as mpimg
 import numpy as np
 
 from NepTrain.core.reporting import (
@@ -11,7 +12,14 @@ from NepTrain.core.reporting import (
 )
 
 
-def test_training_report_builds_deterministic_matplotlib_svg(tmp_path: Path):
+def _assert_png(path: Path) -> None:
+    assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    pixels = mpimg.imread(path)
+    assert pixels.shape[0] > 0
+    assert pixels.shape[1] > 0
+
+
+def test_training_report_builds_deterministic_matplotlib_png(tmp_path: Path):
     loss = tmp_path / "loss.out"
     loss.write_text(
         "\n".join(
@@ -35,12 +43,10 @@ def test_training_report_builds_deterministic_matplotlib_svg(tmp_path: Path):
     assert report["status"] == "ready"
     assert report["renderer"].startswith("matplotlib-")
     assert report["parsed_rows"] == 3
-    assert report["chart"] == "training-convergence.svg"
+    assert report["chart"] == "training-convergence.png"
     assert "energy_train" in report["series"]
     assert artifacts.chart is not None
-    svg = artifacts.chart.read_text(encoding="utf-8")
-    assert "Training convergence" in svg
-    assert "stroke-dasharray" in svg
+    _assert_png(artifacts.chart)
     repeated_dir = tmp_path / "repeated"
     repeated_dir.mkdir()
     repeated_loss = repeated_dir / "loss.out"
@@ -70,7 +76,7 @@ def test_training_report_records_unavailable_loss_without_fake_chart(
     assert report["status"] == "unavailable"
     assert report["parsed_rows"] == 0
     assert artifacts.chart is None
-    assert not (tmp_path / "training-convergence.svg").exists()
+    assert not (tmp_path / "training-convergence.png").exists()
 
 
 def test_evaluation_report_normalises_metrics_by_threshold(tmp_path: Path):
@@ -84,11 +90,9 @@ def test_evaluation_report_normalises_metrics_by_threshold(tmp_path: Path):
     report = json.loads(artifacts.report.read_text(encoding="utf-8"))
     assert report["status"] == "ready"
     assert report["series"] == ["energy_rmse", "force_rmse"]
+    assert report["chart"] == "evaluation-metrics.png"
     assert artifacts.chart is not None
-    svg = artifacts.chart.read_text(encoding="utf-8")
-    assert "Validation metrics versus thresholds" in svg
-    assert "candidate" in svg
-    assert "parent" in svg
+    _assert_png(artifacts.chart)
 
 
 def test_evaluation_report_serialises_non_finite_metrics_as_null(
@@ -138,7 +142,6 @@ def test_parity_report_covers_validation_observables(tmp_path: Path):
     assert set(report["panels"]) == {"energy", "force", "virial"}
     assert report["panels"]["force"]["finite_pairs"] == 12
     assert report["panels"]["force"]["sampling"] == "all"
+    assert report["chart"] == "evaluation-parity.png"
     assert artifacts.chart is not None
-    svg = artifacts.chart.read_text(encoding="utf-8")
-    assert "Validation parity: reference versus candidate" in svg
-    assert "Force components" in svg
+    _assert_png(artifacts.chart)

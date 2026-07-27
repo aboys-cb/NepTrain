@@ -55,8 +55,6 @@ _MATPLOTLIB_STYLE = {
     "legend.frameon": False,
     "savefig.facecolor": "#ffffff",
     "figure.facecolor": "#ffffff",
-    "svg.fonttype": "none",
-    "svg.hashsalt": "neptrain-report-v1",
 }
 
 
@@ -101,8 +99,8 @@ def _save_figure(figure: Figure, path: Path) -> Path:
     with matplotlib.rc_context(_MATPLOTLIB_STYLE):
         figure.savefig(
             temporary,
-            format="svg",
-            metadata={"Date": None, "Creator": "NepTrain"},
+            format="png",
+            metadata={"Software": "NepTrain"},
         )
     os.replace(temporary, path)
     return path
@@ -227,7 +225,7 @@ def build_training_report(
     """Build a deterministic report without fabricating missing loss data."""
 
     report_path = output_dir / "training-report.json"
-    chart_path = output_dir / "training-convergence.svg"
+    chart_path = output_dir / "training-convergence.png"
     report: dict[str, Any] = {
         "version": 1,
         "kind": "training",
@@ -408,7 +406,7 @@ def build_evaluation_report(
     """Compare validation metrics to configured acceptance thresholds."""
 
     report_path = output_dir / f"evaluation-report{suffix}.json"
-    chart_path = output_dir / f"evaluation-metrics{suffix}.svg"
+    chart_path = output_dir / f"evaluation-metrics{suffix}.png"
     report: dict[str, Any] = {
         "version": 1,
         "kind": "evaluation",
@@ -607,7 +605,7 @@ def build_parity_report(
     """Plot reference/prediction agreement for independent validation data."""
 
     report_path = output_dir / f"evaluation-parity-report{suffix}.json"
-    chart_path = output_dir / f"evaluation-parity{suffix}.svg"
+    chart_path = output_dir / f"evaluation-parity{suffix}.png"
     report: dict[str, Any] = {
         "version": 1,
         "kind": "evaluation_parity",

@@ -208,6 +208,30 @@ def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
     ).hexdigest()
 
 
+def test_native_abacus_rejects_an_empty_command_before_creating_a_case(
+    tmp_path: Path, monkeypatch
+):
+    module = importlib.import_module("NepTrain.core.dft.abacus.run")
+    source = tmp_path / "selected.xyz"
+    write(
+        source,
+        Atoms(
+            "Al",
+            positions=[[0.0, 0.0, 0.0]],
+            cell=[4.0, 4.0, 4.0],
+            pbc=True,
+        ),
+    )
+    resources = tmp_path / "resources"
+    _resource_files(resources)
+    monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", "")
+
+    with pytest.raises(NativeAbacusError, match="must not be empty"):
+        module.run_abacus(_arguments(tmp_path, source, resources))
+
+    assert not (tmp_path / "work").exists()
+
+
 def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
     tmp_path: Path, monkeypatch
 ):

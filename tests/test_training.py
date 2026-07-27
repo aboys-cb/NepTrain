@@ -90,7 +90,7 @@ def test_gpumd_training_adapter_prepares_inputs_and_collects_outputs(
         "loss.out",
         "nep.out",
         "output.log",
-        "training-convergence.svg",
+        "training-convergence.png",
         "training-report.json",
     }
 
@@ -279,7 +279,7 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
         "force_train.out",
         "loss.out",
         "output.log",
-        "training-convergence.svg",
+        "training-convergence.png",
         "training-report.json",
     }
     assert captured["finetune_from"] == str(finetune)

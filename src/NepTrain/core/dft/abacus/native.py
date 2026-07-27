@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+import shlex
 from pathlib import Path
 import subprocess
 from typing import Mapping, Sequence
@@ -63,6 +64,9 @@ def run_native_abacus(
     input_frame = atoms.copy()
     spin_frame = prepare_spin_for_dft(input_frame)
     parameters = dict(request.input_parameters)
+    command = shlex.split(request.command)
+    if not command:
+        raise NativeAbacusError("ABACUS command must not be empty")
     electronic_mode = validate_abacus_spin_contract(
         parameters,
         spin_frame=spin_frame,
@@ -94,8 +98,7 @@ def run_native_abacus(
         resource_provenance=resource_provenance,
     )
     completed = subprocess.run(
-        request.command,
-        shell=True,
+        command,
         cwd=case_dir,
         capture_output=True,
         text=True,
