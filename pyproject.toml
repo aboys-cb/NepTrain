@@ -36,7 +36,6 @@ dependencies = [
 "ase",
 "rich",
 "argcomplete",
-"watchdog",
 "ruamel.yaml",
 "matplotlib>=3.8",
 "nep-adapters>=0.1.0"
