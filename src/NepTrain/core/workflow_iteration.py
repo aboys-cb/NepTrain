@@ -1434,12 +1434,26 @@ class WorkflowIterationAdapter:
         self,
         context: StageContext,
         outcomes: Sequence[StageOutcome],
+        *,
+        successful_frame_indices: Sequence[int] | None = None,
+        failures: Sequence[Mapping[str, Any]] = (),
     ) -> StageOutcome:
         """Merge independently labeled batches in their original frame order."""
 
         if not outcomes:
             raise WorkflowIterationError("label stage produced no batch results")
-        expected = _read_frames(context.artifacts["selected_input"])
+        requested = _read_frames(context.artifacts["selected_input"])
+        if successful_frame_indices is None:
+            successful_frame_indices = tuple(range(len(requested)))
+        indices = [int(index) for index in successful_frame_indices]
+        if (
+            indices != sorted(set(indices))
+            or any(index < 0 or index >= len(requested) for index in indices)
+        ):
+            raise WorkflowIterationError(
+                "successful label frame indices must be unique, ordered, and in range"
+            )
+        expected = [requested[index] for index in indices]
         frames: list[Atoms] = []
         backends = set()
         for outcome in outcomes:
@@ -1475,13 +1489,46 @@ class WorkflowIterationAdapter:
             )
         output = context.work_dir / "selected-labels.xyz"
         ase_write(output, frames, format="extxyz")
-        backend = next(iter(backends), str(self.config.get("dft", {}).get("backend", "toy")))
+        backend = next(
+            iter(backends),
+            str(self.config.get("dft", {}).get("backend", "toy")),
+        )
+        artifacts = {"labeled": output}
+        failed_frame_indices = sorted(
+            {
+                int(index)
+                for failure in failures
+                for index in failure.get("frame_indices", ())
+            }
+        )
+        if failures:
+            failure_output = context.work_dir / "label-failures.json"
+            failure_output.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "requested_count": len(requested),
+                        "labeled_count": len(frames),
+                        "failures": list(failures),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            artifacts["label_failures"] = failure_output
         return StageOutcome(
-            artifacts={"labeled": output},
+            artifacts=artifacts,
             metrics={
                 "backend": backend,
+                "requested_count": len(requested),
                 "labeled_count": len(frames),
                 "batch_count": len(outcomes),
+                "failed_batch_count": len(failures),
+                "failed_frame_count": len(failed_frame_indices),
+                "failed_frame_indices": failed_frame_indices,
+                "partial": bool(failures),
             },
         )
 

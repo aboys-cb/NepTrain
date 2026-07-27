@@ -31,6 +31,7 @@ from .execution import (
     ExecutionHandle,
     ExecutionTarget,
     StageExecutor,
+    SubmissionDeferred,
     build_stage_task,
     executor_for,
     load_stage_result,
@@ -520,10 +521,12 @@ class PersistentController:
             for item in current["tasks"]
         )
         group_failed = any(
-            item.get("terminal_failure") for item in current["tasks"]
+            item.get("terminal_failure") and item.get("retryable", True)
+            for item in current["tasks"]
         )
         running = 0
         unknown = 0
+        submission_deferred = False
         for item in current["tasks"]:
             target = self.targets[str(item["target"])]
             executor = self.executor_factory(target)
@@ -536,11 +539,24 @@ class PersistentController:
                 Path(item["bundle"]),
             )
             if item.get("handle") is None:
-                if group_failed or inflight >= maximum:
+                if group_failed or submission_deferred or inflight >= maximum:
                     continue
-                handle = executor.launch(task)
+                try:
+                    handle = executor.launch(task)
+                except SubmissionDeferred as error:
+                    submission_deferred = True
+                    self.state["state"] = "waiting"
+                    self.state["reason"] = (
+                        "Slurm submission capacity is temporarily exhausted; "
+                        "the same task will be submitted again"
+                    )
+                    self.state["last_submission_error"] = str(error)
+                    self._save()
+                    continue
                 item["handle"] = asdict(handle)
                 item["submitted_at"] = _now()
+                self.state.pop("last_submission_error", None)
+                self.state.pop("reason", None)
                 self._save()
                 inflight += 1
                 running += 1
@@ -555,7 +571,23 @@ class PersistentController:
             lost = self._unknown_became_lost(item, status.state)
             if status.state in {"failed", "cancelled"} or lost:
                 item["terminal_failure"] = True
-                group_failed = True
+                item["failure_kind"] = status.failure_kind
+                non_retryable_oom = (
+                    stage == "label"
+                    and status.failure_kind == "out_of_memory"
+                )
+                item["retryable"] = not non_retryable_oom
+                if not non_retryable_oom:
+                    group_failed = True
+                else:
+                    collect_failure = getattr(executor, "collect_failure", None)
+                    if collect_failure is not None:
+                        try:
+                            item["failure_bundle"] = str(
+                                collect_failure(handle)
+                            )
+                        except ExecutionError as error:
+                            item["failure_collection_error"] = str(error)
                 item["failure"] = (
                     (
                         "execution remained unknown beyond the recovery grace "
@@ -586,7 +618,16 @@ class PersistentController:
             self._save()
 
         failures = [
-            item for item in current["tasks"] if item.get("terminal_failure")
+            item
+            for item in current["tasks"]
+            if item.get("terminal_failure")
+            and item.get("retryable", True)
+        ]
+        non_retryable_failures = [
+            item
+            for item in current["tasks"]
+            if item.get("terminal_failure")
+            and not item.get("retryable", True)
         ]
         active = any(
             item.get("handle") is not None
@@ -612,7 +653,14 @@ class PersistentController:
             and not item.get("terminal_failure")
             for item in current["tasks"]
         ):
-            self.state["state"] = "degraded" if unknown else "running"
+            self.state["state"] = (
+                "waiting"
+                if submission_deferred
+                else ("degraded" if unknown else "running")
+            )
+            if not submission_deferred:
+                self.state.pop("last_submission_error", None)
+                self.state.pop("reason", None)
             self._save()
             return ControllerTick(
                 str(self.state["state"]),
@@ -631,8 +679,24 @@ class PersistentController:
             if item.generation == int(current["generation"])
         )
         _, context = self.generation_controller.stage_context(plan, stage)
+        successful_items = [
+            item for item in current["tasks"] if item.get("collected_bundle")
+        ]
+        if not successful_items:
+            self.state["state"] = "stalled"
+            self.state["reason"] = (
+                f"all {len(non_retryable_failures)} label tasks ended in "
+                "non-retryable OOM; failure evidence was preserved"
+            )
+            self._save()
+            return ControllerTick(
+                "stalled",
+                int(current["generation"]),
+                stage,
+                detail=self.state["reason"],
+            )
         outcomes: list[StageOutcome] = []
-        for item in current["tasks"]:
+        for item in successful_items:
             _, outcome = load_stage_result(item["collected_bundle"])
             outcomes.append(outcome)
         from .workflow_iteration import WorkflowIterationAdapter
@@ -645,7 +709,31 @@ class PersistentController:
         if stage == "explore":
             merged = adapter.merge_explore_outcomes(context, outcomes)
         elif stage == "label":
-            merged = adapter.merge_label_outcomes(context, outcomes)
+            merged = adapter.merge_label_outcomes(
+                context,
+                outcomes,
+                successful_frame_indices=[
+                    int(index)
+                    for item in successful_items
+                    for index in item["frame_indices"]
+                ],
+                failures=[
+                    {
+                        "task_id": str(item["task_id"]),
+                        "batch_index": int(item["batch_index"]),
+                        "frame_indices": list(item["frame_indices"]),
+                        "failure_kind": str(
+                            item.get("failure_kind", "unknown")
+                        ),
+                        "detail": str(item.get("failure", "")),
+                        "failure_bundle": item.get("failure_bundle"),
+                        "failure_collection_error": item.get(
+                            "failure_collection_error"
+                        ),
+                    }
+                    for item in non_retryable_failures
+                ],
+            )
         else:
             raise ControllerError(f"unsupported grouped stage: {stage}")
         summary = self._install_outcome(
@@ -666,7 +754,10 @@ class PersistentController:
             "idle",
             plan.generation,
             stage,
-            detail=f"merged {len(outcomes)} {stage} tasks",
+            detail=(
+                f"merged {len(outcomes)} {stage} tasks; "
+                f"{len(non_retryable_failures)} non-retryable failures"
+            ),
         )
 
     def tick(self) -> ControllerTick:
@@ -694,11 +785,29 @@ class PersistentController:
                     str(current["target"]),
                     bundle,
                 )
-                handle = executor.launch(task)
+                try:
+                    handle = executor.launch(task)
+                except SubmissionDeferred as error:
+                    self.state["state"] = "waiting"
+                    self.state["reason"] = (
+                        "Slurm submission capacity is temporarily exhausted; "
+                        "the same task will be submitted again"
+                    )
+                    self.state["last_submission_error"] = str(error)
+                    self._save()
+                    return ControllerTick(
+                        "waiting",
+                        task.generation,
+                        task.stage,
+                        task.target,
+                        detail=self.state["reason"],
+                    )
                 current["handle"] = asdict(handle)
                 current["submitted_at"] = _now()
                 self.state["state"] = "running"
                 self.state.pop("last_transport_error", None)
+                self.state.pop("last_submission_error", None)
+                self.state.pop("reason", None)
                 self._save()
                 return ControllerTick(
                     "running",
@@ -990,7 +1099,9 @@ class PersistentController:
                 new_attempt = int(current.get("attempt", 1)) + 1
                 retried = 0
                 for item in current["tasks"]:
-                    if item.get("collected_bundle"):
+                    if item.get("collected_bundle") or not item.get(
+                        "retryable", True
+                    ):
                         continue
                     handle = item.get("handle")
                     item.setdefault("retry_history", []).append(
@@ -1046,6 +1157,8 @@ class PersistentController:
                     item.pop("observed_state", None)
                     item.pop("observed_at", None)
                     item.pop("detail", None)
+                    item.pop("failure_kind", None)
+                    item.pop("retryable", None)
                     item.pop("cancellation", None)
                     item.pop("cancellation_requested_at", None)
                     retried += 1

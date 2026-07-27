@@ -244,6 +244,7 @@ def test_vasp_single_structure_workflow_job_uses_flat_output(
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
     request = replace(
         _request(tmp_path),
+        output_file=tmp_path / "work" / "selected-labels.xyz",
         options={"flat_single_case": True},
     )
 

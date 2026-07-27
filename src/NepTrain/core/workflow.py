@@ -1162,16 +1162,24 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
     controller_state = str(controller.get("state", "prepared"))
     jobs = []
     for item in history:
-        if item.get("completed_at"):
-            execution_state = "COMPLETED"
-        elif item.get("cancelled_at"):
-            execution_state = "CANCELLED"
-        else:
-            execution_state = "FAILED"
         task_records = (
             item.get("tasks", []) if item.get("kind") == "task_group" else [item]
         )
         for task_record in task_records:
+            if task_record.get("collected_bundle"):
+                execution_state = "COMPLETED"
+            elif (
+                task_record.get("terminal_failure")
+                and not task_record.get("retryable", True)
+                and task_record.get("failure_kind") == "out_of_memory"
+            ):
+                execution_state = "SKIPPED_OOM"
+            elif item.get("cancelled_at"):
+                execution_state = "CANCELLED"
+            elif item.get("completed_at"):
+                execution_state = "COMPLETED"
+            else:
+                execution_state = "FAILED"
             handle = task_record.get("handle") or {}
             jobs.append(
                 {
@@ -1184,7 +1192,9 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                     "dependency": None,
                     "state": execution_state,
                     "current": False,
-                    "detail": item.get("failure")
+                    "detail": task_record.get("failure")
+                    or task_record.get("detail")
+                    or item.get("failure")
                     or (item.get("cancellation") or {}).get("detail"),
                 }
             )
@@ -1207,6 +1217,12 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                 observed = "CANCELLED"
             elif cancellation:
                 observed = "CANCELLING"
+            elif (
+                task_record.get("terminal_failure")
+                and not task_record.get("retryable", True)
+                and task_record.get("failure_kind") == "out_of_memory"
+            ):
+                observed = "SKIPPED_OOM"
             elif task_record.get("terminal_failure"):
                 observed = "FAILED"
             else:
@@ -1267,7 +1283,11 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         reason = str(controller.get("reason", progress.reason))
         next_action = f"neptrain workflow resume {workflow_path}"
     elif active:
-        state = "degraded" if controller_state == "degraded" else "running"
+        state = (
+            controller_state
+            if controller_state in {"degraded", "waiting"}
+            else "running"
+        )
         reason = str(
             controller.get("last_transport_error")
             or controller.get("reason")
@@ -1282,7 +1302,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         state = "paused"
         reason = str(controller.get("reason", "controller is stopped"))
         next_action = f"neptrain workflow resume {workflow_path}"
-    elif controller_state in {"running", "launching", "degraded"}:
+    elif controller_state in {"running", "launching", "degraded", "waiting"}:
         state = "paused"
         reason = "controller process is not running; remote work is preserved"
         next_action = f"neptrain workflow resume {workflow_path}"

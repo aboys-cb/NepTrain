@@ -14,6 +14,7 @@ from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.calculators.vasp import Vasp
 
+from ..attempts import new_attempt_directory
 from .io import VaspInput
 from .resources import validate_vasp_resources
 
@@ -42,7 +43,7 @@ def run_native_vasp(
     """Run one fresh VASP single-point attempt and return a portable frame."""
 
     electronic_mode = None
-    case_dir = _new_attempt_directory(
+    case_dir = new_attempt_directory(
         request.work_dir,
         case_index,
         atoms.get_chemical_formula(),
@@ -229,37 +230,6 @@ def _stress_to_virial(stress: np.ndarray, volume: float) -> np.ndarray:
     return -volume * np.asarray(
         [(xx, xy, xz), (xy, yy, yz), (xz, yz, zz)], dtype=float
     )
-
-
-def _new_attempt_directory(
-    work_dir: Path,
-    index: int,
-    formula: str,
-    *,
-    flat_single_case: bool = False,
-) -> Path:
-    if flat_single_case:
-        work_dir.mkdir(parents=True, exist_ok=True)
-        if not any(work_dir.iterdir()):
-            return work_dir
-        attempt = 2
-        while (work_dir / f"retry-{attempt:04d}").exists():
-            attempt += 1
-        directory = work_dir / f"retry-{attempt:04d}"
-        directory.mkdir()
-        return directory
-    case_root = work_dir / f"{index:06d}-{formula}"
-    try:
-        case_root.mkdir(parents=True)
-        return case_root
-    except FileExistsError:
-        pass
-    attempt = 2
-    while (case_root / f"retry-{attempt:04d}").exists():
-        attempt += 1
-    directory = case_root / f"retry-{attempt:04d}"
-    directory.mkdir()
-    return directory
 
 
 def _write_manifest(

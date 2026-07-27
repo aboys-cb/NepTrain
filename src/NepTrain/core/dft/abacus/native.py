@@ -18,6 +18,7 @@ from ase.data import atomic_masses, atomic_numbers
 from ase.units import Bohr
 
 from ...spin import prepare_spin_for_dft
+from ..attempts import new_attempt_directory
 from .resources import validate_abacus_resources
 
 
@@ -73,7 +74,7 @@ def run_native_abacus(
         input_frame,
         require_orbitals=basis_type == "lcao",
     )
-    case_dir = _new_attempt_directory(
+    case_dir = new_attempt_directory(
         request.work_dir,
         case_index,
         input_frame.get_chemical_formula(),
@@ -436,37 +437,6 @@ def _constraint_mobility(atoms: Atoms) -> np.ndarray:
                 for index, atom_mask in zip(indices, mask):
                     mobility[index, atom_mask] = 0
     return mobility
-
-
-def _new_attempt_directory(
-    work_dir: Path,
-    index: int,
-    formula: str,
-    *,
-    flat_single_case: bool = False,
-) -> Path:
-    if flat_single_case:
-        work_dir.mkdir(parents=True, exist_ok=True)
-        if not any(work_dir.iterdir()):
-            return work_dir
-        attempt = 2
-        while (work_dir / f"retry-{attempt:04d}").exists():
-            attempt += 1
-        directory = work_dir / f"retry-{attempt:04d}"
-        directory.mkdir()
-        return directory
-    case_root = work_dir / f"{index:06d}-{formula}"
-    try:
-        case_root.mkdir(parents=True)
-        return case_root
-    except FileExistsError:
-        pass
-    attempt = 2
-    while (case_root / f"retry-{attempt:04d}").exists():
-        attempt += 1
-    directory = case_root / f"retry-{attempt:04d}"
-    directory.mkdir()
-    return directory
 
 
 def _running_scf_log(case_dir: Path, parameters: Mapping[str, str]) -> Path:

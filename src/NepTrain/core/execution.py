@@ -32,6 +32,10 @@ class ExecutionError(RuntimeError):
     """Raised when a stage cannot be transported, launched, or collected."""
 
 
+class SubmissionDeferred(ExecutionError):
+    """Raised when a scheduler temporarily refuses additional submissions."""
+
+
 _TERMINAL_SUCCESS = {"COMPLETED"}
 _TERMINAL_FAILURE = {
     "BOOT_FAIL",
@@ -61,6 +65,44 @@ def _slurm_state(value: str) -> str:
     """Normalize states such as ``COMPLETED+`` and ``CANCELLED by <uid>``."""
 
     return re.split(r"[+\s]", value.strip(), maxsplit=1)[0].upper()
+
+
+def _slurm_submission_is_throttled(detail: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", detail.lower())
+    compact = normalized.replace(" ", "")
+    markers = (
+        "qosmaxsubmitjobperuserlimit",
+        "assocmaxsubmitjoblimit",
+        "qosmaxjobsperuserlimit",
+        "assocmaxjobsperuserlimit",
+        "maximum number of jobs",
+        "max number of jobs",
+        "job submit limit",
+        "job submission limit",
+        "too many jobs",
+    )
+    return any(
+        marker in normalized or marker.replace(" ", "") in compact
+        for marker in markers
+    )
+
+
+def _failure_kind(detail: str) -> str | None:
+    normalized = detail.lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "out of memory",
+            "out_of_memory",
+            "oom-kill",
+            "oom kill",
+            "cannot allocate memory",
+            "std::bad_alloc",
+            "cuda error: out of memory",
+        )
+    ):
+        return "out_of_memory"
+    return None
 
 
 _STAGE_CONFIG_PATH_FIELDS = {
@@ -128,6 +170,18 @@ _STAGE_PREVIOUS_ARTIFACTS = {
     "merge": (),
     "retrain": ("signals", "scenario_maturity"),
     "evaluate": ("signals", "scenario_maturity"),
+}
+_PORTABLE_ARTIFACT_STEMS = {
+    "model": "nep",
+    "activated_model": "nep",
+    "retrained_model": "candidate-nep",
+    "training_input": "base-train",
+    "training_set": "train",
+    "selected_input": "selected",
+    "labeled": "labels",
+    "checkpoint": "checkpoint",
+    "activated_checkpoint": "checkpoint",
+    "retrained_checkpoint": "candidate-checkpoint",
 }
 _STAGE_DIRECTORY_LABELS = {
     "train": "train",
@@ -464,6 +518,7 @@ class ExecutionHandle:
 class ExecutionStatus:
     state: str
     detail: str = ""
+    failure_kind: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -642,8 +697,10 @@ def build_stage_task(
         if setup_source.is_file():
             _copy_input(setup_source.resolve(), temporary / "target-setup.sh")
 
+    artifact_destinations: dict[Path, str] = {}
+
     def copy_artifacts(
-        values: Mapping[str, Path], category: str, required: Sequence[str]
+        values: Mapping[str, Path], required: Sequence[str]
     ) -> dict[str, str]:
         copied = {}
         for name in required:
@@ -652,9 +709,18 @@ def build_stage_task(
             _validate_artifact_name(name)
             source = values[name]
             source = Path(source).resolve()
-            destination = (
-                inputs / "artifacts" / f"{category}-{name}--{source.name}"
+            stem = _PORTABLE_ARTIFACT_STEMS.get(
+                name,
+                name.replace("_", "-"),
             )
+            destination = inputs / f"{stem}{source.suffix}"
+            previous_name = artifact_destinations.get(destination)
+            if previous_name is not None:
+                raise ExecutionError(
+                    f"portable task artifacts {previous_name} and {name} "
+                    f"both map to {destination.name}"
+                )
+            artifact_destinations[destination] = name
             if stage == "label" and name == "selected_input":
                 raw_indices = (stage_input or {}).get("frame_indices")
                 if raw_indices is None:
@@ -708,11 +774,10 @@ def build_stage_task(
         "plan": asdict(plan),
         "stage_input": dict(stage_input or {}),
         "artifacts": copy_artifacts(
-            context.artifacts, "current", _STAGE_ARTIFACTS[stage]
+            context.artifacts, _STAGE_ARTIFACTS[stage]
         ),
         "previous_artifacts": copy_artifacts(
             context.previous_artifacts,
-            "previous",
             _STAGE_PREVIOUS_ARTIFACTS[stage],
         ),
     }
@@ -1898,7 +1963,8 @@ cat "$bundle/execution.json"
         if state == "COMPLETED":
             return ExecutionStatus("completed", "worker result complete")
         if state == "FAILED":
-            return ExecutionStatus("failed", str(value.get("error", "worker failed")))
+            detail = str(value.get("error", "worker failed"))
+            return ExecutionStatus("failed", detail, _failure_kind(detail))
         if state == "RUNNING":
             return ExecutionStatus("running", "worker running")
         return None
@@ -1994,7 +2060,10 @@ cat "$bundle/execution.json"
             cwd=task.bundle if not self.target.host else None,
         )
         if completed.returncode != 0:
-            raise ExecutionError((completed.stderr or completed.stdout).strip())
+            detail = (completed.stderr or completed.stdout).strip()
+            if _slurm_submission_is_throttled(detail):
+                raise SubmissionDeferred(detail)
+            raise ExecutionError(detail)
         job_id = completed.stdout.strip().split(";", 1)[0]
         if not job_id.isdigit():
             recovered = self._find_job(name, bundle)
@@ -2016,9 +2085,21 @@ cat "$bundle/execution.json"
     def inspect(self, handle: ExecutionHandle) -> ExecutionStatus:
         bundle = handle.remote_bundle or handle.local_bundle
         worker_status = self._worker_status(bundle)
-        if worker_status is not None and worker_status.terminal:
+        if worker_status is not None and worker_status.state == "completed":
             return worker_status
-        squeue = ["squeue", "--noheader", "--jobs", handle.execution_id, "--format", "%T"]
+        if (
+            worker_status is not None
+            and worker_status.failure_kind == "out_of_memory"
+        ):
+            return worker_status
+        squeue = [
+            "squeue",
+            "--noheader",
+            "--jobs",
+            handle.execution_id,
+            "--format",
+            "%T",
+        ]
         completed = self.transport.run(
             [bundle, *squeue] if self.target.host else squeue,
             cwd=Path(bundle) if not self.target.host else None,
@@ -2041,20 +2122,71 @@ cat "$bundle/execution.json"
             cwd=Path(bundle) if not self.target.host else None,
         )
         if completed.returncode != 0:
-            return ExecutionStatus("unknown", (completed.stderr or completed.stdout).strip())
-        rows = [line.split("|") for line in completed.stdout.splitlines() if line.strip()]
+            return worker_status or ExecutionStatus(
+                "unknown", (completed.stderr or completed.stdout).strip()
+            )
+        rows = [
+            line.split("|")
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        ]
         if not rows:
-            return ExecutionStatus("unknown", "Slurm has no accounting record yet")
+            return worker_status or ExecutionStatus(
+                "unknown", "Slurm has no accounting record yet"
+            )
         state = _slurm_state(rows[0][0])
         exit_code = rows[0][1] if len(rows[0]) > 1 else ""
         if state in _TERMINAL_SUCCESS and exit_code.startswith("0:0"):
             return ExecutionStatus("completed", state)
         if state in _TERMINAL_FAILURE or state in _TERMINAL_SUCCESS:
-            return ExecutionStatus("failed", f"Slurm {state} exit={exit_code}")
+            detail = f"Slurm {state} exit={exit_code}"
+            return ExecutionStatus(
+                "failed",
+                detail,
+                "out_of_memory" if state == "OUT_OF_MEMORY" else None,
+            )
         return ExecutionStatus("running", state)
 
     def collect(self, handle: ExecutionHandle) -> Path:
         return self.transport.collect(handle)
+
+    def collect_failure(self, handle: ExecutionHandle) -> Path:
+        """Collect best-effort diagnostics without requiring a stage result."""
+
+        local = Path(handle.local_bundle)
+        if self.target.host is None:
+            return local
+        remote = str(handle.remote_bundle)
+        discovered = self.transport.run_script(
+            """set -eo pipefail
+bundle=$1
+cd "$bundle"
+for path in .output-building-*; do
+  test -e "$path" && printf '%s\\n' "$path"
+done
+""",
+            remote,
+        )
+        building = []
+        if discovered.returncode == 0:
+            building = [
+                line.strip()
+                for line in discovered.stdout.splitlines()
+                if line.strip().startswith(".output-building-")
+                and "/" not in line.strip()
+            ]
+        evidence = local / "failure-evidence" / f"slurm-{handle.execution_id}"
+        self.transport.fetch_paths(
+            remote,
+            (
+                "execution.json",
+                "submit.sh",
+                f"stdout-{handle.execution_id}.log",
+                *building,
+            ),
+            evidence,
+        )
+        return evidence
 
     def cancel(self, handle: ExecutionHandle) -> ExecutionStatus:
         status = self.inspect(handle)
@@ -2113,6 +2245,7 @@ __all__ = [
     "ExecutionTransport",
     "ProcessExecutor",
     "SlurmExecutor",
+    "SubmissionDeferred",
     "StageExecutor",
     "StageTask",
     "build_stage_task",

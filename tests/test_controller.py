@@ -41,6 +41,7 @@ from NepTrain.core.execution import (
     ProcessExecutor,
     SlurmExecutor,
     StageTask,
+    SubmissionDeferred,
     build_stage_task,
     load_stage_result,
     run_stage_worker,
@@ -248,8 +249,10 @@ def test_stage_task_identity_covers_bundle_content_and_workflow_instance(tmp_pat
     )
 
     assert len({first.task_id, second.task_id, third.task_id}) == 3
+    first_descriptor = json.loads(first.descriptor.read_text())
+    assert first_descriptor["artifacts"]["model"] == "input/nep.txt"
     assert (
-        first.bundle / json.loads(first.descriptor.read_text())["artifacts"]["model"]
+        first.bundle / first_descriptor["artifacts"]["model"]
     ).read_text(encoding="utf-8") == "model-one\n"
 
 
@@ -585,6 +588,19 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
         evaluate_task.descriptor.read_text()
     )
     assert set(evaluate_descriptor["artifacts"]) == set(current)
+    assert evaluate_descriptor["artifacts"]["model"] == "input/nep.dat"
+    assert (
+        evaluate_descriptor["artifacts"]["retrained_model"]
+        == "input/candidate-nep.dat"
+    )
+    assert (
+        evaluate_descriptor["artifacts"]["training_input"]
+        == "input/base-train.dat"
+    )
+    assert (
+        evaluate_descriptor["artifacts"]["training_set"]
+        == "input/train.dat"
+    )
 
     previous = {
         "training_set": current["training_set"],
@@ -1269,6 +1285,123 @@ def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
     assert not (dft_root / "calculations").exists()
 
 
+def test_label_oom_is_not_retried_and_does_not_stop_sibling_tasks(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    text = config.read_text(encoding="utf-8").replace(
+        "dft:\n  backend: toy\n",
+        (
+            "dft:\n"
+            "  backend: vasp\n"
+            "  input_path: ./INCAR\n"
+            "  resource_path: ./potpaw\n"
+            "  potcar_manifest_path: ./vasp-resources.json\n"
+            "  structures_per_job: 1\n"
+            "  max_concurrent: 2\n"
+        ),
+    )
+    config.write_text(text, encoding="utf-8")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class OneOomExecutor(ImmediateExecutor):
+        def launch(self, task):
+            descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+            if (
+                task.stage == "label"
+                and descriptor["stage_input"]["batch_index"] == 1
+            ):
+                self.launches.append((task.stage, task.target))
+                return ExecutionHandle(
+                    task.task_id,
+                    task.target,
+                    "slurm",
+                    "oom-label",
+                    str(task.bundle),
+                )
+            return super().launch(task)
+
+        def inspect(self, handle):
+            if handle.execution_id == "oom-label":
+                return ExecutionStatus(
+                    "failed",
+                    "Slurm OUT_OF_MEMORY exit=0:125",
+                    "out_of_memory",
+                )
+            return super().inspect(handle)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: OneOomExecutor(target, launches),
+    )
+
+    for _ in range(40):
+        tick = controller.tick()
+        if tick.state == "complete":
+            break
+    else:
+        raise AssertionError("controller did not finish after partial DFT OOM")
+
+    state = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    label = next(item for item in state["history"] if item["stage"] == "label")
+    assert [item.get("retryable", True) for item in label["tasks"]] == [
+        False,
+        True,
+        True,
+    ]
+    assert [item["failure_kind"] for item in label["tasks"][:1]] == [
+        "out_of_memory"
+    ]
+    assert [stage for stage, _ in launches].count("label") == 3
+    assert label["metrics"]["requested_count"] == 3
+    assert label["metrics"]["labeled_count"] == 2
+    assert label["metrics"]["failed_frame_indices"] == [0]
+    failure_file = (
+        preparation.output_dir
+        / "generations/0001/dft/label-failures.json"
+    )
+    failures = json.loads(failure_file.read_text(encoding="utf-8"))
+    assert failures["failures"][0]["failure_kind"] == "out_of_memory"
+    status = workflow_status(preparation.output_dir)
+    assert any(job["state"] == "SKIPPED_OOM" for job in status.jobs)
+
+
+def test_controller_waits_and_reuses_task_after_submission_throttle(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    deferred = {"remaining": 1}
+
+    class DeferredOnceExecutor(ImmediateExecutor):
+        def launch(self, task):
+            if deferred["remaining"]:
+                deferred["remaining"] -= 1
+                raise SubmissionDeferred(
+                    "Job violates accounting/QOS policy "
+                    "(job submit limit, user's size and/or time limits)"
+                )
+            return super().launch(task)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: DeferredOnceExecutor(target, launches),
+    )
+
+    first = controller.tick()
+    first_task_id = controller.state["current"]["task_id"]
+    second = controller.tick()
+
+    assert first.state == "waiting"
+    assert second.state == "running"
+    assert controller.state["current"]["task_id"] == first_task_id
+    assert controller.state["current"]["attempt"] == 1
+    assert "terminal_failure" not in controller.state["current"]
+    assert launches == [("train", "gpu")]
+
+
 def test_md_wave_retry_preserves_completed_attempts(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     text = config.read_text(encoding="utf-8")
@@ -1724,6 +1857,50 @@ def test_slurm_executor_recognizes_site_annotated_cancelled_state(tmp_path):
 
     assert status.state == "failed"
     assert status.detail == "Slurm CANCELLED exit=0:0"
+
+
+def test_slurm_executor_classifies_out_of_memory_as_non_retryable_kind(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    runner = SlurmRunner()
+    runner.state = "OUT_OF_MEMORY"
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="gpu"), runner=runner
+    )
+    handle = ExecutionHandle("abc", "slurm", "slurm", "123", str(bundle))
+
+    status = executor.inspect(handle)
+
+    assert status.state == "failed"
+    assert status.failure_kind == "out_of_memory"
+    assert status.detail == "Slurm OUT_OF_MEMORY exit=0:0"
+
+
+def test_slurm_submission_limit_is_deferred_instead_of_failed(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    task = StageTask("abc", "demo", 1, "train", "slurm", bundle)
+
+    class ThrottledRunner(SlurmRunner):
+        def __call__(self, args, **kwargs):
+            args = list(args)
+            if args[0] == "sbatch":
+                self.submissions += 1
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    "",
+                    "sbatch: error: QOSMaxSubmitJobPerUserLimit",
+                )
+            return super().__call__(args, **kwargs)
+
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="cpu"),
+        runner=ThrottledRunner(),
+    )
+
+    with pytest.raises(SubmissionDeferred, match="QOSMaxSubmitJobPerUserLimit"):
+        executor.launch(task)
 
 
 def test_slurm_terminal_state_overrides_stale_running_worker_file(tmp_path):
