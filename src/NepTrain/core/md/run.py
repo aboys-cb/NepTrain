@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from importlib.resources import files
-import json
 from pathlib import Path
 from typing import Mapping
 
@@ -13,6 +12,7 @@ from ase import Atoms
 from ase.io import iread as ase_iread
 from ase.io import write as ase_write
 
+from ..persistence import atomic_write_json
 from .lammps import LammpsError, run_lammps
 from .health import (
     TrajectoryHealthError,
@@ -215,13 +215,7 @@ def _run_gpumd(
     health_payload = health.to_dict()
     health_payload["process_failure_reason"] = process_failure
     health_path = request.output_dir / "trajectory-health.json"
-    health_path.write_text(
-        json.dumps(
-            health_payload, indent=2, sort_keys=True, allow_nan=False
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(health_path, health_payload)
     failure_code = None
     failure_reason = None
     if health.first_bad_frame is not None:

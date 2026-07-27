@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,7 +26,9 @@ from typing import Any, Mapping, Sequence
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .content_addressing import canonical_sha256, file_sha256
 from .execution import ExecutionError, ExecutionTarget, ExecutionTransport
+from .persistence import atomic_write_json
 from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_LABEL_JOB
 from .scientific_data import (
     STRUCTURE_ID_VERSION,
@@ -81,16 +82,6 @@ def _progress(message: str) -> None:
     print(f"[NepTrain] {message}", file=sys.stderr, flush=True)
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -101,25 +92,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ManualTaskError(f"task metadata {path} must contain an object")
     return dict(value)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _canonical_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode()
-    ).hexdigest()
 
 
 def _manual_spec(descriptor: Mapping[str, Any]) -> dict[str, Any]:
@@ -167,17 +139,17 @@ def _verify_operation_bundle(root: Path) -> dict[str, Any]:
         if (
             not path.is_file()
             or path.stat().st_size != int(record.get("size", -1))
-            or _sha256(path) != record.get("sha256")
+            or file_sha256(path) != record.get("sha256")
         ):
             raise ManualTaskError(f"manual task input drifted: {path}")
     input_manifest = descriptor.get("input_manifest", {})
     manifest_path = root / str(input_manifest.get("path", ""))
     if (
         not manifest_path.is_file()
-        or _sha256(manifest_path) != input_manifest.get("sha256")
+        or file_sha256(manifest_path) != input_manifest.get("sha256")
     ):
         raise ManualTaskError("manual input checksum manifest drifted or is missing")
-    expected = _canonical_hash(_manual_spec(descriptor))
+    expected = canonical_sha256(_manual_spec(descriptor))
     if descriptor.get("spec_sha256") != expected:
         raise ManualTaskError("manual operation content identity is invalid")
     return descriptor
@@ -248,9 +220,7 @@ def target_from_project(
 
 
 def _operation_id(kind: str, payload: Mapping[str, Any]) -> str:
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:12]
+    digest = canonical_sha256(payload)[:12]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     return f"{kind}-{stamp}-{digest}"
 
@@ -319,7 +289,7 @@ def _write_operation(
     value["files"] = [
         {
             "path": str(path.relative_to(root)),
-            "sha256": _sha256(path),
+            "sha256": file_sha256(path),
             "size": path.stat().st_size,
         }
         for path in sorted(root.rglob("*"))
@@ -338,10 +308,10 @@ def _write_operation(
     )
     value["input_manifest"] = {
         "path": checksum_manifest.name,
-        "sha256": _sha256(checksum_manifest),
+        "sha256": file_sha256(checksum_manifest),
     }
-    value["spec_sha256"] = _canonical_hash(_manual_spec(value))
-    _write_json(root / "operation.json", value)
+    value["spec_sha256"] = canonical_sha256(_manual_spec(value))
+    atomic_write_json(root / "operation.json", value)
     _progress(
         f"{kind}: prepared {len(jobs)} job(s) in {root}"
     )
@@ -396,7 +366,7 @@ def prepare_training(
         request["restart_file"] = str(
             Path(_copy(Path(restart_file), job / "restart")).relative_to(root)
         )
-    _write_json(job / "request.json", request)
+    atomic_write_json(job / "request.json", request)
     return _write_operation(
         root,
         operation_id=operation_id,
@@ -682,7 +652,7 @@ def prepare_labeling(
             "device": device,
             "precision": precision,
         }
-        _write_json(job / "request.json", request)
+        atomic_write_json(job / "request.json", request)
         jobs.append(
             {
                 "index": index,
@@ -796,7 +766,7 @@ def prepare_md(
                 "bad_tail_frames": int(bad_tail_frames),
                 "health": dict(health or {}),
             }
-            _write_json(job / "request.json", request)
+            atomic_write_json(job / "request.json", request)
             jobs.append(
                 {
                     "index": index,
@@ -891,7 +861,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 return 0
             result_file = _expected_job_result(operation, job)
             _archive_worker_state(job, result_file)
-            _write_json(
+            atomic_write_json(
                 execution,
                 {
                     "state": "RUNNING",
@@ -1036,7 +1006,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 raise ManualTaskError(f"unsupported manual task: {operation.kind}")
             artifact = {
                 "path": str(result_file.relative_to(job)),
-                "sha256": _sha256(result_file),
+                "sha256": file_sha256(result_file),
                 "size": result_file.stat().st_size,
             }
             result_descriptor = {
@@ -1062,8 +1032,8 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                         f"MD job {index} produced an empty trajectory"
                     )
                 result_descriptor["frame_count"] = len(trajectory_frames)
-            _write_json(job / "result.json", result_descriptor)
-            _write_json(
+            atomic_write_json(job / "result.json", result_descriptor)
+            atomic_write_json(
                 execution,
                 {
                     "state": "COMPLETED",
@@ -1080,10 +1050,10 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 except Exception as error:
                     descriptor = _read_json(operation.descriptor)
                     descriptor["collection_error"] = str(error)
-                    _write_json(operation.descriptor, descriptor)
+                    atomic_write_json(operation.descriptor, descriptor)
             return 0
         except Exception as error:
-            _write_json(
+            atomic_write_json(
                 execution,
                 {
                     "state": "FAILED",
@@ -1126,7 +1096,7 @@ def _deploy_remote(operation: ManualOperation) -> str:
             handle.add(operation.root, arcname=operation.operation_id)
         remote_parent = remote.rsplit("/", 1)[0]
         remote_archive = f"{remote_parent}/.incoming/{archive.name}"
-        descriptor_sha256 = _sha256(operation.descriptor)
+        descriptor_sha256 = file_sha256(operation.descriptor)
         _progress(f"{operation.kind}: creating remote run directory on {target.name}")
         prepared = transport.run_script(
             """set -eo pipefail
@@ -1226,7 +1196,7 @@ mv -- "$temporary" "$destination"
             remote_parent,
             remote,
             remote_archive,
-            _sha256(archive),
+            file_sha256(archive),
             descriptor_sha256,
             token,
             operation.operation_id,
@@ -1378,7 +1348,7 @@ def submit_operation(
     descriptor["attempts"].append(
         {"submitted_at": _now(), "job_id": job_id, "indices": indices}
     )
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     if wait:
         return wait_operation(operation, poll_interval=poll_interval)
     _progress(f"{operation.kind}: checking initial scheduler state")
@@ -1438,7 +1408,7 @@ def _validate_job_result(
         not artifact.is_file()
         or artifact != _expected_job_result(operation, job).resolve()
         or artifact.stat().st_size != int(record.get("size", -1))
-        or _sha256(artifact) != record.get("sha256")
+        or file_sha256(artifact) != record.get("sha256")
     ):
         raise ManualTaskError(f"job {index} result artifact drifted or is missing")
     if operation.kind == "label":
@@ -1571,7 +1541,7 @@ def _final_result_error(
     if (
         not output.is_file()
         or output.stat().st_size != int(record.get("size", -1))
-        or _sha256(output) != record.get("sha256")
+        or file_sha256(output) != record.get("sha256")
     ):
         return f"final result drifted or is missing: {output}"
     if operation.kind == "label":
@@ -1666,14 +1636,14 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
     descriptor["completed_at"] = _now()
     descriptor["result"] = {
         "path": str(output),
-        "sha256": _sha256(output),
+        "sha256": file_sha256(output),
         "size": output.stat().st_size,
     }
     if operation.kind == "label":
         descriptor["result"]["frame_count"] = len(expected_ids)
         descriptor["result"]["frame_ids"] = expected_ids
     descriptor.pop("collection_error", None)
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     return output
 
 
@@ -1923,7 +1893,7 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
         descriptor["state"] = state
         changed = True
     if changed:
-        _write_json(operation.descriptor, descriptor)
+        atomic_write_json(operation.descriptor, descriptor)
     next_action = None
     if state in {"prepared", "submitted", "running", "cancelling"}:
         next_action = f"neptrain task wait {shlex.quote(str(operation.root))}"
@@ -2022,7 +1992,7 @@ def cancel_operation(operation: ManualOperation) -> dict[str, Any]:
             completed.stderr or completed.stdout
         ).strip()
     descriptor.setdefault("cancellations", []).append(cancellation)
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     return refresh_operation(operation)
 
 
@@ -2107,7 +2077,7 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
     descriptor["attempts"].append(
         {"submitted_at": _now(), "job_id": job_id, "indices": failed}
     )
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     return refresh_operation(operation)
 
 

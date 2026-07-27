@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
-import json
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -13,10 +11,12 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from ..content_addressing import file_sha256
 from ..fps import hierarchical_farthest_point_sampling
 from ..nep.calculator import DescriptorCalculator
 from ..scientific_data import STRUCTURE_ID_VERSION, structure_id
 from ..md.health import is_structure_reasonable
+from ..persistence import atomic_write_json
 
 
 class SelectionError(RuntimeError):
@@ -74,7 +74,7 @@ def _descriptor_calculator(args, frames: Sequence[Atoms]) -> tuple[Any, dict[str
         return calculator, {
             "kind": "nep",
             "model": str(model),
-            "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+            "model_sha256": file_sha256(model),
             "backend": args.backend,
         }
     species = sorted(
@@ -104,16 +104,6 @@ def _descriptor_calculator(args, frames: Sequence[Atoms]) -> tuple[Any, dict[str
         "n_max": args.n_max,
         "l_max": args.l_max,
     }
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
 
 
 def run_select(args) -> dict[str, Any]:
@@ -231,7 +221,7 @@ def run_select(args) -> dict[str, Any]:
         "descriptor": descriptor_record,
         "output": str(output),
     }
-    _write_json(report_path, report)
+    atomic_write_json(report_path, report)
     print(
         f"Selected {len(selected)} of {read_count} structures -> {output}\n"
         f"Selection report -> {report_path}"

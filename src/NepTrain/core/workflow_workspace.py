@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
 from typing import Any, Mapping
+
+from .content_addressing import canonical_sha256, file_sha256
+from .persistence import atomic_write_json
 
 
 _LAYOUT_VERSION = 4
@@ -32,16 +34,6 @@ _PUBLICATION_FILENAMES = (
 )
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
 def _copy_file(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
@@ -61,21 +53,6 @@ def _copy_path(source: Path, target: Path) -> None:
         shutil.rmtree(temporary)
     shutil.copytree(source, temporary)
     temporary.replace(target)
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _canonical_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode()
-    ).hexdigest()
 
 
 def _atomic_symlink(target: str, link: Path) -> None:
@@ -124,7 +101,7 @@ class WorkflowWorkspace:
             "summary.md",
         ):
             _atomic_symlink(f"current/{name}", workspace.results_dir / name)
-        _write_json(
+        atomic_write_json(
             workspace.layout_file,
             {
                 "layout": "neptrain.workflow",
@@ -400,7 +377,7 @@ class WorkflowWorkspace:
         for name in required:
             record = artifacts[name]
             source = Path(record["path"])
-            if not source.is_file() or _sha256(source) != record["sha256"]:
+            if not source.is_file() or file_sha256(source) != record["sha256"]:
                 raise ValueError(
                     f"accepted workflow artifact drifted before publication: {source}"
                 )
@@ -408,7 +385,7 @@ class WorkflowWorkspace:
                 "path": str(source),
                 "sha256": record["sha256"],
             }
-        content_sha256 = _canonical_hash(
+        content_sha256 = canonical_sha256(
             {
                 "generation": generation,
                 "sources": sources,
@@ -435,7 +412,7 @@ class WorkflowWorkspace:
                         and (final / name).is_file()
                         and (final / name).stat().st_size
                         == int(record["size"])
-                        and _sha256(final / name)
+                        and file_sha256(final / name)
                         == record["sha256"]
                         for name, record in existing.get("files", {}).items()
                     )
@@ -466,7 +443,7 @@ class WorkflowWorkspace:
                         Path(sources[artifact_name]["path"]),
                         temporary / filename,
                     )
-                _write_json(temporary / "summary.json", summary)
+                atomic_write_json(temporary / "summary.json", summary)
                 (temporary / "summary.md").write_text(
                     self._summary_markdown(summary),
                     encoding="utf-8",
@@ -474,12 +451,12 @@ class WorkflowWorkspace:
                 files = {
                     filename: {
                         "path": filename,
-                        "sha256": _sha256(temporary / filename),
+                        "sha256": file_sha256(temporary / filename),
                         "size": (temporary / filename).stat().st_size,
                     }
                     for filename in _PUBLICATION_FILENAMES
                 }
-                _write_json(
+                atomic_write_json(
                     temporary / "publication.json",
                     {
                         "protocol": "neptrain.accepted-result.v1",
@@ -504,7 +481,7 @@ class WorkflowWorkspace:
             "directory": str(final),
             "manifest": {
                 "path": str(manifest),
-                "sha256": _sha256(manifest),
+                "sha256": file_sha256(manifest),
             },
             "files": {
                 name: {
@@ -527,7 +504,7 @@ class WorkflowWorkspace:
         """Repair human projections and atomically activate one publication."""
 
         summary = self._generation_summary(generation, generation_record)
-        _write_json(self.generation_dir(generation) / "summary.json", summary)
+        atomic_write_json(self.generation_dir(generation) / "summary.json", summary)
         if generation_record.get("accepted") is not True:
             return
         publication = generation_record.get("publication")
@@ -575,7 +552,7 @@ class WorkflowWorkspace:
         if (
             not directory.is_dir()
             or not manifest.is_file()
-            or _sha256(manifest) != manifest_record.get("sha256")
+            or file_sha256(manifest) != manifest_record.get("sha256")
         ):
             issues.append(f"accepted publication metadata drifted: {directory}")
             return issues
@@ -608,7 +585,7 @@ class WorkflowWorkspace:
                 != int(record.get("size", -1))
                 or not path.is_file()
                 or path.stat().st_size != int(record.get("size", -1))
-                or _sha256(path) != record.get("sha256")
+                or file_sha256(path) != record.get("sha256")
             ):
                 issues.append(f"accepted result drifted: {name} ({path})")
         if not check_projection:

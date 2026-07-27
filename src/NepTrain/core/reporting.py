@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 import json
 import math
 import os
@@ -13,6 +12,8 @@ from typing import Any, Mapping, Sequence
 import matplotlib
 from matplotlib.figure import Figure
 import numpy as np
+
+from .content_addressing import file_sha256
 
 
 _LOSS_COLUMNS = (
@@ -241,7 +242,7 @@ def build_training_report(
 
     report["source"] = {
         "name": loss_path.name,
-        "sha256": sha256(loss_path.read_bytes()).hexdigest(),
+        "sha256": file_sha256(loss_path),
     }
     rows = _read_loss(loss_path)
     report["parsed_rows"] = len(rows)

@@ -15,6 +15,8 @@ import shutil
 from typing import Any, Mapping
 import uuid
 
+from .content_addressing import canonical_sha256, file_sha256
+from .persistence import atomic_write_json
 from .workflow_workspace import WorkflowWorkspace
 from .sampling_route import load_sampling_routes
 from .scientific_data import STRUCTURE_ID_VERSION
@@ -87,15 +89,6 @@ def _workflow_lock(output_dir: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _canonical_hash(value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
 def _read_json(path: Path, *, role: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -159,19 +152,19 @@ def _path_record(role: str, path: Path) -> dict[str, Any]:
             "role": role,
             "kind": "file",
             "path": str(path),
-            "sha256": _sha256(path),
+            "sha256": file_sha256(path),
         }
     if path.is_dir():
         files = sorted(item for item in path.rglob("*") if item.is_file())
         entries = [
-            {"path": str(item.relative_to(path)), "sha256": _sha256(item)}
+            {"path": str(item.relative_to(path)), "sha256": file_sha256(item)}
             for item in files
         ]
         return {
             "role": role,
             "kind": "directory",
             "path": str(path),
-            "sha256": _canonical_hash(entries),
+            "sha256": canonical_sha256(entries),
             "file_count": len(entries),
         }
     raise WorkflowError(f"workflow dependency does not exist: {path}")
@@ -180,7 +173,7 @@ def _path_record(role: str, path: Path) -> dict[str, Any]:
 def _record_matches(record: Mapping[str, Any]) -> bool:
     path = Path(record["path"])
     if record.get("kind", "file") == "file":
-        return path.is_file() and _sha256(path) == record["sha256"]
+        return path.is_file() and file_sha256(path) == record["sha256"]
     if not path.is_dir():
         return False
     current = _path_record(str(record.get("role", "dependency")), path)
@@ -193,13 +186,6 @@ def _write_text(path: Path, text: str) -> Path:
     temporary.write_text(text, encoding="utf-8")
     temporary.replace(path)
     return path
-
-
-def _write_json(path: Path, value: Any) -> Path:
-    return _write_text(
-        path,
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-    )
 
 
 def _absolute_path(value: Any, base_dir: Path) -> str | None:
@@ -618,12 +604,12 @@ def prepare_workflow(
         "structure_id_version": STRUCTURE_ID_VERSION,
         "config": config,
         "initial_training": str(initial),
-        "initial_training_sha256": _sha256(initial),
+        "initial_training_sha256": file_sha256(initial),
         "plans": [asdict(plan) for plan in plans],
         "command": command,
         "dependencies": source_dependencies,
     }
-    spec_sha256 = _canonical_hash(spec)
+    spec_sha256 = canonical_sha256(spec)
     if (output / "workflow-manifest.json").is_file():
         workspace = WorkflowWorkspace.locate(output)
     elif (output / ".neptrain" / "layout.json").is_file():
@@ -684,7 +670,7 @@ def prepare_workflow(
     plan_paths: list[Path] = []
     for plan in plans:
         plan_path = workspace.plans_dir / f"generation-{plan.generation}.json"
-        _write_json(plan_path, asdict(plan))
+        atomic_write_json(plan_path, asdict(plan))
         plan_paths.append(plan_path)
     manifest = {
         "version": 7,
@@ -694,18 +680,18 @@ def prepare_workflow(
         "workflow_id": selected_id,
         "instance_id": uuid.uuid4().hex,
         "spec_sha256": spec_sha256,
-        "config": {"path": str(resolved_config), "sha256": _sha256(resolved_config)},
+        "config": {"path": str(resolved_config), "sha256": file_sha256(resolved_config)},
         "initial_training": {
             "path": str(initial_snapshot),
-            "sha256": _sha256(initial_snapshot),
+            "sha256": file_sha256(initial_snapshot),
         },
         "plans": [
-            {"path": str(path), "sha256": _sha256(path)} for path in plan_paths
+            {"path": str(path), "sha256": file_sha256(path)} for path in plan_paths
         ],
         "dependencies": dependencies,
         "sampling_routes": sampling_routes,
     }
-    _write_json(manifest_path, manifest)
+    atomic_write_json(manifest_path, manifest)
     return _preparation_from_manifest(manifest_path)
 
 
@@ -746,8 +732,8 @@ def extend_workflow(
             for path in preparation.plans
         ]
         if [
-            _canonical_hash(asdict(plan)) for plan in all_plans[:current_total]
-        ] != [_canonical_hash(value) for value in existing_values]:
+            canonical_sha256(asdict(plan)) for plan in all_plans[:current_total]
+        ] != [canonical_sha256(value) for value in existing_values]:
             raise WorkflowError("workflow extension changed an existing generation plan")
 
         new_plans = all_plans[current_total:]
@@ -755,11 +741,11 @@ def extend_workflow(
         workspace = WorkflowWorkspace.locate(preparation.output_dir)
         for plan in new_plans:
             path = workspace.plans_dir / f"generation-{plan.generation}.json"
-            _write_json(path, asdict(plan))
+            atomic_write_json(path, asdict(plan))
             new_plan_paths.append(path)
 
         manifest["plans"].extend(
-            {"path": str(path), "sha256": _sha256(path)} for path in new_plan_paths
+            {"path": str(path), "sha256": file_sha256(path)} for path in new_plan_paths
         )
         extension = {
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -768,8 +754,8 @@ def extend_workflow(
         }
         manifest.setdefault("extensions", []).append(extension)
         save_config(portable_config, preparation.config_file)
-        manifest["config"]["sha256"] = _sha256(preparation.config_file)
-        _write_json(preparation.manifest, manifest)
+        manifest["config"]["sha256"] = file_sha256(preparation.config_file)
+        atomic_write_json(preparation.manifest, manifest)
         if workspace.controller_file.is_file():
             controller_state = _read_json(
                 workspace.controller_file,
@@ -779,7 +765,7 @@ def extend_workflow(
                 controller_state["state"] = "idle"
                 controller_state["current"] = None
                 controller_state.pop("reason", None)
-                _write_json(workspace.controller_file, controller_state)
+                atomic_write_json(workspace.controller_file, controller_state)
         return _preparation_from_manifest(preparation.manifest)
 
 
@@ -893,7 +879,7 @@ def _workflow_progress(
                 "train",
                 f"generation {generation} has not started",
             )
-        if record.get("plan_sha256") != _canonical_hash(plan):
+        if record.get("plan_sha256") != canonical_sha256(plan):
             raise WorkflowError(
                 f"generation {generation} plan changed after it entered the ledger"
             )
@@ -941,7 +927,7 @@ def _workflow_progress(
                         )
                     if (
                         not path.is_file()
-                        or _sha256(path) != artifact_record.get("sha256")
+                        or file_sha256(path) != artifact_record.get("sha256")
                     ):
                         return damaged(
                             generation,
@@ -1436,13 +1422,13 @@ def _repair_damaged_workflow(preparation: WorkflowPreparation) -> tuple[str, ...
                     )
                 except (OSError, ValueError):
                     continue
-                if destination.is_file() and _sha256(destination) == expected:
+                if destination.is_file() and file_sha256(destination) == expected:
                     continue
                 source = next(
                     (
                         item
                         for item in candidates.get(expected, [])
-                        if item.is_file() and _sha256(item) == expected
+                        if item.is_file() and file_sha256(item) == expected
                     ),
                     None,
                 )
@@ -1456,7 +1442,7 @@ def _repair_damaged_workflow(preparation: WorkflowPreparation) -> tuple[str, ...
                 temporary = destination.with_suffix(destination.suffix + ".repair")
                 shutil.copy2(source, temporary)
                 temporary.replace(destination)
-                if _sha256(destination) != expected:
+                if file_sha256(destination) != expected:
                     raise WorkflowError(
                         f"restored artifact failed its ledger hash: {destination}"
                     )

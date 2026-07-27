@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -13,9 +12,11 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .content_addressing import file_sha256
 from .labeling import LabelRequest, label
 from .dft.toy import ToyTeacher
 from .fps import farthest_point_sampling
+from .persistence import atomic_write_json
 from .spin import SpinDataError, validate_spin_dataset
 from .toy_workflow import toy_base_frame, toy_candidate_frames, toy_features
 
@@ -106,10 +107,6 @@ def _derivative_probe(
     )
 
 
-def _hash_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _recovery_probe(root: Path, frames: list[Atoms], profile: str) -> bool:
     direct_input = root / "recovery-direct-input.xyz"
     direct_output = root / "recovery-direct.xyz"
@@ -138,7 +135,7 @@ def _recovery_probe(root: Path, frames: list[Atoms], profile: str) -> bool:
         LabelRequest(second, resumed_output, root / "resumed-2", append=True, settings={"profile": profile}),
         "toy",
     )
-    return _hash_file(direct_output) == _hash_file(resumed_output)
+    return file_sha256(direct_output) == file_sha256(resumed_output)
 
 
 def run_smoke(
@@ -258,9 +255,7 @@ def run_smoke(
         recovery_match=recovery_match,
         passed=passed,
     )
-    (root / "smoke-report.json").write_text(
-        json.dumps(asdict(report), indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    atomic_write_json(root / "smoke-report.json", asdict(report))
     if not passed:
         raise SmokeError(f"{profile} smoke failed; see {root / 'smoke-report.json'}")
     return report

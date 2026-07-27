@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -17,6 +16,7 @@ from ase.constraints import FixAtoms, FixCartesian
 from ase.data import atomic_masses, atomic_numbers
 from ase.units import Bohr
 
+from ...content_addressing import file_sha256
 from ...spin import prepare_spin_for_dft
 from ..attempts import new_attempt_directory
 from .resources import validate_abacus_resources
@@ -396,14 +396,14 @@ def _write_input_manifest(
         pseudo = resource_dir / filename
         record = {
             "pseudopotential": str(pseudo),
-            "pseudopotential_sha256": hashlib.sha256(pseudo.read_bytes()).hexdigest(),
+            "pseudopotential_sha256": file_sha256(pseudo),
         }
         if element in orb_files:
             orbital = resource_dir / orb_files[element]
             record.update(
                 {
                     "orbital": str(orbital),
-                    "orbital_sha256": hashlib.sha256(orbital.read_bytes()).hexdigest(),
+                    "orbital_sha256": file_sha256(orbital),
                 }
             )
         resources[element] = record
@@ -577,7 +577,7 @@ def _write_result_manifest(
     for name in ("INPUT", "STRU", "KPT", "abacus-input.json"):
         path = case_dir / name
         if path.is_file():
-            inputs[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            inputs[name] = file_sha256(path)
     payload = {
         "backend": "abacus",
         "command": command,
@@ -590,7 +590,7 @@ def _write_result_manifest(
     }
     if log_path is not None:
         payload["running_scf_log"] = str(log_path)
-        payload["running_scf_sha256"] = hashlib.sha256(log_path.read_bytes()).hexdigest()
+        payload["running_scf_sha256"] = file_sha256(log_path)
     if parsed is not None:
         payload["result"] = {
             "energy_eV": parsed.energy,

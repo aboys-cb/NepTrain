@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
 import json
 from pathlib import Path
 from collections import Counter
@@ -12,13 +11,12 @@ from typing import Mapping, Sequence
 from ase import Atoms
 from ase.io import write as ase_write
 
+from .content_addressing import file_sha256
+from .persistence import atomic_write_json
+
 
 class CandidatePoolError(ValueError):
     """Raised when candidates are mixed across model generations."""
-
-
-def file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def regular_batch_minimum(max_selected: int) -> int:
@@ -107,18 +105,13 @@ def write_candidate_pool(
         route_fingerprints=dict(sorted(route_fingerprints.items())),
         counts_by_route=dict(sorted(counts_by_route.items())),
     )
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "version": 2,
-                **asdict(manifest),
-                "frontier_exhausted": manifest.frontier_exhausted,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    atomic_write_json(
+        manifest_path,
+        {
+            "version": 2,
+            **asdict(manifest),
+            "frontier_exhausted": manifest.frontier_exhausted,
+        },
     )
     return manifest
 

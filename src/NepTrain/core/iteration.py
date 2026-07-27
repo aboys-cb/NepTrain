@@ -5,14 +5,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import fcntl
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
+from .content_addressing import canonical_sha256, file_sha256
 from .fps import farthest_point_sampling
+from .persistence import atomic_write_json
 
 STAGES = (
     "train",
@@ -28,15 +29,6 @@ STAGES = (
 
 class IterationError(RuntimeError):
     """Raised when a workflow plan, ledger, or artifact is inconsistent."""
-
-
-def _canonical_hash(value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _file_hash(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -59,7 +51,7 @@ class GenerationPlan:
 
     @property
     def sha256(self) -> str:
-        return _canonical_hash(asdict(self))
+        return canonical_sha256(asdict(self))
 
 
 def progressive_plans(
@@ -223,19 +215,14 @@ class GenerationController:
         return ledger
 
     def _write(self, ledger: Mapping[str, Any]) -> None:
-        temporary = self.ledger_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(ledger, indent=2, sort_keys=True, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self.ledger_path)
+        atomic_write_json(self.ledger_path, ledger)
 
     @staticmethod
     def _restore_artifacts(stage_record: Mapping[str, Any]) -> dict[str, Path]:
         restored = {}
         for name, record in stage_record.get("artifacts", {}).items():
             path = Path(record["path"])
-            if not path.is_file() or _file_hash(path) != record["sha256"]:
+            if not path.is_file() or file_sha256(path) != record["sha256"]:
                 raise IterationError(f"completed artifact drifted: {path}")
             restored[name] = path
         return restored
@@ -419,7 +406,7 @@ class GenerationController:
                 )
             artifact_records[name] = {
                 "path": str(path),
-                "sha256": _file_hash(path),
+                "sha256": file_sha256(path),
             }
             resolved_artifacts[name] = path
         stage_record = {

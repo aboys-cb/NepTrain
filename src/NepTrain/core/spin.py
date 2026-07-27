@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from pathlib import Path
 import tempfile
 from typing import Iterable
@@ -12,6 +11,8 @@ import numpy as np
 from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
+
+from .content_addressing import file_sha256
 
 
 SPIN_KEY = "spin"
@@ -195,9 +196,9 @@ def migrate_spin_dataset(
     return {
         "protocol": "neptrain.spin-migration.v1",
         "input": str(source_path),
-        "input_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "input_sha256": file_sha256(source_path),
         "output": str(output_path),
-        "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+        "output_sha256": file_sha256(output_path),
         "frames": total,
         "spin_frames": spin_frames,
         "legacy_fields_removed": migrated_fields,

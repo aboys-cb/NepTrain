@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import hashlib
 from pathlib import Path
 import shlex
 import subprocess
@@ -14,6 +13,7 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from ..content_addressing import file_sha256
 from ..scientific_data import (
     ScientificDataError,
     bind_labeled_frames_to_inputs,
@@ -130,14 +130,6 @@ def _label_toy(request: LabelRequest) -> LabelResult:
     )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _label_model(request: LabelRequest) -> LabelResult:
     settings = request.settings
     model = _path_setting(request, "model_file")
@@ -199,7 +191,7 @@ def _label_model(request: LabelRequest) -> LabelResult:
         {
             "origin": "teacher_model",
             "engine": model_name,
-            "model_sha256": _sha256(model),
+            "model_sha256": file_sha256(model),
             "runner": runner,
             "device": device,
             "precision": precision,

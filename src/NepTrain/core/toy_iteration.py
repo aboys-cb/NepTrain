@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -15,6 +14,7 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .content_addressing import file_sha256
 from .labeling import LabelRequest, label
 from .dft.toy import ToyTeacher
 from .iteration import (
@@ -24,6 +24,7 @@ from .iteration import (
     StageOutcome,
     stratified_farthest_point_sampling,
 )
+from .persistence import atomic_write_json
 from .spin import validate_spin_dataset
 from .scenario import ScenarioLadder
 from .scientific_data import structure_id
@@ -75,18 +76,6 @@ class ToyIterationReport:
 def _frames(path: Path) -> list[Atoms]:
     loaded = ase_read(path, index=":", format="extxyz")
     return loaded if isinstance(loaded, list) else [loaded]
-
-
-def _write_json(path: Path, value: Any) -> Path:
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    return path
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _prepare_inputs(root: Path, profile: str, seed: int) -> tuple[Path, Path]:
@@ -166,13 +155,13 @@ class ToyIterationAdapter:
         frames = _frames(training_input)
         validate_spin_dataset(frames, require_mforce=True)
         model = context.generation_dir / "toy-model.json"
-        _write_json(
+        atomic_write_json(
             model,
             {
                 "kind": "coverage-surrogate",
                 "profile": self.profile,
                 "training_count": len(frames),
-                "training_sha256": _sha256(training_input),
+                "training_sha256": file_sha256(training_input),
             },
         )
         return StageOutcome(
@@ -195,7 +184,7 @@ class ToyIterationAdapter:
             generation=context.generation,
             seed=context.plan.seed,
             limit=len(context.plan.temperatures),
-            model_id=_sha256(context.artifacts["model"]),
+            model_id=file_sha256(context.artifacts["model"]),
             history=history,
         )
         by_temperature = {attempt.temperature: attempt for attempt in attempts}
@@ -218,7 +207,7 @@ class ToyIterationAdapter:
         output = context.generation_dir / "candidates.xyz"
         ase_write(output, candidates, format="extxyz")
         scenario_plan = context.generation_dir / "scenario-plan.json"
-        _write_json(
+        atomic_write_json(
             scenario_plan,
             {
                 "version": 2,
@@ -263,7 +252,7 @@ class ToyIterationAdapter:
         selected_path = context.generation_dir / "selected-input.xyz"
         ase_write(selected_path, selected, format="extxyz")
         result_path = context.generation_dir / "selection-result.json"
-        _write_json(result_path, asdict(result))
+        atomic_write_json(result_path, asdict(result))
         return StageOutcome(
             artifacts={"selected_input": selected_path, "selection_result": result_path},
             metrics={
@@ -313,7 +302,7 @@ class ToyIterationAdapter:
             "current_model_coverage_p95": float(np.quantile(distances, 0.95)),
         }
         output = context.generation_dir / "acquisition-signals.json"
-        _write_json(output, signals)
+        atomic_write_json(output, signals)
         return StageOutcome(
             artifacts={"acquisition_signals": output}, metrics=signals
         )
@@ -342,13 +331,13 @@ class ToyIterationAdapter:
         frames = _frames(training_input)
         validate_spin_dataset(frames, require_mforce=True)
         model = context.generation_dir / "toy-retrained-model.json"
-        _write_json(
+        atomic_write_json(
             model,
             {
                 "kind": "coverage-surrogate",
                 "profile": self.profile,
                 "training_count": len(frames),
-                "training_sha256": _sha256(training_input),
+                "training_sha256": file_sha256(training_input),
             },
         )
         return StageOutcome(
@@ -427,13 +416,13 @@ class ToyIterationAdapter:
             validation_accepted=bool(accepted),
             model_improved=True,
             novelty_converged=True,
-            final_model_id=_sha256(context.artifacts["retrained_model"]),
+            final_model_id=file_sha256(context.artifacts["retrained_model"]),
         )
         signals["scenario_counts_by_maturity"] = maturity["counts_by_maturity"]
         output = context.generation_dir / "signals.json"
-        _write_json(output, signals)
+        atomic_write_json(output, signals)
         maturity_path = context.generation_dir / "scenario-maturity.json"
-        _write_json(maturity_path, maturity)
+        atomic_write_json(maturity_path, maturity)
         return StageOutcome(
             artifacts={
                 "signals": output,
@@ -570,7 +559,7 @@ def run_toy_iteration_smoke(
         resume_reused_artifacts=resume_reused,
         passed=passed,
     )
-    _write_json(root / "toy-iteration-report.json", asdict(report))
+    atomic_write_json(root / "toy-iteration-report.json", asdict(report))
     if not passed:
         raise ToyIterationError(
             f"Toy iteration smoke failed; see {root / 'toy-iteration-report.json'}"

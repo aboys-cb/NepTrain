@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +18,8 @@ from typing import Any, Callable, Mapping
 
 from ase.io import read as ase_read
 
+from .content_addressing import canonical_sha256, file_sha256
+from .persistence import atomic_write_json
 from .workflow_workspace import WorkflowWorkspace
 from .config import (
     ConfigError,
@@ -62,16 +63,6 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
 def _read_json(
     path: Path,
     default: Mapping[str, Any] | None = None,
@@ -95,30 +86,18 @@ def _read_json(
     return dict(value)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _record_matches(record: Mapping[str, Any]) -> bool:
     path = Path(str(record["path"]))
     if record.get("kind", "file") == "file":
-        return path.is_file() and _sha256(path) == record.get("sha256")
+        return path.is_file() and file_sha256(path) == record.get("sha256")
     if not path.is_dir():
         return False
     entries = [
-        {"path": str(item.relative_to(path)), "sha256": _sha256(item)}
+        {"path": str(item.relative_to(path)), "sha256": file_sha256(item)}
         for item in sorted(path.rglob("*"))
         if item.is_file()
     ]
-    digest = hashlib.sha256(
-        json.dumps(
-            entries, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode()
-    ).hexdigest()
+    digest = canonical_sha256(entries)
     return digest == record.get("sha256")
 
 
@@ -292,7 +271,7 @@ class PersistentController:
 
     def _save(self) -> None:
         self.state["heartbeat_at"] = _now()
-        _write_json(self.workspace.controller_file, self.state)
+        atomic_write_json(self.workspace.controller_file, self.state)
 
     def _ledger(self) -> dict[str, Any]:
         return _read_json(
@@ -396,7 +375,7 @@ class PersistentController:
                 None,
             )
             if existing_name is not None:
-                if _sha256(source) != _sha256(destination):
+                if file_sha256(source) != file_sha256(destination):
                     raise ControllerError(
                         f"stage artifacts {existing_name} and {name} both "
                         f"publish as {destination.name}"
@@ -1489,7 +1468,7 @@ def _append_execution_event(
                 **dict(event),
             }
         )
-        _write_json(workspace.ledger, ledger)
+        atomic_write_json(workspace.ledger, ledger)
 
 
 def stop_workflow(

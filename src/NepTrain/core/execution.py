@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,7 +23,9 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .content_addressing import canonical_sha256, file_sha256
 from .iteration import GenerationPlan, StageContext, StageOutcome
+from .persistence import atomic_write_json
 from .sampling_route import load_sampling_routes
 from .slurm import (
     ACTIVE_STATES as _ACTIVE,
@@ -162,46 +163,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _canonical_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode()
-    ).hexdigest()
-
-
 def _tree_hash(path: Path) -> str:
     if path.is_file():
-        return _sha256(path)
+        return file_sha256(path)
     records = [
-        (str(item.relative_to(path)), _sha256(item))
+        (str(item.relative_to(path)), file_sha256(item))
         for item in sorted(path.rglob("*"))
         if item.is_file()
     ]
-    return hashlib.sha256(
-        json.dumps(records, separators=(",", ":")).encode()
-    ).hexdigest()
+    return canonical_sha256(records)
 
 
 def _copy_input(source: Path, target: Path) -> None:
@@ -755,14 +725,14 @@ def build_stage_task(
     records = [
         {
             "path": str(path.relative_to(temporary)),
-            "sha256": _sha256(path),
+            "sha256": file_sha256(path),
             "size": path.stat().st_size,
         }
         for path in sorted(temporary.rglob("*"))
         if path.is_file() and path.name != "task.json"
     ]
     descriptor["files"] = records
-    spec_sha256 = _canonical_hash(_task_content_spec(descriptor))
+    spec_sha256 = canonical_sha256(_task_content_spec(descriptor))
     task_id = spec_sha256[:24]
     descriptor["task_id"] = task_id
     descriptor["spec_sha256"] = spec_sha256
@@ -775,7 +745,7 @@ def build_stage_task(
         stage_input=dict(stage_input or {}),
     )
     bundle = tasks_dir / directory_name
-    _write_json(temporary / "task.json", descriptor)
+    atomic_write_json(temporary / "task.json", descriptor)
     if bundle.exists():
         try:
             existing = _verify_task_bundle(bundle)
@@ -825,10 +795,10 @@ def _verify_task_bundle(bundle: Path) -> dict[str, Any]:
         if (
             not path.is_file()
             or path.stat().st_size != int(record["size"])
-            or _sha256(path) != record["sha256"]
+            or file_sha256(path) != record["sha256"]
         ):
             raise ExecutionError(f"stage task input drifted: {path}")
-    expected = _canonical_hash(_task_content_spec(descriptor))
+    expected = canonical_sha256(_task_content_spec(descriptor))
     if descriptor.get("spec_sha256") != expected:
         raise ExecutionError("stage task content identity does not match its manifest")
     if descriptor.get("task_id") != expected[:24]:
@@ -861,7 +831,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             except ExecutionError:
                 pass
             else:
-                _write_json(
+                atomic_write_json(
                     execution_path,
                     {
                         "task_id": descriptor["task_id"],
@@ -873,7 +843,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     },
                 )
                 return 0
-            _write_json(
+            atomic_write_json(
                 execution_path,
                 {
                     "task_id": descriptor["task_id"],
@@ -939,7 +909,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                 relative_output = destination.relative_to(work_dir)
                 result_artifacts[name] = {
                     "path": str(Path("output") / relative_output),
-                    "sha256": _sha256(destination),
+                    "sha256": file_sha256(destination),
                     "size": destination.stat().st_size,
                 }
             published_output = bundle / "output"
@@ -971,8 +941,8 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                 "artifacts": result_artifacts,
                 "metrics": dict(outcome.metrics),
             }
-            _write_json(bundle / "result.json", result)
-            _write_json(
+            atomic_write_json(bundle / "result.json", result)
+            atomic_write_json(
                 execution_path,
                 {
                     "task_id": descriptor["task_id"],
@@ -984,7 +954,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             )
             return 0
         except Exception as error:
-            _write_json(
+            atomic_write_json(
                 execution_path,
                 {
                     "state": "FAILED",
@@ -1033,7 +1003,7 @@ def _load_stage_result_payload(
         if (
             not artifact.is_file()
             or artifact.stat().st_size != int(record["size"])
-            or _sha256(artifact) != record["sha256"]
+            or file_sha256(artifact) != record["sha256"]
         ):
             raise ExecutionError(f"stage result artifact drifted: {artifact}")
         artifacts[name] = artifact
@@ -1339,7 +1309,7 @@ exec "$@"
             f"{root.rstrip('/')}/{task.workflow_id}/incoming/"
             f"{remote_name}-{token}.tar.gz"
         )
-        descriptor_sha256 = _sha256(task.descriptor)
+        descriptor_sha256 = file_sha256(task.descriptor)
         verify_command = shlex.split(self.target.command)
         setup = """set -eo pipefail
 root=$1
@@ -1399,7 +1369,7 @@ printf '%s\\n' MISSING
         try:
             with tarfile.open(archive, "w:gz") as handle:
                 handle.add(task.bundle, arcname=remote_name)
-            digest = _sha256(archive)
+            digest = file_sha256(archive)
             upload = self.copy(
                 archive,
                 f"{self.target.host}:{remote_archive}",

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Iterable, Mapping
 
 from ase import Atoms
+
+from ...content_addressing import file_sha256
 
 
 class AbacusResourceError(RuntimeError):
@@ -17,14 +18,6 @@ class AbacusResourceError(RuntimeError):
 
 _PROTOCOL = "neptrain.abacus-resources.v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _resource_record(
@@ -136,7 +129,7 @@ def validate_abacus_manifest_elements(
         )
     return {
         "protocol": _PROTOCOL,
-        "manifest_sha256": _sha256(path),
+        "manifest_sha256": file_sha256(path),
         "release": manifest["release"],
         "required_elements": sorted(required),
     }
@@ -219,7 +212,7 @@ def validate_abacus_resources(
                 raise AbacusResourceError(
                     f"ABACUS {kind} for {element} does not exist: {resource}"
                 )
-            if _sha256(resource) != file_record["sha256"]:
+            if file_sha256(resource) != file_record["sha256"]:
                 raise AbacusResourceError(
                     f"ABACUS {kind} hash mismatch for {element}: {resource}"
                 )
@@ -237,7 +230,7 @@ def validate_abacus_resources(
         records[element] = record
     provenance = {
         "protocol": _PROTOCOL,
-        "manifest_sha256": _sha256(manifest_file),
+        "manifest_sha256": file_sha256(manifest_file),
         "release": manifest["release"],
         "element_order": list(elements),
         "resources": records,
