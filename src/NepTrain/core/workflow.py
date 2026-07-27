@@ -17,6 +17,7 @@ import uuid
 
 from .workflow_workspace import WorkflowWorkspace
 from .sampling_route import load_sampling_routes
+from .scientific_data import STRUCTURE_ID_VERSION
 
 
 class WorkflowError(RuntimeError):
@@ -126,10 +127,13 @@ def _normalise_manifest(
     manifest_path: Path,
 ) -> dict[str, Any]:
     value = dict(manifest)
-    if value.get("version") not in {5, 6}:
+    if (
+        value.get("version") != 7
+        or value.get("structure_id_version") != STRUCTURE_ID_VERSION
+    ):
         raise WorkflowError(
-            "unsupported workflow manifest; create a new workflow with the "
-            "current NepTrain"
+            "unsupported workflow manifest or structure identity version; "
+            "create a new workflow with the current NepTrain"
         )
     required_records = ("config", "initial_training")
     if (
@@ -489,7 +493,10 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _preparation_from_manifest(path: Path) -> WorkflowPreparation:
-    manifest = _read_json(path, role="workflow manifest")
+    manifest = _normalise_manifest(
+        _read_json(path, role="workflow manifest"),
+        path,
+    )
     workspace = WorkflowWorkspace.locate(path)
     return WorkflowPreparation(
         workflow_id=manifest["workflow_id"],
@@ -608,6 +615,7 @@ def prepare_workflow(
     source_dependencies = _dependencies(config)
     spec = {
         "workflow_id": selected_id,
+        "structure_id_version": STRUCTURE_ID_VERSION,
         "config": config,
         "initial_training": str(initial),
         "initial_training_sha256": _sha256(initial),
@@ -653,9 +661,6 @@ def prepare_workflow(
                 raise WorkflowError(
                     f"prepared workflow artifact drifted: {record['path']}"
                 )
-        if existing.get("version") == 5:
-            existing["version"] = 6
-            _write_json(manifest_path, existing)
         return _preparation_from_manifest(manifest_path)
 
     resolved_config = workspace.project_file
@@ -682,8 +687,9 @@ def prepare_workflow(
         _write_json(plan_path, asdict(plan))
         plan_paths.append(plan_path)
     manifest = {
-        "version": 6,
+        "version": 7,
         "layout_version": workspace.version,
+        "structure_id_version": STRUCTURE_ID_VERSION,
         "orchestration": "controller",
         "workflow_id": selected_id,
         "instance_id": uuid.uuid4().hex,

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.io import read, write
 
 from NepTrain.core.scientific_data import (
     ScientificDataError,
@@ -42,6 +43,32 @@ def test_structure_identity_includes_nonzero_collinear_initial_moments():
 
     assert structure_id(up) != structure_id(down)
     assert structure_id(up) != structure_id(ordinary)
+
+
+def test_structure_identity_survives_extxyz_roundtrip(tmp_path):
+    rng = np.random.default_rng(20260727)
+    original = Atoms(
+        "FeCoNi",
+        positions=rng.random((3, 3)) * 3.0,
+        cell=rng.random((3, 3)) * 5.0,
+        pbc=True,
+    )
+    original.set_array("spin", rng.random((3, 3)))
+    path = tmp_path / "structure.xyz"
+
+    write(path, original, format="extxyz")
+    restored = read(path)
+
+    assert not np.array_equal(original.positions, restored.positions)
+    assert structure_id(original) == structure_id(restored)
+
+
+def test_structure_identity_preserves_declared_precision():
+    original = _frame()
+    changed = original.copy()
+    changed.positions[1, 0] += 2.0e-8
+
+    assert structure_id(original) != structure_id(changed)
 
 
 def test_label_validation_rejects_missing_or_nonfinite_scientific_fields():

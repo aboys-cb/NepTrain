@@ -30,6 +30,7 @@ from ase.io import write as ase_write
 from .execution import ExecutionError, ExecutionTarget, ExecutionTransport
 from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_LABEL_JOB
 from .scientific_data import (
+    STRUCTURE_ID_VERSION,
     ScientificDataError,
     labeled_input_structure_ids,
     structure_id,
@@ -139,6 +140,7 @@ def _manual_spec(descriptor: Mapping[str, Any]) -> dict[str, Any]:
         for key in (
             "operation_id",
             "kind",
+            "structure_id_version",
             "target",
             "output",
             "max_concurrent",
@@ -153,17 +155,22 @@ def _manual_spec(descriptor: Mapping[str, Any]) -> dict[str, Any]:
 def _verify_operation_bundle(root: Path) -> dict[str, Any]:
     descriptor = _read_json(root / "operation.json")
     protocol = descriptor.get("protocol")
-    if protocol != "neptrain.manual-operation.v3":
+    if protocol != "neptrain.manual-operation.v4":
         if protocol in {
             "neptrain.manual-operation.v1",
             "neptrain.manual-operation.v2",
+            "neptrain.manual-operation.v3",
         }:
             raise ManualTaskError(
                 "manual run uses an unsafe legacy protocol and cannot be "
                 "collected or retried automatically; keep its raw job outputs "
-                "and prepare a new v3 run"
+                "and prepare a new v4 run"
             )
         raise ManualTaskError(f"not a NepTrain manual run: {root}")
+    if descriptor.get("structure_id_version") != STRUCTURE_ID_VERSION:
+        raise ManualTaskError(
+            "manual run uses an unsupported structure identity version"
+        )
     for record in descriptor.get("files", []):
         relative = Path(str(record.get("path", "")))
         if relative.is_absolute() or ".." in relative.parts:
@@ -308,9 +315,10 @@ def _write_operation(
         _copy(setup, packaged)
         target = replace(target, setup_script="./inputs/setup.sh")
     value = {
-        "protocol": "neptrain.manual-operation.v3",
+        "protocol": "neptrain.manual-operation.v4",
         "operation_id": operation_id,
         "kind": kind,
+        "structure_id_version": STRUCTURE_ID_VERSION,
         "created_at": _now(),
         "state": "prepared",
         "target": asdict(target),
@@ -707,7 +715,7 @@ def prepare_labeling(
         jobs=jobs,
         max_concurrent=max_concurrent,
         scientific_input={
-            "structure_id_version": "neptrain.structure-id.v2",
+            "structure_id_version": STRUCTURE_ID_VERSION,
             "frame_count": len(frame_ids),
             "frame_ids": frame_ids,
             "labeling_resources": resource_provenance,

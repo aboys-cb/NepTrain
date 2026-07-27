@@ -109,6 +109,23 @@ neptrain label candidates.xyz \
 NepTrain 会记录 Teacher 模型 SHA256 和运行配置，并在发布前校验结构身份、顺序和
 标签完整性。Spin 输入还必须由 runner 真实输出 `mforce`，不会自动补零。
 
+### 手动采样
+
+```bash
+neptrain select md-300.xyz md-600.xyz \
+  --base train.xyz \
+  --nep nep.txt \
+  --max-selected 64 \
+  --min-novelty 0.01 \
+  --out selected.xyz \
+  --report selected.selection.json
+```
+
+手动命令和 workflow 共用按元素集合分组、按来源条件平衡的 FPS 策略。
+`--base` 作为已有训练集 warm start；精确重复结构和描述符重复点不会为填满上限而
+再次入选。提供 `--nep` 时使用 NEP 描述符，否则使用 SOAP。JSON 报告记录结构
+身份版本、描述符来源、入选 ID、novelty 和各分组统计。
+
 ### Slurm target
 
 手动命令不要求项目文件；只有复用 Slurm 或远端环境时才需要 `--project` 和

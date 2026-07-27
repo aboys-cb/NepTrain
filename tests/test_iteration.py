@@ -178,7 +178,7 @@ def test_stratified_fps_is_input_order_independent_and_balanced():
     assert first.counts_by_stratum == {"A": 2, "B": 2}
 
 
-def test_zero_min_novelty_allows_duplicate_smoke_candidates():
+def test_zero_min_novelty_rejects_candidates_duplicating_reference():
     plan = GenerationPlan(1, 1, 1, selection_novelty_threshold=0.0)
     result = stratified_farthest_point_sampling(
         np.asarray([[1.0, 1.0], [1.0, 1.0]]),
@@ -188,7 +188,7 @@ def test_zero_min_novelty_allows_duplicate_smoke_candidates():
         plan,
     )
 
-    assert result.selected_ids == ("candidate-a",)
+    assert result.selected_ids == ()
 
 
 def test_two_generation_toy_workflow_is_deterministic_and_resumable(tmp_path: Path):

@@ -6,7 +6,7 @@
 
 import time
 import numpy as np
-from scipy.spatial.distance import cdist
+from ..fps import farthest_point_sampling as _shared_fps
 
 
 
@@ -27,57 +27,16 @@ def farthest_point_sampling(points, n_samples, min_dist=0.1, selected_data=None)
         sampled_indices (list): 采样点的索引。
     """
     points = np.asarray(points, dtype=np.float64)
-    if points.ndim != 2:
-        raise ValueError("FPS points must have shape (n_points, n_features)")
-    n_points = points.shape[0]
-    if n_points == 0 or n_samples <= 0:
-        return []
-    if min_dist < 0:
-        raise ValueError("FPS min_dist must be non-negative")
-    n_samples = min(int(n_samples), n_points)
-
-    if selected_data is not None and np.asarray(selected_data).size == 0:
-        selected_data=None
-    # 初始化采样点列表
-    sampled_indices = []
-
-    # 如果已有采样点，则计算到所有点的最小距离
-    if selected_data is not None :
-        selected_data = np.asarray(selected_data, dtype=np.float64)
-        if selected_data.ndim != 2 or selected_data.shape[1] != points.shape[1]:
-            raise ValueError("FPS selected_data must match the point feature dimension")
-        # 使用 cdist 计算已有点与所有点之间的距离，返回形状为 (n_points, len(sampled_indices)) 的矩阵
-        distances_to_samples = cdist(points, selected_data)
-        min_distances = np.min(distances_to_samples, axis=1)  # 每个点到现有采样点集的最小距离
-
-    else:
-        # Choose deterministically so a restarted generation selects the same frames.
-        centroid = points.mean(axis=0)
-        first_index = int(np.argmax(np.linalg.norm(points - centroid, axis=1)))
-        sampled_indices.append(first_index)
-        # 计算所有点到第一个点的距离
-        min_distances = np.linalg.norm(points - points[first_index], axis=1)
-
-    # 进行最远点采样
-    while len(sampled_indices) < n_samples:
-        # 找到距离采样点集最远的点
-        current_index = np.argmax(min_distances)
-
-        # 如果没有点能满足最小距离要求，则提前终止
-        if min_distances[current_index] <= min_dist:
-            break
-
-        # 添加当前点到采样集
-        sampled_indices.append(current_index)
-
-        # 更新最小距离：仅计算当前点到新选择点的距离
-        # 获取当前点到所有其他点的距离
-        new_point = points[current_index]
-        new_distances = np.linalg.norm(points - new_point, axis=1)
-
-        # 更新每个点到现有样本点集的最小距离
-        min_distances = np.minimum(min_distances, new_distances)
-    return sampled_indices
+    references = None
+    if selected_data is not None and np.asarray(selected_data).size:
+        references = np.asarray(selected_data, dtype=np.float64)
+    result = _shared_fps(
+        points,
+        budget=int(n_samples),
+        min_novelty=float(min_dist),
+        reference_descriptors=references,
+    )
+    return list(result.selected_indices)
 
 
 def select_structures(train, new_atoms ,descriptor, max_selected=20, min_distance=0.01 ):

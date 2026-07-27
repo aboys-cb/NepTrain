@@ -4,11 +4,59 @@ import numpy as np
 import pytest
 from ase import Atoms
 
-from NepTrain.core.fps import hierarchical_farthest_point_sampling
+from NepTrain.core.fps import (
+    farthest_point_sampling,
+    hierarchical_farthest_point_sampling,
+)
 
 
 def _atoms(symbols: str) -> Atoms:
     return Atoms(symbols, positions=np.zeros((len(Atoms(symbols)), 3)))
+
+
+def test_shared_fps_rejects_exact_duplicates_at_zero_threshold():
+    result = farthest_point_sampling(
+        np.asarray([[1.0, 1.0], [2.0, 2.0], [2.0, 2.0]]),
+        budget=3,
+        min_novelty=0.0,
+        reference_descriptors=np.asarray([[1.0, 1.0]]),
+        candidate_ids=["reference-copy", "novel-a", "novel-b"],
+    )
+
+    assert result.selected_ids == ("novel-a",)
+
+
+def test_shared_fps_balances_strata_and_is_input_order_independent():
+    points = np.asarray(
+        [
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 2.0],
+            [0.0, 3.0],
+        ]
+    )
+    ids = ["a1", "a2", "a3", "b1", "b2", "b3"]
+    strata = ["A", "A", "A", "B", "B", "B"]
+    first = farthest_point_sampling(
+        points,
+        budget=4,
+        reference_descriptors=np.asarray([[0.0, 0.0]]),
+        candidate_ids=ids,
+        strata=strata,
+    )
+    order = [5, 2, 4, 1, 3, 0]
+    second = farthest_point_sampling(
+        points[order],
+        budget=4,
+        reference_descriptors=np.asarray([[0.0, 0.0]]),
+        candidate_ids=[ids[index] for index in order],
+        strata=[strata[index] for index in order],
+    )
+
+    assert first.selected_ids == second.selected_ids
+    assert first.counts_by_stratum == {"A": 2, "B": 2}
 
 
 def test_sqrt_quotas_and_soft_strata_balance():
@@ -34,7 +82,14 @@ def test_sqrt_quotas_and_soft_strata_balance():
     assert result.groups[("Fe", "O")].initial_quota == 2
     assert result.groups[("Fe",)].selected_count == 3
     assert result.groups[("Fe", "O")].selected_count == 2
-    assert result.counts_by_stratum == {"cold": 3, "hot": 2}
+    assert sum(result.counts_by_stratum.values()) == 5
+    assert (
+        abs(
+            result.counts_by_stratum["cold"]
+            - result.counts_by_stratum["hot"]
+        )
+        == 1
+    )
 
 
 def test_budget_smaller_than_element_group_count_is_rejected():

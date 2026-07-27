@@ -154,6 +154,19 @@ def test_manual_commands_offer_human_output_and_explicit_json():
     assert "--json" in completed.stdout
 
 
+def test_select_exposes_production_sampling_controls():
+    completed = _help("select", "--help")
+
+    assert completed.returncode == 0
+    assert "--base" in completed.stdout
+    assert "--nep" in completed.stdout
+    assert "--max-selected" in completed.stdout
+    assert "--min-novelty" in completed.stdout
+    assert "--report" in completed.stdout
+    assert "--pca" not in completed.stdout
+    assert "--umap" not in completed.stdout
+
+
 def test_manual_status_is_human_readable_by_default(capsys):
     value = {
         "operation_id": "dft-abc",

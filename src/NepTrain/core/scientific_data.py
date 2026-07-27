@@ -16,8 +16,8 @@ from ase import Atoms
 from .spin import SpinDataError, validate_spin_structure
 
 
-STRUCTURE_ID_VERSION = "neptrain.structure-id.v2"
-GEOMETRY_ID_VERSION = "neptrain.geometry-id.v1"
+STRUCTURE_ID_VERSION = "neptrain.structure-id.v3"
+GEOMETRY_ID_VERSION = "neptrain.geometry-id.v2"
 INPUT_STRUCTURE_ID_KEY = "neptrain_input_structure_id"
 
 
@@ -30,23 +30,37 @@ def _canonical_float64(value: object) -> bytes:
     return array.tobytes(order="C")
 
 
+def _canonical_extxyz_array(value: object) -> bytes:
+    """Encode atom properties at ASE extxyz's persisted precision."""
+
+    array = np.asarray(value, dtype=np.float64)
+    if not np.isfinite(array).all():
+        raise ScientificDataError(
+            "structure identity requires finite atom properties"
+        )
+    header = np.asarray(array.shape, dtype="<i8").tobytes(order="C")
+    payload = "\n".join(f"{float(item):.8f}" for item in array.ravel(order="C"))
+    return header + payload.encode("ascii")
+
+
 def structure_id(atoms: Atoms) -> str:
-    """Return a stable identity for the physical structure sent to a model.
+    """Return a persistence-stable identity for a model input structure.
 
     Labels and incidental ``Atoms.info`` metadata are intentionally excluded.
     Boundary conditions are part of the physical structure and therefore part
-    of the identity.
+    of the identity. Atom properties use ASE extxyz's eight-decimal persisted
+    precision so a NepTrain write/read round trip does not change ownership.
     """
 
     digest = hashlib.sha256()
     digest.update(STRUCTURE_ID_VERSION.encode("ascii"))
     digest.update(np.asarray(atoms.numbers, dtype="<i8").tobytes(order="C"))
     digest.update(_canonical_float64(atoms.cell))
-    digest.update(_canonical_float64(atoms.positions))
+    digest.update(_canonical_extxyz_array(atoms.positions))
     digest.update(np.asarray(atoms.pbc, dtype=np.uint8).tobytes(order="C"))
     if "spin" in atoms.arrays:
         digest.update(b"spin")
-        digest.update(_canonical_float64(atoms.arrays["spin"]))
+        digest.update(_canonical_extxyz_array(atoms.arrays["spin"]))
     else:
         digest.update(b"ordinary")
         initial_magmoms = atoms.arrays.get("initial_magmoms")
@@ -54,7 +68,7 @@ def structure_id(atoms: Atoms) -> str:
             np.asarray(initial_magmoms, dtype=np.float64) != 0.0
         ):
             digest.update(b"collinear-initial-magmoms")
-            digest.update(_canonical_float64(initial_magmoms))
+            digest.update(_canonical_extxyz_array(initial_magmoms))
     return digest.hexdigest()
 
 
@@ -65,7 +79,7 @@ def geometry_id(atoms: Atoms) -> str:
     digest.update(GEOMETRY_ID_VERSION.encode("ascii"))
     digest.update(np.asarray(atoms.numbers, dtype="<i8").tobytes(order="C"))
     digest.update(_canonical_float64(atoms.cell))
-    digest.update(_canonical_float64(atoms.positions))
+    digest.update(_canonical_extxyz_array(atoms.positions))
     digest.update(np.asarray(atoms.pbc, dtype=np.uint8).tobytes(order="C"))
     return digest.hexdigest()
 
