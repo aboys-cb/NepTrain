@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import os
@@ -29,6 +29,11 @@ from .iteration import (
 )
 from .md import MdError, MdRequest, MdResult, run_md
 from .nep.calculator import DescriptorCalculator, Nep3Calculator
+from .reporting import (
+    ParitySeries,
+    build_evaluation_report,
+    build_parity_report,
+)
 from .scenario import ScenarioLadder
 from .sampling_route import (
     SamplingRoute,
@@ -54,7 +59,20 @@ TrainRunner = Callable[[TrainingRequest, str], TrainingResult]
 MdRunner = Callable[[MdRequest, str], MdResult]
 LabelRunner = Callable[[LabelRequest, str], LabelResult]
 DescriptorRunner = Callable[[Path, Sequence[Atoms]], np.ndarray]
-PredictionRunner = Callable[[Path, Sequence[Atoms], str], Mapping[str, float]]
+
+
+@dataclass(frozen=True)
+class PredictionEvaluation:
+    """Metrics and paired values from one model inference pass."""
+
+    metrics: Mapping[str, float]
+    comparisons: Mapping[str, ParitySeries] = field(default_factory=dict)
+
+
+PredictionRunner = Callable[
+    [Path, Sequence[Atoms], str],
+    PredictionEvaluation,
+]
 _DESCRIPTOR_BATCH_SIZE = 4096
 _CANDIDATE_VALIDATION_REGRESSION_FACTOR = 1.02
 
@@ -138,9 +156,9 @@ def _threshold_score(
     )
 
 
-def _nep_prediction_metrics(
+def _nep_prediction_evaluation(
     model: Path, frames: Sequence[Atoms], backend: str
-) -> Mapping[str, float]:
+) -> PredictionEvaluation:
     if not frames:
         raise WorkflowIterationError("evaluation requires at least one labeled frame")
     spin = "spin" in frames[0].arrays
@@ -150,24 +168,55 @@ def _nep_prediction_metrics(
         else:
             energy, forces, virials = calculator.calculate(frames)
             mforces = None
-    result = {
-        "energy_rmse": _rmse(
-            np.asarray([frame.get_potential_energy() for frame in frames]), energy
+    reference_energy = np.asarray(
+        [frame.get_potential_energy() for frame in frames]
+    )
+    predicted_energy = np.asarray(energy)
+    reference_force = np.concatenate(
+        [reference_forces(frame) for frame in frames]
+    )
+    predicted_force = np.concatenate(forces)
+    reference_virial = np.asarray(
+        [frame.info["virial"] for frame in frames]
+    )
+    predicted_virial = np.asarray(virials)
+    metrics = {
+        "energy_rmse": _rmse(reference_energy, predicted_energy),
+        "force_rmse": _rmse(reference_force, predicted_force),
+        "virial_rmse": _rmse(reference_virial, predicted_virial),
+    }
+    comparisons = {
+        "energy": ParitySeries(
+            reference_energy,
+            predicted_energy,
+            "eV",
         ),
-        "force_rmse": _rmse(
-            np.concatenate([reference_forces(frame) for frame in frames]),
-            np.concatenate(forces),
+        "force": ParitySeries(
+            reference_force,
+            predicted_force,
+            "eV/Å",
         ),
-        "virial_rmse": _rmse(
-            np.asarray([frame.info["virial"] for frame in frames]), virials
+        "virial": ParitySeries(
+            reference_virial,
+            predicted_virial,
+            "eV",
         ),
     }
     if spin:
-        result["mforce_rmse"] = _rmse(
-            np.concatenate([frame.arrays["mforce"] for frame in frames]),
-            np.concatenate(mforces),
+        reference_mforce = np.concatenate(
+            [frame.arrays["mforce"] for frame in frames]
         )
-    return result
+        predicted_mforce = np.concatenate(mforces)
+        metrics["mforce_rmse"] = _rmse(
+            reference_mforce,
+            predicted_mforce,
+        )
+        comparisons["mforce"] = ParitySeries(
+            reference_mforce,
+            predicted_mforce,
+            "eV/spin unit",
+        )
+    return PredictionEvaluation(metrics, comparisons)
 
 
 @dataclass(frozen=True)
@@ -178,7 +227,7 @@ class WorkflowRuntime:
     md: MdRunner = run_md
     label: LabelRunner = label
     descriptors: DescriptorRunner = _nep_descriptors
-    predict: PredictionRunner = _nep_prediction_metrics
+    predict: PredictionRunner = _nep_prediction_evaluation
 
 
 def _read_frames(path: Path) -> list[Atoms]:
@@ -1630,7 +1679,7 @@ class WorkflowIterationAdapter:
             context.artifacts["model"],
             frames,
             str(options.get("inference_backend", "auto")),
-        )
+        ).metrics
         metrics = {
             f"current_model_{name}": float(value)
             for name, value in raw_metrics.items()
@@ -1649,7 +1698,7 @@ class WorkflowIterationAdapter:
                     context.artifacts["model"],
                     attempt_frames,
                     str(options.get("inference_backend", "auto")),
-                ).items()
+                ).metrics.items()
             }
             attempt_metrics[attempt_id] = values
             attempt_accepted[attempt_id] = (
@@ -2000,7 +2049,7 @@ class WorkflowIterationAdapter:
                     candidate_model,
                     labeled_frames,
                     str(options.get("inference_backend", "auto")),
-                ).items()
+                ).metrics.items()
             }
             if candidate_trained
             else {}
@@ -2128,6 +2177,12 @@ class WorkflowIterationAdapter:
                 context.work_dir / "signals.json", signals
             ),
         }
+        report = build_evaluation_report(
+            context.work_dir,
+            metrics=label_metrics,
+            thresholds={},
+        )
+        artifacts["evaluation_report"] = report.report
         if active_checkpoint is not None:
             artifacts["activated_checkpoint"] = active_checkpoint
         return StageOutcome(artifacts=artifacts, metrics=signals)
@@ -2154,13 +2209,12 @@ class WorkflowIterationAdapter:
         candidate_model = context.artifacts["retrained_model"]
         parent_model_sha256 = _file_sha256(parent_model)
         candidate_model_sha256 = _file_sha256(candidate_model)
-        parent_metrics = dict(
-            self.runtime.predict(
-                parent_model,
-                frames,
-                inference_backend,
-            )
+        parent_evaluation = self.runtime.predict(
+            parent_model,
+            frames,
+            inference_backend,
         )
+        parent_metrics = dict(parent_evaluation.metrics)
         parent_finite = all(
             np.isfinite(float(value)) for value in parent_metrics.values()
         )
@@ -2216,17 +2270,16 @@ class WorkflowIterationAdapter:
             and candidate_model_sha256 != parent_model_sha256
         )
         candidate_trained = retraining.get("retrained") is True
-        candidate_metrics = (
-            dict(
-                self.runtime.predict(
-                    candidate_model,
-                    frames,
-                    inference_backend,
-                )
+        candidate_evaluation = (
+            self.runtime.predict(
+                candidate_model,
+                frames,
+                inference_backend,
             )
             if candidate_trained
-            else dict(parent_metrics)
+            else parent_evaluation
         )
+        candidate_metrics = dict(candidate_evaluation.metrics)
         candidate_finite = all(
             np.isfinite(float(value)) for value in candidate_metrics.values()
         )
@@ -2250,7 +2303,7 @@ class WorkflowIterationAdapter:
                     candidate_model,
                     labeled_frames,
                     inference_backend,
-                ).items()
+                ).metrics.items()
             }
             candidate_label_accepted = _within_thresholds(
                 candidate_label_metrics, thresholds
@@ -2271,7 +2324,7 @@ class WorkflowIterationAdapter:
                         candidate_model,
                         attempt_frames,
                         inference_backend,
-                    ).items()
+                    ).metrics.items()
                 }
                 candidate_label_attempt_metrics[
                     attempt_id
@@ -2486,10 +2539,36 @@ class WorkflowIterationAdapter:
         )
         output = _write_json(context.work_dir / f"signals{suffix}.json", signals)
         artifacts["signals"] = output
+        report = build_evaluation_report(
+            context.work_dir,
+            metrics=candidate_metrics,
+            thresholds=thresholds,
+            parent_metrics=parent_metrics,
+            suffix=suffix,
+        )
+        artifacts["evaluation_report"] = report.report
+        if report.chart is not None:
+            artifacts["evaluation_chart"] = report.chart
+        if candidate_evaluation.comparisons:
+            parity = build_parity_report(
+                context.work_dir,
+                series=candidate_evaluation.comparisons,
+                source={
+                    "validation_name": self.validation.name,
+                    "validation_sha256": _file_sha256(self.validation),
+                    "candidate_model_sha256": candidate_model_sha256,
+                    "evaluated_count": len(frames),
+                },
+                suffix=suffix,
+            )
+            artifacts["evaluation_parity_report"] = parity.report
+            if parity.chart is not None:
+                artifacts["evaluation_parity"] = parity.chart
         return StageOutcome(artifacts=artifacts, metrics=signals)
 
 
 __all__ = [
+    "PredictionEvaluation",
     "WorkflowIterationAdapter",
     "WorkflowIterationError",
     "WorkflowRuntime",

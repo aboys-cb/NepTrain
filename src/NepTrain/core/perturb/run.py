@@ -9,7 +9,7 @@ from ase import Atoms
 from ase.io import write as ase_write
 from rich.progress import track
 
-from NepTrain import utils
+from ..structures import read_structures
 
 
 def perturb_position(prim, min_distance, rng=None):
@@ -51,12 +51,9 @@ def generate_deformed_structure(prim, strain_lim, min_distance, rng=None):
     atoms.set_cell(cell_new, scale_atoms=True)
 
     return perturb_position(atoms, min_distance, rng)
-@utils.iter_path_to_atoms(
-    ["*.vasp", "*.xyz"],
-    show_progress=False,
-    fail_fast=True,
-)
-def perturb(
+
+
+def _perturb_structure(
     atoms: Atoms,
     cell_pert_fraction=0.04,
     min_distance=0.1,
@@ -94,6 +91,29 @@ def perturb(
 
         structures_rattle.append(structure)
     return structures_rattle
+
+
+def perturb(
+    source,
+    cell_pert_fraction=0.04,
+    min_distance=0.1,
+    num=50,
+    rng=None,
+):
+    """Perturb every input structure in deterministic file/frame order."""
+
+    if rng is None:
+        rng = np.random.default_rng()
+    return [
+        _perturb_structure(
+            atoms,
+            cell_pert_fraction=cell_pert_fraction,
+            min_distance=min_distance,
+            num=num,
+            rng=rng,
+        )
+        for atoms in read_structures(source)
+    ]
 
 
 def run_perturb(argparse):

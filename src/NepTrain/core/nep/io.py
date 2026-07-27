@@ -5,7 +5,9 @@
 # @email    : 1747193328@qq.com
 
 import os
+from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 
@@ -18,8 +20,6 @@ except ImportError:  # pragma: no cover - optional progress dependency
     FileSystemEventHandler = object
     Observer = None
 
-
-from NepTrain import utils
 from .utils import read_symbols_from_file
 
 
@@ -28,7 +28,7 @@ from .utils import read_symbols_from_file
 class NepFileMoniter(FileSystemEventHandler):
     def __init__(self,file_path,total):
 
-        self.file_path = file_path
+        self.file_path = Path(file_path).resolve()
         self.progress = Progress( )
         self.current_steps=0
         self.total=int(total)
@@ -36,8 +36,8 @@ class NepFileMoniter(FileSystemEventHandler):
         self.pbar=self.progress.add_task(total=int(total),description="NEP training")
     def on_modified(self, event):
 
-        if not utils.is_diff_path(event.src_path , self.file_path):
-            with open(self.file_path,'r',encoding="utf8") as f:
+        if Path(event.src_path).resolve() == self.file_path:
+            with self.file_path.open('r',encoding="utf8") as f:
                 lines = f.readlines()
                 if not lines:
                     return
@@ -106,47 +106,53 @@ class RunInput:
 
 
     def calculate(self,directory,show_progress=True):
-        utils.verify_path(directory)
+        directory = Path(directory).expanduser().resolve()
+        directory.mkdir(parents=True, exist_ok=True)
         if self.restart:
-            # utils.print_tip("Start the restart mode!")
-            if utils.is_diff_path(self.restart_nep_path,os.path.join(directory,"nep.restart")):
+            restart_target = directory / "nep.restart"
+            restart_source = Path(self.restart_nep_path).expanduser().resolve()
+            if restart_source != restart_target:
+                shutil.copy2(restart_source, restart_target)
 
-                utils.copy(self.restart_nep_path,os.path.join(directory,"nep.restart"))
 
-
-        self.write_run(os.path.join(directory,"nep.in"))
+        self.write_run(directory / "nep.in")
         if self.train_xyz_path is   None or not  os.path.exists(self.train_xyz_path):
             raise ValueError("A valid train.xyz must be specified.")
-        if utils.is_diff_path(self.train_xyz_path ,os.path.join(directory,"train.xyz")):
-
-            shutil.copy(self.train_xyz_path,os.path.join(directory,"train.xyz"))
+        train_source = Path(self.train_xyz_path).expanduser().resolve()
+        train_target = directory / "train.xyz"
+        if train_source != train_target:
+            shutil.copy2(train_source, train_target)
         if self.test_xyz_path is not None and os.path.exists(self.test_xyz_path):
-            if utils.is_diff_path(self.test_xyz_path, os.path.join(directory, "test.xyz")):
-
-                shutil.copy(self.test_xyz_path, os.path.join(directory, "test.xyz"))
+            test_source = Path(self.test_xyz_path).expanduser().resolve()
+            test_target = directory / "test.xyz"
+            if test_source != test_target:
+                shutil.copy2(test_source, test_target)
         observer = Observer() if show_progress and Observer is not None else None
         if observer is not None:
 
-            handler=NepFileMoniter(os.path.join(directory,"loss.out"),self.run_in["generation"])
-            watch=observer.schedule(handler, os.path.abspath(directory) , recursive=False)
+            handler=NepFileMoniter(directory / "loss.out",self.run_in["generation"])
+            watch=observer.schedule(handler, str(directory), recursive=False)
 
 
             if not observer.is_alive():
 
                 observer.start()
 
-        with   open(os.path.join(directory,"nep.out"), "w") as f_std, open(os.path.join(directory,"nep.err"), "w", buffering=1) as f_err:
+        with (directory / "nep.out").open("w") as f_std, (directory / "nep.err").open("w", buffering=1) as f_err:
 
-            errorcode = subprocess.call(self.command,
-                                        shell=True,
-                                        stdout=f_std,
-                                        stderr=f_err,
-                                        cwd=directory)
+            completed = subprocess.run(
+                shlex.split(self.command),
+                stdout=f_std,
+                stderr=f_err,
+                cwd=directory,
+                check=False,
+            )
 
-        if errorcode != 0:
+        if completed.returncode != 0:
             raise RuntimeError(
-                f"GPUMD NEP training failed with exit code {errorcode}; "
-                f"see {os.path.join(directory, 'nep.err')}"
+                "GPUMD NEP training failed with exit code "
+                f"{completed.returncode}; "
+                f"see {directory / 'nep.err'}"
             )
 
 

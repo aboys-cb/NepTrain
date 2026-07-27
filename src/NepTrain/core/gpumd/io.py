@@ -4,18 +4,13 @@
 # @Author  : 兵
 # @email    : 1747193328@qq.com
 import os
+from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 
 from ase.io import write as ase_write
-
-from NepTrain import utils
-from .plot import *
-
-
-
-
 
 class RunInput:
 
@@ -88,33 +83,34 @@ class RunInput:
         :param show_progress:
         :return:
         """
-        if not os.path.exists(directory):
-            os.makedirs(directory )
+        directory = Path(directory).expanduser().resolve()
+        directory.mkdir(parents=True, exist_ok=True)
 
-        self.write_run(os.path.join(directory,"run.in"))
-        ase_write(os.path.join(directory,"model.xyz"),atoms,format="extxyz")
+        self.write_run(directory / "run.in")
+        ase_write(directory / "model.xyz",atoms,format="extxyz")
         if self.nep_txt_path is not None and os.path.exists(self.nep_txt_path):
-            if utils.is_diff_path(self.nep_txt_path, os.path.join(directory, "nep.txt")):
-
-                shutil.copy(self.nep_txt_path, os.path.join(directory, "nep.txt"))
+            model_source = Path(self.nep_txt_path).expanduser().resolve()
+            model_target = directory / "nep.txt"
+            if model_source != model_target:
+                shutil.copy2(model_source, model_target)
         else:
             raise ValueError(f"{self.nep_txt_path} is an invalid path！")
 
-        with   open(os.path.join(directory,"gpumd.out"), "w") as f_std, open(os.path.join(directory,"gpumd.err"), "w", buffering=1) as f_err:
+        with (directory / "gpumd.out").open("w") as f_std, (directory / "gpumd.err").open("w", buffering=1) as f_err:
 
-            errorcode = subprocess.call(self.command,
-                                        shell=True,
-                                        stdout=f_std,
-                                        stderr=f_err,
-                                        cwd=directory)
-
-        if errorcode != 0:
-            raise RuntimeError(
-                f"GPUMD MD failed with exit code {errorcode}; "
-                f"see {os.path.join(directory, 'gpumd.err')}"
+            completed = subprocess.run(
+                shlex.split(self.command),
+                stdout=f_std,
+                stderr=f_err,
+                cwd=directory,
+                check=False,
             )
 
-        plot_md_thermo(os.path.join(directory,"thermo.out") )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"GPUMD MD failed with exit code {completed.returncode}; "
+                f"see {directory / 'gpumd.err'}"
+            )
 
 if __name__ == '__main__':
     # read_thermo("1.out",80)

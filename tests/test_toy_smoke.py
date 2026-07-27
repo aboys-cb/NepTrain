@@ -8,11 +8,11 @@ from ase import Atoms
 from ase.io import read, write
 
 from NepTrain.core.labeling import LabelRequest, LabelingError, label
+from NepTrain.core.fps import farthest_point_sampling
 from NepTrain.core.scientific_data import (
     labeled_input_structure_ids,
     structure_id,
 )
-from NepTrain.core.select import farthest_point_sampling
 from NepTrain.core.smoke import SmokeError, run_smoke
 from NepTrain.core.spin import validate_spin_dataset
 
@@ -196,8 +196,16 @@ write(args.output, frames, format="extxyz")
 
 def test_fps_is_deterministic_without_a_reference_and_never_repeats():
     points = np.asarray([[0.0], [1.0], [1.0], [2.0]])
-    first = farthest_point_sampling(points, 10, min_dist=0.0)
-    second = farthest_point_sampling(points, 10, min_dist=0.0)
+    first = farthest_point_sampling(
+        points,
+        budget=10,
+        min_novelty=0.0,
+    ).selected_indices
+    second = farthest_point_sampling(
+        points,
+        budget=10,
+        min_novelty=0.0,
+    ).selected_indices
     assert first == second
     assert len(first) == len(set(first))
     assert len(first) == 3

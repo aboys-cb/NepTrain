@@ -170,7 +170,6 @@ def test_abacus_deltaspin_switch_requires_canonical_spin_input():
 
 def test_native_abacus_labels_without_ase_plugin(tmp_path: Path, monkeypatch):
     module = importlib.import_module("NepTrain.core.dft.abacus.run")
-    monkeypatch.setattr(module, "atoms_index", 1)
     source = tmp_path / "selected.xyz"
     write(
         source,

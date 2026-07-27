@@ -5,23 +5,14 @@ from pathlib import Path
 
 from ase import Atoms
 from ase.io import write as ase_write
+from rich.progress import track
 
-from NepTrain import utils
-
+from ...structures import read_structures
 from .io import read_input_file
 from .native import NativeAbacusRequest, run_native_abacus
 
-atoms_index = 1
 
-
-@utils.iter_path_to_atoms(
-    ["*.vasp", "*.xyz"],
-    show_progress=True,
-    fail_fast=True,
-    description="ABACUS calculation progress",
-)
-def calculate_abacus(atoms: Atoms, args):
-    global atoms_index
+def calculate_abacus(atoms: Atoms, args, *, case_index: int = 1):
     resource_dir = Path(getattr(args, "resource_dir", None) or "./").resolve()
     raw_manifest = getattr(args, "resource_manifest", None)
     resource_manifest = (
@@ -58,24 +49,30 @@ def calculate_abacus(atoms: Atoms, args):
                 getattr(args, "flat_single_case", False)
             ),
         ),
-        case_index=atoms_index,
+        case_index=case_index,
     )
-    atoms_index += 1
     return result
 
 
 def run_abacus(args):
-    global atoms_index
-    atoms_index = 1
-    result = calculate_abacus(args.model_path, args)
+    result = [
+        calculate_abacus(atoms, args, case_index=index)
+        for index, atoms in enumerate(
+            track(
+                read_structures(args.model_path),
+                description="ABACUS calculation progress",
+            ),
+            start=1,
+        )
+    ]
     path = os.path.dirname(args.out_file_path)
-    if path and not os.path.exists(path):
-        os.makedirs(path)
+    if path:
+        os.makedirs(path, exist_ok=True)
     if len(result) and isinstance(result[0], list):
         result = [atoms for _list in result for atoms in _list]
     if not result:
         raise RuntimeError("ABACUS produced no labeled structures")
     ase_write(args.out_file_path, result, format="extxyz", append=args.append)
 
-    utils.print_success("ABACUS calculation task completed!")
+    print("ABACUS calculation task completed!")
     return result

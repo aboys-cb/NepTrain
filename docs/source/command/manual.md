@@ -62,7 +62,8 @@ neptrain select md-300.xyz md-600.xyz \
 空间中的严格阈值；精确重复点在阈值为 `0` 时也不会重复入选。
 
 候选结构先按稳定的 structure ID 去重。提供 `--nep` 时通过 NEPAdapters 计算
-NEP 描述符；未提供时使用 SOAP，可用 `--r-cut`、`--n-max` 和 `--l-max` 调整参数。
+NEP 描述符；未提供时使用 SOAP（需安装 `NepTrain[soap]`），可用 `--r-cut`、
+`--n-max` 和 `--l-max` 调整参数。
 需要先过滤异常短键时使用 `--filter 0.6`，并可通过 `--rejected-out` 单独保存被拒
 结构。选择报告默认写在输出文件旁，也可由 `--report` 指定路径。
 

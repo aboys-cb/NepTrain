@@ -28,7 +28,11 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
         (output / "nep_final.txt").write_text("nep4 1 Fe\n", encoding="utf-8")
         (output / "checkpoint.pt").write_bytes(b"checkpoint")
         (output / "checkpoint_stage1.pt").write_bytes(b"stage 1")
-        (output / "loss.out").write_text("loss\n", encoding="utf-8")
+        (output / "loss.out").write_text(
+            "0 4 0.1 0.2 2 3 4 2.5 3.5 4.5\n"
+            "10 2 0.1 0.2 1 2 3 1.5 2.5 3.5\n",
+            encoding="utf-8",
+        )
         (output / "force_train.out").write_text("forces\n", encoding="utf-8")
         (output / "output.log").write_text("training log\n", encoding="utf-8")
 
@@ -70,6 +74,8 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
         "force_train.out",
         "loss.out",
         "output.log",
+        "training-convergence.svg",
+        "training-report.json",
     }
     assert captured["finetune_from"] == str(finetune)
     assert captured["resume_from"] is None

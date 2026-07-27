@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import random
 import shutil
@@ -11,6 +11,7 @@ from typing import Mapping
 from ase.io import read as ase_read
 import numpy as np
 
+from .reporting import build_training_report
 from .spin import validate_spin_dataset
 
 
@@ -84,11 +85,20 @@ def _train_gpumd(request: TrainingRequest) -> TrainingResult:
     model = request.output_dir / "nep.txt"
     if not model.is_file():
         raise TrainingError("GPUMD training completed without nep.txt")
+    outputs = {
+        path.name: path
+        for path in sorted(request.output_dir.glob("*.out"))
+        if path.is_file()
+    }
+    output_log = request.output_dir / "output.log"
+    if output_log.is_file():
+        outputs[output_log.name] = output_log
     return TrainingResult(
         backend="gpumd",
         best_model=model,
         final_model=model,
         checkpoint=(request.output_dir / "nep.restart") if (request.output_dir / "nep.restart").is_file() else None,
+        outputs=outputs,
     )
 
 
@@ -165,4 +175,13 @@ def train(request: TrainingRequest, backend: str) -> TrainingResult:
     else:
         raise TrainingError("training backend must be gpumd or torchnep")
     _validate_adapter_model(result.best_model, expects_spin=expects_spin)
-    return result
+    report = build_training_report(
+        request.output_dir,
+        backend=result.backend,
+        loss_path=result.outputs.get("loss.out"),
+    )
+    outputs = dict(result.outputs)
+    outputs[report.report.name] = report.report
+    if report.chart is not None:
+        outputs[report.chart.name] = report.chart
+    return replace(result, outputs=outputs)

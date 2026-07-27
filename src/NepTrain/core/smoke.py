@@ -15,7 +15,7 @@ from ase.io import write as ase_write
 
 from .labeling import LabelRequest, label
 from .dft.toy import ToyTeacher
-from .select.select import farthest_point_sampling
+from .fps import farthest_point_sampling
 from .spin import SpinDataError, validate_spin_dataset
 from .toy_workflow import toy_base_frame, toy_candidate_frames, toy_features
 
@@ -176,11 +176,17 @@ def run_smoke(
     seed_features = feature_matrix[:1]
     candidate_features = feature_matrix[1:]
     selected = farthest_point_sampling(
-        candidate_features, max_selected, 0.0, seed_features
-    )
+        candidate_features,
+        budget=max_selected,
+        min_novelty=0.0,
+        reference_descriptors=seed_features,
+    ).selected_indices
     repeated = farthest_point_sampling(
-        candidate_features, max_selected, 0.0, seed_features
-    )
+        candidate_features,
+        budget=max_selected,
+        min_novelty=0.0,
+        reference_descriptors=seed_features,
+    ).selected_indices
     selected_frames = [candidates[index] for index in selected]
     selected_input = root / "selected-input.xyz"
     selected_output = root / "selected-labels.xyz"
@@ -214,11 +220,11 @@ def run_smoke(
 
     teacher = ToyTeacher(teacher_profile)
     force_error, virial_error, mforce_error = _derivative_probe(teacher, seed_frame)
-    selected_features = candidate_features[selected]
+    selected_features = candidate_features[list(selected)]
     reference = np.vstack([seed_features, selected_features])
     remaining = np.linalg.norm(candidate_features[:, None, :] - reference[None, :, :], axis=2).min(axis=1)
     energies = np.asarray([frame.get_potential_energy() for frame in truth])
-    selected_energies = energies[selected]
+    selected_energies = energies[list(selected)]
     energy_span = float(np.ptp(energies))
     span_fraction = float(np.ptp(selected_energies) / energy_span) if energy_span > 0 else 1.0
 

@@ -16,7 +16,7 @@ from ase.io import write as ase_write
 from ..fps import hierarchical_farthest_point_sampling
 from ..nep.calculator import DescriptorCalculator
 from ..scientific_data import STRUCTURE_ID_VERSION, structure_id
-from .filter import adjust_reasonable
+from ..md.health import is_structure_reasonable
 
 
 class SelectionError(RuntimeError):
@@ -94,8 +94,8 @@ def _descriptor_calculator(args, frames: Sequence[Atoms]) -> tuple[Any, dict[str
         )
     except ImportError as error:
         raise SelectionError(
-            "SOAP selection requires dscribe; install NepTrain with its "
-            "selection dependencies or pass --nep"
+            "SOAP selection requires dscribe; install NepTrain[soap] "
+            "or pass --nep"
         ) from error
     return calculator, {
         "kind": "soap",
@@ -140,7 +140,10 @@ def run_select(args) -> dict[str, Any]:
         coefficient = float(args.filter)
         accepted = []
         for record in records:
-            if adjust_reasonable(record.frame, coefficient):
+            if is_structure_reasonable(
+                record.frame,
+                min_distance_ratio=coefficient,
+            ):
                 accepted.append(record)
             else:
                 rejected.append(record.frame)

@@ -24,11 +24,13 @@ from NepTrain.core.toy_iteration import (
 from NepTrain.core.toy_workflow import toy_candidate_frames, toy_raw_features
 from NepTrain.core.training import TrainingResult
 from NepTrain.core.workflow_iteration import (
+    PredictionEvaluation,
     WorkflowIterationAdapter,
     WorkflowIterationError,
     WorkflowRuntime,
     _batched_descriptors,
 )
+from NepTrain.core.reporting import ParitySeries
 from NepTrain.core.dft.toy import ToyTeacher
 from NepTrain.core.labeling import LabelResult
 from NepTrain.core.candidate_pool import (
@@ -498,12 +500,21 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
         calls.append(("predict", backend, len(frames)))
         candidate = model.read_text(encoding="utf-8").strip().endswith("2")
         scale = 1.0 if candidate or len(frames) != 3 else 10.0
-        return {
-            "energy_rmse": 0.1 * scale,
-            "force_rmse": 0.2 * scale,
-            "virial_rmse": 0.3 * scale,
-            "mforce_rmse": 0.4 * scale,
-        }
+        return PredictionEvaluation(
+            {
+                "energy_rmse": 0.1 * scale,
+                "force_rmse": 0.2 * scale,
+                "virial_rmse": 0.3 * scale,
+                "mforce_rmse": 0.4 * scale,
+            },
+            {
+                "energy": ParitySeries(
+                    np.asarray([0.0, 1.0]),
+                    np.asarray([0.1, 0.9]),
+                    "eV",
+                )
+            },
+        )
 
     config = {
         "training": {
@@ -567,6 +578,8 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     )
     assert summary.metrics["evaluate"]["added_training_count"] == 3
     assert summary.metrics["evaluate"]["mforce_rmse"] == 0.4
+    assert "evaluation_parity" in summary.artifacts
+    assert "evaluation_parity_report" in summary.artifacts
     assert summary.metrics["evaluate"]["model_trained_on_current_labels"] is True
     assert summary.metrics["explore"]["scenario_targets"] == ["smoke_passed"]
     assert summary.metrics["evaluate"]["scenario_counts_by_maturity"] == {
@@ -1001,7 +1014,9 @@ def test_next_md_round_uses_the_newly_published_model(tmp_path: Path):
             if model.read_text(encoding="utf-8").strip() == "model-2"
             else 2.0
         )
-        return {"energy_rmse": value, "force_rmse": value}
+        return PredictionEvaluation(
+            {"energy_rmse": value, "force_rmse": value}
+        )
 
     adapter = WorkflowIterationAdapter(
         {
@@ -1098,7 +1113,9 @@ def test_candidate_model_must_pass_activation_before_the_next_round(
             if model.read_text(encoding="utf-8").strip() == "candidate"
             else 2.0
         )
-        return {"energy_rmse": value, "force_rmse": value}
+        return PredictionEvaluation(
+            {"energy_rmse": value, "force_rmse": value}
+        )
 
     adapter = WorkflowIterationAdapter(
         {

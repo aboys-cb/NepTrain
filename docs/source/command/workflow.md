@@ -310,7 +310,14 @@ generations/0001/
 ```
 
 训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；
-`calculation` 软链指向真实执行目录，便于直接排查。
+`calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 Matplotlib
+从 `loss.out` 自动生成 `training-convergence.svg` 和可审计的
+`training-report.json`。配置独立验证集时，evaluate 还会生成按验收阈值归一化的
+`evaluation-metrics.svg` 与 `evaluation-report.json`；图中 1× 线就是配置阈值。
+同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction parity 图
+`evaluation-parity.svg`，spin 模型会增加 magnetic-force 面板。对应报告记录
+validation/model hash、总点数、实际绘制点数和 RMSE；大数组只对显示点做确定性
+抽样，RMSE 仍使用全部有限数据。
 
 内部 job 也只保留一层输入和一层输出。job 名称已经包含代数、阶段、route、
 attempt 和任务指纹，因此输出目录不再重复这些信息：
