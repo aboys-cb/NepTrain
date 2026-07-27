@@ -1,7 +1,0 @@
-potential nep.txt
-velocity 50
-ensemble npt_scr 50 50 100 0 0 0 0 0 0 100 100 100 100 100 100 1000
-time_step 1.0
-dump_thermo 1000
-dump_exyz 1000 0 0
-run 100000

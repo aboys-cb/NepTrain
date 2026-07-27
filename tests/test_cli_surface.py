@@ -95,6 +95,7 @@ def test_workflow_stop_exposes_explicit_job_preservation():
 def test_md_cli_keeps_template_owned_parameters_out_of_the_interface():
     completed = _help("md", "--help")
     assert completed.returncode == 0
+    assert "--seed" in completed.stdout
     for removed in (
         "--plugin-path",
         "--timestep",
@@ -320,6 +321,7 @@ def test_manual_md_inherits_the_selected_route_and_route_target(
     assert captured["target"].name == "route-worker"
     assert captured["temperatures"] == [400, 800]
     assert captured["steps"] == 456
+    assert captured["seed"] == 12345
     assert captured["pressure"] == 2.5
     assert captured["template_path"] == str((tmp_path / "route-b.in").resolve())
     assert json.loads(capsys.readouterr().out)["state"] == "complete"

@@ -241,7 +241,12 @@ def classify_trajectory(
     first_bad_step = (
         None
         if first_bad is None
-        else int(frames[first_bad].info.get("lammps_step", first_bad))
+        else int(
+            frames[first_bad].info.get(
+                "md_step",
+                frames[first_bad].info.get("lammps_step", first_bad),
+            )
+        )
     )
     return TrajectoryHealthReport(
         process_completed=bool(process_completed),

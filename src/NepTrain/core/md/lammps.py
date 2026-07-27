@@ -212,6 +212,7 @@ def read_lammps_dump(
         )
         frame.info["Config_type"] = f"lammps-step-{step}"
         frame.info["lammps_step"] = step
+        frame.info["md_step"] = step
         force_columns = ("fx", "fy", "fz")
         if all(name in index for name in force_columns):
             forces = np.asarray(

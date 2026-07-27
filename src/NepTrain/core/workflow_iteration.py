@@ -792,8 +792,6 @@ class WorkflowIterationAdapter:
                 try:
                     result = self.runtime.md(request, backend)
                 except MdError as error:
-                    if backend != "lammps":
-                        raise
                     attempt_results.append(
                         {
                             **base_result,
@@ -835,7 +833,12 @@ class WorkflowIterationAdapter:
                         0
                         if frame.info.get("md_window") == "pre_failure"
                         else 1,
-                        int(frame.info.get("lammps_step", 0)),
+                        int(
+                            frame.info.get(
+                                "md_step",
+                                frame.info.get("lammps_step", 0),
+                            )
+                        ),
                     )
                 )
                 if usable_frames:
@@ -954,7 +957,12 @@ class WorkflowIterationAdapter:
                 source_id=source,
                 temperature=metadata["temperature"],
                 pressure=metadata["pressure"],
-                frame_step=int(frame.info.get("lammps_step", frame_index)),
+                frame_step=int(
+                    frame.info.get(
+                        "md_step",
+                        frame.info.get("lammps_step", frame_index),
+                    )
+                ),
                 scenario_structure_id=metadata["structure_id"],
                 structure_hash=metadata["structure_hash"],
                 md_steps=metadata["md_steps"],

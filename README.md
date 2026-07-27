@@ -55,7 +55,7 @@ neptrain train train.xyz \
 训练后立即通过 NEPAdapters 检查模型格式和 spin 能力。TorchNEP 的最佳模型统一发布
 为 `nep.txt`。
 
-### 批量 LAMMPS
+### 批量 MD
 
 ```bash
 neptrain md structures/ \
@@ -70,6 +70,13 @@ neptrain md structures/ \
 
 输入会按“结构 × 温度”展开成独立任务。使用 Slurm target 时，它们会成为一个带并发
 上限的 job array，而不是在登录终端串行运行。
+
+将 `--backend` 改为 `gpumd` 即可使用 GPUMD。无模板时 NepTrain 会生成 NVT/NPT
+输入；`--seed` 控制初速度随机种子，`--pressure` 的 GPUMD 单位为 GPa。提供
+`run.in` 模板时，模板仍负责 thermostat/barostat 类型、耦合常数、`time_step`
+和 dump 间隔；NepTrain 只写入本轮模型、温度、NPT 目标压强、步数和种子，并确保
+dump 包含力。GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留
+稳定段和炸前帧。Spin MD 仍只支持 LAMMPS DynSpin。
 
 ### 批量标注
 
@@ -242,7 +249,7 @@ neptrain workflow stop workflow --keep-jobs
 
 ## schema v8
 
-自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、LAMMPS
+自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、MD
 模板和温度路径。默认压强、递进策略、轨迹帧策略和 FPS 上限无需重复填写：
 
 ```yaml
@@ -317,10 +324,10 @@ execution:
         NEPTRAIN_VASP_COMMAND: srun vasp_std
 ```
 
-`md` 只选择 MD Adapter 和推理后端。结构、LAMMPS 模板、温度、压强和递进步数
+`md` 只选择 MD Adapter 和推理后端。结构、MD 模板、温度、压强和递进步数
 都由 `sampling.routes` 管理。
 轨迹健康检查和 FPS 批量上限统一放在 `sampling`。`timestep`、`tdamp`、`pdamp`、
-`spin_alpha` 和 dump 频率直接写在用户的 LAMMPS 模板中。
+`spin_alpha` 和 dump 频率直接写在用户的 MD 模板中。
 
 `labeling.kpoint_mode: auto` 优先保留 INCAR 中的 `KSPACING`/`KGAMMA`
 或 ABACUS INPUT 中的 `kspacing`；生成的默认输入已给出可直接修改的

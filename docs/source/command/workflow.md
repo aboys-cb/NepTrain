@@ -98,6 +98,13 @@ NepTrain 只向 LAMMPS 模板注入 `temperature`、`pressure`、`steps`、`seed
 `plugin_path`，也不判断模板是 FIRE、NVT/NPT、spin MD、MC+MD 还是 chemical
 swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。
 
+选择 `md.backend: gpumd` 时，route 的 `template_path` 指向 GPUMD `run.in`。
+NepTrain 保留模板选择的 `nvt_*`/`npt_*` 方法、耦合常数、`time_step` 和 dump
+间隔，更新本轮模型、温度、步数与确定性 velocity seed；对 `npt_ber` 和
+`npt_scr` 还会按模板的 isotropic、orthorhombic 或 triclinic 形式写入目标压强
+（GPa）。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。Spin workflow
+仍明确使用 LAMMPS DynSpin。
+
 每条 route 的 `conditions.temperature_path` 是有顺序的温度探路路径。例如
 `[300, 500, 700, 900]` 会先验证 300 K，只有通过后才解锁 500 K。
 默认全部温度都会跑到最长时长。显式设置 `production_temperatures` 后，未列入

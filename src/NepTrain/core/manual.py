@@ -721,6 +721,7 @@ def prepare_md(
     workdir: str | Path | None,
     target: ExecutionTarget,
     steps: int,
+    seed: int = 12345,
     pressure: float = 0.0,
     ensemble: str = "nvt",
     template_path: str | Path | None = None,
@@ -745,6 +746,8 @@ def prepare_md(
     )
     if not temperatures:
         raise ManualTaskError("at least one temperature is required")
+    if seed < 1:
+        raise ManualTaskError("MD seed must be positive")
     payload = {
         "backend": backend,
         "source": str(Path(source).expanduser().resolve()),
@@ -779,6 +782,7 @@ def prepare_md(
                 "model_file": model,
                 "temperature": float(temperature),
                 "steps": int(steps),
+                "seed": int(seed) + index,
                 "pressure": float(pressure),
                 "ensemble": ensemble,
                 "template_path": template,
@@ -1003,6 +1007,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                         output_file=result_file,
                         temperature=float(request["temperature"]),
                         steps=int(request["steps"]),
+                        seed=int(request.get("seed", 12345)),
                         pressure=float(request["pressure"]),
                         ensemble=request["ensemble"],
                         template_path=_resolve(
@@ -1023,6 +1028,9 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 metrics = {
                     "backend": result.backend,
                     "temperature": request["temperature"],
+                    "completed": result.completed,
+                    "last_step": result.last_step,
+                    "failure_code": result.failure_code,
                 }
             else:
                 raise ManualTaskError(f"unsupported manual task: {operation.kind}")

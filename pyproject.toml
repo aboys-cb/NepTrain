@@ -76,7 +76,6 @@ local_scheme = "no-local-version"  # or "node-and-date"
 "NepTrain.core.dft.vasp" = ["INCAR" ]
 "NepTrain.core.dft.abacus" = ["INPUT" ]
 
-"NepTrain.core.gpumd" = ["run.in" ]
 "NepTrain.core.md" = ["templates/*.in"]
 
 

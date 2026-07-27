@@ -879,6 +879,7 @@ def test_manual_md_runtime_options_are_explicit_request_inputs(tmp_path):
             cpus_per_task=4,
         ),
         steps=10,
+        seed=700,
         lmp="/opt/lammps/lmp",
         mpi_ranks=4,
         inference_backend="cpu",
@@ -891,6 +892,7 @@ def test_manual_md_runtime_options_are_explicit_request_inputs(tmp_path):
     )
 
     assert request["lmp"] == "/opt/lammps/lmp"
+    assert request["seed"] == 700
     assert request["mpi_ranks"] == 4
     assert request["inference_backend"] == "cpu"
 

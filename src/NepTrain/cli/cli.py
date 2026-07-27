@@ -1070,6 +1070,11 @@ def run_manual_md_command(args):
             if args.steps is not None
             else progression["steps"][args.maturity]
         ),
+        seed=(
+            getattr(args, "seed", None)
+            if getattr(args, "seed", None) is not None
+            else int(project.get("workflow", {}).get("seed", 12345))
+        ),
         pressure=(
             args.pressure
             if args.pressure is not None
@@ -1340,6 +1345,7 @@ def build_manual_md(subparsers):
     parser.add_argument("--temperature", type=float, nargs="+")
     parser.add_argument("--pressure", type=float)
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--ensemble", choices=["nvt", "npt"])
     parser.add_argument("--template")
     parser.add_argument(
