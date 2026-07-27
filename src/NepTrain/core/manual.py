@@ -36,6 +36,16 @@ from .scientific_data import (
     structure_id,
     validate_labeled_frames,
 )
+from .slurm import (
+    ACTIVE_STATES as _SLURM_ACTIVE,
+    FAILURE_STATES as _SLURM_FAILURE,
+    SlurmScript,
+    SlurmSubmissionError,
+    query_job,
+    render_script,
+    setup_line,
+    submit_job,
+)
 from .spin import SpinDataError, validate_spin_dataset
 
 
@@ -43,28 +53,6 @@ class ManualTaskError(RuntimeError):
     """Raised when a manual step cannot be prepared, run, or collected."""
 
 
-_SLURM_ACTIVE = {
-    "CONFIGURING",
-    "COMPLETING",
-    "PENDING",
-    "REQUEUED",
-    "RESIZING",
-    "RUNNING",
-    "STAGE_OUT",
-    "SUSPENDED",
-}
-_SLURM_FAILURE = {
-    "BOOT_FAIL",
-    "CANCELLED",
-    "DEADLINE",
-    "FAILED",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "REVOKED",
-    "SPECIAL_EXIT",
-    "TIMEOUT",
-}
 _SCHEDULER_MISSING_GRACE_SECONDS = 300.0
 
 
@@ -1103,15 +1091,6 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
             return 1
 
 
-def _setup_line(target: ExecutionTarget, root: str) -> str | None:
-    if not target.setup_script:
-        return None
-    candidate = Path(target.setup_script).expanduser()
-    if candidate.is_file() and target.host is None:
-        return f"source {shlex.quote(str(candidate.resolve()))}"
-    return f"source {shlex.quote(str(target.setup_script))}"
-
-
 def _remote_root(operation: ManualOperation) -> str:
     assert operation.target.work_root
     return (
@@ -1263,34 +1242,10 @@ def _slurm_script(
     array = ",".join(str(value) for value in indices)
     if len(indices) > 1:
         array += f"%{_read_json(operation.descriptor)['max_concurrent']}"
-    lines = [
-        "#!/bin/bash",
-        f"#SBATCH --job-name=nt-{operation.operation_id}",
-        f"#SBATCH --output={root}/logs/scheduler-%A_%a.out",
-        f"#SBATCH --time={target.time}",
-        f"#SBATCH --partition={target.partition}",
-        f"#SBATCH --array={array}",
-    ]
-    if target.qos:
-        lines.append(f"#SBATCH --qos={target.qos}")
-    if target.cpus_per_task is not None:
-        lines.append(f"#SBATCH --cpus-per-task={target.cpus_per_task}")
-    if target.gpus_per_node is not None:
-        lines.append(f"#SBATCH --gpus-per-node={target.gpus_per_node}")
-    lines.extend(
-        directive
-        if directive.startswith("#SBATCH ")
-        else f"#SBATCH {directive}"
-        for directive in target.directives
+    setup = setup_line(
+        target.setup_script,
+        local=target.host is None,
     )
-    lines.extend(["", "set -eo pipefail", f"cd {shlex.quote(root)}"])
-    setup = _setup_line(target, root)
-    if setup:
-        lines.append(setup)
-    if target.cpus_per_task is not None:
-        lines.append('export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"')
-    for key, value in target.environment.items():
-        lines.append(f"export {key}={shlex.quote(value)}")
     worker = shlex.join(
         [
             *shlex.split(target.command),
@@ -1299,8 +1254,56 @@ def _slurm_script(
             "${SLURM_ARRAY_TASK_ID}",
         ]
     ).replace("'${SLURM_ARRAY_TASK_ID}'", '"${SLURM_ARRAY_TASK_ID}"')
-    lines.extend([worker, ""])
-    return "\n".join(lines)
+    return render_script(
+        SlurmScript(
+            job_name=f"nt-{operation.operation_id}",
+            output_path=f"{root}/logs/scheduler-%A_%a.out",
+            workdir=root,
+            command=worker,
+            partition=str(target.partition),
+            time_limit=target.time,
+            qos=target.qos,
+            cpus_per_task=target.cpus_per_task,
+            gpus_per_node=target.gpus_per_node,
+            directives=target.directives,
+            environment=target.environment,
+            setup_line=setup,
+            array=array,
+        )
+    )
+
+
+def _submit_slurm_script(
+    operation: ManualOperation,
+    root: str,
+    script_name: str,
+) -> str:
+    if operation.target.host:
+        transport = ExecutionTransport(operation.target)
+
+        def run(command):
+            return transport.run_script(
+                """set -eo pipefail
+cd "$1"
+exec sbatch --parsable "$2"
+""",
+                root,
+                command[-1],
+            )
+    else:
+
+        def run(command):
+            return subprocess.run(
+                list(command),
+                cwd=operation.root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+    try:
+        return submit_job(run, script_name)
+    except SlurmSubmissionError as error:
+        raise ManualTaskError(str(error)) from error
 
 
 def submit_operation(
@@ -1349,30 +1352,11 @@ def submit_operation(
             f"with max concurrency "
             f"{_read_json(operation.descriptor)['max_concurrent']}"
         )
-        completed = transport.run_script(
-            """set -eo pipefail
-cd "$1"
-sbatch --parsable "$2"
-""",
-            remote,
-            "job.sbatch",
-        )
     else:
         _progress(
             f"{operation.kind}: submitting {operation.shard_count} Slurm task(s)"
         )
-        completed = subprocess.run(
-            ["sbatch", "--parsable", "job.sbatch"],
-            cwd=operation.root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    if completed.returncode != 0:
-        raise ManualTaskError((completed.stderr or completed.stdout).strip())
-    job_id = completed.stdout.strip().split(";", 1)[0]
-    if not job_id.isdigit():
-        raise ManualTaskError(f"Slurm returned an invalid job id: {job_id}")
+    job_id = _submit_slurm_script(operation, remote, "job.sbatch")
     _progress(f"{operation.kind}: submitted Slurm job {job_id}")
     descriptor = _read_json(operation.descriptor)
     descriptor["state"] = "submitted"
@@ -1706,28 +1690,6 @@ def _publish_if_ready(operation: ManualOperation) -> None:
         _collect(operation)
 
 
-def _normalise_slurm_state(value: str) -> str:
-    state = value.strip().split("|", 1)[0]
-    return re.split(r"[+\s]", state, maxsplit=1)[0].upper()
-
-
-def _aggregate_slurm_states(states: Sequence[str]) -> str | None:
-    values = [_normalise_slurm_state(value) for value in states if value.strip()]
-    if not values:
-        return None
-    if any(value in {"RUNNING", "COMPLETING"} for value in values):
-        return "RUNNING"
-    if any(value in _SLURM_ACTIVE for value in values):
-        return "PENDING"
-    if any(value in _SLURM_FAILURE for value in values):
-        if all(value == "CANCELLED" for value in values):
-            return "CANCELLED"
-        return next(value for value in values if value in _SLURM_FAILURE)
-    if all(value == "COMPLETED" for value in values):
-        return "COMPLETED"
-    return values[0]
-
-
 def _run_on_target(
     operation: ManualOperation, command: Sequence[str]
 ) -> subprocess.CompletedProcess:
@@ -1765,37 +1727,11 @@ def _run_on_target(
 def _slurm_job_state(
     operation: ManualOperation, job_id: str | None
 ) -> tuple[str | None, str | None]:
-    if not job_id or not str(job_id).isdigit():
-        return None, None
-    queue = _run_on_target(
-        operation, ["squeue", "-h", "-j", str(job_id), "-o", "%T"]
+    observation = query_job(
+        lambda command: _run_on_target(operation, command),
+        job_id,
     )
-    if queue.returncode == 0:
-        state = _aggregate_slurm_states(queue.stdout.splitlines())
-        if state:
-            return state, None
-    account = _run_on_target(
-        operation,
-        [
-            "sacct",
-            "-n",
-            "-X",
-            "-j",
-            str(job_id),
-            "--format=State",
-            "--parsable2",
-        ],
-    )
-    if account.returncode == 0:
-        state = _aggregate_slurm_states(account.stdout.splitlines())
-        if state:
-            return state, None
-    detail = (
-        account.stderr.strip()
-        or queue.stderr.strip()
-        or "job is absent from squeue and sacct"
-    )
-    return None, detail
+    return observation.state, observation.error
 
 
 def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
@@ -2152,27 +2088,7 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
             check=True,
         )
         _progress(f"{operation.kind}: submitting failed jobs for retry")
-        completed = transport.run_script(
-            """set -eo pipefail
-cd "$1"
-sbatch --parsable "$2"
-""",
-            remote,
-            "retry.sbatch",
-        )
-    else:
-        completed = subprocess.run(
-            ["sbatch", "--parsable", "retry.sbatch"],
-            cwd=operation.root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    if completed.returncode != 0:
-        raise ManualTaskError((completed.stderr or completed.stdout).strip())
-    job_id = completed.stdout.strip().split(";", 1)[0]
-    if not job_id.isdigit():
-        raise ManualTaskError(f"Slurm returned an invalid job id: {job_id}")
+    job_id = _submit_slurm_script(operation, remote, "retry.sbatch")
     _progress(f"{operation.kind}: submitted retry job {job_id}")
     descriptor["state"] = "submitted"
     descriptor["job_id"] = job_id

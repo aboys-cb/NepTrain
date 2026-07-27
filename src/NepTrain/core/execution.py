@@ -26,6 +26,18 @@ from ase.io import write as ase_write
 
 from .iteration import GenerationPlan, StageContext, StageOutcome
 from .sampling_route import load_sampling_routes
+from .slurm import (
+    ACTIVE_STATES as _ACTIVE,
+    FAILURE_STATES as _TERMINAL_FAILURE,
+    SUCCESS_STATES as _TERMINAL_SUCCESS,
+    SlurmScript,
+    SlurmSubmissionError,
+    SlurmSubmissionThrottled,
+    query_job,
+    render_script,
+    setup_line,
+    submit_job,
+)
 
 
 class ExecutionError(RuntimeError):
@@ -34,57 +46,6 @@ class ExecutionError(RuntimeError):
 
 class SubmissionDeferred(ExecutionError):
     """Raised when a scheduler temporarily refuses additional submissions."""
-
-
-_TERMINAL_SUCCESS = {"COMPLETED"}
-_TERMINAL_FAILURE = {
-    "BOOT_FAIL",
-    "CANCELLED",
-    "DEADLINE",
-    "FAILED",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "REVOKED",
-    "SPECIAL_EXIT",
-    "TIMEOUT",
-}
-_ACTIVE = {
-    "CONFIGURING",
-    "COMPLETING",
-    "PENDING",
-    "REQUEUED",
-    "RESIZING",
-    "RUNNING",
-    "STAGE_OUT",
-    "SUSPENDED",
-}
-
-
-def _slurm_state(value: str) -> str:
-    """Normalize states such as ``COMPLETED+`` and ``CANCELLED by <uid>``."""
-
-    return re.split(r"[+\s]", value.strip(), maxsplit=1)[0].upper()
-
-
-def _slurm_submission_is_throttled(detail: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", " ", detail.lower())
-    compact = normalized.replace(" ", "")
-    markers = (
-        "qosmaxsubmitjobperuserlimit",
-        "assocmaxsubmitjoblimit",
-        "qosmaxjobsperuserlimit",
-        "assocmaxjobsperuserlimit",
-        "maximum number of jobs",
-        "max number of jobs",
-        "job submit limit",
-        "job submission limit",
-        "too many jobs",
-    )
-    return any(
-        marker in normalized or marker.replace(" ", "") in compact
-        for marker in markers
-    )
 
 
 def _failure_kind(detail: str) -> str | None:
@@ -1615,17 +1576,6 @@ def _prepare_setup(target: ExecutionTarget, task: StageTask) -> None:
         shutil.copy2(candidate, task.bundle / "target-setup.sh")
 
 
-def _setup_line(target: ExecutionTarget, bundle: str) -> str | None:
-    if not target.setup_script:
-        return None
-    path = target.setup_script
-    candidate = Path(path).expanduser()
-    if candidate.is_file():
-        source = str(candidate.resolve()) if target.host is None else f"{bundle}/target-setup.sh"
-        return f"source {shlex.quote(source)}"
-    return f"source {shlex.quote(path)}"
-
-
 def _worker_command(target: ExecutionTarget, bundle: str) -> str:
     return shlex.join([*shlex.split(target.command), "stage-worker", bundle])
 
@@ -1746,7 +1696,11 @@ class ProcessExecutor:
             archive.mkdir(parents=True, exist_ok=False)
             local_execution.replace(archive / "execution.json")
         lines = ["#!/bin/bash", "set -eo pipefail"]
-        setup = _setup_line(self.target, bundle)
+        setup = setup_line(
+            self.target.setup_script,
+            local=self.target.host is None,
+            packaged_remote_path=f"{bundle}/target-setup.sh",
+        )
         if setup:
             lines.append(setup)
         for key, value in self.target.environment.items():
@@ -2058,33 +2012,30 @@ cat "$bundle/execution.json"
                     "recovered_from_worker_result": True,
                 },
             )
-        lines = [
-            "#!/bin/bash",
-            f"#SBATCH --job-name={self._job_name(task.task_id)}",
-            f"#SBATCH --output={bundle}/{output_name}",
-            f"#SBATCH --time={self.target.time}",
-            f"#SBATCH --partition={self.target.partition}",
-        ]
-        if self.target.qos:
-            lines.append(f"#SBATCH --qos={self.target.qos}")
-        if self.target.cpus_per_task is not None:
-            lines.append(f"#SBATCH --cpus-per-task={self.target.cpus_per_task}")
-        if self.target.gpus_per_node is not None:
-            lines.append(f"#SBATCH --gpus-per-node={self.target.gpus_per_node}")
-        for directive in self.target.directives:
-            lines.append(
-                directive if directive.startswith("#SBATCH ") else f"#SBATCH {directive}"
-            )
-        lines.extend(["", "set -eo pipefail"])
-        setup = _setup_line(self.target, bundle)
-        if setup:
-            lines.append(setup)
-        if self.target.cpus_per_task is not None:
-            lines.append('export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"')
-        for key, value in self.target.environment.items():
-            lines.append(f"export {key}={shlex.quote(value)}")
-        lines.extend([f"cd {shlex.quote(bundle)}", _worker_command(self.target, bundle), ""])
-        script.write_text("\n".join(lines), encoding="utf-8")
+        setup = setup_line(
+            self.target.setup_script,
+            local=self.target.host is None,
+            packaged_remote_path=f"{bundle}/target-setup.sh",
+        )
+        script.write_text(
+            render_script(
+                SlurmScript(
+                    job_name=self._job_name(task.task_id),
+                    output_path=f"{bundle}/{output_name}",
+                    workdir=bundle,
+                    command=_worker_command(self.target, bundle),
+                    partition=str(self.target.partition),
+                    time_limit=self.target.time,
+                    qos=self.target.qos,
+                    cpus_per_task=self.target.cpus_per_task,
+                    gpus_per_node=self.target.gpus_per_node,
+                    directives=self.target.directives,
+                    environment=self.target.environment,
+                    setup_line=setup,
+                )
+            ),
+            encoding="utf-8",
+        )
         if self.target.host:
             uploaded = self.transport.copy(
                 script,
@@ -2104,23 +2055,24 @@ cat "$bundle/execution.json"
                 remote_bundle=bundle if self.target.host else None,
                 metadata={"job_name": name},
             )
-        args = ["sbatch", "--parsable", script_name]
-        completed = self.transport.run(
-            [bundle, *args] if self.target.host else args,
-            cwd=task.bundle if not self.target.host else None,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()
-            if _slurm_submission_is_throttled(detail):
-                raise SubmissionDeferred(detail)
-            raise ExecutionError(detail)
-        job_id = completed.stdout.strip().split(";", 1)[0]
-        if not job_id.isdigit():
+        try:
+            job_id = submit_job(
+                lambda command: self.transport.run(
+                    [bundle, *command] if self.target.host else command,
+                    cwd=task.bundle if not self.target.host else None,
+                ),
+                script_name,
+            )
+        except SlurmSubmissionThrottled as error:
+            raise SubmissionDeferred(str(error)) from error
+        except SlurmSubmissionError as error:
+            if not error.accepted:
+                raise ExecutionError(str(error)) from error
             recovered = self._find_job(name, bundle)
             if recovered is None:
                 raise ExecutionError(
-                    f"Slurm accepted an unparseable submission for {name}: {completed.stdout.strip()}"
-                )
+                    f"{error}; active job {name} could not be recovered"
+                ) from error
             job_id = recovered
         return ExecutionHandle(
             task.task_id,
@@ -2142,50 +2094,22 @@ cat "$bundle/execution.json"
             and worker_status.failure_kind == "out_of_memory"
         ):
             return worker_status
-        squeue = [
-            "squeue",
-            "--noheader",
-            "--jobs",
+        observation = query_job(
+            lambda command: self.transport.run(
+                [bundle, *command] if self.target.host else command,
+                cwd=Path(bundle) if not self.target.host else None,
+            ),
             handle.execution_id,
-            "--format",
-            "%T",
-        ]
-        completed = self.transport.run(
-            [bundle, *squeue] if self.target.host else squeue,
-            cwd=Path(bundle) if not self.target.host else None,
         )
-        if completed.returncode == 0 and completed.stdout.strip():
-            state = _slurm_state(completed.stdout.strip().splitlines()[0])
-            if state in _ACTIVE:
-                return ExecutionStatus("running", state)
-        sacct = [
-            "sacct",
-            "--noheader",
-            "--parsable2",
-            "--jobs",
-            handle.execution_id,
-            "--format",
-            "State,ExitCode",
-        ]
-        completed = self.transport.run(
-            [bundle, *sacct] if self.target.host else sacct,
-            cwd=Path(bundle) if not self.target.host else None,
-        )
-        if completed.returncode != 0:
+        if observation.state is None:
             return worker_status or ExecutionStatus(
-                "unknown", (completed.stderr or completed.stdout).strip()
+                "unknown",
+                observation.error or "Slurm has no accounting record yet",
             )
-        rows = [
-            line.split("|")
-            for line in completed.stdout.splitlines()
-            if line.strip()
-        ]
-        if not rows:
-            return worker_status or ExecutionStatus(
-                "unknown", "Slurm has no accounting record yet"
-            )
-        state = _slurm_state(rows[0][0])
-        exit_code = rows[0][1] if len(rows[0]) > 1 else ""
+        state = observation.state
+        exit_code = observation.exit_code
+        if state in _ACTIVE:
+            return ExecutionStatus("running", state)
         if state in _TERMINAL_SUCCESS and exit_code.startswith("0:0"):
             return ExecutionStatus("completed", state)
         if state in _TERMINAL_FAILURE or state in _TERMINAL_SUCCESS:
