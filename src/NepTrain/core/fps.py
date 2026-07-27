@@ -44,6 +44,17 @@ class HierarchicalFPSResult:
     remaining_novelty: float
 
 
+@dataclass(frozen=True)
+class FarthestPointResult:
+    """Result from the shared single-group FPS interface."""
+
+    selected_indices: tuple[int, ...]
+    selected_ids: tuple[str, ...]
+    selected_novelty: tuple[float, ...]
+    counts_by_stratum: Mapping[str, int]
+    remaining_novelty: float
+
+
 @dataclass
 class _GroupState:
     key: ElementSet
@@ -86,12 +97,19 @@ class _GroupState:
         )
 
     def select(self, index: int) -> None:
+        first_without_reference = (
+            not self.reference_count and not self.selected_local
+        )
         self.selected_local.append(index)
         self.selected_novelty.append(float(self.distances[index]))
         self.counts_by_stratum[self.strata[index]] += 1
         self.available[index] = False
         new_distances = np.linalg.norm(self.points - self.points[index], axis=1)
-        self.distances = np.minimum(self.distances, new_distances)
+        self.distances = (
+            new_distances
+            if first_without_reference
+            else np.minimum(self.distances, new_distances)
+        )
 
     def remaining_novelty(self) -> float:
         return float(self.distances[self.available].max(initial=0.0))
@@ -200,14 +218,145 @@ def _normalized_group(
 def _nearest_distances(
     points: np.ndarray,
     references: np.ndarray,
+    *,
+    point_batch_size: int = 4096,
+    reference_batch_size: int = 512,
 ) -> np.ndarray:
-    distances = np.full(len(points), np.inf, dtype=np.float64)
-    for reference in references:
-        distances = np.minimum(
-            distances,
-            np.linalg.norm(points - reference, axis=1),
+    """Return exact nearest-reference distances with bounded peak memory."""
+
+    result = np.full(len(points), np.inf, dtype=np.float64)
+    for point_start in range(0, len(points), point_batch_size):
+        point_stop = min(point_start + point_batch_size, len(points))
+        point_chunk = points[point_start:point_stop]
+        point_norm = np.einsum("ij,ij->i", point_chunk, point_chunk)
+        chunk_min = np.full(len(point_chunk), np.inf, dtype=np.float64)
+        for reference_start in range(0, len(references), reference_batch_size):
+            reference_stop = min(
+                reference_start + reference_batch_size, len(references)
+            )
+            reference_chunk = references[reference_start:reference_stop]
+            reference_norm = np.einsum(
+                "ij,ij->i", reference_chunk, reference_chunk
+            )
+            squared = (
+                point_norm[:, None]
+                + reference_norm[None, :]
+                - 2.0 * point_chunk @ reference_chunk.T
+            )
+            chunk_min = np.minimum(
+                chunk_min,
+                np.maximum(squared, 0.0).min(axis=1),
+            )
+        result[point_start:point_stop] = np.sqrt(chunk_min)
+    return result
+
+
+def farthest_point_sampling(
+    candidate_descriptors: np.ndarray,
+    *,
+    budget: int,
+    min_novelty: float = 0.0,
+    reference_descriptors: np.ndarray | None = None,
+    candidate_ids: Sequence[str] | None = None,
+    strata: Sequence[str] | None = None,
+) -> FarthestPointResult:
+    """Select one deterministic, balanced FPS group.
+
+    ``min_novelty`` is a strict gate after the deterministic no-reference seed.
+    Exact duplicates of a reference or selected candidate are therefore never
+    selected, including when the threshold is zero.
+    """
+
+    if budget < 0:
+        raise ValueError("budget must be non-negative")
+    if min_novelty < 0:
+        raise ValueError("min_novelty must be non-negative")
+    points = np.asarray(candidate_descriptors, dtype=np.float64)
+    if points.ndim != 2:
+        raise ValueError("candidate_descriptors must be a two-dimensional array")
+    if not np.isfinite(points).all():
+        raise ValueError("candidate_descriptors must contain only finite values")
+    if reference_descriptors is None:
+        references = np.empty((0, points.shape[1]), dtype=np.float64)
+    else:
+        references = np.asarray(reference_descriptors, dtype=np.float64)
+        if references.ndim != 2 or references.shape[1] != points.shape[1]:
+            raise ValueError(
+                "candidate and reference descriptors must have matching features"
+            )
+        if not np.isfinite(references).all():
+            raise ValueError(
+                "reference_descriptors must contain only finite values"
+            )
+    ids = tuple(
+        str(value)
+        for value in (
+            candidate_ids
+            if candidate_ids is not None
+            else (f"{index:012d}" for index in range(len(points)))
         )
-    return distances
+    )
+    if len(ids) != len(points):
+        raise ValueError("candidate_ids must match candidate descriptors")
+    if len(set(ids)) != len(ids):
+        raise ValueError("candidate_ids must be unique")
+    group_names = tuple(
+        str(value)
+        for value in (
+            strata if strata is not None else ("all" for _ in range(len(points)))
+        )
+    )
+    if len(group_names) != len(points):
+        raise ValueError("strata must match candidate descriptors")
+    if not len(points) or budget == 0:
+        return FarthestPointResult((), (), (), {}, 0.0)
+
+    original_indices = np.arange(len(points))
+    order = np.asarray(sorted(range(len(points)), key=lambda index: ids[index]))
+    points = points[order]
+    original_indices = original_indices[order]
+    ids = tuple(ids[index] for index in order)
+    group_names = tuple(group_names[index] for index in order)
+    normalized_points, normalized_references = _normalized_group(
+        points, references
+    )
+    if len(normalized_references):
+        distances = _nearest_distances(
+            normalized_points, normalized_references
+        )
+    else:
+        distances = np.linalg.norm(
+            normalized_points - normalized_points.mean(axis=0),
+            axis=1,
+        )
+    state = _GroupState(
+        key=(),
+        original_indices=original_indices,
+        ids=ids,
+        strata=group_names,
+        points=normalized_points,
+        distances=distances,
+        reference_count=len(normalized_references),
+        quota=min(int(budget), len(points)),
+        available=np.ones(len(points), dtype=bool),
+        selected_local=[],
+        selected_novelty=[],
+        counts_by_stratum=Counter(),
+    )
+    while len(state.selected_local) < state.quota:
+        candidate = state.next_candidate(min_novelty)
+        if candidate is None:
+            break
+        state.select(candidate)
+    return FarthestPointResult(
+        selected_indices=tuple(
+            int(state.original_indices[index]) for index in state.selected_local
+        ),
+        selected_ids=tuple(state.ids[index] for index in state.selected_local),
+        selected_novelty=tuple(state.selected_novelty),
+        counts_by_stratum=dict(sorted(state.counts_by_stratum.items())),
+        remaining_novelty=state.remaining_novelty(),
+    )
 
 
 def hierarchical_farthest_point_sampling(
@@ -396,8 +545,10 @@ def hierarchical_farthest_point_sampling(
 
 __all__ = [
     "ElementSet",
+    "FarthestPointResult",
     "FPSGroupReport",
     "HierarchicalFPSResult",
     "element_set",
+    "farthest_point_sampling",
     "hierarchical_farthest_point_sampling",
 ]

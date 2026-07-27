@@ -9,7 +9,6 @@ import shutil
 
 from ruamel.yaml import YAML
 
-from NepTrain import utils
 from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_LABEL_JOB
 
 
@@ -221,7 +220,7 @@ def init_project(
             if not path.exists() or force:
                 path.write_text(content, encoding="utf-8")
                 path.chmod(0o755)
-    utils.print_success(
+    print(
         f"Created {project}. Add train.xyz, nep.in and route structures; "
         "optionally configure evaluation, then run "
         "`neptrain doctor --project project.yaml`."

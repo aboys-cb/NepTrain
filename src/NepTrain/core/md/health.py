@@ -58,6 +58,24 @@ class TrajectoryHealthReport:
         }
 
 
+def is_structure_reasonable(
+    atoms: Atoms,
+    *,
+    min_distance_ratio: float = 0.7,
+) -> bool:
+    """Return whether every periodic pair clears a covalent-radius cutoff."""
+
+    if min_distance_ratio < 0:
+        raise ValueError("min_distance_ratio must be non-negative")
+    if not len(atoms) or min_distance_ratio == 0:
+        return True
+    radii = np.asarray(covalent_radii[atoms.numbers], dtype=np.float64)
+    if not np.all(np.isfinite(radii)) or np.any(radii <= 0):
+        raise ValueError("all atoms must have finite positive covalent radii")
+    pair_i, _ = neighbor_list("ij", atoms, radii * min_distance_ratio)
+    return len(pair_i) == 0
+
+
 def _maximum_norm(
     frame: Atoms, names: Sequence[str]
 ) -> tuple[float | None, bool]:
@@ -223,7 +241,12 @@ def classify_trajectory(
     first_bad_step = (
         None
         if first_bad is None
-        else int(frames[first_bad].info.get("lammps_step", first_bad))
+        else int(
+            frames[first_bad].info.get(
+                "md_step",
+                frames[first_bad].info.get("lammps_step", first_bad),
+            )
+        )
     )
     return TrajectoryHealthReport(
         process_completed=bool(process_completed),
@@ -246,4 +269,5 @@ __all__ = [
     "TrajectoryHealthPolicy",
     "TrajectoryHealthReport",
     "classify_trajectory",
+    "is_structure_reasonable",
 ]

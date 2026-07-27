@@ -98,6 +98,13 @@ NepTrain 只向 LAMMPS 模板注入 `temperature`、`pressure`、`steps`、`seed
 `plugin_path`，也不判断模板是 FIRE、NVT/NPT、spin MD、MC+MD 还是 chemical
 swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。
 
+选择 `md.backend: gpumd` 时，route 的 `template_path` 指向 GPUMD `run.in`。
+NepTrain 保留模板选择的 `nvt_*`/`npt_*` 方法、耦合常数、`time_step` 和 dump
+间隔，更新本轮模型、温度、步数与确定性 velocity seed；对 `npt_ber` 和
+`npt_scr` 还会按模板的 isotropic、orthorhombic 或 triclinic 形式写入目标压强
+（GPa）。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。Spin workflow
+仍明确使用 LAMMPS DynSpin。
+
 每条 route 的 `conditions.temperature_path` 是有顺序的温度探路路径。例如
 `[300, 500, 700, 900]` 会先验证 300 K，只有通过后才解锁 500 K。
 默认全部温度都会跑到最长时长。显式设置 `production_temperatures` 后，未列入
@@ -310,7 +317,14 @@ generations/0001/
 ```
 
 训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；
-`calculation` 软链指向真实执行目录，便于直接排查。
+`calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 Matplotlib
+从 `loss.out` 自动生成 `training-convergence.png` 和可审计的
+`training-report.json`。配置独立验证集时，evaluate 还会生成按验收阈值归一化的
+`evaluation-metrics.png` 与 `evaluation-report.json`；图中 1× 线就是配置阈值。
+同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction parity 图
+`evaluation-parity.png`，spin 模型会增加 magnetic-force 面板。对应报告记录
+validation/model hash、总点数、实际绘制点数和 RMSE；大数组只对显示点做确定性
+抽样，RMSE 仍使用全部有限数据。
 
 内部 job 也只保留一层输入和一层输出。job 名称已经包含代数、阶段、route、
 attempt 和任务指纹，因此输出目录不再重复这些信息：

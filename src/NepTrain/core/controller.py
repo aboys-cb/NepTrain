@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +18,8 @@ from typing import Any, Callable, Mapping
 
 from ase.io import read as ase_read
 
+from .content_addressing import canonical_sha256, file_sha256
+from .persistence import atomic_write_json
 from .workflow_workspace import WorkflowWorkspace
 from .config import (
     ConfigError,
@@ -53,23 +54,11 @@ _RESOURCE_FOR_STAGE = {
     "retrain": "training",
     "evaluate": "analysis",
 }
-_STOP = False
-_STOP_EVENT = threading.Event()
 _EXECUTION_UNKNOWN_GRACE_SECONDS = 300.0
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
 
 
 def _read_json(
@@ -95,30 +84,18 @@ def _read_json(
     return dict(value)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _record_matches(record: Mapping[str, Any]) -> bool:
     path = Path(str(record["path"]))
     if record.get("kind", "file") == "file":
-        return path.is_file() and _sha256(path) == record.get("sha256")
+        return path.is_file() and file_sha256(path) == record.get("sha256")
     if not path.is_dir():
         return False
     entries = [
-        {"path": str(item.relative_to(path)), "sha256": _sha256(item)}
+        {"path": str(item.relative_to(path)), "sha256": file_sha256(item)}
         for item in sorted(path.rglob("*"))
         if item.is_file()
     ]
-    digest = hashlib.sha256(
-        json.dumps(
-            entries, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode()
-    ).hexdigest()
+    digest = canonical_sha256(entries)
     return digest == record.get("sha256")
 
 
@@ -134,7 +111,7 @@ def _controller_command() -> list[str]:
 def _process_matches(pid: int, project: Path) -> bool:
     try:
         completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             check=False,
@@ -292,7 +269,7 @@ class PersistentController:
 
     def _save(self) -> None:
         self.state["heartbeat_at"] = _now()
-        _write_json(self.workspace.controller_file, self.state)
+        atomic_write_json(self.workspace.controller_file, self.state)
 
     def _ledger(self) -> dict[str, Any]:
         return _read_json(
@@ -396,7 +373,7 @@ class PersistentController:
                 None,
             )
             if existing_name is not None:
-                if _sha256(source) != _sha256(destination):
+                if file_sha256(source) != file_sha256(destination):
                     raise ControllerError(
                         f"stage artifacts {existing_name} and {name} both "
                         f"publish as {destination.name}"
@@ -1294,18 +1271,9 @@ class PersistentController:
         )
 
 
-def _signal_stop(_signum, _frame) -> None:
-    global _STOP
-    _STOP = True
-    _STOP_EVENT.set()
-
-
 def run_controller(project: str | Path, *, poll_interval: float | None = None) -> int:
     """Hold the workflow controller lock and supervise until a terminal state."""
 
-    global _STOP
-    _STOP = False
-    _STOP_EVENT.clear()
     workspace = WorkflowWorkspace.locate(project)
     interval = poll_interval
     if interval is None:
@@ -1313,64 +1281,89 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
         interval = float(config.get("execution", {}).get("poll_interval", 30.0))
     if interval < 0.2:
         raise ControllerError("execution.poll_interval must be at least 0.2 seconds")
-    signal.signal(signal.SIGTERM, _signal_stop)
-    signal.signal(signal.SIGINT, _signal_stop)
-    with workspace.controller_lock.open("a+", encoding="utf-8") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise ControllerError("workflow controller is already running") from error
-        workspace.controller_pid.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        controller = PersistentController(workspace.root)
-        controller.state["pid"] = os.getpid()
-        controller.state["started_at"] = _now()
-        controller.state["state"] = "running"
-        controller.state.pop("reason", None)
-        controller._save()
-        try:
-            while not _STOP:
-                try:
-                    tick = controller.tick()
-                    if tick.state != "degraded":
-                        recovered = controller.state.pop(
-                            "last_transport_error", None
-                        )
-                        if recovered is not None or controller.state.get(
-                            "transport_failures", 0
-                        ):
-                            controller.state["transport_failures"] = 0
-                            controller._save()
-                except ExecutionError as error:
-                    failures = int(controller.state.get("transport_failures", 0)) + 1
-                    controller.state["transport_failures"] = failures
-                    controller.state["last_transport_error"] = str(error)
-                    controller.state["state"] = "degraded"
-                    controller._save()
-                    tick = ControllerTick("degraded", detail=str(error))
-                if tick.state in {
-                    "complete",
-                    "rejected",
-                    "failed",
-                    "stalled",
-                    "budget_exhausted",
-                }:
-                    return 0 if tick.state == "complete" else 2
-                _STOP_EVENT.wait(interval)
-            controller.state["state"] = "stopped"
-            controller.state["reason"] = "controller stopped by user"
-            controller._save()
-            return 0
-        except Exception as error:
-            controller.state["state"] = "failed"
-            controller.state["reason"] = str(error)
-            controller._save()
-            raise
-        finally:
+    stop_event = threading.Event()
+
+    def request_stop(_signum, _frame) -> None:
+        stop_event.set()
+
+    previous_handlers = {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        for signum in previous_handlers:
+            signal.signal(signum, request_stop)
+        with workspace.controller_lock.open("a+", encoding="utf-8") as lock:
             try:
-                if workspace.controller_pid.read_text(encoding="utf-8").strip() == str(os.getpid()):
-                    workspace.controller_pid.unlink()
-            except FileNotFoundError:
-                pass
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ControllerError(
+                    "workflow controller is already running"
+                ) from error
+            workspace.controller_pid.write_text(
+                f"{os.getpid()}\n", encoding="utf-8"
+            )
+            controller = PersistentController(workspace.root)
+            controller.state["pid"] = os.getpid()
+            controller.state["started_at"] = _now()
+            controller.state["state"] = "running"
+            controller.state.pop("reason", None)
+            controller._save()
+            try:
+                while not stop_event.is_set():
+                    try:
+                        tick = controller.tick()
+                        if tick.state != "degraded":
+                            recovered = controller.state.pop(
+                                "last_transport_error", None
+                            )
+                            if recovered is not None or controller.state.get(
+                                "transport_failures", 0
+                            ):
+                                controller.state["transport_failures"] = 0
+                                controller._save()
+                    except ExecutionError as error:
+                        failures = (
+                            int(controller.state.get("transport_failures", 0))
+                            + 1
+                        )
+                        controller.state["transport_failures"] = failures
+                        controller.state["last_transport_error"] = str(error)
+                        controller.state["state"] = "degraded"
+                        controller._save()
+                        tick = ControllerTick("degraded", detail=str(error))
+                    if tick.state in {
+                        "complete",
+                        "rejected",
+                        "failed",
+                        "stalled",
+                        "budget_exhausted",
+                    }:
+                        return 0 if tick.state == "complete" else 2
+                    stop_event.wait(interval)
+                controller.state["state"] = "stopped"
+                controller.state["reason"] = "controller stopped by user"
+                controller._save()
+                return 0
+            except Exception as error:
+                controller.state["state"] = "failed"
+                controller.state["reason"] = str(error)
+                controller._save()
+                raise
+            finally:
+                try:
+                    if (
+                        workspace.controller_pid.read_text(
+                            encoding="utf-8"
+                        ).strip()
+                        == str(os.getpid())
+                    ):
+                        workspace.controller_pid.unlink()
+                except FileNotFoundError:
+                    pass
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def start_controller(
@@ -1489,7 +1482,7 @@ def _append_execution_event(
                 **dict(event),
             }
         )
-        _write_json(workspace.ledger, ledger)
+        atomic_write_json(workspace.ledger, ledger)
 
 
 def stop_workflow(

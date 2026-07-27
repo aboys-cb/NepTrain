@@ -735,45 +735,59 @@ def run_doctor(args):
     print("Doctor completed successfully.")
 
 def build_perturb(subparsers):
-    parser_perturb = subparsers.add_parser(
+    parser = subparsers.add_parser(
         "perturb",
         help="Generate perturbed structures.",
     )
-
-    parser_perturb.set_defaults(func=run_perturb)
-
-    parser_perturb.add_argument("model_path",
-                             type=str,
-
-                             help="The structure path or structure file required for calculation only supports files in xyz and vasp formats.")
-    parser_perturb.add_argument("--num","-n",
-                             type=int,
-                                default=20,
-                             help="The number of perturbations for each structure, if a folder is input, the final number generated should be the number of structures multiplied by num.default 20.")
-
-    parser_perturb.add_argument("--cell", "-c",
-                                dest="cell_pert_fraction",
-                                type=float,
-                                default=0.03,
-                                help="The deformation ratio,default 0.03.")
-
-    parser_perturb.add_argument("--distance", "-d",
-                                type=float,
-                                dest="min_distance",
-                                default=0.1,
-                                help="Min atom distance, unit Å, default 0.1.")
-
-    parser_perturb.add_argument("--out", "-o",
-                             dest="out_file_path",
-                             type=str,
-                             help="Output file for perturbed structures, default ./perturb.xyz.",
-                             default="./perturb.xyz"
-                             )
-    parser_perturb.add_argument("--append", "-a",
-                             dest="append", action='store_true', default=False,
-                             help="Write to out_file_path in append mode, default False.",
-
-                             )
+    parser.set_defaults(func=run_perturb)
+    parser.add_argument(
+        "model_path",
+        help="Structure file or directory containing XYZ/VASP structures.",
+    )
+    parser.add_argument(
+        "--num",
+        "-n",
+        type=int,
+        default=20,
+        help="Number of perturbations generated per input structure.",
+    )
+    parser.add_argument(
+        "--cell-perturbation",
+        "--cell",
+        "-c",
+        dest="cell_pert_fraction",
+        type=float,
+        default=0.03,
+        help="Maximum cell deformation fraction, default 0.03.",
+    )
+    parser.add_argument(
+        "--max-displacement",
+        "--distance",
+        "-d",
+        type=float,
+        dest="max_displacement",
+        default=0.1,
+        help="Maximum Cartesian displacement amplitude in Å, default 0.1.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible perturbations, default 42.",
+    )
+    parser.add_argument(
+        "--out",
+        "-o",
+        dest="out_file_path",
+        default="./perturb.xyz",
+        help="Output extxyz path, default ./perturb.xyz.",
+    )
+    parser.add_argument(
+        "--append",
+        "-a",
+        action="store_true",
+        help="Append to an existing output file.",
+    )
 
 def build_doctor(subparsers):
     parser = subparsers.add_parser("doctor", help="Check selected runtime capabilities.")
@@ -816,55 +830,77 @@ def build_smoke(subparsers):
 def build_select(subparsers):
     parser_select = subparsers.add_parser(
         "select",
-        help="Select samples.",
+        help="Select structures manually with the production FPS policy.",
     )
-    parser_select.set_defaults(func=run_select,decomposition='pca')
+    parser_select.set_defaults(func=run_select)
 
-    parser_select.add_argument("trajectory_paths",
-                              nargs="+",
-                             help="The trajectory files needed for sampling is in xyz format.")
+    parser_select.add_argument(
+        "trajectory_paths",
+        nargs="+",
+        help="Candidate extxyz trajectory files.",
+    )
+    parser_select.add_argument(
+        "--base",
+        "-base",
+        help="Optional reference extxyz dataset used to warm-start FPS.",
+    )
+    parser_select.add_argument(
+        "--nep",
+        "-nep",
+        help="NEP model used for descriptors; without it SOAP is used.",
+    )
+    parser_select.add_argument(
+        "--backend",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="NEPAdapters descriptor backend, default auto.",
+    )
+    parser_select.add_argument(
+        "--max-selected",
+        "-max",
+        type=int,
+        default=20,
+        help="Maximum number of selected structures, default 20.",
+    )
+    parser_select.add_argument(
+        "--min-novelty",
+        "--min-distance",
+        "--min_distance",
+        "-d",
+        type=float,
+        dest="min_novelty",
+        default=0.01,
+        help="Strict normalized descriptor novelty threshold, default 0.01.",
+    )
+    parser_select.add_argument(
+        "--filter",
+        "-f",
+        type=float,
+        const=0.6,
+        nargs="?",
+        default=False,
+        help="Reject short bonds using this covalent-radius coefficient.",
+    )
+    parser_select.add_argument(
+        "--rejected-out",
+        help="Optional extxyz output for structures rejected by --filter.",
+    )
+    parser_select.add_argument(
+        "--out",
+        "-o",
+        dest="out_file_path",
+        default="./selected.xyz",
+        help="Selected extxyz output, default ./selected.xyz.",
+    )
+    parser_select.add_argument(
+        "--report",
+        help="Selection JSON report; defaults beside --out.",
+    )
 
-
-    parser_select.add_argument("--base", "-base",
-                               type=str,
-                               default="train.xyz",
-                               help="Provide a path to base.xyz, and sample the trajectory based on base.xyz, default is train.xyz."
-                               )
-    parser_select.add_argument("--nep", "-nep",
-                               type=str,
-                               default="./nep.txt",
-                               help="Provide a path to a nep.txt file to extract descriptors for the structure, default is ./nep.txt. If the file does not exist, use SOAP descriptors."
-                               )
-    parser_select.add_argument("--max-selected", "-max", type=int,
-                               help="Maximum number of structures to select, default is 20.",
-                               default=20)
-    parser_select.add_argument("--min_distance","-d", type=float,
-                               help="Minimum bond length for farthest-point sampling, default is 0.01.",
-                               default=0.01)
-    parser_select.add_argument("--filter", "-f", type=float,
-                               const=0.6,nargs='?',
-                               help="Whether to filter based on covalent radius, the default is False. If True, the default coefficient is 0.6, and a coefficient can be passed in",
-                               default=False)
-
-    dc_group = parser_select.add_mutually_exclusive_group(required=False)
-    dc_group.add_argument('-pca',"--pca", action='store_const', const='pca', dest='decomposition',
-                       help='Use PCA for decomposition')
-    dc_group.add_argument('-umap',"--umap", action='store_const', const='umap', dest='decomposition',
-                       help='Use UMAP for decomposition')
-
-    parser_select.add_argument("--out", "-o",
-                               dest="out_file_path",
-
-                               type=str,
-                               default="./selected.xyz",
-                               help="Output path for selected structures.default ./selected.xyz"
-                               )
-
-    group= parser_select.add_argument_group("SOAP","SOAP Parameters")
-
-    group.add_argument("--r_cut", "-r", type=float, help="A cutoff for local region in angstroms,default 6", default=6)
-    group.add_argument("--n_max", "-n", type=int, help="The number of radial basis functions,default 8", default=8)
-    group.add_argument("--l_max", "-l", type=int, help="The maximum degree of spherical harmonics,default 6", default=6)
+    group = parser_select.add_argument_group("SOAP parameters")
+    group.add_argument("--r-cut", "--r_cut", "-r", type=float, default=6.0)
+    group.add_argument("--n-max", "--n_max", "-n", type=int, default=8)
+    group.add_argument("--l-max", "--l_max", "-l", type=int, default=6)
 
 def _print_manual_status(value, *, json_output=False):
     if json_output:
@@ -1041,6 +1077,11 @@ def run_manual_md_command(args):
             args.steps
             if args.steps is not None
             else progression["steps"][args.maturity]
+        ),
+        seed=(
+            getattr(args, "seed", None)
+            if getattr(args, "seed", None) is not None
+            else int(project.get("workflow", {}).get("seed", 12345))
         ),
         pressure=(
             args.pressure
@@ -1312,6 +1353,7 @@ def build_manual_md(subparsers):
     parser.add_argument("--temperature", type=float, nargs="+")
     parser.add_argument("--pressure", type=float)
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--ensemble", choices=["nvt", "npt"])
     parser.add_argument("--template")
     parser.add_argument(
@@ -1602,6 +1644,7 @@ def main():
             "MdError",
             "SmokeError",
             "SpinDataError",
+            "SelectionError",
             "TrainingError",
             "WorkflowIterationError",
         }

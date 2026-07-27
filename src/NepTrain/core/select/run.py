@@ -1,147 +1,232 @@
-#!/usr/bin/env python 
-# -*- coding: utf-8 -*-
-# @Time    : 2024/11/13 19:36
-# @Author  : 兵
-# @email    : 1747193328@qq.com
-import os.path
+"""Manual structure selection through the production FPS policy."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Sequence
 
 import numpy as np
-
-
-# from joblib import Parallel, delayed
-from tqdm import tqdm
-from NepTrain import utils
+from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
-from .select import select_structures, filter_by_bonds, farthest_point_sampling
-from .filter import adjust_reasonable, parallel_filter_trajectory
-from ..gpumd.plot import plot_md_selected
 
+from ..content_addressing import file_sha256
+from ..fps import hierarchical_farthest_point_sampling
 from ..nep.calculator import DescriptorCalculator
+from ..scientific_data import STRUCTURE_ID_VERSION, structure_id
+from ..md.health import is_structure_reasonable
+from ..persistence import atomic_write_json
 
 
-def run_select(argparse):
-    import matplotlib.pyplot as plt
-    map_path_index=[]
-    all_trajectory=[]
-    plot_config=[]
-    trajectory_structures=[]
-    filter_structures = []
-    for index,_path in enumerate(argparse.trajectory_paths):
-
-        if utils.is_file_empty(_path):
-            utils.print_warning(f"An invalid file path was provided: {argparse.trajectory_paths}.")
-            continue
-
-        utils.print_msg(f"Reading trajectory {_path}")
-
-        trajectory=ase_read(_path,":",format="extxyz")
-
-        if argparse.filter:
-            utils.print_msg(f"Start filtering...")
-            file_name = os.path.basename(_path)
-
-            # 使用示例
-            trajectory, filter_structures = parallel_filter_trajectory(
-                trajectory, argparse.filter, n_jobs=os.cpu_count()-2  # -1 表示使用所有CPU核心
-            )
+class SelectionError(RuntimeError):
+    """Raised when a manual selection cannot produce a valid result."""
 
 
-            if len(filter_structures) > 0:
-                utils.print_msg(f"Filtering {len(filter_structures)} structures.")
-                ase_write(os.path.join(os.path.dirname(_path),f"filter_{file_name}.xyz"),filter_structures,append=False)
+@dataclass(frozen=True)
+class _Candidate:
+    frame: Atoms
+    source: str
+    frame_index: int
+
+    @property
+    def preference(self) -> tuple[str, int]:
+        return self.source, self.frame_index
 
 
+def _frames(path: str | Path, *, role: str) -> list[Atoms]:
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise SelectionError(f"{role} does not exist: {source}")
+    try:
+        value = ase_read(source, index=":", format="extxyz")
+    except Exception as error:
+        raise SelectionError(f"cannot read {role} {source}: {error}") from error
+    frames = value if isinstance(value, list) else [value]
+    if not frames:
+        raise SelectionError(f"{role} contains no structures: {source}")
+    return frames
 
-        map_path_index.append(np.full(len(trajectory),index))
-        trajectory_structures.extend(trajectory)
-    map_path_index=np.concatenate(map_path_index)
-    if len(trajectory_structures)==0:
-        utils.print_warning("no structure.")
-        ase_write(argparse.out_file_path, trajectory_structures)
 
-        return
+def _stratum(frame: Atoms, source: str) -> str:
+    values = []
+    for label, key in (
+        ("W", "md_window"),
+        ("R", "route_id"),
+        ("T", "temperature"),
+        ("P", "pressure"),
+    ):
+        if key in frame.info:
+            values.append(f"{label}={frame.info[key]}")
+    return "|".join(values) if values else f"source={Path(source).name}"
 
-    if utils.is_file_empty(argparse.base):
-        base_train=[]
-    else:
-        base_train=ase_read(argparse.base,":",format="extxyz")
 
-    if utils.is_file_empty(argparse.nep):
-        utils.print_msg("An invalid path for nep.txt was provided, using SOAP descriptors instead.")
-        species=set()
-        for atoms in trajectory_structures+base_train:
-            for i in atoms.get_chemical_symbols():
-                species.add(i)
-        kwargs_dict={
-            "species":list(species),
-            "r_cut":argparse.r_cut,
-            "n_max": argparse.n_max,
-            "l_max": argparse.l_max
-
+def _descriptor_calculator(args, frames: Sequence[Atoms]) -> tuple[Any, dict[str, Any]]:
+    if args.nep:
+        model = Path(args.nep).expanduser().resolve()
+        if not model.is_file():
+            raise SelectionError(f"NEP model does not exist: {model}")
+        calculator = DescriptorCalculator(
+            "nep",
+            model_file=model,
+            backend=args.backend,
+        )
+        return calculator, {
+            "kind": "nep",
+            "model": str(model),
+            "model_sha256": file_sha256(model),
+            "backend": args.backend,
         }
-
-        descriptor =DescriptorCalculator("soap",**kwargs_dict)
-
-    else:
-        descriptor =DescriptorCalculator("nep", model_file=argparse.nep)
-
-    utils.print_msg("Start generating structure descriptor, please wait")
-    train_structure_des =descriptor.get_structures_descriptors(base_train)
-    trajectory_structure_des=[]
-    uniqe_index = np.unique(map_path_index)
-
-    # 使用 'viridis' colormap 从色图中获取颜色
-    cmap = plt.cm.viridis  # 你也可以选择其他色图，例如 'plasma', 'inferno', 'cividis' 等
-    num_colors = len(uniqe_index)
-
-    # 创建颜色数组
-    colors = [cmap(i / num_colors) for i in range(num_colors)]
-    for index  in uniqe_index:
-        indices = np.where(map_path_index == index)[0]
-        trajectory_structure=[trajectory_structures[i] for i in indices]
-        new =descriptor.get_structures_descriptors(trajectory_structure)
-        trajectory_structure_des.append(new)
-        label = Path(argparse.trajectory_paths[index]).name
-
-        plot_config.append((new,label, colors[index]))
-
-    utils.print_msg("Starting to select points, please wait...")
-    new_structure_des=np.vstack(trajectory_structure_des)
-
+    species = sorted(
+        {
+            symbol
+            for frame in frames
+            for symbol in frame.get_chemical_symbols()
+        }
+    )
+    try:
+        calculator = DescriptorCalculator(
+            "soap",
+            species=species,
+            r_cut=args.r_cut,
+            n_max=args.n_max,
+            l_max=args.l_max,
+        )
+    except ImportError as error:
+        raise SelectionError(
+            "SOAP selection requires dscribe; install NepTrain[soap] "
+            "or pass --nep"
+        ) from error
+    return calculator, {
+        "kind": "soap",
+        "species": species,
+        "r_cut": args.r_cut,
+        "n_max": args.n_max,
+        "l_max": args.l_max,
+    }
 
 
-    selected_i =farthest_point_sampling(new_structure_des,argparse.max_selected,argparse.min_distance,selected_data=train_structure_des)
+def run_select(args) -> dict[str, Any]:
+    if args.max_selected <= 0:
+        raise SelectionError("--max-selected must be a positive integer")
+    if args.min_novelty < 0:
+        raise SelectionError("--min-novelty must be non-negative")
+    if args.filter is not False and args.filter is not None and args.filter < 0:
+        raise SelectionError("--filter coefficient must be non-negative")
 
-    selected_structures=[]
+    records = []
+    for raw_source in args.trajectory_paths:
+        source = str(Path(raw_source).expanduser().resolve())
+        records.extend(
+            _Candidate(frame, source, index)
+            for index, frame in enumerate(
+                _frames(source, role="candidate trajectory")
+            )
+        )
+    read_count = len(records)
 
-    base_dir=os.path.dirname(argparse.out_file_path)
+    rejected = []
+    if args.filter is not False and args.filter is not None:
+        coefficient = float(args.filter)
+        accepted = []
+        for record in records:
+            if is_structure_reasonable(
+                record.frame,
+                min_distance_ratio=coefficient,
+            ):
+                accepted.append(record)
+            else:
+                rejected.append(record.frame)
+        records = accepted
+    if args.rejected_out and rejected:
+        rejected_path = Path(args.rejected_out).expanduser().resolve()
+        rejected_path.parent.mkdir(parents=True, exist_ok=True)
+        ase_write(rejected_path, rejected, format="extxyz")
 
-    utils.remove_file_by_re(os.path.join(base_dir,"selected*.xyz"))
+    unique: dict[str, _Candidate] = {}
+    for record in records:
+        identifier = structure_id(record.frame)
+        current = unique.get(identifier)
+        if current is None or record.preference < current.preference:
+            unique[identifier] = record
+    identifiers = sorted(unique)
+    candidates = [unique[identifier].frame for identifier in identifiers]
+    if not candidates:
+        raise SelectionError("no valid candidate structures remain after filtering")
 
-    for i in selected_i:
-        file_index=map_path_index[i]
+    references = (
+        _frames(args.base, role="reference dataset") if args.base else []
+    )
+    calculator, descriptor_record = _descriptor_calculator(
+        args, [*candidates, *references]
+    )
+    candidate_descriptors = np.asarray(
+        calculator.get_structures_descriptors(candidates),
+        dtype=np.float64,
+    )
+    reference_descriptors = (
+        np.asarray(
+            calculator.get_structures_descriptors(references),
+            dtype=np.float64,
+        )
+        if references
+        else None
+    )
+    result = hierarchical_farthest_point_sampling(
+        candidates,
+        candidate_descriptors,
+        identifiers,
+        [
+            _stratum(unique[identifier].frame, unique[identifier].source)
+            for identifier in identifiers
+        ],
+        budget=args.max_selected,
+        min_novelty=args.min_novelty,
+        reference_structures=references,
+        reference_descriptors=reference_descriptors,
+    )
+    if not result.selected_indices:
+        raise SelectionError(
+            "FPS selected no structures; lower --min-novelty or check that "
+            "the candidates are not already present in --base"
+        )
 
-        fila_name = Path(argparse.trajectory_paths[file_index]).name
-        save_path=os.path.join(base_dir,f"selected_{fila_name}.xyz")
+    selected = [candidates[index] for index in result.selected_indices]
+    output = Path(args.out_file_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(output, selected, format="extxyz")
+    report_path = (
+        Path(args.report).expanduser().resolve()
+        if args.report
+        else output.with_suffix(".selection.json")
+    )
+    report = {
+        "protocol": "neptrain.manual-selection.v1",
+        "structure_id_version": STRUCTURE_ID_VERSION,
+        "candidate_count_read": read_count,
+        "candidate_count_after_filter": len(records),
+        "candidate_count_after_deduplication": len(candidates),
+        "duplicate_count": len(records) - len(candidates),
+        "rejected_count": len(rejected),
+        "reference_count": len(references),
+        "selected_count": len(selected),
+        "selected_ids": list(result.selected_ids),
+        "selected_novelty": list(result.selected_novelty),
+        "counts_by_stratum": dict(result.counts_by_stratum),
+        "remaining_novelty": result.remaining_novelty,
+        "groups": {
+            "+".join(key): asdict(group)
+            for key, group in result.groups.items()
+        },
+        "descriptor": descriptor_record,
+        "output": str(output),
+    }
+    atomic_write_json(report_path, report)
+    print(
+        f"Selected {len(selected)} of {read_count} structures -> {output}\n"
+        f"Selection report -> {report_path}"
+    )
+    return report
 
 
-        structure = trajectory_structures[i]
-        ase_write(save_path,structure,append=True)
-        selected_structures.append(structure)
-    selected_des=new_structure_des[selected_i,:]
-
-
-    utils.print_msg(f"Obtained {len(selected_i)} structures." )
-    ase_write(argparse.out_file_path, selected_structures)
-    png_path=os.path.join(os.path.dirname(argparse.out_file_path),"selected.png")
-    plot_md_selected(train_structure_des,
-                     plot_config,
-                     selected_des,
-                       png_path ,
-                     argparse.decomposition
-                     )
-    utils.print_msg(f"The point selection distribution chart is saved to {png_path}." )
-    utils.print_msg(f"The selected structures are saved to {argparse.out_file_path}." )
-
+__all__ = ["SelectionError", "run_select"]

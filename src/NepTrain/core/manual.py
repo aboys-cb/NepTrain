@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,13 +26,26 @@ from typing import Any, Mapping, Sequence
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .content_addressing import canonical_sha256, file_sha256
 from .execution import ExecutionError, ExecutionTarget, ExecutionTransport
+from .persistence import atomic_write_json
 from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_LABEL_JOB
 from .scientific_data import (
+    STRUCTURE_ID_VERSION,
     ScientificDataError,
     labeled_input_structure_ids,
     structure_id,
     validate_labeled_frames,
+)
+from .slurm import (
+    ACTIVE_STATES as _SLURM_ACTIVE,
+    FAILURE_STATES as _SLURM_FAILURE,
+    SlurmScript,
+    SlurmSubmissionError,
+    query_job,
+    render_script,
+    setup_line,
+    submit_job,
 )
 from .spin import SpinDataError, validate_spin_dataset
 
@@ -42,28 +54,6 @@ class ManualTaskError(RuntimeError):
     """Raised when a manual step cannot be prepared, run, or collected."""
 
 
-_SLURM_ACTIVE = {
-    "CONFIGURING",
-    "COMPLETING",
-    "PENDING",
-    "REQUEUED",
-    "RESIZING",
-    "RUNNING",
-    "STAGE_OUT",
-    "SUSPENDED",
-}
-_SLURM_FAILURE = {
-    "BOOT_FAIL",
-    "CANCELLED",
-    "DEADLINE",
-    "FAILED",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "REVOKED",
-    "SPECIAL_EXIT",
-    "TIMEOUT",
-}
 _SCHEDULER_MISSING_GRACE_SECONDS = 300.0
 
 
@@ -92,16 +82,6 @@ def _progress(message: str) -> None:
     print(f"[NepTrain] {message}", file=sys.stderr, flush=True)
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -114,31 +94,13 @@ def _read_json(path: Path) -> dict[str, Any]:
     return dict(value)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _canonical_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode()
-    ).hexdigest()
-
-
 def _manual_spec(descriptor: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: descriptor.get(key)
         for key in (
             "operation_id",
             "kind",
+            "structure_id_version",
             "target",
             "output",
             "max_concurrent",
@@ -153,17 +115,22 @@ def _manual_spec(descriptor: Mapping[str, Any]) -> dict[str, Any]:
 def _verify_operation_bundle(root: Path) -> dict[str, Any]:
     descriptor = _read_json(root / "operation.json")
     protocol = descriptor.get("protocol")
-    if protocol != "neptrain.manual-operation.v3":
+    if protocol != "neptrain.manual-operation.v4":
         if protocol in {
             "neptrain.manual-operation.v1",
             "neptrain.manual-operation.v2",
+            "neptrain.manual-operation.v3",
         }:
             raise ManualTaskError(
                 "manual run uses an unsafe legacy protocol and cannot be "
                 "collected or retried automatically; keep its raw job outputs "
-                "and prepare a new v3 run"
+                "and prepare a new v4 run"
             )
         raise ManualTaskError(f"not a NepTrain manual run: {root}")
+    if descriptor.get("structure_id_version") != STRUCTURE_ID_VERSION:
+        raise ManualTaskError(
+            "manual run uses an unsupported structure identity version"
+        )
     for record in descriptor.get("files", []):
         relative = Path(str(record.get("path", "")))
         if relative.is_absolute() or ".." in relative.parts:
@@ -172,17 +139,17 @@ def _verify_operation_bundle(root: Path) -> dict[str, Any]:
         if (
             not path.is_file()
             or path.stat().st_size != int(record.get("size", -1))
-            or _sha256(path) != record.get("sha256")
+            or file_sha256(path) != record.get("sha256")
         ):
             raise ManualTaskError(f"manual task input drifted: {path}")
     input_manifest = descriptor.get("input_manifest", {})
     manifest_path = root / str(input_manifest.get("path", ""))
     if (
         not manifest_path.is_file()
-        or _sha256(manifest_path) != input_manifest.get("sha256")
+        or file_sha256(manifest_path) != input_manifest.get("sha256")
     ):
         raise ManualTaskError("manual input checksum manifest drifted or is missing")
-    expected = _canonical_hash(_manual_spec(descriptor))
+    expected = canonical_sha256(_manual_spec(descriptor))
     if descriptor.get("spec_sha256") != expected:
         raise ManualTaskError("manual operation content identity is invalid")
     return descriptor
@@ -253,9 +220,7 @@ def target_from_project(
 
 
 def _operation_id(kind: str, payload: Mapping[str, Any]) -> str:
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:12]
+    digest = canonical_sha256(payload)[:12]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     return f"{kind}-{stamp}-{digest}"
 
@@ -308,9 +273,10 @@ def _write_operation(
         _copy(setup, packaged)
         target = replace(target, setup_script="./inputs/setup.sh")
     value = {
-        "protocol": "neptrain.manual-operation.v3",
+        "protocol": "neptrain.manual-operation.v4",
         "operation_id": operation_id,
         "kind": kind,
+        "structure_id_version": STRUCTURE_ID_VERSION,
         "created_at": _now(),
         "state": "prepared",
         "target": asdict(target),
@@ -323,7 +289,7 @@ def _write_operation(
     value["files"] = [
         {
             "path": str(path.relative_to(root)),
-            "sha256": _sha256(path),
+            "sha256": file_sha256(path),
             "size": path.stat().st_size,
         }
         for path in sorted(root.rglob("*"))
@@ -342,10 +308,10 @@ def _write_operation(
     )
     value["input_manifest"] = {
         "path": checksum_manifest.name,
-        "sha256": _sha256(checksum_manifest),
+        "sha256": file_sha256(checksum_manifest),
     }
-    value["spec_sha256"] = _canonical_hash(_manual_spec(value))
-    _write_json(root / "operation.json", value)
+    value["spec_sha256"] = canonical_sha256(_manual_spec(value))
+    atomic_write_json(root / "operation.json", value)
     _progress(
         f"{kind}: prepared {len(jobs)} job(s) in {root}"
     )
@@ -400,7 +366,7 @@ def prepare_training(
         request["restart_file"] = str(
             Path(_copy(Path(restart_file), job / "restart")).relative_to(root)
         )
-    _write_json(job / "request.json", request)
+    atomic_write_json(job / "request.json", request)
     return _write_operation(
         root,
         operation_id=operation_id,
@@ -686,7 +652,7 @@ def prepare_labeling(
             "device": device,
             "precision": precision,
         }
-        _write_json(job / "request.json", request)
+        atomic_write_json(job / "request.json", request)
         jobs.append(
             {
                 "index": index,
@@ -707,7 +673,7 @@ def prepare_labeling(
         jobs=jobs,
         max_concurrent=max_concurrent,
         scientific_input={
-            "structure_id_version": "neptrain.structure-id.v2",
+            "structure_id_version": STRUCTURE_ID_VERSION,
             "frame_count": len(frame_ids),
             "frame_ids": frame_ids,
             "labeling_resources": resource_provenance,
@@ -725,6 +691,7 @@ def prepare_md(
     workdir: str | Path | None,
     target: ExecutionTarget,
     steps: int,
+    seed: int = 12345,
     pressure: float = 0.0,
     ensemble: str = "nvt",
     template_path: str | Path | None = None,
@@ -749,6 +716,8 @@ def prepare_md(
     )
     if not temperatures:
         raise ManualTaskError("at least one temperature is required")
+    if seed < 1:
+        raise ManualTaskError("MD seed must be positive")
     payload = {
         "backend": backend,
         "source": str(Path(source).expanduser().resolve()),
@@ -783,6 +752,7 @@ def prepare_md(
                 "model_file": model,
                 "temperature": float(temperature),
                 "steps": int(steps),
+                "seed": int(seed) + index,
                 "pressure": float(pressure),
                 "ensemble": ensemble,
                 "template_path": template,
@@ -796,7 +766,7 @@ def prepare_md(
                 "bad_tail_frames": int(bad_tail_frames),
                 "health": dict(health or {}),
             }
-            _write_json(job / "request.json", request)
+            atomic_write_json(job / "request.json", request)
             jobs.append(
                 {
                     "index": index,
@@ -891,7 +861,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 return 0
             result_file = _expected_job_result(operation, job)
             _archive_worker_state(job, result_file)
-            _write_json(
+            atomic_write_json(
                 execution,
                 {
                     "state": "RUNNING",
@@ -1007,6 +977,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                         output_file=result_file,
                         temperature=float(request["temperature"]),
                         steps=int(request["steps"]),
+                        seed=int(request.get("seed", 12345)),
                         pressure=float(request["pressure"]),
                         ensemble=request["ensemble"],
                         template_path=_resolve(
@@ -1027,12 +998,15 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 metrics = {
                     "backend": result.backend,
                     "temperature": request["temperature"],
+                    "completed": result.completed,
+                    "last_step": result.last_step,
+                    "failure_code": result.failure_code,
                 }
             else:
                 raise ManualTaskError(f"unsupported manual task: {operation.kind}")
             artifact = {
                 "path": str(result_file.relative_to(job)),
-                "sha256": _sha256(result_file),
+                "sha256": file_sha256(result_file),
                 "size": result_file.stat().st_size,
             }
             result_descriptor = {
@@ -1058,8 +1032,8 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                         f"MD job {index} produced an empty trajectory"
                     )
                 result_descriptor["frame_count"] = len(trajectory_frames)
-            _write_json(job / "result.json", result_descriptor)
-            _write_json(
+            atomic_write_json(job / "result.json", result_descriptor)
+            atomic_write_json(
                 execution,
                 {
                     "state": "COMPLETED",
@@ -1076,10 +1050,10 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 except Exception as error:
                     descriptor = _read_json(operation.descriptor)
                     descriptor["collection_error"] = str(error)
-                    _write_json(operation.descriptor, descriptor)
+                    atomic_write_json(operation.descriptor, descriptor)
             return 0
         except Exception as error:
-            _write_json(
+            atomic_write_json(
                 execution,
                 {
                     "state": "FAILED",
@@ -1093,15 +1067,6 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 },
             )
             return 1
-
-
-def _setup_line(target: ExecutionTarget, root: str) -> str | None:
-    if not target.setup_script:
-        return None
-    candidate = Path(target.setup_script).expanduser()
-    if candidate.is_file() and target.host is None:
-        return f"source {shlex.quote(str(candidate.resolve()))}"
-    return f"source {shlex.quote(str(target.setup_script))}"
 
 
 def _remote_root(operation: ManualOperation) -> str:
@@ -1125,22 +1090,13 @@ def _deploy_remote(operation: ManualOperation) -> str:
     try:
         if remote.startswith("~/"):
             _progress(f"{operation.kind}: resolving remote home on {target.name}")
-            home_result = transport.run_script(
-                'printf %s "$HOME"',
-                check=True,
-            )
-            remote_home = home_result.stdout.strip()
-            if not remote_home.startswith("/"):
-                raise ManualTaskError(
-                    f"remote target {target.name} returned an invalid home directory"
-                )
-            remote = remote_home.rstrip("/") + "/" + remote[2:]
+            remote = transport.resolve_remote_path(remote)
         _progress(f"{operation.kind}: packing portable task inputs")
         with tarfile.open(archive, "w:gz") as handle:
             handle.add(operation.root, arcname=operation.operation_id)
         remote_parent = remote.rsplit("/", 1)[0]
         remote_archive = f"{remote_parent}/.incoming/{archive.name}"
-        descriptor_sha256 = _sha256(operation.descriptor)
+        descriptor_sha256 = file_sha256(operation.descriptor)
         _progress(f"{operation.kind}: creating remote run directory on {target.name}")
         prepared = transport.run_script(
             """set -eo pipefail
@@ -1240,7 +1196,7 @@ mv -- "$temporary" "$destination"
             remote_parent,
             remote,
             remote_archive,
-            _sha256(archive),
+            file_sha256(archive),
             descriptor_sha256,
             token,
             operation.operation_id,
@@ -1264,34 +1220,10 @@ def _slurm_script(
     array = ",".join(str(value) for value in indices)
     if len(indices) > 1:
         array += f"%{_read_json(operation.descriptor)['max_concurrent']}"
-    lines = [
-        "#!/bin/bash",
-        f"#SBATCH --job-name=nt-{operation.operation_id}",
-        f"#SBATCH --output={root}/logs/scheduler-%A_%a.out",
-        f"#SBATCH --time={target.time}",
-        f"#SBATCH --partition={target.partition}",
-        f"#SBATCH --array={array}",
-    ]
-    if target.qos:
-        lines.append(f"#SBATCH --qos={target.qos}")
-    if target.cpus_per_task is not None:
-        lines.append(f"#SBATCH --cpus-per-task={target.cpus_per_task}")
-    if target.gpus_per_node is not None:
-        lines.append(f"#SBATCH --gpus-per-node={target.gpus_per_node}")
-    lines.extend(
-        directive
-        if directive.startswith("#SBATCH ")
-        else f"#SBATCH {directive}"
-        for directive in target.directives
+    setup = setup_line(
+        target.setup_script,
+        local=target.host is None,
     )
-    lines.extend(["", "set -eo pipefail", f"cd {shlex.quote(root)}"])
-    setup = _setup_line(target, root)
-    if setup:
-        lines.append(setup)
-    if target.cpus_per_task is not None:
-        lines.append('export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"')
-    for key, value in target.environment.items():
-        lines.append(f"export {key}={shlex.quote(value)}")
     worker = shlex.join(
         [
             *shlex.split(target.command),
@@ -1300,8 +1232,56 @@ def _slurm_script(
             "${SLURM_ARRAY_TASK_ID}",
         ]
     ).replace("'${SLURM_ARRAY_TASK_ID}'", '"${SLURM_ARRAY_TASK_ID}"')
-    lines.extend([worker, ""])
-    return "\n".join(lines)
+    return render_script(
+        SlurmScript(
+            job_name=f"nt-{operation.operation_id}",
+            output_path=f"{root}/logs/scheduler-%A_%a.out",
+            workdir=root,
+            command=worker,
+            partition=str(target.partition),
+            time_limit=target.time,
+            qos=target.qos,
+            cpus_per_task=target.cpus_per_task,
+            gpus_per_node=target.gpus_per_node,
+            directives=target.directives,
+            environment=target.environment,
+            setup_line=setup,
+            array=array,
+        )
+    )
+
+
+def _submit_slurm_script(
+    operation: ManualOperation,
+    root: str,
+    script_name: str,
+) -> str:
+    if operation.target.host:
+        transport = ExecutionTransport(operation.target)
+
+        def run(command):
+            return transport.run_script(
+                """set -eo pipefail
+cd "$1"
+exec sbatch --parsable "$2"
+""",
+                root,
+                command[-1],
+            )
+    else:
+
+        def run(command):
+            return subprocess.run(
+                list(command),
+                cwd=operation.root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+    try:
+        return submit_job(run, script_name)
+    except SlurmSubmissionError as error:
+        raise ManualTaskError(str(error)) from error
 
 
 def submit_operation(
@@ -1350,30 +1330,11 @@ def submit_operation(
             f"with max concurrency "
             f"{_read_json(operation.descriptor)['max_concurrent']}"
         )
-        completed = transport.run_script(
-            """set -eo pipefail
-cd "$1"
-sbatch --parsable "$2"
-""",
-            remote,
-            "job.sbatch",
-        )
     else:
         _progress(
             f"{operation.kind}: submitting {operation.shard_count} Slurm task(s)"
         )
-        completed = subprocess.run(
-            ["sbatch", "--parsable", "job.sbatch"],
-            cwd=operation.root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    if completed.returncode != 0:
-        raise ManualTaskError((completed.stderr or completed.stdout).strip())
-    job_id = completed.stdout.strip().split(";", 1)[0]
-    if not job_id.isdigit():
-        raise ManualTaskError(f"Slurm returned an invalid job id: {job_id}")
+    job_id = _submit_slurm_script(operation, remote, "job.sbatch")
     _progress(f"{operation.kind}: submitted Slurm job {job_id}")
     descriptor = _read_json(operation.descriptor)
     descriptor["state"] = "submitted"
@@ -1387,7 +1348,7 @@ sbatch --parsable "$2"
     descriptor["attempts"].append(
         {"submitted_at": _now(), "job_id": job_id, "indices": indices}
     )
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     if wait:
         return wait_operation(operation, poll_interval=poll_interval)
     _progress(f"{operation.kind}: checking initial scheduler state")
@@ -1447,7 +1408,7 @@ def _validate_job_result(
         not artifact.is_file()
         or artifact != _expected_job_result(operation, job).resolve()
         or artifact.stat().st_size != int(record.get("size", -1))
-        or _sha256(artifact) != record.get("sha256")
+        or file_sha256(artifact) != record.get("sha256")
     ):
         raise ManualTaskError(f"job {index} result artifact drifted or is missing")
     if operation.kind == "label":
@@ -1580,7 +1541,7 @@ def _final_result_error(
     if (
         not output.is_file()
         or output.stat().st_size != int(record.get("size", -1))
-        or _sha256(output) != record.get("sha256")
+        or file_sha256(output) != record.get("sha256")
     ):
         return f"final result drifted or is missing: {output}"
     if operation.kind == "label":
@@ -1675,14 +1636,14 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
     descriptor["completed_at"] = _now()
     descriptor["result"] = {
         "path": str(output),
-        "sha256": _sha256(output),
+        "sha256": file_sha256(output),
         "size": output.stat().st_size,
     }
     if operation.kind == "label":
         descriptor["result"]["frame_count"] = len(expected_ids)
         descriptor["result"]["frame_ids"] = expected_ids
     descriptor.pop("collection_error", None)
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     return output
 
 
@@ -1705,28 +1666,6 @@ def _collect(operation: ManualOperation) -> Path:
 def _publish_if_ready(operation: ManualOperation) -> None:
     if _all_jobs_completed(operation):
         _collect(operation)
-
-
-def _normalise_slurm_state(value: str) -> str:
-    state = value.strip().split("|", 1)[0]
-    return re.split(r"[+\s]", state, maxsplit=1)[0].upper()
-
-
-def _aggregate_slurm_states(states: Sequence[str]) -> str | None:
-    values = [_normalise_slurm_state(value) for value in states if value.strip()]
-    if not values:
-        return None
-    if any(value in {"RUNNING", "COMPLETING"} for value in values):
-        return "RUNNING"
-    if any(value in _SLURM_ACTIVE for value in values):
-        return "PENDING"
-    if any(value in _SLURM_FAILURE for value in values):
-        if all(value == "CANCELLED" for value in values):
-            return "CANCELLED"
-        return next(value for value in values if value in _SLURM_FAILURE)
-    if all(value == "COMPLETED" for value in values):
-        return "COMPLETED"
-    return values[0]
 
 
 def _run_on_target(
@@ -1766,37 +1705,11 @@ def _run_on_target(
 def _slurm_job_state(
     operation: ManualOperation, job_id: str | None
 ) -> tuple[str | None, str | None]:
-    if not job_id or not str(job_id).isdigit():
-        return None, None
-    queue = _run_on_target(
-        operation, ["squeue", "-h", "-j", str(job_id), "-o", "%T"]
+    observation = query_job(
+        lambda command: _run_on_target(operation, command),
+        job_id,
     )
-    if queue.returncode == 0:
-        state = _aggregate_slurm_states(queue.stdout.splitlines())
-        if state:
-            return state, None
-    account = _run_on_target(
-        operation,
-        [
-            "sacct",
-            "-n",
-            "-X",
-            "-j",
-            str(job_id),
-            "--format=State",
-            "--parsable2",
-        ],
-    )
-    if account.returncode == 0:
-        state = _aggregate_slurm_states(account.stdout.splitlines())
-        if state:
-            return state, None
-    detail = (
-        account.stderr.strip()
-        or queue.stderr.strip()
-        or "job is absent from squeue and sacct"
-    )
-    return None, detail
+    return observation.state, observation.error
 
 
 def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
@@ -1980,7 +1893,7 @@ def refresh_operation(operation: ManualOperation) -> dict[str, Any]:
         descriptor["state"] = state
         changed = True
     if changed:
-        _write_json(operation.descriptor, descriptor)
+        atomic_write_json(operation.descriptor, descriptor)
     next_action = None
     if state in {"prepared", "submitted", "running", "cancelling"}:
         next_action = f"neptrain task wait {shlex.quote(str(operation.root))}"
@@ -2079,7 +1992,7 @@ def cancel_operation(operation: ManualOperation) -> dict[str, Any]:
             completed.stderr or completed.stdout
         ).strip()
     descriptor.setdefault("cancellations", []).append(cancellation)
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     return refresh_operation(operation)
 
 
@@ -2153,27 +2066,7 @@ def retry_failed(operation: ManualOperation) -> dict[str, Any]:
             check=True,
         )
         _progress(f"{operation.kind}: submitting failed jobs for retry")
-        completed = transport.run_script(
-            """set -eo pipefail
-cd "$1"
-sbatch --parsable "$2"
-""",
-            remote,
-            "retry.sbatch",
-        )
-    else:
-        completed = subprocess.run(
-            ["sbatch", "--parsable", "retry.sbatch"],
-            cwd=operation.root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    if completed.returncode != 0:
-        raise ManualTaskError((completed.stderr or completed.stdout).strip())
-    job_id = completed.stdout.strip().split(";", 1)[0]
-    if not job_id.isdigit():
-        raise ManualTaskError(f"Slurm returned an invalid job id: {job_id}")
+    job_id = _submit_slurm_script(operation, remote, "retry.sbatch")
     _progress(f"{operation.kind}: submitted retry job {job_id}")
     descriptor["state"] = "submitted"
     descriptor["job_id"] = job_id
@@ -2184,7 +2077,7 @@ sbatch --parsable "$2"
     descriptor["attempts"].append(
         {"submitted_at": _now(), "job_id": job_id, "indices": failed}
     )
-    _write_json(operation.descriptor, descriptor)
+    atomic_write_json(operation.descriptor, descriptor)
     return refresh_operation(operation)
 
 

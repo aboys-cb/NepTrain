@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-import hashlib
+from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
@@ -21,6 +20,7 @@ from .candidate_pool import (
     validate_candidate_pool,
     write_candidate_pool,
 )
+from .content_addressing import file_sha256
 from .fps import hierarchical_farthest_point_sampling
 from .labeling import LabelRequest, LabelResult, label
 from .iteration import (
@@ -29,6 +29,12 @@ from .iteration import (
 )
 from .md import MdError, MdRequest, MdResult, run_md
 from .nep.calculator import DescriptorCalculator, Nep3Calculator
+from .reporting import (
+    ParitySeries,
+    build_evaluation_report,
+    build_parity_report,
+)
+from .persistence import atomic_write_json
 from .scenario import ScenarioLadder
 from .sampling_route import (
     SamplingRoute,
@@ -54,7 +60,20 @@ TrainRunner = Callable[[TrainingRequest, str], TrainingResult]
 MdRunner = Callable[[MdRequest, str], MdResult]
 LabelRunner = Callable[[LabelRequest, str], LabelResult]
 DescriptorRunner = Callable[[Path, Sequence[Atoms]], np.ndarray]
-PredictionRunner = Callable[[Path, Sequence[Atoms], str], Mapping[str, float]]
+
+
+@dataclass(frozen=True)
+class PredictionEvaluation:
+    """Metrics and paired values from one model inference pass."""
+
+    metrics: Mapping[str, float]
+    comparisons: Mapping[str, ParitySeries] = field(default_factory=dict)
+
+
+PredictionRunner = Callable[
+    [Path, Sequence[Atoms], str],
+    PredictionEvaluation,
+]
 _DESCRIPTOR_BATCH_SIZE = 4096
 _CANDIDATE_VALIDATION_REGRESSION_FACTOR = 1.02
 
@@ -105,10 +124,6 @@ def _rmse(reference: np.ndarray, prediction: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(prediction - reference))))
 
 
-def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _within_thresholds(
     metrics: Mapping[str, float], thresholds: Mapping[str, Any]
 ) -> bool:
@@ -138,9 +153,9 @@ def _threshold_score(
     )
 
 
-def _nep_prediction_metrics(
+def _nep_prediction_evaluation(
     model: Path, frames: Sequence[Atoms], backend: str
-) -> Mapping[str, float]:
+) -> PredictionEvaluation:
     if not frames:
         raise WorkflowIterationError("evaluation requires at least one labeled frame")
     spin = "spin" in frames[0].arrays
@@ -150,24 +165,55 @@ def _nep_prediction_metrics(
         else:
             energy, forces, virials = calculator.calculate(frames)
             mforces = None
-    result = {
-        "energy_rmse": _rmse(
-            np.asarray([frame.get_potential_energy() for frame in frames]), energy
+    reference_energy = np.asarray(
+        [frame.get_potential_energy() for frame in frames]
+    )
+    predicted_energy = np.asarray(energy)
+    reference_force = np.concatenate(
+        [reference_forces(frame) for frame in frames]
+    )
+    predicted_force = np.concatenate(forces)
+    reference_virial = np.asarray(
+        [frame.info["virial"] for frame in frames]
+    )
+    predicted_virial = np.asarray(virials)
+    metrics = {
+        "energy_rmse": _rmse(reference_energy, predicted_energy),
+        "force_rmse": _rmse(reference_force, predicted_force),
+        "virial_rmse": _rmse(reference_virial, predicted_virial),
+    }
+    comparisons = {
+        "energy": ParitySeries(
+            reference_energy,
+            predicted_energy,
+            "eV",
         ),
-        "force_rmse": _rmse(
-            np.concatenate([reference_forces(frame) for frame in frames]),
-            np.concatenate(forces),
+        "force": ParitySeries(
+            reference_force,
+            predicted_force,
+            "eV/Å",
         ),
-        "virial_rmse": _rmse(
-            np.asarray([frame.info["virial"] for frame in frames]), virials
+        "virial": ParitySeries(
+            reference_virial,
+            predicted_virial,
+            "eV",
         ),
     }
     if spin:
-        result["mforce_rmse"] = _rmse(
-            np.concatenate([frame.arrays["mforce"] for frame in frames]),
-            np.concatenate(mforces),
+        reference_mforce = np.concatenate(
+            [frame.arrays["mforce"] for frame in frames]
         )
-    return result
+        predicted_mforce = np.concatenate(mforces)
+        metrics["mforce_rmse"] = _rmse(
+            reference_mforce,
+            predicted_mforce,
+        )
+        comparisons["mforce"] = ParitySeries(
+            reference_mforce,
+            predicted_mforce,
+            "eV/spin unit",
+        )
+    return PredictionEvaluation(metrics, comparisons)
 
 
 @dataclass(frozen=True)
@@ -178,7 +224,7 @@ class WorkflowRuntime:
     md: MdRunner = run_md
     label: LabelRunner = label
     descriptors: DescriptorRunner = _nep_descriptors
-    predict: PredictionRunner = _nep_prediction_metrics
+    predict: PredictionRunner = _nep_prediction_evaluation
 
 
 def _read_frames(path: Path) -> list[Atoms]:
@@ -198,14 +244,6 @@ def _read_frames(path: Path) -> list[Atoms]:
     if not frames:
         raise WorkflowIterationError(f"no structures found in {path}")
     return frames
-
-
-def _write_json(path: Path, value: Any) -> Path:
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    return path
 
 
 class WorkflowIterationAdapter:
@@ -451,7 +489,7 @@ class WorkflowIterationAdapter:
             if (
                 lineage.get("generation") != context.generation - 1
                 or lineage.get("active_model_sha256")
-                != _file_sha256(previous_model)
+                != file_sha256(previous_model)
             ):
                 raise WorkflowIterationError(
                     "the previous round did not publish a valid active model lineage"
@@ -533,7 +571,7 @@ class WorkflowIterationAdapter:
                     "unsupported multi-route scenario maturity history"
                 )
             previous_route_histories = previous["routes"]
-        model_id = _file_sha256(context.artifacts["model"])
+        model_id = file_sha256(context.artifacts["model"])
         planned: list[dict[str, Any]] = []
         for route_index, route in enumerate(self.routes):
             ladder = self.scenario_ladders[route.route_id]
@@ -610,7 +648,7 @@ class WorkflowIterationAdapter:
                 )
             previous_route_histories = previous["routes"]
 
-        model_id = _file_sha256(context.artifacts["model"])
+        model_id = file_sha256(context.artifacts["model"])
         requested_md_runs = 0
         available_md_runs = 0
         route_plans: list[dict[str, Any]] = []
@@ -743,8 +781,6 @@ class WorkflowIterationAdapter:
                 try:
                     result = self.runtime.md(request, backend)
                 except MdError as error:
-                    if backend != "lammps":
-                        raise
                     attempt_results.append(
                         {
                             **base_result,
@@ -786,7 +822,12 @@ class WorkflowIterationAdapter:
                         0
                         if frame.info.get("md_window") == "pre_failure"
                         else 1,
-                        int(frame.info.get("lammps_step", 0)),
+                        int(
+                            frame.info.get(
+                                "md_step",
+                                frame.info.get("lammps_step", 0),
+                            )
+                        ),
                     )
                 )
                 if usable_frames:
@@ -866,7 +907,7 @@ class WorkflowIterationAdapter:
             if context.stage_input.get("allow_empty", False):
                 return StageOutcome(
                     artifacts={
-                        "md_attempts": _write_json(
+                        "md_attempts": atomic_write_json(
                             context.work_dir / "md-attempts.json",
                             {
                                 "version": 2,
@@ -875,7 +916,7 @@ class WorkflowIterationAdapter:
                                 "attempts": attempt_results,
                             },
                         ),
-                        "scenario_plan": _write_json(
+                        "scenario_plan": atomic_write_json(
                             context.work_dir / "scenario-plan.json",
                             {
                                 "version": 3,
@@ -905,7 +946,12 @@ class WorkflowIterationAdapter:
                 source_id=source,
                 temperature=metadata["temperature"],
                 pressure=metadata["pressure"],
-                frame_step=int(frame.info.get("lammps_step", frame_index)),
+                frame_step=int(
+                    frame.info.get(
+                        "md_step",
+                        frame.info.get("lammps_step", frame_index),
+                    )
+                ),
                 scenario_structure_id=metadata["structure_id"],
                 structure_hash=metadata["structure_hash"],
                 md_steps=metadata["md_steps"],
@@ -948,7 +994,7 @@ class WorkflowIterationAdapter:
         artifacts = {
             "candidates": output,
             "candidate_pool_manifest": pool_manifest_path,
-            "md_attempts": _write_json(
+            "md_attempts": atomic_write_json(
                 context.work_dir / "md-attempts.json",
                 {
                     "version": 2,
@@ -958,7 +1004,7 @@ class WorkflowIterationAdapter:
                 },
             ),
         }
-        scenario_plan = _write_json(
+        scenario_plan = atomic_write_json(
             context.work_dir / "scenario-plan.json",
             {
                 "version": 3,
@@ -1027,7 +1073,7 @@ class WorkflowIterationAdapter:
         attempts: list[dict[str, Any]] = []
         route_metric_parts: dict[str, list[dict[str, Any]]] = {}
         route_plan_parts: dict[str, list[dict[str, Any]]] = {}
-        model_id = _file_sha256(context.artifacts["model"])
+        model_id = file_sha256(context.artifacts["model"])
         for outcome in outcomes:
             candidate_path = outcome.artifacts.get("candidates")
             if candidate_path is not None:
@@ -1133,7 +1179,7 @@ class WorkflowIterationAdapter:
         artifacts = {
             "candidates": output,
             "candidate_pool_manifest": pool_manifest_path,
-            "md_attempts": _write_json(
+            "md_attempts": atomic_write_json(
                 context.work_dir / "md-attempts.json",
                 {
                     "version": 2,
@@ -1142,7 +1188,7 @@ class WorkflowIterationAdapter:
                     "attempts": attempts,
                 },
             ),
-            "scenario_plan": _write_json(
+            "scenario_plan": atomic_write_json(
                 context.work_dir / "scenario-plan.json",
                 {
                     "version": 3,
@@ -1298,7 +1344,7 @@ class WorkflowIterationAdapter:
                 )
             )
         )
-        result_path = _write_json(
+        result_path = atomic_write_json(
             context.work_dir / "selection-result.json",
             {
                 "selected_indices": list(result.selected_indices),
@@ -1443,19 +1489,14 @@ class WorkflowIterationAdapter:
                 "labeling backend changed or reordered selected structures"
             )
         provenance_path = context.work_dir / "label-provenance.json"
-        provenance_path.write_text(
-            json.dumps(
-                {
-                    **dict(result.provenance),
-                    "input_structure_ids": expected_ids,
-                    "labeled_count": len(result.frames),
-                    "labels_sha256": _file_sha256(result.output_file),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        atomic_write_json(
+            provenance_path,
+            {
+                **dict(result.provenance),
+                "input_structure_ids": expected_ids,
+                "labeled_count": len(result.frames),
+                "labels_sha256": file_sha256(result.output_file),
+            },
         )
         return StageOutcome(
             artifacts={
@@ -1567,18 +1608,10 @@ class WorkflowIterationAdapter:
             },
             "input_structure_ids": actual_ids,
             "labeled_count": len(frames),
-            "labels_sha256": _file_sha256(output),
+            "labels_sha256": file_sha256(output),
         }
         provenance_output = context.work_dir / "label-provenance.json"
-        provenance_output.write_text(
-            json.dumps(
-                combined_provenance,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(provenance_output, combined_provenance)
         artifacts = {
             "labeled": output,
             "label_provenance": provenance_output,
@@ -1592,19 +1625,14 @@ class WorkflowIterationAdapter:
         )
         if failures:
             failure_output = context.work_dir / "label-failures.json"
-            failure_output.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "requested_count": len(requested),
-                        "labeled_count": len(frames),
-                        "failures": list(failures),
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
+            atomic_write_json(
+                failure_output,
+                {
+                    "version": 1,
+                    "requested_count": len(requested),
+                    "labeled_count": len(frames),
+                    "failures": list(failures),
+                },
             )
             artifacts["label_failures"] = failure_output
         return StageOutcome(
@@ -1630,7 +1658,7 @@ class WorkflowIterationAdapter:
             context.artifacts["model"],
             frames,
             str(options.get("inference_backend", "auto")),
-        )
+        ).metrics
         metrics = {
             f"current_model_{name}": float(value)
             for name, value in raw_metrics.items()
@@ -1649,7 +1677,7 @@ class WorkflowIterationAdapter:
                     context.artifacts["model"],
                     attempt_frames,
                     str(options.get("inference_backend", "auto")),
-                ).items()
+                ).metrics.items()
             }
             attempt_metrics[attempt_id] = values
             attempt_accepted[attempt_id] = (
@@ -1672,7 +1700,7 @@ class WorkflowIterationAdapter:
             "evaluated_count": len(frames),
             "spin_frame_count": spin_count,
         }
-        output = _write_json(
+        output = atomic_write_json(
             context.work_dir / "acquisition-signals.json", signals
         )
         return StageOutcome(
@@ -1749,7 +1777,7 @@ class WorkflowIterationAdapter:
             or not diagnostic.get("diagnostic_accepted", False)
             or continue_training
         )
-        parent_model_sha256 = _file_sha256(context.artifacts["model"])
+        parent_model_sha256 = file_sha256(context.artifacts["model"])
         training_count = len(_read_frames(training_input))
         previous_training_count = len(
             _read_frames(context.artifacts["training_input"])
@@ -1769,20 +1797,20 @@ class WorkflowIterationAdapter:
                 "parent_model_sha256": parent_model_sha256,
                 "candidate_model_sha256": parent_model_sha256,
                 "model_updated": False,
-                "training_dataset_sha256": _file_sha256(training_input),
+                "training_dataset_sha256": file_sha256(training_input),
                 "training_count": training_count,
                 "pending_label_count": added_count,
                 "trained_on_current_labels": False,
-                "label_provenance_sha256": _file_sha256(
+                "label_provenance_sha256": file_sha256(
                     context.artifacts["label_provenance"]
                 ),
             }
             artifacts = {
                 "retrained_model": context.artifacts["model"],
-                "retraining_decision": _write_json(
+                "retraining_decision": atomic_write_json(
                     context.work_dir / "retraining-decision.json", decision
                 ),
-                "model_lineage": _write_json(
+                "model_lineage": atomic_write_json(
                     context.work_dir / "model-lineage.json", lineage
                 ),
             }
@@ -1836,26 +1864,26 @@ class WorkflowIterationAdapter:
                 )
             ),
         }
-        artifacts["retraining_decision"] = _write_json(
+        artifacts["retraining_decision"] = atomic_write_json(
             context.work_dir / "retraining-decision.json", decision
         )
         lineage = {
             "version": 1,
             "generation": context.generation,
             "parent_model_sha256": parent_model_sha256,
-            "candidate_model_sha256": _file_sha256(result.best_model),
+            "candidate_model_sha256": file_sha256(result.best_model),
             "model_updated": (
-                _file_sha256(result.best_model) != parent_model_sha256
+                file_sha256(result.best_model) != parent_model_sha256
             ),
-            "training_dataset_sha256": _file_sha256(training_input),
+            "training_dataset_sha256": file_sha256(training_input),
             "training_count": frame_count,
             "pending_label_count": 0,
             "trained_on_current_labels": True,
-            "label_provenance_sha256": _file_sha256(
+            "label_provenance_sha256": file_sha256(
                 context.artifacts["label_provenance"]
             ),
         }
-        artifacts["model_lineage"] = _write_json(
+        artifacts["model_lineage"] = atomic_write_json(
             context.work_dir / "model-lineage.json", lineage
         )
         return StageOutcome(
@@ -1981,8 +2009,8 @@ class WorkflowIterationAdapter:
         options = self.config.get("evaluation", {})
         parent_model = context.artifacts["model"]
         candidate_model = context.artifacts["retrained_model"]
-        parent_model_sha256 = _file_sha256(parent_model)
-        candidate_model_sha256 = _file_sha256(candidate_model)
+        parent_model_sha256 = file_sha256(parent_model)
+        candidate_model_sha256 = file_sha256(candidate_model)
         retraining = json.loads(
             context.artifacts["retraining_decision"].read_text(
                 encoding="utf-8"
@@ -2000,7 +2028,7 @@ class WorkflowIterationAdapter:
                     candidate_model,
                     labeled_frames,
                     str(options.get("inference_backend", "auto")),
-                ).items()
+                ).metrics.items()
             }
             if candidate_trained
             else {}
@@ -2025,7 +2053,7 @@ class WorkflowIterationAdapter:
             if candidate_activation_accepted
             else parent_model
         )
-        active_model_sha256 = _file_sha256(active_model)
+        active_model_sha256 = file_sha256(active_model)
         active_checkpoint = (
             context.artifacts.get("retrained_checkpoint")
             if candidate_activation_accepted and candidate_trained
@@ -2054,7 +2082,7 @@ class WorkflowIterationAdapter:
         )
         history["workflow_converged"] = False
         history["workflow_stalled"] = False
-        maturity_path = _write_json(
+        maturity_path = atomic_write_json(
             context.work_dir / "scenario-maturity.json", history
         )
         active_lineage = {
@@ -2119,15 +2147,21 @@ class WorkflowIterationAdapter:
         }
         artifacts = {
             "activated_model": active_model,
-            "active_model_lineage": _write_json(
+            "active_model_lineage": atomic_write_json(
                 context.work_dir / "active-model-lineage.json",
                 active_lineage,
             ),
             "scenario_maturity": maturity_path,
-            "signals": _write_json(
+            "signals": atomic_write_json(
                 context.work_dir / "signals.json", signals
             ),
         }
+        report = build_evaluation_report(
+            context.work_dir,
+            metrics=label_metrics,
+            thresholds={},
+        )
+        artifacts["evaluation_report"] = report.report
         if active_checkpoint is not None:
             artifacts["activated_checkpoint"] = active_checkpoint
         return StageOutcome(artifacts=artifacts, metrics=signals)
@@ -2152,15 +2186,14 @@ class WorkflowIterationAdapter:
         thresholds = dict(options.get("max_rmse", {}))
         parent_model = context.artifacts["model"]
         candidate_model = context.artifacts["retrained_model"]
-        parent_model_sha256 = _file_sha256(parent_model)
-        candidate_model_sha256 = _file_sha256(candidate_model)
-        parent_metrics = dict(
-            self.runtime.predict(
-                parent_model,
-                frames,
-                inference_backend,
-            )
+        parent_model_sha256 = file_sha256(parent_model)
+        candidate_model_sha256 = file_sha256(candidate_model)
+        parent_evaluation = self.runtime.predict(
+            parent_model,
+            frames,
+            inference_backend,
         )
+        parent_metrics = dict(parent_evaluation.metrics)
         parent_finite = all(
             np.isfinite(float(value)) for value in parent_metrics.values()
         )
@@ -2216,17 +2249,16 @@ class WorkflowIterationAdapter:
             and candidate_model_sha256 != parent_model_sha256
         )
         candidate_trained = retraining.get("retrained") is True
-        candidate_metrics = (
-            dict(
-                self.runtime.predict(
-                    candidate_model,
-                    frames,
-                    inference_backend,
-                )
+        candidate_evaluation = (
+            self.runtime.predict(
+                candidate_model,
+                frames,
+                inference_backend,
             )
             if candidate_trained
-            else dict(parent_metrics)
+            else parent_evaluation
         )
+        candidate_metrics = dict(candidate_evaluation.metrics)
         candidate_finite = all(
             np.isfinite(float(value)) for value in candidate_metrics.values()
         )
@@ -2250,7 +2282,7 @@ class WorkflowIterationAdapter:
                     candidate_model,
                     labeled_frames,
                     inference_backend,
-                ).items()
+                ).metrics.items()
             }
             candidate_label_accepted = _within_thresholds(
                 candidate_label_metrics, thresholds
@@ -2271,7 +2303,7 @@ class WorkflowIterationAdapter:
                         candidate_model,
                         attempt_frames,
                         inference_backend,
-                    ).items()
+                    ).metrics.items()
                 }
                 candidate_label_attempt_metrics[
                     attempt_id
@@ -2434,7 +2466,7 @@ class WorkflowIterationAdapter:
         }
         artifacts = {
             "activated_model": active_model,
-            "active_model_lineage": _write_json(
+            "active_model_lineage": atomic_write_json(
                 context.work_dir / "active-model-lineage.json",
                 active_lineage,
             ),
@@ -2466,7 +2498,7 @@ class WorkflowIterationAdapter:
         )
         history["workflow_converged"] = workflow_converged
         history["workflow_stalled"] = workflow_stalled
-        maturity_path = _write_json(
+        maturity_path = atomic_write_json(
             context.work_dir / f"scenario-maturity{suffix}.json", history
         )
         artifacts["scenario_maturity"] = maturity_path
@@ -2484,12 +2516,38 @@ class WorkflowIterationAdapter:
             workflow_stalled=workflow_stalled,
             no_progress_rounds=int(history.get("no_progress_rounds", 0)),
         )
-        output = _write_json(context.work_dir / f"signals{suffix}.json", signals)
+        output = atomic_write_json(context.work_dir / f"signals{suffix}.json", signals)
         artifacts["signals"] = output
+        report = build_evaluation_report(
+            context.work_dir,
+            metrics=candidate_metrics,
+            thresholds=thresholds,
+            parent_metrics=parent_metrics,
+            suffix=suffix,
+        )
+        artifacts["evaluation_report"] = report.report
+        if report.chart is not None:
+            artifacts["evaluation_chart"] = report.chart
+        if candidate_evaluation.comparisons:
+            parity = build_parity_report(
+                context.work_dir,
+                series=candidate_evaluation.comparisons,
+                source={
+                    "validation_name": self.validation.name,
+                    "validation_sha256": file_sha256(self.validation),
+                    "candidate_model_sha256": candidate_model_sha256,
+                    "evaluated_count": len(frames),
+                },
+                suffix=suffix,
+            )
+            artifacts["evaluation_parity_report"] = parity.report
+            if parity.chart is not None:
+                artifacts["evaluation_parity"] = parity.chart
         return StageOutcome(artifacts=artifacts, metrics=signals)
 
 
 __all__ = [
+    "PredictionEvaluation",
     "WorkflowIterationAdapter",
     "WorkflowIterationError",
     "WorkflowRuntime",

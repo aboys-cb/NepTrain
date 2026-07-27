@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -14,6 +13,7 @@ from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.calculators.vasp import Vasp
 
+from ...content_addressing import file_sha256
 from ..attempts import new_attempt_directory
 from .io import VaspInput
 from .resources import validate_vasp_resources
@@ -247,7 +247,7 @@ def _write_manifest(
     for name in ("INCAR", "POSCAR", "KPOINTS", "POTCAR"):
         path = case_dir / name
         if path.is_file():
-            inputs[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            inputs[name] = file_sha256(path)
     payload = {
         "backend": "vasp",
         "command": command,
@@ -262,7 +262,7 @@ def _write_manifest(
     for name in ("vasprun.xml", "OUTCAR"):
         path = case_dir / name
         if path.is_file():
-            outputs[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            outputs[name] = file_sha256(path)
     if outputs:
         payload["output_sha256"] = outputs
     if resources is not None:

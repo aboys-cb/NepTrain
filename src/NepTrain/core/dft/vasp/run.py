@@ -7,23 +7,13 @@ from pathlib import Path
 
 from ase import Atoms
 from ase.io import write as ase_write
+from rich.progress import track
 
-from NepTrain import utils
-
+from ...structures import read_structures
 from .native import NativeVaspRequest, run_native_vasp
 
 
-atoms_index = 1
-
-
-@utils.iter_path_to_atoms(
-    ["*.vasp", "*.xyz"],
-    show_progress=True,
-    fail_fast=True,
-    description="VASP calculation progress",
-)
-def calculate_vasp(atoms: Atoms, args):
-    global atoms_index
+def calculate_vasp(atoms: Atoms, args, *, case_index: int = 1):
     if not getattr(args, "resource_dir", None):
         raise FileNotFoundError(
             "VASP labeling requires labeling.resource_path or --resources"
@@ -60,15 +50,12 @@ def calculate_vasp(atoms: Atoms, args):
                 getattr(args, "flat_single_case", False)
             ),
         ),
-        case_index=atoms_index,
+        case_index=case_index,
     )
-    atoms_index += 1
     return result
 
 
 def run_vasp(args):
-    global atoms_index
-    atoms_index = 1
     raw_resource = getattr(args, "resource_dir", None)
     if not raw_resource:
         raise FileNotFoundError(
@@ -85,7 +72,16 @@ def run_vasp(args):
             "VASP POTCAR manifest does not exist: "
             f"{manifest or '<not configured>'}"
         )
-    result = calculate_vasp(args.model_path, args)
+    result = [
+        calculate_vasp(atoms, args, case_index=index)
+        for index, atoms in enumerate(
+            track(
+                read_structures(args.model_path),
+                description="VASP calculation progress",
+            ),
+            start=1,
+        )
+    ]
     output = Path(args.out_file_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     if len(result) and isinstance(result[0], list):
@@ -93,7 +89,7 @@ def run_vasp(args):
     if not result:
         raise RuntimeError("VASP produced no labeled structures")
     ase_write(output, result, format="extxyz", append=args.append)
-    utils.print_success("VASP calculation task completed!")
+    print("VASP calculation task completed!")
     return result
 
 

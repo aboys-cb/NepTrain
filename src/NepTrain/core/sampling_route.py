@@ -8,11 +8,11 @@ LAMMPS template.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 from pathlib import Path
 import re
 from typing import Any, Mapping
+
+from .content_addressing import canonical_sha256, file_sha256
 
 
 class SamplingRouteError(ValueError):
@@ -61,30 +61,19 @@ def normalized_progression(
     }
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _canonical_sha256(value: Any) -> str:
-    payload = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), allow_nan=False
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
 def _path_digest(path: Path) -> str:
     if path.is_file():
-        return _sha256(path)
+        return file_sha256(path)
     if path.is_dir():
         entries = [
             {
                 "path": str(item.relative_to(path)),
-                "sha256": _sha256(item),
+                "sha256": file_sha256(item),
             }
             for item in sorted(path.rglob("*"))
             if item.is_file()
         ]
-        return _canonical_sha256(entries)
+        return canonical_sha256(entries)
     raise SamplingRouteError(f"sampling route input does not exist: {path}")
 
 
@@ -166,7 +155,7 @@ class SamplingRoute:
             "pressure": float(raw_conditions.get("pressure", 0.0)),
         }
         progression = normalized_progression(raw_progression)
-        template_sha256 = _sha256(template_path)
+        template_sha256 = file_sha256(template_path)
         source_hashes = tuple(_path_digest(path) for path in structure_paths)
         fingerprint_payload = {
             "route_id": route_id,
@@ -183,7 +172,7 @@ class SamplingRoute:
             progression=progression,
             template_sha256=template_sha256,
             structure_source_sha256=source_hashes,
-            fingerprint=_canonical_sha256(fingerprint_payload),
+            fingerprint=canonical_sha256(fingerprint_payload),
         )
 
 

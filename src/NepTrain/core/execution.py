@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,8 +23,22 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .content_addressing import canonical_sha256, file_sha256
 from .iteration import GenerationPlan, StageContext, StageOutcome
+from .persistence import atomic_write_json
 from .sampling_route import load_sampling_routes
+from .slurm import (
+    ACTIVE_STATES as _ACTIVE,
+    FAILURE_STATES as _TERMINAL_FAILURE,
+    SUCCESS_STATES as _TERMINAL_SUCCESS,
+    SlurmScript,
+    SlurmSubmissionError,
+    SlurmSubmissionThrottled,
+    query_job,
+    render_script,
+    setup_line,
+    submit_job,
+)
 
 
 class ExecutionError(RuntimeError):
@@ -34,57 +47,6 @@ class ExecutionError(RuntimeError):
 
 class SubmissionDeferred(ExecutionError):
     """Raised when a scheduler temporarily refuses additional submissions."""
-
-
-_TERMINAL_SUCCESS = {"COMPLETED"}
-_TERMINAL_FAILURE = {
-    "BOOT_FAIL",
-    "CANCELLED",
-    "DEADLINE",
-    "FAILED",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "REVOKED",
-    "SPECIAL_EXIT",
-    "TIMEOUT",
-}
-_ACTIVE = {
-    "CONFIGURING",
-    "COMPLETING",
-    "PENDING",
-    "REQUEUED",
-    "RESIZING",
-    "RUNNING",
-    "STAGE_OUT",
-    "SUSPENDED",
-}
-
-
-def _slurm_state(value: str) -> str:
-    """Normalize states such as ``COMPLETED+`` and ``CANCELLED by <uid>``."""
-
-    return re.split(r"[+\s]", value.strip(), maxsplit=1)[0].upper()
-
-
-def _slurm_submission_is_throttled(detail: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", " ", detail.lower())
-    compact = normalized.replace(" ", "")
-    markers = (
-        "qosmaxsubmitjobperuserlimit",
-        "assocmaxsubmitjoblimit",
-        "qosmaxjobsperuserlimit",
-        "assocmaxjobsperuserlimit",
-        "maximum number of jobs",
-        "max number of jobs",
-        "job submit limit",
-        "job submission limit",
-        "too many jobs",
-    )
-    return any(
-        marker in normalized or marker.replace(" ", "") in compact
-        for marker in markers
-    )
 
 
 def _failure_kind(detail: str) -> str | None:
@@ -201,46 +163,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _canonical_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode()
-    ).hexdigest()
-
-
 def _tree_hash(path: Path) -> str:
     if path.is_file():
-        return _sha256(path)
+        return file_sha256(path)
     records = [
-        (str(item.relative_to(path)), _sha256(item))
+        (str(item.relative_to(path)), file_sha256(item))
         for item in sorted(path.rglob("*"))
         if item.is_file()
     ]
-    return hashlib.sha256(
-        json.dumps(records, separators=(",", ":")).encode()
-    ).hexdigest()
+    return canonical_sha256(records)
 
 
 def _copy_input(source: Path, target: Path) -> None:
@@ -794,14 +725,14 @@ def build_stage_task(
     records = [
         {
             "path": str(path.relative_to(temporary)),
-            "sha256": _sha256(path),
+            "sha256": file_sha256(path),
             "size": path.stat().st_size,
         }
         for path in sorted(temporary.rglob("*"))
         if path.is_file() and path.name != "task.json"
     ]
     descriptor["files"] = records
-    spec_sha256 = _canonical_hash(_task_content_spec(descriptor))
+    spec_sha256 = canonical_sha256(_task_content_spec(descriptor))
     task_id = spec_sha256[:24]
     descriptor["task_id"] = task_id
     descriptor["spec_sha256"] = spec_sha256
@@ -814,7 +745,7 @@ def build_stage_task(
         stage_input=dict(stage_input or {}),
     )
     bundle = tasks_dir / directory_name
-    _write_json(temporary / "task.json", descriptor)
+    atomic_write_json(temporary / "task.json", descriptor)
     if bundle.exists():
         try:
             existing = _verify_task_bundle(bundle)
@@ -864,10 +795,10 @@ def _verify_task_bundle(bundle: Path) -> dict[str, Any]:
         if (
             not path.is_file()
             or path.stat().st_size != int(record["size"])
-            or _sha256(path) != record["sha256"]
+            or file_sha256(path) != record["sha256"]
         ):
             raise ExecutionError(f"stage task input drifted: {path}")
-    expected = _canonical_hash(_task_content_spec(descriptor))
+    expected = canonical_sha256(_task_content_spec(descriptor))
     if descriptor.get("spec_sha256") != expected:
         raise ExecutionError("stage task content identity does not match its manifest")
     if descriptor.get("task_id") != expected[:24]:
@@ -900,7 +831,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             except ExecutionError:
                 pass
             else:
-                _write_json(
+                atomic_write_json(
                     execution_path,
                     {
                         "task_id": descriptor["task_id"],
@@ -912,7 +843,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     },
                 )
                 return 0
-            _write_json(
+            atomic_write_json(
                 execution_path,
                 {
                     "task_id": descriptor["task_id"],
@@ -978,7 +909,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                 relative_output = destination.relative_to(work_dir)
                 result_artifacts[name] = {
                     "path": str(Path("output") / relative_output),
-                    "sha256": _sha256(destination),
+                    "sha256": file_sha256(destination),
                     "size": destination.stat().st_size,
                 }
             published_output = bundle / "output"
@@ -1010,8 +941,8 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                 "artifacts": result_artifacts,
                 "metrics": dict(outcome.metrics),
             }
-            _write_json(bundle / "result.json", result)
-            _write_json(
+            atomic_write_json(bundle / "result.json", result)
+            atomic_write_json(
                 execution_path,
                 {
                     "task_id": descriptor["task_id"],
@@ -1023,7 +954,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             )
             return 0
         except Exception as error:
-            _write_json(
+            atomic_write_json(
                 execution_path,
                 {
                     "state": "FAILED",
@@ -1072,7 +1003,7 @@ def _load_stage_result_payload(
         if (
             not artifact.is_file()
             or artifact.stat().st_size != int(record["size"])
-            or _sha256(artifact) != record["sha256"]
+            or file_sha256(artifact) != record["sha256"]
         ):
             raise ExecutionError(f"stage result artifact drifted: {artifact}")
         artifacts[name] = artifact
@@ -1110,6 +1041,8 @@ class ExecutionTransport:
             raise ExecutionError("remote script requires an SSH execution target")
         command = [
             "ssh",
+            "-o",
+            "BatchMode=yes",
             str(self.target.host),
             "bash",
             "-s",
@@ -1134,6 +1067,42 @@ class ExecutionTransport:
             raise ExecutionError(f"execution command failed: {detail}")
         return completed
 
+    def resolve_remote_path(self, path: str | Path) -> str:
+        """Return an absolute remote path, expanding a leading ``~/`` safely."""
+
+        raw = str(path)
+        if raw.startswith("/"):
+            return raw
+        if not raw.startswith("~/"):
+            raise ExecutionError(
+                "remote path must be absolute or start with ~/"
+            )
+        completed = self.run_script(
+            """set -eo pipefail
+path=$1
+case "$path" in
+  '~/'*) path="$HOME/${path:2}" ;;
+  *) exit 2 ;;
+esac
+case "$path" in
+  /*) printf '%s\n' "$path" ;;
+  *) exit 2 ;;
+esac
+""",
+            raw,
+            check=True,
+        )
+        resolved = completed.stdout.strip()
+        if (
+            not resolved.startswith("/")
+            or "\n" in resolved
+            or "\r" in resolved
+        ):
+            raise ExecutionError(
+                f"remote target {self.target.name} returned an invalid path"
+            )
+        return resolved
+
     def copy(
         self,
         source: str | Path,
@@ -1145,7 +1114,7 @@ class ExecutionTransport:
     ) -> subprocess.CompletedProcess[str]:
         if not self.remote:
             raise ExecutionError("remote copy requires an SSH execution target")
-        command = ["scp"]
+        command = ["scp", "-o", "BatchMode=yes"]
         if recursive:
             command.append("-r")
         command.extend([str(source), str(destination)])
@@ -1195,7 +1164,7 @@ class ExecutionTransport:
         destination.mkdir(parents=True, exist_ok=True)
         token = f"{os.getpid()}-{time.time_ns()}"
         archive_name = f".neptrain-fetch-{token}.tar.gz"
-        remote_base = str(remote_root).rstrip("/")
+        remote_base = self.resolve_remote_path(remote_root).rstrip("/")
         remote_archive = f"{remote_base}/{archive_name}"
         local_archive = destination / archive_name
         prepared = self.run_script(
@@ -1283,6 +1252,8 @@ fi
         if self.remote:
             command = [
                 "ssh",
+                "-o",
+                "BatchMode=yes",
                 str(self.target.host),
                 "bash",
                 "-s",
@@ -1328,7 +1299,7 @@ exec "$@"
         descriptor = _verify_task_bundle(task.bundle)
         if descriptor["task_id"] != task.task_id:
             raise ExecutionError("stage task object does not match its bundle")
-        root = str(self.target.work_root)
+        root = self.resolve_remote_path(str(self.target.work_root))
         remote_name = task.bundle.name
         remote_bundle = (
             f"{root.rstrip('/')}/{task.workflow_id}/jobs/{remote_name}"
@@ -1338,7 +1309,7 @@ exec "$@"
             f"{root.rstrip('/')}/{task.workflow_id}/incoming/"
             f"{remote_name}-{token}.tar.gz"
         )
-        descriptor_sha256 = _sha256(task.descriptor)
+        descriptor_sha256 = file_sha256(task.descriptor)
         verify_command = shlex.split(self.target.command)
         setup = """set -eo pipefail
 root=$1
@@ -1398,7 +1369,7 @@ printf '%s\\n' MISSING
         try:
             with tarfile.open(archive, "w:gz") as handle:
                 handle.add(task.bundle, arcname=remote_name)
-            digest = _sha256(archive)
+            digest = file_sha256(archive)
             upload = self.copy(
                 archive,
                 f"{self.target.host}:{remote_archive}",
@@ -1575,24 +1546,13 @@ def _prepare_setup(target: ExecutionTarget, task: StageTask) -> None:
         shutil.copy2(candidate, task.bundle / "target-setup.sh")
 
 
-def _setup_line(target: ExecutionTarget, bundle: str) -> str | None:
-    if not target.setup_script:
-        return None
-    path = target.setup_script
-    candidate = Path(path).expanduser()
-    if candidate.is_file():
-        source = str(candidate.resolve()) if target.host is None else f"{bundle}/target-setup.sh"
-        return f"source {shlex.quote(source)}"
-    return f"source {shlex.quote(path)}"
-
-
 def _worker_command(target: ExecutionTarget, bundle: str) -> str:
     return shlex.join([*shlex.split(target.command), "stage-worker", bundle])
 
 
 def _pid_matches_bundle(pid: int, bundle: str) -> bool:
     completed = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "command="],
         capture_output=True,
         text=True,
         check=False,
@@ -1706,7 +1666,11 @@ class ProcessExecutor:
             archive.mkdir(parents=True, exist_ok=False)
             local_execution.replace(archive / "execution.json")
         lines = ["#!/bin/bash", "set -eo pipefail"]
-        setup = _setup_line(self.target, bundle)
+        setup = setup_line(
+            self.target.setup_script,
+            local=self.target.host is None,
+            packaged_remote_path=f"{bundle}/target-setup.sh",
+        )
         if setup:
             lines.append(setup)
         for key, value in self.target.environment.items():
@@ -1752,7 +1716,7 @@ if [ -f execution.json ] && grep -q '"state": "COMPLETED"' execution.json; then
   exit 0
 fi
 if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null && \
-   ps -p "$(cat worker.pid)" -o args= | grep -F -- "$bundle" >/dev/null; then
+   ps -ww -p "$(cat worker.pid)" -o args= | grep -F -- "$bundle" >/dev/null; then
   cat worker.pid
   exit 0
 fi
@@ -1818,7 +1782,7 @@ bundle=$1
 if [ -f "$bundle/execution.json" ]; then cat "$bundle/execution.json"; exit 0; fi
 if [ -f "$bundle/worker.pid" ] && \
    kill -0 "$(cat "$bundle/worker.pid")" 2>/dev/null && \
-   ps -p "$(cat "$bundle/worker.pid")" -o args= | grep -F -- "$bundle" >/dev/null; then
+   ps -ww -p "$(cat "$bundle/worker.pid")" -o args= | grep -F -- "$bundle" >/dev/null; then
   echo '{"state":"RUNNING"}'
 else
   echo '{"state":"FAILED","error":"remote worker exited without a result"}'
@@ -1898,7 +1862,7 @@ fi
 bundle=$1
 pid=$2
 kill -0 "$pid" 2>/dev/null || exit 3
-ps -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
+ps -ww -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
 pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
 [ "$pgid" = "$pid" ]
 kill -TERM -- "-$pgid"
@@ -1906,7 +1870,7 @@ for _ in $(seq 1 30); do
   kill -0 "$pid" 2>/dev/null || exit 0
   sleep 0.1
 done
-ps -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
+ps -ww -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
 kill -KILL -- "-$pgid"
 for _ in $(seq 1 20); do
   kill -0 "$pid" 2>/dev/null || exit 0
@@ -2018,33 +1982,30 @@ cat "$bundle/execution.json"
                     "recovered_from_worker_result": True,
                 },
             )
-        lines = [
-            "#!/bin/bash",
-            f"#SBATCH --job-name={self._job_name(task.task_id)}",
-            f"#SBATCH --output={bundle}/{output_name}",
-            f"#SBATCH --time={self.target.time}",
-            f"#SBATCH --partition={self.target.partition}",
-        ]
-        if self.target.qos:
-            lines.append(f"#SBATCH --qos={self.target.qos}")
-        if self.target.cpus_per_task is not None:
-            lines.append(f"#SBATCH --cpus-per-task={self.target.cpus_per_task}")
-        if self.target.gpus_per_node is not None:
-            lines.append(f"#SBATCH --gpus-per-node={self.target.gpus_per_node}")
-        for directive in self.target.directives:
-            lines.append(
-                directive if directive.startswith("#SBATCH ") else f"#SBATCH {directive}"
-            )
-        lines.extend(["", "set -eo pipefail"])
-        setup = _setup_line(self.target, bundle)
-        if setup:
-            lines.append(setup)
-        if self.target.cpus_per_task is not None:
-            lines.append('export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"')
-        for key, value in self.target.environment.items():
-            lines.append(f"export {key}={shlex.quote(value)}")
-        lines.extend([f"cd {shlex.quote(bundle)}", _worker_command(self.target, bundle), ""])
-        script.write_text("\n".join(lines), encoding="utf-8")
+        setup = setup_line(
+            self.target.setup_script,
+            local=self.target.host is None,
+            packaged_remote_path=f"{bundle}/target-setup.sh",
+        )
+        script.write_text(
+            render_script(
+                SlurmScript(
+                    job_name=self._job_name(task.task_id),
+                    output_path=f"{bundle}/{output_name}",
+                    workdir=bundle,
+                    command=_worker_command(self.target, bundle),
+                    partition=str(self.target.partition),
+                    time_limit=self.target.time,
+                    qos=self.target.qos,
+                    cpus_per_task=self.target.cpus_per_task,
+                    gpus_per_node=self.target.gpus_per_node,
+                    directives=self.target.directives,
+                    environment=self.target.environment,
+                    setup_line=setup,
+                )
+            ),
+            encoding="utf-8",
+        )
         if self.target.host:
             uploaded = self.transport.copy(
                 script,
@@ -2064,23 +2025,24 @@ cat "$bundle/execution.json"
                 remote_bundle=bundle if self.target.host else None,
                 metadata={"job_name": name},
             )
-        args = ["sbatch", "--parsable", script_name]
-        completed = self.transport.run(
-            [bundle, *args] if self.target.host else args,
-            cwd=task.bundle if not self.target.host else None,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()
-            if _slurm_submission_is_throttled(detail):
-                raise SubmissionDeferred(detail)
-            raise ExecutionError(detail)
-        job_id = completed.stdout.strip().split(";", 1)[0]
-        if not job_id.isdigit():
+        try:
+            job_id = submit_job(
+                lambda command: self.transport.run(
+                    [bundle, *command] if self.target.host else command,
+                    cwd=task.bundle if not self.target.host else None,
+                ),
+                script_name,
+            )
+        except SlurmSubmissionThrottled as error:
+            raise SubmissionDeferred(str(error)) from error
+        except SlurmSubmissionError as error:
+            if not error.accepted:
+                raise ExecutionError(str(error)) from error
             recovered = self._find_job(name, bundle)
             if recovered is None:
                 raise ExecutionError(
-                    f"Slurm accepted an unparseable submission for {name}: {completed.stdout.strip()}"
-                )
+                    f"{error}; active job {name} could not be recovered"
+                ) from error
             job_id = recovered
         return ExecutionHandle(
             task.task_id,
@@ -2102,50 +2064,22 @@ cat "$bundle/execution.json"
             and worker_status.failure_kind == "out_of_memory"
         ):
             return worker_status
-        squeue = [
-            "squeue",
-            "--noheader",
-            "--jobs",
+        observation = query_job(
+            lambda command: self.transport.run(
+                [bundle, *command] if self.target.host else command,
+                cwd=Path(bundle) if not self.target.host else None,
+            ),
             handle.execution_id,
-            "--format",
-            "%T",
-        ]
-        completed = self.transport.run(
-            [bundle, *squeue] if self.target.host else squeue,
-            cwd=Path(bundle) if not self.target.host else None,
         )
-        if completed.returncode == 0 and completed.stdout.strip():
-            state = _slurm_state(completed.stdout.strip().splitlines()[0])
-            if state in _ACTIVE:
-                return ExecutionStatus("running", state)
-        sacct = [
-            "sacct",
-            "--noheader",
-            "--parsable2",
-            "--jobs",
-            handle.execution_id,
-            "--format",
-            "State,ExitCode",
-        ]
-        completed = self.transport.run(
-            [bundle, *sacct] if self.target.host else sacct,
-            cwd=Path(bundle) if not self.target.host else None,
-        )
-        if completed.returncode != 0:
+        if observation.state is None:
             return worker_status or ExecutionStatus(
-                "unknown", (completed.stderr or completed.stdout).strip()
+                "unknown",
+                observation.error or "Slurm has no accounting record yet",
             )
-        rows = [
-            line.split("|")
-            for line in completed.stdout.splitlines()
-            if line.strip()
-        ]
-        if not rows:
-            return worker_status or ExecutionStatus(
-                "unknown", "Slurm has no accounting record yet"
-            )
-        state = _slurm_state(rows[0][0])
-        exit_code = rows[0][1] if len(rows[0]) > 1 else ""
+        state = observation.state
+        exit_code = observation.exit_code
+        if state in _ACTIVE:
+            return ExecutionStatus("running", state)
         if state in _TERMINAL_SUCCESS and exit_code.startswith("0:0"):
             return ExecutionStatus("completed", state)
         if state in _TERMINAL_FAILURE or state in _TERMINAL_SUCCESS:

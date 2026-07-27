@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 import re
@@ -18,6 +17,7 @@ from ase.data import atomic_masses, atomic_numbers
 from ase.io import write as ase_write
 
 from ..nep.calculator import resolve_backend
+from ..persistence import atomic_write_json
 from ..spin import SPIN_KEY, spin_from_lammps, spin_to_lammps, validate_spin_structure
 from .health import TrajectoryHealthPolicy, classify_trajectory
 
@@ -212,6 +212,7 @@ def read_lammps_dump(
         )
         frame.info["Config_type"] = f"lammps-step-{step}"
         frame.info["lammps_step"] = step
+        frame.info["md_step"] = step
         force_columns = ("fx", "fy", "fz")
         if all(name in index for name in force_columns):
             forces = np.asarray(
@@ -392,10 +393,7 @@ def run_lammps(
     health_payload = health.to_dict()
     health_payload["process_failure_reason"] = failure_reason
     health_path = output_dir / "trajectory-health.json"
-    health_path.write_text(
-        json.dumps(health_payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(health_path, health_payload)
     result_failure_code = None
     result_failure_reason = None
     if health.first_bad_frame is not None:

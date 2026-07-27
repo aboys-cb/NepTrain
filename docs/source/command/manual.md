@@ -43,6 +43,51 @@ neptrain md structures/ \
 
 Slurm target 会将“结构 × 温度”展开成带并发上限的 job array。
 
+GPUMD 使用同一个命令面：
+
+```bash
+neptrain md structures/ \
+  --backend gpumd \
+  --model nep.txt \
+  --temperature 300 500 700 \
+  --ensemble npt \
+  --pressure 0 \
+  --steps 100000 \
+  --seed 20260727 \
+  -o trajectories.xyz
+```
+
+不提供模板时会生成可直接运行的 NVT/NPT 输入。提供 `--template run.in` 时，
+thermostat/barostat 类型、耦合常数、`time_step` 和 dump 间隔来自模板；
+NepTrain 更新模型、温度、NPT 目标压强、步数和种子。GPUMD 压强单位为 GPa。
+两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧；
+GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS
+DynSpin。
+
+## 手动采样
+
+```bash
+neptrain select md-300.xyz md-600.xyz \
+  --base train.xyz \
+  --nep nep.txt \
+  --backend auto \
+  --max-selected 64 \
+  --min-novelty 0.01 \
+  --out selected.xyz \
+  --report selected.selection.json
+```
+
+该命令与自动 workflow 共用同一套层级 FPS：先按精确元素集合分组，再按组规模的
+平方根分配初始名额，并在组内平衡轨迹来源、route、温度和压强。`--base` 中只有
+元素集合相同的结构会参与对应组的 warm start。`--min-novelty` 是归一化描述符
+空间中的严格阈值；精确重复点在阈值为 `0` 时也不会重复入选。
+
+候选结构先按稳定的 structure ID 去重。提供 `--nep` 时通过 NEPAdapters 计算
+NEP 描述符；未提供时使用 SOAP（需安装 `NepTrain[soap]`），可用 `--r-cut`、
+`--n-max` 和 `--l-max` 调整参数。
+需要先过滤异常短键时使用 `--filter 0.6`，并可通过 `--rejected-out` 单独保存被拒
+结构。选择报告默认写在输出文件旁，也可由 `--report` 指定路径。
+
 ## 批量标注
 
 ```bash

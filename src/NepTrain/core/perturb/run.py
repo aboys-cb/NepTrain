@@ -1,87 +1,128 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-# @Time    : 2024/10/25 18:12
-# @Author  : 兵
-# @email    : 1747193328@qq.com
-import os
+"""Deterministic structure perturbation."""
 
+from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 from ase import Atoms
 from ase.io import write as ase_write
-from rich.progress import track
 
-from NepTrain import utils
-from NepTrain.core.select import filter_by_bonds
+from ..structures import read_structures
 
 
-def perturb_position(prim,min_distance):
+class PerturbError(ValueError):
+    """Raised when a perturbation request is invalid."""
 
-    atoms = prim.copy()
-    # 获取原子位置
-    positions = atoms.get_positions()
 
-    # 添加随机微扰
-    perturbed_positions = positions + np.random.uniform(
-        low=-min_distance,
-        high=min_distance,
-        size=positions.shape
+def _perturb_positions(
+    atoms: Atoms,
+    max_displacement: float,
+    rng: np.random.Generator,
+) -> Atoms:
+    perturbed = atoms.copy()
+    perturbed.positions += rng.uniform(
+        -max_displacement,
+        max_displacement,
+        size=perturbed.positions.shape,
+    )
+    return perturbed
+
+
+def _strained_structure(
+    atoms: Atoms,
+    cell_perturbation: float,
+    max_displacement: float,
+    rng: np.random.Generator,
+) -> Atoms:
+    strained = atoms.copy()
+    strains = rng.uniform(-cell_perturbation, cell_perturbation, size=3)
+    strained.set_cell(atoms.cell.array * (1.0 + strains), scale_atoms=True)
+    return _perturb_positions(strained, max_displacement, rng)
+
+
+def _deformed_structure(
+    atoms: Atoms,
+    cell_perturbation: float,
+    max_displacement: float,
+    rng: np.random.Generator,
+) -> Atoms:
+    deformed = atoms.copy()
+    deformation = np.eye(3) + rng.uniform(
+        -cell_perturbation,
+        cell_perturbation,
+        size=(3, 3),
+    )
+    deformed.set_cell(deformation @ atoms.cell.array, scale_atoms=True)
+    return _perturb_positions(deformed, max_displacement, rng)
+
+
+def perturb(
+    source: str | Path,
+    *,
+    cell_perturbation: float = 0.04,
+    max_displacement: float = 0.1,
+    count: int = 50,
+    seed: int = 42,
+) -> list[Atoms]:
+    """Perturb all input structures in stable file/frame order."""
+
+    if count < 1:
+        raise PerturbError("count must be at least 1")
+    if cell_perturbation < 0:
+        raise PerturbError("cell_perturbation must be non-negative")
+    if max_displacement < 0:
+        raise PerturbError("max_displacement must be non-negative")
+    if seed < 0:
+        raise PerturbError("seed must be non-negative")
+
+    rng = np.random.default_rng(seed)
+    result: list[Atoms] = []
+    for atoms in read_structures(source):
+        for index in range(count):
+            mode = "deformed" if index % 2 == 0 else "strained"
+            generated = (
+                _deformed_structure(
+                    atoms,
+                    cell_perturbation,
+                    max_displacement,
+                    rng,
+                )
+                if mode == "deformed"
+                else _strained_structure(
+                    atoms,
+                    cell_perturbation,
+                    max_displacement,
+                    rng,
+                )
+            )
+            generated.info["Config_type"] = (
+                f"perturb {index + 1} {mode} "
+                f"cell_perturbation {cell_perturbation:g} "
+                f"max_displacement {max_displacement:g} seed {seed}"
+            )
+            result.append(generated)
+    return result
+
+
+def run_perturb(args) -> None:
+    """CLI adapter for deterministic structure perturbation."""
+
+    frames = perturb(
+        args.model_path,
+        cell_perturbation=args.cell_pert_fraction,
+        max_displacement=args.max_displacement,
+        count=args.num,
+        seed=args.seed,
+    )
+    output = Path(args.out_file_path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(
+        output,
+        frames,
+        format="extxyz",
+        append=args.append,
     )
 
-    # 更新结构的原子位置
-    atoms.set_positions(perturbed_positions)
-    return atoms
 
-def generate_strained_structure(prim, strain_lim,min_distance):
-    strains = np.random.uniform(*strain_lim, (3, ))
-    atoms = prim.copy()
-    cell_new = prim.cell[:] * (1 + strains)
-    atoms.set_cell(cell_new, scale_atoms=True)
-
-    return perturb_position(atoms,min_distance)
-
-
-def generate_deformed_structure(prim, strain_lim,min_distance):
-    R = np.random.uniform(*strain_lim, (3, 3))
-    M = np.eye(3) + R
-    atoms = prim.copy()
-    cell_new = M @ atoms.cell[:]
-    atoms.set_cell(cell_new, scale_atoms=True)
-
-    return perturb_position(atoms,min_distance)
-
-
-
-@utils.iter_path_to_atoms(["*.vasp","*.xyz"],show_progress=False )
-def perturb(atoms:Atoms,cell_pert_fraction=0.04, min_distance=0.1,num=50):
-    cell_pert_fraction=[-cell_pert_fraction,cell_pert_fraction]
-    structures_rattle=[]
-    for i in track(range(num),description=f"Current structure:{atoms.symbols}"):
-        if i%2==0:
-            structure=generate_deformed_structure(atoms,cell_pert_fraction,min_distance)
-            structure.info['Config_type'] = f"perturb {i+1} deformed {cell_pert_fraction}  min_distance {min_distance}"
-
-        else:
-            structure=generate_strained_structure(atoms,cell_pert_fraction,min_distance)
-            structure.info['Config_type'] = f"perturb {i+1} strained {cell_pert_fraction}  min_distance {min_distance}"
-
-        structures_rattle.append(structure)
-
-
-
-    return structures_rattle
-def run_perturb(argparse):
-
-    result = perturb(argparse.model_path,
-                     cell_pert_fraction=argparse.cell_pert_fraction,
-                     min_distance=argparse.min_distance,
-
-                     num=argparse.num,
-
-                     )
-    path=os.path.dirname(argparse.out_file_path)
-
-    if path and  not os.path.exists(path):
-        os.makedirs(path)
-
-    ase_write(argparse.out_file_path,[atom for _list in result for atom in _list],format="extxyz",append=argparse.append)
+__all__ = ["PerturbError", "perturb", "run_perturb"]

@@ -24,6 +24,12 @@ pip install torch
 pip install 'NepTrain[torchnep]'
 ```
 
+不提供 `--nep`、需要用 SOAP 做手动采样时安装：
+
+```bash
+pip install 'NepTrain[soap]'
+```
+
 LAMMPS、VASP 和 ABACUS 由用户或计算平台提供。使用 NEPAdapters LAMMPS plugin
 时设置：
 
@@ -49,7 +55,7 @@ neptrain train train.xyz \
 训练后立即通过 NEPAdapters 检查模型格式和 spin 能力。TorchNEP 的最佳模型统一发布
 为 `nep.txt`。
 
-### 批量 LAMMPS
+### 批量 MD
 
 ```bash
 neptrain md structures/ \
@@ -64,6 +70,13 @@ neptrain md structures/ \
 
 输入会按“结构 × 温度”展开成独立任务。使用 Slurm target 时，它们会成为一个带并发
 上限的 job array，而不是在登录终端串行运行。
+
+将 `--backend` 改为 `gpumd` 即可使用 GPUMD。无模板时 NepTrain 会生成 NVT/NPT
+输入；`--seed` 控制初速度随机种子，`--pressure` 的 GPUMD 单位为 GPa。提供
+`run.in` 模板时，模板仍负责 thermostat/barostat 类型、耦合常数、`time_step`
+和 dump 间隔；NepTrain 只写入本轮模型、温度、NPT 目标压强、步数和种子，并确保
+dump 包含力。GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留
+稳定段和炸前帧。Spin MD 仍只支持 LAMMPS DynSpin。
 
 ### 批量标注
 
@@ -108,6 +121,23 @@ neptrain label candidates.xyz \
 
 NepTrain 会记录 Teacher 模型 SHA256 和运行配置，并在发布前校验结构身份、顺序和
 标签完整性。Spin 输入还必须由 runner 真实输出 `mforce`，不会自动补零。
+
+### 手动采样
+
+```bash
+neptrain select md-300.xyz md-600.xyz \
+  --base train.xyz \
+  --nep nep.txt \
+  --max-selected 64 \
+  --min-novelty 0.01 \
+  --out selected.xyz \
+  --report selected.selection.json
+```
+
+手动命令和 workflow 共用按元素集合分组、按来源条件平衡的 FPS 策略。
+`--base` 作为已有训练集 warm start；精确重复结构和描述符重复点不会为填满上限而
+再次入选。提供 `--nep` 时使用 NEP 描述符，否则使用 SOAP。JSON 报告记录结构
+身份版本、描述符来源、入选 ID、novelty 和各分组统计。
 
 ### Slurm target
 
@@ -219,7 +249,7 @@ neptrain workflow stop workflow --keep-jobs
 
 ## schema v8
 
-自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、LAMMPS
+自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、MD
 模板和温度路径。默认压强、递进策略、轨迹帧策略和 FPS 上限无需重复填写：
 
 ```yaml
@@ -294,10 +324,10 @@ execution:
         NEPTRAIN_VASP_COMMAND: srun vasp_std
 ```
 
-`md` 只选择 MD Adapter 和推理后端。结构、LAMMPS 模板、温度、压强和递进步数
+`md` 只选择 MD Adapter 和推理后端。结构、MD 模板、温度、压强和递进步数
 都由 `sampling.routes` 管理。
 轨迹健康检查和 FPS 批量上限统一放在 `sampling`。`timestep`、`tdamp`、`pdamp`、
-`spin_alpha` 和 dump 频率直接写在用户的 LAMMPS 模板中。
+`spin_alpha` 和 dump 频率直接写在用户的 MD 模板中。
 
 `labeling.kpoint_mode: auto` 优先保留 INCAR 中的 `KSPACING`/`KGAMMA`
 或 ABACUS INPUT 中的 `kspacing`；生成的默认输入已给出可直接修改的
@@ -438,7 +468,11 @@ workflow/
 
 每代目录直接是 `train/`、`md/`、`select/`、`label/`、`diagnose/`、
 `dataset/`、`retrain/` 和 `evaluate/`。训练输出、loss 和模型发布到对应阶段
-目录，`calculation` 软链指向真实执行目录。
+目录，`calculation` 软链指向真实执行目录。训练阶段会用 Matplotlib 发布
+`training-convergence.png` 和 `training-report.json`；配置独立验证集时，
+evaluate 阶段还会发布按阈值归一化的 `evaluation-metrics.png`，以及 Energy、
+Force、Virial（spin 模型另含 magnetic force）的 reference/prediction parity 图
+`evaluation-parity.png`。每张图都有对应的 JSON 报告记录数据来源、点数和 RMSE。
 
 开发阶段的确定性工作流 smoke：
 

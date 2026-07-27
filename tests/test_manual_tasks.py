@@ -304,10 +304,13 @@ def test_execution_transport_sends_remote_scripts_via_stdin():
         "value; still one argument",
         check=True,
     )
+    transport.copy("source.tar.gz", "remote:/remote/work/source.tar.gz")
 
     assert completed.stdout == "ok\n"
     assert calls[0][0] == [
         "ssh",
+        "-o",
+        "BatchMode=yes",
         "remote",
         "bash",
         "-s",
@@ -317,6 +320,13 @@ def test_execution_transport_sends_remote_scripts_via_stdin():
     ]
     assert "-lc" not in calls[0][0]
     assert calls[0][1]["input"].endswith("\n")
+    assert calls[1][0] == [
+        "scp",
+        "-o",
+        "BatchMode=yes",
+        "source.tar.gz",
+        "remote:/remote/work/source.tar.gz",
+    ]
 
 
 def test_execution_transport_times_out_remote_scheduler_commands():
@@ -869,6 +879,7 @@ def test_manual_md_runtime_options_are_explicit_request_inputs(tmp_path):
             cpus_per_task=4,
         ),
         steps=10,
+        seed=700,
         lmp="/opt/lammps/lmp",
         mpi_ranks=4,
         inference_backend="cpu",
@@ -881,6 +892,7 @@ def test_manual_md_runtime_options_are_explicit_request_inputs(tmp_path):
     )
 
     assert request["lmp"] == "/opt/lammps/lmp"
+    assert request["seed"] == 700
     assert request["mpi_ranks"] == 4
     assert request["inference_backend"] == "cpu"
 

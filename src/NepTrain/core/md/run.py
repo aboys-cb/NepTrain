@@ -7,12 +7,18 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Mapping
 
+import numpy as np
 from ase import Atoms
-from ase.io import read as ase_read
+from ase.io import iread as ase_iread
 from ase.io import write as ase_write
 
+from ..persistence import atomic_write_json
 from .lammps import LammpsError, run_lammps
-from .health import TrajectoryHealthError, TrajectoryHealthPolicy
+from .health import (
+    TrajectoryHealthError,
+    TrajectoryHealthPolicy,
+    classify_trajectory,
+)
 
 
 class MdError(RuntimeError):
@@ -70,31 +76,171 @@ def _template(request: MdRequest) -> str:
     return resource.read_text(encoding="utf-8")
 
 
-def _run_gpumd(request: MdRequest) -> MdResult:
+def _gpumd_failure_reason(returncode: int, stderr: Path, stdout: Path) -> str:
+    lines: list[str] = []
+    for path in (stderr, stdout):
+        if path.is_file():
+            lines.extend(
+                line.strip()
+                for line in path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if line.strip()
+            )
+    detail = lines[-1] if lines else "no output detail"
+    return f"exit code {returncode}: {detail}"
+
+
+def _read_gpumd_frames(
+    dump: Path,
+    *,
+    timestep_fs: float,
+    dump_interval: int,
+    allow_incomplete_tail: bool,
+) -> list[Atoms]:
+    frames: list[Atoms] = []
+    try:
+        for index, frame in enumerate(
+            ase_iread(dump, index=":", format="extxyz")
+        ):
+            time_value = frame.info.get("Time")
+            if isinstance(time_value, int | float | np.number):
+                step = int(round(float(time_value) / timestep_fs))
+            else:
+                step = (index + 1) * dump_interval
+            frame.info.update(
+                Config_type=f"gpumd-step-{step}",
+                gpumd_step=step,
+                md_step=step,
+            )
+            if (
+                "nep_force" not in frame.arrays
+                and frame.calc is not None
+                and "forces" in frame.calc.results
+            ):
+                frame.set_array(
+                    "nep_force",
+                    np.asarray(frame.calc.results["forces"], dtype=np.float64),
+                )
+            frames.append(frame)
+    except (EOFError, OSError, ValueError):
+        if not allow_incomplete_tail or not frames:
+            raise
+    return frames
+
+
+def _run_gpumd(
+    request: MdRequest,
+    health_policy: TrajectoryHealthPolicy,
+) -> MdResult:
     if request.spin:
         raise MdError("spin evolution uses the LAMMPS DynSpin backend")
-    from ..gpumd.io import RunInput
+    from ..gpumd.io import GpumdInputError, RunInput
 
-    run = RunInput(str(request.model_file))
-    if request.template_path is None:
-        resource = files("NepTrain.core.gpumd").joinpath("run.in")
-        run.read_run(str(resource))
-    else:
-        run.read_run(str(request.template_path))
-    duration_ps = request.steps * request.timestep
-    run.set_time_temp(duration_ps, request.temperature)
-    run.calculate(request.atoms, str(request.output_dir))
+    timestep_fs = request.timestep * 1000.0
+    try:
+        run = RunInput(request.model_file)
+        if request.template_path is None:
+            run.use_default(
+                ensemble=request.ensemble,
+                temperature=request.temperature,
+                pressure=request.pressure,
+                steps=request.steps,
+                timestep_fs=timestep_fs,
+                seed=request.seed,
+            )
+        else:
+            run.read_run(request.template_path)
+            run.configure(
+                temperature=request.temperature,
+                pressure=request.pressure,
+                steps=request.steps,
+                timestep_fs=timestep_fs,
+                seed=request.seed,
+            )
+        dump_interval = run.dump_interval()
+        effective_timestep_fs = run.timestep_fs()
+        process = run.calculate(request.atoms, request.output_dir)
+    except (GpumdInputError, OSError, ValueError) as error:
+        raise MdError(str(error)) from error
+
+    process_completed = process.returncode == 0
+    process_failure = (
+        None
+        if process_completed
+        else _gpumd_failure_reason(
+            process.returncode, process.stderr, process.stdout
+        )
+    )
     dump = request.output_dir / "dump.xyz"
     if not dump.is_file():
-        raise MdError("GPUMD completed without dump.xyz")
-    frames = ase_read(dump, index=":", format="extxyz")
+        if process_failure is None:
+            raise MdError("GPUMD completed without dump.xyz")
+        raise MdError(
+            f"GPUMD failed ({process_failure}) and produced no recoverable trajectory"
+        )
+    try:
+        frames = _read_gpumd_frames(
+            dump,
+            timestep_fs=effective_timestep_fs,
+            dump_interval=dump_interval,
+            allow_incomplete_tail=not process_completed,
+        )
+    except (EOFError, OSError, ValueError) as error:
+        if process_failure is None:
+            raise MdError(f"GPUMD produced an unreadable dump.xyz: {error}") from error
+        raise MdError(
+            f"GPUMD failed ({process_failure}) and produced no recoverable "
+            f"trajectory: {error}"
+        ) from error
+    if not frames:
+        raise MdError("GPUMD produced no readable frames in dump.xyz")
+
+    try:
+        health = classify_trajectory(
+            frames,
+            request.atoms,
+            process_completed=process_completed,
+            policy=health_policy,
+            pre_failure_frames=request.pre_failure_frames,
+            bad_tail_frames=request.bad_tail_frames,
+        )
+    except TrajectoryHealthError as error:
+        raise MdError(str(error)) from error
+    for frame, window in zip(frames, health.windows):
+        frame.info.update(
+            md_window=window,
+            md_completed=health.trajectory_completed,
+        )
+    health_payload = health.to_dict()
+    health_payload["process_failure_reason"] = process_failure
+    health_path = request.output_dir / "trajectory-health.json"
+    atomic_write_json(health_path, health_payload)
+    failure_code = None
+    failure_reason = None
+    if health.first_bad_frame is not None:
+        failure_code = "trajectory_health"
+        failure_reason = (
+            f"trajectory health failed at step {health.first_bad_step}: "
+            + ", ".join(health.reason_codes)
+        )
+        if process_failure is not None:
+            failure_reason += f"; GPUMD also failed ({process_failure})"
+    elif not process_completed:
+        failure_code = "gpumd_nonzero_exit"
+        failure_reason = process_failure
     request.output_file.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(
-        request.output_file,
-        frames,
-        format="extxyz",
+    ase_write(request.output_file, frames, format="extxyz")
+    return MdResult(
+        backend="gpumd",
+        trajectory=request.output_file,
+        run_directory=request.output_dir,
+        completed=health.trajectory_completed,
+        last_step=int(frames[-1].info["md_step"]),
+        failure_code=failure_code,
+        failure_reason=failure_reason,
+        health_report=health_path,
     )
-    return MdResult("gpumd", request.output_file, request.output_dir)
 
 
 def run_md(request: MdRequest, backend: str) -> MdResult:
@@ -120,7 +266,7 @@ def run_md(request: MdRequest, backend: str) -> MdResult:
     except TrajectoryHealthError as error:
         raise MdError(str(error)) from error
     if backend == "gpumd":
-        return _run_gpumd(request)
+        return _run_gpumd(request, health_policy)
     if backend != "lammps":
         raise MdError("MD backend must be gpumd or lammps")
     variables = {

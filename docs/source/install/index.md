@@ -13,6 +13,12 @@ pip install torch
 pip install 'NepTrain[torchnep]'
 ```
 
+手动采样不提供 NEP 模型、需要 SOAP 描述符时：
+
+```bash
+pip install 'NepTrain[soap]'
+```
+
 LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和
 `LAMMPS_PLUGIN_PATH` 写入 execution target 的 `setup_script`，然后运行：
 

@@ -23,6 +23,7 @@ from NepTrain.core.toy_workflow import toy_candidate_frames, toy_raw_features
 from NepTrain.core.training import TrainingResult
 from NepTrain.core.workflow import WorkflowError, prepare_workflow
 from NepTrain.core.workflow_iteration import (
+    PredictionEvaluation,
     WorkflowIterationAdapter,
     WorkflowRuntime,
 )
@@ -373,11 +374,13 @@ def test_workflow_generation_runs_without_evaluation(tmp_path: Path):
         return MdResult(backend, request.output_file, request.output_dir, "cpu")
 
     def finite_predict(_model, _frames, _backend):
-        return {
-            "energy_rmse": 0.5,
-            "force_rmse": 0.5,
-            "virial_rmse": 0.5,
-        }
+        return PredictionEvaluation(
+            {
+                "energy_rmse": 0.5,
+                "force_rmse": 0.5,
+                "virial_rmse": 0.5,
+            }
+        )
 
     adapter = WorkflowIterationAdapter(
         {

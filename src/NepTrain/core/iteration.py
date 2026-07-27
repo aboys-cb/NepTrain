@@ -5,13 +5,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import fcntl
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
+from .content_addressing import canonical_sha256, file_sha256
+from .fps import farthest_point_sampling
+from .persistence import atomic_write_json
 
 STAGES = (
     "train",
@@ -27,15 +29,6 @@ STAGES = (
 
 class IterationError(RuntimeError):
     """Raised when a workflow plan, ledger, or artifact is inconsistent."""
-
-
-def _canonical_hash(value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _file_hash(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -58,7 +51,7 @@ class GenerationPlan:
 
     @property
     def sha256(self) -> str:
-        return _canonical_hash(asdict(self))
+        return canonical_sha256(asdict(self))
 
 
 def progressive_plans(
@@ -98,42 +91,6 @@ class SelectionResult:
     remaining_novelty: float
 
 
-def _nearest_reference_distances(
-    points: np.ndarray,
-    reference: np.ndarray,
-    *,
-    point_batch_size: int = 4096,
-    reference_batch_size: int = 512,
-) -> np.ndarray:
-    """Return exact nearest-reference distances with bounded peak memory."""
-
-    result = np.full(len(points), np.inf, dtype=np.float64)
-    for point_start in range(0, len(points), point_batch_size):
-        point_stop = min(point_start + point_batch_size, len(points))
-        point_chunk = points[point_start:point_stop]
-        point_norm = np.einsum("ij,ij->i", point_chunk, point_chunk)
-        chunk_min = np.full(len(point_chunk), np.inf, dtype=np.float64)
-        for reference_start in range(0, len(reference), reference_batch_size):
-            reference_stop = min(
-                reference_start + reference_batch_size, len(reference)
-            )
-            reference_chunk = reference[reference_start:reference_stop]
-            reference_norm = np.einsum(
-                "ij,ij->i", reference_chunk, reference_chunk
-            )
-            squared = (
-                point_norm[:, None]
-                + reference_norm[None, :]
-                - 2.0 * point_chunk @ reference_chunk.T
-            )
-            chunk_min = np.minimum(
-                chunk_min,
-                np.maximum(squared, 0.0).min(axis=1),
-            )
-        result[point_start:point_stop] = np.sqrt(chunk_min)
-    return result
-
-
 def stratified_farthest_point_sampling(
     points: np.ndarray,
     reference: np.ndarray,
@@ -143,80 +100,21 @@ def stratified_farthest_point_sampling(
 ) -> SelectionResult:
     """Select a balanced deterministic subset in normalized feature space."""
 
-    points = np.asarray(points, dtype=np.float64)
-    reference = np.asarray(reference, dtype=np.float64)
-    if points.ndim != 2 or reference.ndim != 2:
-        raise ValueError("points and reference must be two-dimensional")
-    if points.shape[1] != reference.shape[1]:
-        raise ValueError("points and reference feature dimensions must match")
-    if len(points) != len(candidate_ids) or len(points) != len(strata):
-        raise ValueError("candidate metadata must match points")
-    if len(set(candidate_ids)) != len(candidate_ids):
-        raise ValueError("candidate_ids must be unique")
-    if len(points) == 0:
-        return SelectionResult(plan.sha256, (), (), (), {}, 0.0)
-
-    original_indices = np.arange(len(points))
-    order = np.asarray(sorted(range(len(points)), key=lambda index: candidate_ids[index]))
-    points = points[order]
-    original_indices = original_indices[order]
-    ids = [str(candidate_ids[index]) for index in order]
-    groups = [str(strata[index]) for index in order]
-
-    combined = np.vstack([reference, points]) if len(reference) else points
-    center = np.median(combined, axis=0)
-    scale = np.std(combined, axis=0)
-    scale[scale < 1.0e-12] = 1.0
-    normalized_points = (points - center) / scale
-    normalized_reference = (reference - center) / scale
-    if len(reference):
-        distances = _nearest_reference_distances(
-            normalized_points, normalized_reference
-        )
-    else:
-        distances = np.linalg.norm(
-            normalized_points - normalized_points.mean(axis=0), axis=1
-        )
-
-    budget = min(plan.max_selected, len(points))
-    selected: list[int] = []
-    novelty: list[float] = []
-    counts = {group: 0 for group in sorted(set(groups))}
-    available = np.ones(len(points), dtype=bool)
-    while len(selected) < budget:
-        novelty_gate = (
-            np.ones(len(points), dtype=bool)
-            if plan.selection_novelty_threshold == 0.0
-            else distances > plan.selection_novelty_threshold
-        )
-        eligible = np.flatnonzero(available & novelty_gate)
-        if not len(eligible):
-            break
-        active_groups = {groups[index] for index in eligible}
-        minimum_count = min(counts[group] for group in active_groups)
-        balanced = [
-            index
-            for index in eligible
-            if counts[groups[index]] == minimum_count
-        ]
-        best = min(balanced, key=lambda index: (-distances[index], ids[index]))
-        selected.append(best)
-        novelty.append(float(distances[best]))
-        counts[groups[best]] += 1
-        available[best] = False
-        new_distance = np.linalg.norm(
-            normalized_points - normalized_points[best], axis=1
-        )
-        distances = np.minimum(distances, new_distance)
-
-    remaining = float(distances[available].max(initial=0.0))
+    result = farthest_point_sampling(
+        points,
+        budget=plan.max_selected,
+        min_novelty=plan.selection_novelty_threshold,
+        reference_descriptors=reference,
+        candidate_ids=candidate_ids,
+        strata=strata,
+    )
     return SelectionResult(
         plan_sha256=plan.sha256,
-        selected_indices=tuple(int(original_indices[index]) for index in selected),
-        selected_ids=tuple(ids[index] for index in selected),
-        selected_novelty=tuple(novelty),
-        counts_by_stratum={key: value for key, value in counts.items() if value},
-        remaining_novelty=remaining,
+        selected_indices=result.selected_indices,
+        selected_ids=result.selected_ids,
+        selected_novelty=result.selected_novelty,
+        counts_by_stratum=result.counts_by_stratum,
+        remaining_novelty=result.remaining_novelty,
     )
 
 
@@ -317,19 +215,14 @@ class GenerationController:
         return ledger
 
     def _write(self, ledger: Mapping[str, Any]) -> None:
-        temporary = self.ledger_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(ledger, indent=2, sort_keys=True, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self.ledger_path)
+        atomic_write_json(self.ledger_path, ledger)
 
     @staticmethod
     def _restore_artifacts(stage_record: Mapping[str, Any]) -> dict[str, Path]:
         restored = {}
         for name, record in stage_record.get("artifacts", {}).items():
             path = Path(record["path"])
-            if not path.is_file() or _file_hash(path) != record["sha256"]:
+            if not path.is_file() or file_sha256(path) != record["sha256"]:
                 raise IterationError(f"completed artifact drifted: {path}")
             restored[name] = path
         return restored
@@ -513,7 +406,7 @@ class GenerationController:
                 )
             artifact_records[name] = {
                 "path": str(path),
-                "sha256": _file_hash(path),
+                "sha256": file_sha256(path),
             }
             resolved_artifacts[name] = path
         stage_record = {

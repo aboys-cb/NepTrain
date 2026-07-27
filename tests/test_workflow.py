@@ -163,7 +163,8 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert all(path.parent == workspace.plans_dir for path in result.plans)
     assert workspace.tasks_dir.is_dir()
     manifest = json.loads(result.manifest.read_text())
-    assert manifest["version"] == 6
+    assert manifest["version"] == 7
+    assert manifest["structure_id_version"] == "neptrain.structure-id.v3"
     assert len(manifest["instance_id"]) == 32
     assert manifest["orchestration"] == "controller"
     assert "scripts" not in manifest

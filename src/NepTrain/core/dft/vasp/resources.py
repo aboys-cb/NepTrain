@@ -10,6 +10,8 @@ from typing import Any, Iterable, Mapping
 
 from ase import Atoms
 
+from ...content_addressing import file_sha256
+
 
 class VaspResourceError(RuntimeError):
     """Raised before VASP launch when POTCAR provenance is incomplete."""
@@ -17,14 +19,6 @@ class VaspResourceError(RuntimeError):
 
 _PROTOCOL = "neptrain.vasp-resources.v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
@@ -132,7 +126,7 @@ def validate_vasp_manifest_elements(
         )
     return {
         "protocol": _PROTOCOL,
-        "manifest_sha256": _sha256(path),
+        "manifest_sha256": file_sha256(path),
         "family": manifest["family"],
         "release": manifest["release"],
         "required_elements": sorted(required),
@@ -204,7 +198,7 @@ def validate_vasp_resources(
             raise VaspResourceError(
                 f"VASP resource for {symbol} does not exist: {potcar}"
             )
-        actual_sha256 = _sha256(potcar)
+        actual_sha256 = file_sha256(potcar)
         if actual_sha256 != expected["sha256"]:
             raise VaspResourceError(
                 f"VASP resource hash mismatch for {symbol}: {potcar}"
@@ -239,7 +233,7 @@ def validate_vasp_resources(
         )
     return {
         "protocol": _PROTOCOL,
-        "manifest_sha256": _sha256(manifest_file),
+        "manifest_sha256": file_sha256(manifest_file),
         "family": family,
         "release": manifest["release"],
         "element_order": list(order),

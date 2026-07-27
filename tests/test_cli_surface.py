@@ -95,6 +95,7 @@ def test_workflow_stop_exposes_explicit_job_preservation():
 def test_md_cli_keeps_template_owned_parameters_out_of_the_interface():
     completed = _help("md", "--help")
     assert completed.returncode == 0
+    assert "--seed" in completed.stdout
     for removed in (
         "--plugin-path",
         "--timestep",
@@ -106,6 +107,14 @@ def test_md_cli_keeps_template_owned_parameters_out_of_the_interface():
         "--midpoint-iter",
     ):
         assert removed not in completed.stdout
+
+
+def test_perturb_cli_names_the_two_physical_amplitudes_explicitly():
+    completed = _help("perturb", "--help")
+    assert completed.returncode == 0
+    assert "--cell-perturbation" in completed.stdout
+    assert "--max-displacement" in completed.stdout
+    assert "--seed" in completed.stdout
 
 
 def test_label_cli_rejects_competing_kpoint_overrides():
@@ -152,6 +161,19 @@ def test_manual_commands_offer_human_output_and_explicit_json():
     completed = _help("task", "status", "--help")
     assert completed.returncode == 0
     assert "--json" in completed.stdout
+
+
+def test_select_exposes_production_sampling_controls():
+    completed = _help("select", "--help")
+
+    assert completed.returncode == 0
+    assert "--base" in completed.stdout
+    assert "--nep" in completed.stdout
+    assert "--max-selected" in completed.stdout
+    assert "--min-novelty" in completed.stdout
+    assert "--report" in completed.stdout
+    assert "--pca" not in completed.stdout
+    assert "--umap" not in completed.stdout
 
 
 def test_manual_status_is_human_readable_by_default(capsys):
@@ -307,6 +329,7 @@ def test_manual_md_inherits_the_selected_route_and_route_target(
     assert captured["target"].name == "route-worker"
     assert captured["temperatures"] == [400, 800]
     assert captured["steps"] == 456
+    assert captured["seed"] == 12345
     assert captured["pressure"] == 2.5
     assert captured["template_path"] == str((tmp_path / "route-b.in").resolve())
     assert json.loads(capsys.readouterr().out)["state"] == "complete"
