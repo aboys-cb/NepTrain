@@ -488,37 +488,256 @@ def _doctor_resource_probe(resource_root, records):
     return "\n".join(lines) + "\n"
 
 
+def _doctor_command_tools(command: str) -> list[str]:
+    """Return the launcher and payload executables from a configured command."""
+
+    import shlex
+
+    tokens = shlex.split(command)
+    if not tokens:
+        return []
+    tools = [tokens[0]]
+    for token in reversed(tokens[1:]):
+        if (
+            token.startswith("-")
+            or token.replace(".", "", 1).isdigit()
+            or ("=" in token and "/" not in token)
+        ):
+            continue
+        if token not in tools:
+            tools.append(token)
+        break
+    return tools
+
+
+def _doctor_target_requirements(config, target_name, target):
+    """Resolve the commands and Python packages used on one project target."""
+
+    execution = config["execution"]
+    stage_targets = execution["stage_targets"]
+    roles = {
+        role
+        for role, name in stage_targets.items()
+        if str(name) == target_name
+    }
+    if target_name in {
+        str(name)
+        for name in execution.get("sampling_route_targets", {}).values()
+    }:
+        roles.add("sampling")
+
+    tools = []
+    packages = []
+
+    def add_command(command):
+        tools.extend(_doctor_command_tools(command))
+
+    if target.executor == "slurm":
+        tools.extend(["sbatch", "squeue", "sacct"])
+    add_command(target.command)
+    environment = target.environment
+    if "training" in roles:
+        backend = str(config["training"]["backend"])
+        if backend == "gpumd":
+            add_command(environment.get("NEPTRAIN_NEP_COMMAND", "nep"))
+        else:
+            packages.append("torchnep")
+    if "sampling" in roles:
+        backend = str(config["md"]["backend"])
+        if backend == "gpumd":
+            add_command(environment.get("NEPTRAIN_GPUMD_COMMAND", "gpumd"))
+        else:
+            add_command(environment.get("NEPTRAIN_LMP_COMMAND", "lmp"))
+            if (target.cpus_per_task or 1) > 1:
+                add_command(environment.get("NEPTRAIN_MPIEXEC", "mpirun"))
+    if "labeling" in roles:
+        labeling = config["labeling"]
+        backend = str(labeling.get("backend", "vasp"))
+        if backend == "vasp":
+            add_command(
+                environment.get(
+                    "NEPTRAIN_VASP_COMMAND",
+                    "mpirun -n 1 vasp_std",
+                )
+            )
+        elif backend == "abacus":
+            add_command(
+                environment.get(
+                    "NEPTRAIN_ABACUS_COMMAND",
+                    "mpirun -n 1 abacus",
+                )
+            )
+        elif backend == "model":
+            runner = shlex.split(str(labeling["runner"]))
+            if runner:
+                tools.append(runner[0])
+            if len(runner) >= 3 and runner[:2] == [
+                "neptrain",
+                "model-worker",
+            ]:
+                if runner[2] == "mace":
+                    packages.append("mace.calculators")
+                elif runner[2] == "deepmd":
+                    packages.append("deepmd.calculator")
+    return (
+        sorted(set(tools)),
+        sorted(set(packages)),
+        sorted(roles),
+    )
+
+
+def _doctor_target_probe(target, tools, packages, setup_path):
+    import shlex
+
+    lines = ["set -eo pipefail"]
+    if setup_path is not None:
+        if setup_path.is_file():
+            lines.append(setup_path.read_text(encoding="utf-8"))
+        else:
+            setup_text = str(setup_path)
+            setup_source = (
+                f'"$HOME"/{shlex.quote(setup_text[2:])}'
+                if setup_text.startswith("~/")
+                else shlex.quote(setup_text)
+            )
+            lines.extend(
+                [
+                    f"test -r {setup_source} || {{ "
+                    f"echo {shlex.quote(f'missing setup script: {setup_path}')} "
+                    ">&2; exit 2; }",
+                    f"source {setup_source}",
+                ]
+            )
+    for key, value in target.environment.items():
+        lines.append(f"export {key}={shlex.quote(str(value))}")
+    lines.extend(["set +e", "status=0"])
+    required_tools = [*tools]
+    if packages and "python" not in required_tools:
+        required_tools.append("python")
+    for tool in required_tools:
+        lines.append(
+            f"command -v {shlex.quote(tool)} >/dev/null || {{ "
+            f"echo {shlex.quote(f'missing command: {tool}')} >&2; status=1; }}"
+        )
+    for package in packages:
+        lines.append(
+            "python -c "
+            + shlex.quote(
+                "import importlib, sys; importlib.import_module(sys.argv[1])"
+            )
+            + " "
+            + shlex.quote(package)
+            + " >/dev/null 2>&1 || { "
+            + f"echo {shlex.quote(f'missing Python package: {package}')} >&2; "
+            + "status=1; }"
+        )
+    lines.append('exit "$status"')
+    return "\n".join(lines) + "\n"
+
+
+def _doctor_run_probe(target, script, *, timeout_message):
+    import subprocess
+
+    command = (
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            target.host,
+            "bash",
+            "-s",
+        ]
+        if target.host
+        else ["bash", "-s"]
+    )
+    try:
+        return subprocess.run(
+            command,
+            input=script,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            stdout="",
+            stderr=timeout_message,
+        )
+
+
 def run_doctor(args):
     import importlib.util
-    import shutil
+    import os
     import shlex
+    import shutil
     import subprocess
     import tempfile
 
     failures = []
     package_status = {}
+    config = None
+    project = None
+    if args.project:
+        from NepTrain.core.config import ConfigError, load_config
+
+        project = Path(args.project).expanduser().resolve()
+        try:
+            config, _ = load_config(project)
+        except ConfigError as error:
+            raise SystemExit(
+                f"NepTrain: error: invalid project configuration: {error}"
+            ) from error
+
+    training_backend = (
+        args.training_backend
+        or (str(config["training"]["backend"]) if config else "gpumd")
+    )
+    md_backend = (
+        args.md_backend
+        or (str(config["md"]["backend"]) if config else "gpumd")
+    )
+    selected_inference = (
+        args.inference_backend
+        or (
+            str(config["md"].get("inference_backend", "auto"))
+            if config
+            else "cpu"
+        )
+    )
+    print(
+        "CHECK "
+        f"training={training_backend} md={md_backend} "
+        f"inference={selected_inference}"
+    )
+
     for package in ("nep_adapters", "ase"):
         available = importlib.util.find_spec(package) is not None
         package_status[package] = available
         print(f"{'OK' if available else 'FAIL'} package {package}")
         if not available:
             failures.append(package)
-    if args.training_backend == "torchnep":
-        available = importlib.util.find_spec("torchnep") is not None
-        print(f"{'OK' if available else 'FAIL'} package torchnep")
-        if not available:
-            failures.append("torchnep")
-    selected_inference = args.inference_backend
+
     model_info = None
-    if args.project:
-        from NepTrain.core.config import ConfigError, load_config
+    if config is not None:
         from NepTrain.core.execution import ExecutionTarget
 
-        project = Path(args.project).expanduser().resolve()
-        try:
-            config, _ = load_config(project)
-        except ConfigError as error:
-            raise SystemExit(f"NepTrain: error: invalid project configuration: {error}") from error
+        checked_config = {
+            **config,
+            "training": {
+                **config["training"],
+                "backend": training_backend,
+            },
+            "md": {
+                **config["md"],
+                "backend": md_backend,
+                "inference_backend": selected_inference,
+            },
+        }
         try:
             resource_contract = _doctor_resource_contract(config, project)
         except (KeyError, OSError, RuntimeError, ValueError) as error:
@@ -527,94 +746,56 @@ def run_doctor(args):
             ) from error
         labeling = config.get("labeling", {})
         labeling_backend = str(labeling.get("backend", "vasp"))
-        labeling_target_name = str(
-            config["execution"]["stage_targets"]["labeling"]
-        )
         if labeling_backend == "model":
             teacher = Path(str(labeling["model_path"])).expanduser()
             if not teacher.is_absolute():
                 teacher = (project.parent / teacher).resolve()
             available = teacher.is_file()
-            print(
-                f"{'OK' if available else 'FAIL'} teacher model {teacher}"
-            )
+            print(f"{'OK' if available else 'FAIL'} teacher model {teacher}")
             if not available:
                 failures.append(f"teacher model {teacher}")
         resolved_targets = {}
-        for name, raw_target in config.get("execution", {}).get("targets", {}).items():
+        for name, raw_target in config["execution"]["targets"].items():
             value = dict(raw_target)
-            setup = value.get("setup_script")
-            setup_is_local = False
-            if setup:
-                candidate = Path(setup).expanduser()
-                local = (project.parent / candidate).resolve() if not candidate.is_absolute() else candidate
-                if local.is_file():
-                    value["setup_script"] = str(local)
-                    setup_is_local = True
+            raw_setup = value.get("setup_script")
+            setup_path = None
+            if raw_setup:
+                setup_text = str(raw_setup)
+                candidate = Path(setup_text).expanduser()
+                local_candidate = (
+                    (project.parent / candidate).resolve()
+                    if not candidate.is_absolute()
+                    else candidate
+                )
+                if local_candidate.is_file():
+                    value["setup_script"] = str(local_candidate)
+                    setup_path = local_candidate
+                else:
+                    setup_path = Path(setup_text)
             target = ExecutionTarget.from_mapping(str(name), value)
             resolved_targets[str(name)] = target
-            required = []
-            if target.executor == "slurm":
-                required.extend(["sbatch", "squeue", "sacct"])
-            required.append(shlex.split(target.command)[0])
-            if (
-                labeling_backend == "model"
-                and str(name) == labeling_target_name
-            ):
-                required.append(shlex.split(str(labeling["runner"]))[0])
-            setup_line = ""
-            path_check = ""
-            if target.setup_script and target.executor == "process":
-                setup_path = target.setup_script
-                if Path(setup_path).is_file():
-                    setup_line = Path(setup_path).read_text(encoding="utf-8") + "\n"
-                else:
-                    setup_line = f"source {shlex.quote(setup_path)}\n"
-            elif target.setup_script and not setup_is_local:
-                path_check = f"test -r {shlex.quote(target.setup_script)}\n"
-            probe = (
-                "set -eo pipefail\n"
-                + setup_line
-                + path_check
-                + "for tool in "
-                + " ".join(shlex.quote(tool) for tool in required)
-                + "; do command -v \"$tool\" >/dev/null; done\n"
+            tools, packages, roles = _doctor_target_requirements(
+                checked_config,
+                str(name),
+                target,
             )
-            command = (
-                [
-                    "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ConnectTimeout=10",
-                    target.host,
-                    "bash",
-                    "-s",
-                ]
-                if target.host
-                else ["bash", "-s"]
+            probe = _doctor_target_probe(
+                target,
+                tools,
+                packages,
+                setup_path,
             )
-            try:
-                completed = subprocess.run(
-                    command,
-                    input=probe,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=30,
-                )
-            except subprocess.TimeoutExpired:
-                completed = subprocess.CompletedProcess(
-                    command,
-                    124,
-                    stdout="",
-                    stderr="probe timed out after 30s",
-                )
+            completed = _doctor_run_probe(
+                target,
+                probe,
+                timeout_message="probe timed out after 30s",
+            )
             available = completed.returncode == 0
             location = target.host or "local"
+            role_text = ",".join(roles) if roles else "unused"
             print(
                 f"{'OK' if available else 'FAIL'} execution target {name} "
-                f"({target.executor} on {location})"
+                f"({target.executor} on {location}; roles={role_text})"
             )
             if not available:
                 failures.append(f"execution target {name}")
@@ -624,36 +805,11 @@ def run_doctor(args):
         if resource_contract is not None:
             target_name, resource_root, label, records = resource_contract
             target = resolved_targets[target_name]
-            command = (
-                [
-                    "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ConnectTimeout=10",
-                    target.host,
-                    "bash",
-                    "-s",
-                ]
-                if target.host
-                else ["bash", "-s"]
+            completed = _doctor_run_probe(
+                target,
+                _doctor_resource_probe(resource_root, records),
+                timeout_message="resource probe timed out after 30s",
             )
-            try:
-                completed = subprocess.run(
-                    command,
-                    input=_doctor_resource_probe(resource_root, records),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=30,
-                )
-            except subprocess.TimeoutExpired:
-                completed = subprocess.CompletedProcess(
-                    command,
-                    124,
-                    stdout="",
-                    stderr="resource probe timed out after 30s",
-                )
             available = completed.returncode == 0
             location = target.host or "local"
             print(
@@ -665,24 +821,47 @@ def run_doctor(args):
                 detail = (completed.stderr or completed.stdout).strip()
                 if detail:
                     print(f"  {detail}")
+    else:
+        if training_backend == "torchnep":
+            available = importlib.util.find_spec("torchnep") is not None
+            print(f"{'OK' if available else 'FAIL'} package torchnep")
+            if not available:
+                failures.append("torchnep")
+        else:
+            for tool in _doctor_command_tools(
+                os.environ.get("NEPTRAIN_NEP_COMMAND", "nep")
+            ):
+                available = shutil.which(tool) is not None
+                print(f"{'OK' if available else 'FAIL'} GPUMD trainer {tool}")
+                if not available:
+                    failures.append(tool)
+        if md_backend == "gpumd":
+            for tool in _doctor_command_tools(
+                os.environ.get("NEPTRAIN_GPUMD_COMMAND", "gpumd")
+            ):
+                available = shutil.which(tool) is not None
+                print(f"{'OK' if available else 'FAIL'} GPUMD MD {tool}")
+                if not available:
+                    failures.append(tool)
+
     if args.model and package_status["nep_adapters"]:
         from nep_adapters import inspect_model
         from NepTrain.core.nep.calculator import resolve_backend
 
         model_info = inspect_model(args.model)
-        selected_inference = resolve_backend(args.model, args.inference_backend)
+        selected_inference = resolve_backend(args.model, selected_inference)
         print(
             f"OK model type={model_info.model_type} elements={','.join(model_info.elements)} "
             f"backend={selected_inference}"
         )
-    if args.md_backend == "lammps":
-        executable = shutil.which(args.lmp.split()[0])
+    if config is None and md_backend == "lammps":
+        lmp_tokens = shlex.split(args.lmp)
+        executable = shutil.which(lmp_tokens[0]) if lmp_tokens else None
         print(f"{'OK' if executable else 'FAIL'} LAMMPS executable {args.lmp}")
         if not executable:
             failures.append("lammps")
         else:
-            probe_command = shlex.split(args.lmp)
-            probe_command.append("-h")
+            probe_command = [*lmp_tokens, "-h"]
             try:
                 completed = subprocess.run(
                     probe_command,
@@ -703,7 +882,13 @@ def run_doctor(args):
             print(f"{'OK' if pair_available else 'FAIL'} LAMMPS pair style {pair}")
             if not pair_available:
                 failures.append(pair)
-    if args.structure and args.model and args.md_backend == "lammps" and not failures:
+    if (
+        config is None
+        and args.structure
+        and args.model
+        and md_backend == "lammps"
+        and not failures
+    ):
         from ase.io import read as ase_read
         from NepTrain.core.md import MdRequest, run_md
 
@@ -792,9 +977,24 @@ def build_perturb(subparsers):
 def build_doctor(subparsers):
     parser = subparsers.add_parser("doctor", help="Check selected runtime capabilities.")
     parser.set_defaults(func=run_doctor)
-    parser.add_argument("--training-backend", choices=["gpumd", "torchnep"], default="gpumd")
-    parser.add_argument("--md-backend", choices=["gpumd", "lammps"], default="gpumd")
-    parser.add_argument("--inference-backend", choices=["auto", "cpu", "cuda"], default="cpu")
+    parser.add_argument(
+        "--training-backend",
+        choices=["gpumd", "torchnep"],
+        help="Override project training.backend; default gpumd without --project.",
+    )
+    parser.add_argument(
+        "--md-backend",
+        choices=["gpumd", "lammps"],
+        help="Override project md.backend; default gpumd without --project.",
+    )
+    parser.add_argument(
+        "--inference-backend",
+        choices=["auto", "cpu", "cuda"],
+        help=(
+            "Override project md.inference_backend; default cpu without "
+            "--project."
+        ),
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--structure", default=None)
     parser.add_argument("--lmp", default="lmp")
@@ -1270,6 +1470,36 @@ def run_manual_worker_command(args):
     return run_manual_worker(args.run, args.index)
 
 
+def run_model_worker_command(args):
+    from NepTrain.core.labeling.interface import LabelingError
+
+    try:
+        if args.adapter == "mace":
+            from NepTrain.runners.mace import label_frames
+
+            label_frames(
+                args.model,
+                args.input,
+                args.output,
+                device=args.device,
+                precision=args.precision,
+            )
+        else:
+            from NepTrain.runners.deepmd import label_frames
+
+            label_frames(
+                args.model,
+                args.input,
+                args.output,
+                device=args.device,
+                precision=args.precision,
+                head=args.head,
+            )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise LabelingError(str(error)) from error
+    return 0
+
+
 def run_spin_migration_command(args):
     from NepTrain.core.spin import migrate_spin_dataset
 
@@ -1584,6 +1814,21 @@ def build_internal_commands(subparsers):
     manual.set_defaults(func=run_manual_worker_command)
     manual.add_argument("run")
     manual.add_argument("index", type=int)
+
+    model = subparsers.add_parser("model-worker", help=argparse.SUPPRESS)
+    subparsers._choices_actions.pop()
+    model.set_defaults(func=run_model_worker_command)
+    model.add_argument("adapter", choices=["mace", "deepmd"])
+    model.add_argument("--head")
+    model.add_argument("--model", required=True)
+    model.add_argument("--input", required=True)
+    model.add_argument("--output", required=True)
+    model.add_argument("--device", choices=["cpu", "cuda"], required=True)
+    model.add_argument(
+        "--precision",
+        choices=["float32", "float64"],
+        required=True,
+    )
 
 
 def main():

@@ -98,6 +98,12 @@ def test_shared_setup_line_uses_packaged_remote_copy(tmp_path):
     ) == "source /remote/task/target-setup.sh"
 
 
+def test_shared_setup_line_expands_remote_home():
+    assert setup_line("~/env/setup.sh", local=False) == (
+        'source "$HOME"/env/setup.sh'
+    )
+
+
 def test_shared_submission_parses_cluster_suffix_and_classifies_throttling():
     def accepted(command):
         return subprocess.CompletedProcess(

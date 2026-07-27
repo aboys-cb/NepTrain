@@ -24,7 +24,6 @@ pip install 'NepTrain[deepmd,torchnep]'
 
 ```bash
 command -v neptrain
-command -v neptrain-label-deepmd
 command -v dp
 python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
 ```
@@ -74,7 +73,7 @@ neptrain label candidates.xyz \
   --backend model \
   --model DPA-3.2-5M.pt \
   --model-name dpa-3.2-5m-omol25 \
-  --runner 'neptrain-label-deepmd --head OMol25' \
+  --runner 'neptrain model-worker deepmd --head OMol25' \
   --device cuda \
   --precision float32 \
   --structures-per-job 2 \
@@ -129,10 +128,7 @@ test -s student-train/training-convergence.png
 
 ```bash
 command -v gpumd
-neptrain doctor \
-  --project project.yaml \
-  --training-backend torchnep \
-  --md-backend gpumd
+neptrain doctor --project project.yaml
 ```
 
 本例为三个原子的测试体系提供 `gpumd-nve.in`。NVE 仍按 50 K 初始化速度，但不
@@ -188,7 +184,7 @@ neptrain label candidates.xyz \
   --backend model \
   --model frozen-dpa4.pt2 \
   --model-name dpa4-sezm \
-  --runner neptrain-label-deepmd \
+  --runner 'neptrain model-worker deepmd' \
   --device cuda \
   --precision float32 \
   --wait \

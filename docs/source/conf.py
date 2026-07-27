@@ -1,29 +1,16 @@
-# Configuration file for the Sphinx documentation builder.
-#
-# For the full list of built-in configuration values, see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
-
-# -- Project information -----------------------------------------------------
-# https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
+from importlib.metadata import version as distribution_version
 
 
-project = 'NepTrain'
-copyright = '2024, NepTrain Team'
-author = ",".join(['ChengBing Chen','YuTong Li'])
-release = '1.5.0'
+project = "NepTrain"
+copyright = "2024-2026, NepTrain Team"
+author = ", ".join(["ChengBing Chen", "YuTong Li"])
+release = distribution_version("NepTrain")
 
-# -- General configuration ---------------------------------------------------
-# https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
- 
 
 html_show_sourcelink = False
 extensions = [
-    # 'sphinx.ext.autodoc',
-    # 'sphinx.ext.napoleon',
-    # 'sphinx.ext.mathjax',
-
-"sphinx_design",
-    "myst_parser"
+    "sphinx_design",
+    "myst_parser",
 ]
 myst_enable_extensions = [
     "amsmath",
@@ -42,21 +29,20 @@ myst_enable_extensions = [
     "tasklist",
 ]
 
-templates_path = ['_templates']
-# locale_dirs = ['docs/locales']  # directory for language files
-language = 'en'
+templates_path = ["_templates"]
+language = "zh_CN"
 
 
-html_theme = 'sphinx_rtd_theme'
-html_static_path = ['_static']
+html_theme = "sphinx_rtd_theme"
+html_static_path = ["_static"]
 html_context = {
     "author_name": author,
 }
 html_css_files = [
-    'css/custom.css',  # specify your custom CSS file here
+    "css/custom.css",
 ]
 
 source_suffix = {
-    '.rst': 'restructuredtext',
-    '.md': 'markdown',
+    ".rst": "restructuredtext",
+    ".md": "markdown",
 }

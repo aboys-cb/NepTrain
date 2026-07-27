@@ -105,10 +105,7 @@ grep -R "REPLACE" project.yaml env-*.sh vasp-resources.json
 ## 5. 运行预检
 
 ```bash
-neptrain doctor \
-  --project project.yaml \
-  --training-backend torchnep \
-  --md-backend gpumd
+neptrain doctor --project project.yaml
 ```
 
 预检会检查 schema-v8 配置、Slurm 命令、setup script 和计算节点上的 POTCAR

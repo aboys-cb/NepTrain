@@ -127,8 +127,8 @@ VASP manifest 的路径必须是 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这一层形式�
 NepTrain 会把该路径反向写入 ASE `setups`，保证“校验的 POTCAR”就是实际拼接
 进计算的 POTCAR。
 
-预训练或微调后的等变模型使用 `model` Adapter。NepTrain 自带
-`neptrain-label-mace` runner；它读取本地 MACE checkpoint，输出具有
+预训练或微调后的等变模型使用 `model` Adapter。NepTrain 的内部
+`model-worker mace` 适配器读取本地 MACE checkpoint，输出具有
 energy、forces、virial 的 extxyz：
 
 ```bash
@@ -136,7 +136,7 @@ neptrain label candidates.xyz \
   --backend model \
   --model mace-small.model \
   --model-name mace-mp-0-small \
-  --runner neptrain-label-mace \
+  --runner 'neptrain model-worker mace' \
   --device cuda \
   --structures-per-job 64 \
   -o labeled.xyz
@@ -157,14 +157,17 @@ neptrain label candidates.xyz \
   --backend model \
   --model DPA-3.2-5M.pt \
   --model-name dpa-3.2-5m-omol25 \
-  --runner 'neptrain-label-deepmd --head OMol25' \
+  --runner 'neptrain model-worker deepmd --head OMol25' \
   --device cuda \
   -o labeled.xyz
 ```
 
-DPA-4 使用同一个 runner 和本地 `.pt2` 文件，不增加 workflow backend。当前
+DPA-4 使用同一个适配器和本地 `.pt2` 文件，不增加 workflow backend。当前
 DPA-4 需要 DeePMD-kit 3.2 预发布版；完整下载、标注、Student 冒烟训练和版本边界见
 [`examples/distillation-deepmd`](examples/distillation-deepmd/README.md)。
+
+`model-worker` 是 workflow/手动 `label` 调用的内部协议，不作为第二套用户命令；
+用户入口始终是 `neptrain label`。
 
 ### 手动采样
 

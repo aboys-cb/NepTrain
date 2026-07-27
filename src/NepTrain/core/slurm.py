@@ -169,6 +169,8 @@ def setup_line(
         )
     else:
         source = setup_script
+    if source.startswith("~/"):
+        return f'source "$HOME"/{shlex.quote(source[2:])}'
     return f"source {shlex.quote(source)}"
 
 

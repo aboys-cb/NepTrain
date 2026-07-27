@@ -19,7 +19,6 @@ pip install 'NepTrain[mace,torchnep]'
 
 ```bash
 command -v neptrain
-command -v neptrain-label-mace
 python -c 'import torch, mace; print(torch.__version__, torch.cuda.is_available())'
 ```
 
@@ -65,7 +64,7 @@ neptrain label candidates.xyz \
   --backend model \
   --model mace-mp-0-small.model \
   --model-name mace-mp-0-small \
-  --runner neptrain-label-mace \
+  --runner 'neptrain model-worker mace' \
   --device cpu \
   --precision float32 \
   --structures-per-job 2 \
@@ -114,10 +113,7 @@ test -s student-train/training-convergence.png
 
 ```bash
 command -v gpumd
-neptrain doctor \
-  --project project.yaml \
-  --training-backend torchnep \
-  --md-backend gpumd
+neptrain doctor --project project.yaml
 ```
 
 `project.yaml` 使用本地 process target，适合在已经分配 GPU 的节点运行。

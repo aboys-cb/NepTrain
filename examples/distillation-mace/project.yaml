@@ -42,7 +42,7 @@ labeling:
   backend: model
   model_path: ./mace-mp-0-small.model
   model_name: mace-mp-0-small
-  runner: neptrain-label-mace
+  runner: neptrain model-worker mace
   device: cuda
   precision: float32
   structures_per_job: 2

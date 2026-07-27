@@ -59,8 +59,6 @@ Issues = "https://github.com/aboys-cb/NepTrain/issues"
 
 [project.scripts]
 neptrain = "NepTrain.cli.cli:main"
-neptrain-label-mace = "NepTrain.runners.mace:main"
-neptrain-label-deepmd = "NepTrain.runners.deepmd:main"
 
 [tool.setuptools]
 include-package-data = false

@@ -47,6 +47,10 @@ jobs:
           test "$RELEASE_TAG" = "v$package_version"
           "$release_cli" --version
           "$release_cli" --help
+          "$release_cli" model-worker mace --help
+          "$release_cli" model-worker deepmd --help
+          test ! -e "$RUNNER_TEMP/neptrain-release/bin/neptrain-label-mace"
+          test ! -e "$RUNNER_TEMP/neptrain-release/bin/neptrain-label-deepmd"
           "$release_cli" smoke --profile ordinary --output "$RUNNER_TEMP/neptrain-smoke"
       - name: Store release distributions
         uses: actions/upload-artifact@v6

@@ -140,7 +140,7 @@ neptrain label candidates.xyz \
   --backend model \
   --model mace-small.model \
   --model-name mace-mp-0-small \
-  --runner neptrain-label-mace \
+  --runner 'neptrain model-worker mace' \
   --device cuda \
   --precision float32 \
   --project project.yaml \
@@ -148,7 +148,7 @@ neptrain label candidates.xyz \
   -o labeled.xyz
 ```
 
-`neptrain-label-mace` 由 `NepTrain[mace]` 提供，读取本地 MACE checkpoint。
+`model-worker mace` 的运行时由 `NepTrain[mace]` 提供，读取本地 MACE checkpoint。
 它复用一个 ASE calculator 批量计算结构，将 ASE stress 转成
 `virial = -stress × volume`，并保持结构顺序、晶胞和 PBC 不变。当前 MACE
 runner 不输出磁力，所以明确拒绝含 `spin` 的输入。
@@ -160,7 +160,7 @@ neptrain label candidates.xyz \
   --backend model \
   --model DPA-3.2-5M.pt \
   --model-name dpa-3.2-5m-omol25 \
-  --runner 'neptrain-label-deepmd --head OMol25' \
+  --runner 'neptrain model-worker deepmd --head OMol25' \
   --device cuda \
   --precision float32 \
   -o labeled.xyz
@@ -168,7 +168,7 @@ neptrain label candidates.xyz \
 
 模型格式和后端由 DeePMD-kit 识别。多任务模型通过 runner 的 `--head` 选择
 分支；DPA-4 仍使用这个 runner，只需把 `--model` 换成本地 `.pt2` 文件。
-`neptrain-label-deepmd` 由 `NepTrain[deepmd]` 提供；DPA-4 需要支持该格式的
+`model-worker deepmd` 的运行时由 `NepTrain[deepmd]` 提供；DPA-4 需要支持该格式的
 DeePMD-kit 3.2 或更新版本。
 
 所有模型 runner 都遵守五参数协议：`--model`、`--input`、`--output`、
@@ -176,6 +176,8 @@ DeePMD-kit 3.2 或更新版本。
 NepTrain 负责模型 hash、结构身份、energy/forces/virial、可选 spin/mforce
 和最终原子发布；runner 失败或标签不完整时不会产生部分结果。完整示例见仓库的
 `examples/distillation-mace/` 和 `examples/distillation-deepmd/`。
+`model-worker` 只承载 NepTrain 内部 runner 协议，不是需要用户单独学习的命令；
+正常使用请始终从 `neptrain label` 进入。
 
 任务提交后通过统一 task 命令管理：
 

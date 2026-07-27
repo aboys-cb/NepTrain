@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 import os
 from pathlib import Path
 
@@ -140,41 +139,3 @@ def label_frames(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ase_write(output_path, labeled_frames, format="extxyz")
     return labeled_frames
-
-
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Label extxyz structures with a local DeePMD model."
-    )
-    parser.add_argument("--head")
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--device", choices=["cpu", "cuda"], required=True)
-    parser.add_argument(
-        "--precision",
-        choices=["float32", "float64"],
-        required=True,
-    )
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
-    try:
-        label_frames(
-            args.model,
-            args.input,
-            args.output,
-            device=args.device,
-            precision=args.precision,
-            head=args.head,
-        )
-    except (DeepmdRunnerError, OSError, ValueError) as error:
-        parser.exit(1, f"neptrain-label-deepmd: error: {error}\n")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

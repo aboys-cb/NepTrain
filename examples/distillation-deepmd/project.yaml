@@ -42,7 +42,7 @@ labeling:
   backend: model
   model_path: ./DPA-3.2-5M.pt
   model_name: dpa-3.2-5m-omol25
-  runner: neptrain-label-deepmd --head OMol25
+  runner: neptrain model-worker deepmd --head OMol25
   device: cuda
   precision: float32
   structures_per_job: 2

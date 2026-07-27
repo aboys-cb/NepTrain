@@ -95,10 +95,7 @@ grep -R "REPLACE" project.yaml env-*.sh abacus-resources.json
 ## 5. 运行预检
 
 ```bash
-neptrain doctor \
-  --project project.yaml \
-  --training-backend torchnep \
-  --md-backend gpumd
+neptrain doctor --project project.yaml
 ```
 
 预检会检查 schema、Slurm target、setup script，以及计算节点上的 UPF 路径和

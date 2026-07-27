@@ -15,8 +15,11 @@ ROOT = Path(__file__).parents[1]
 @pytest.mark.parametrize(
     ("example", "runner"),
     [
-        ("distillation-deepmd", "neptrain-label-deepmd --head OMol25"),
-        ("distillation-mace", "neptrain-label-mace"),
+        (
+            "distillation-deepmd",
+            "neptrain model-worker deepmd --head OMol25",
+        ),
+        ("distillation-mace", "neptrain model-worker mace"),
     ],
 )
 def test_distillation_workflow_examples_are_schema_valid(example, runner):

@@ -16,11 +16,16 @@ from ase.io import write as ase_write
 from ruamel.yaml import YAML
 
 from NepTrain.cli.cli import (
+    _doctor_command_tools,
     _doctor_resource_probe,
+    _doctor_target_requirements,
     _print_manual_status,
     run_manual_label_command,
     run_manual_md_command,
+    run_doctor,
+    run_model_worker_command,
 )
+from NepTrain.core.execution import ExecutionTarget
 
 
 def _help(*arguments):
@@ -77,6 +82,107 @@ def test_primary_help_only_shows_the_new_product_surface():
     assert "stage-worker" not in completed.stdout
     assert "stage-verify" not in completed.stdout
     assert "manual-worker" not in completed.stdout
+    assert "model-worker" not in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("adapter", "module_name"),
+    [
+        ("mace", "NepTrain.runners.mace"),
+        ("deepmd", "NepTrain.runners.deepmd"),
+    ],
+)
+def test_internal_model_worker_dispatches_to_the_selected_adapter(
+    adapter,
+    module_name,
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_label_frames(*arguments, **options):
+        captured["arguments"] = arguments
+        captured["options"] = options
+
+    monkeypatch.setattr(f"{module_name}.label_frames", fake_label_frames)
+    result = run_model_worker_command(
+        SimpleNamespace(
+            adapter=adapter,
+            head="OMol25",
+            model="teacher.model",
+            input="input.xyz",
+            output="output.xyz",
+            device="cpu",
+            precision="float64",
+        )
+    )
+
+    assert result == 0
+    assert captured["arguments"] == (
+        "teacher.model",
+        "input.xyz",
+        "output.xyz",
+    )
+    assert captured["options"]["device"] == "cpu"
+    assert captured["options"]["precision"] == "float64"
+    if adapter == "deepmd":
+        assert captured["options"]["head"] == "OMol25"
+    else:
+        assert "head" not in captured["options"]
+
+
+def test_doctor_extracts_launcher_and_payload_commands():
+    assert _doctor_command_tools("mpirun -n 8 vasp_std") == [
+        "mpirun",
+        "vasp_std",
+    ]
+    assert _doctor_command_tools("srun --exclusive gpumd") == [
+        "srun",
+        "gpumd",
+    ]
+
+
+def test_doctor_infers_all_project_target_requirements():
+    config = {
+        "training": {"backend": "torchnep"},
+        "md": {"backend": "lammps"},
+        "labeling": {
+            "backend": "model",
+            "runner": "neptrain model-worker deepmd --head OMol25",
+        },
+        "execution": {
+            "stage_targets": {
+                "training": "gpu",
+                "sampling": "gpu",
+                "labeling": "gpu",
+                "analysis": "gpu",
+            },
+            "sampling_route_targets": {},
+        },
+    }
+    target = ExecutionTarget(
+        name="gpu",
+        executor="slurm",
+        command="neptrain",
+        partition="gpu",
+        cpus_per_task=4,
+    )
+
+    tools, packages, roles = _doctor_target_requirements(
+        config,
+        "gpu",
+        target,
+    )
+
+    assert tools == [
+        "lmp",
+        "mpirun",
+        "neptrain",
+        "sacct",
+        "sbatch",
+        "squeue",
+    ]
+    assert packages == ["deepmd.calculator", "torchnep"]
+    assert roles == ["analysis", "labeling", "sampling", "training"]
 
 
 def test_workflow_commands_are_grouped():
@@ -277,6 +383,48 @@ def _manual_project(tmp_path: Path) -> Path:
     with path.open("w", encoding="utf-8") as handle:
         YAML().dump(value, handle)
     return path
+
+
+def test_doctor_reads_backends_and_route_targets_from_project(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    project = _manual_project(tmp_path)
+    yaml = YAML()
+    with project.open(encoding="utf-8") as handle:
+        value = yaml.load(handle)
+    value["training"]["backend"] = "gpumd"
+    value["md"]["backend"] = "gpumd"
+    for target in value["execution"]["targets"].values():
+        target["command"] = sys.executable
+        target["environment"] = {
+            "NEPTRAIN_NEP_COMMAND": sys.executable,
+            "NEPTRAIN_GPUMD_COMMAND": sys.executable,
+        }
+    with project.open("w", encoding="utf-8") as handle:
+        yaml.dump(value, handle)
+    monkeypatch.setattr("importlib.util.find_spec", lambda _package: object())
+
+    run_doctor(
+        SimpleNamespace(
+            project=str(project),
+            training_backend=None,
+            md_backend=None,
+            inference_backend=None,
+            model=None,
+            structure=None,
+            lmp="lmp",
+            mpiexec="mpirun",
+            mpi_ranks=1,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "CHECK training=gpumd md=gpumd inference=auto" in output
+    assert "roles=analysis,labeling,sampling,training" in output
+    assert "roles=sampling" in output
+    assert "Doctor completed successfully." in output
 
 
 def test_manual_md_inherits_the_selected_route_and_route_target(

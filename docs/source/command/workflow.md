@@ -208,7 +208,7 @@ labeling:
   backend: model
   model_path: ./mace-small.model
   model_name: mace-mp-0-small
-  runner: neptrain-label-mace
+  runner: neptrain model-worker mace
   device: cuda
   precision: float32
 ```
@@ -219,18 +219,18 @@ runner、device 和 precision 会写入 `label-provenance.json`；extxyz 帧本�
 `execution.stage_targets.labeling` 指定的环境执行，因此 Teacher 框架的
 PyTorch/CUDA 依赖不需要安装到 Controller 环境。
 
-MACE runner 由 `NepTrain[mace]` 提供，要求本地 checkpoint 文件和正体积周期
+MACE 适配器由 `NepTrain[mace]` 提供，要求本地 checkpoint 文件和正体积周期
 晶胞；它输出 energy、forces 和按 `-stress × volume` 转换的 virial。MACE
 不输出磁力，所以这个 runner 不支持 spin workflow。
 
-DeepMD runner 由 `NepTrain[deepmd]` 提供。DPA-3 多任务模型可写成：
+DeepMD 适配器由 `NepTrain[deepmd]` 提供。DPA-3 多任务模型可写成：
 
 ```yaml
 labeling:
   backend: model
   model_path: ./DPA-3.2-5M.pt
   model_name: dpa-3.2-5m-omol25
-  runner: neptrain-label-deepmd --head OMol25
+  runner: neptrain model-worker deepmd --head OMol25
   device: cuda
   precision: float32
 ```
@@ -239,6 +239,9 @@ DPA-4 使用相同 runner 和本地 `.pt2` 模型；不新增 workflow backend�
 head 和推理后端由 DeePMD-kit 处理，NepTrain 仍按本地文件内容记录 SHA256。
 当前 DPA-4 要求 DeePMD-kit 3.2 或更新版本。DeepMD runner 同样不生成
 `mforce`，因此不支持 spin workflow。
+
+这里的 `model-worker` 是 label stage 的内部协议，不是独立产品入口；用户仍通过
+`neptrain label` 或 workflow 启动标注。
 
 这一路径在调度上完全替代 DFT，但报告会保留 `teacher_model` 来源，避免把蒸馏
 标签误称为 DFT 标签。若配置独立 `evaluation.validation_path`，最终验收仍以该
