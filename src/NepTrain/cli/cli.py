@@ -761,7 +761,13 @@ def build_perturb(subparsers):
                                 type=float,
                                 dest="min_distance",
                                 default=0.1,
-                                help="Min atom distance, unit Å, default 0.1.")
+                                help="Maximum Cartesian displacement amplitude in Å, default 0.1.")
+    parser_perturb.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible perturbations, default 42.",
+    )
 
     parser_perturb.add_argument("--out", "-o",
                              dest="out_file_path",

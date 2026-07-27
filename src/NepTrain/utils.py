@@ -81,17 +81,15 @@ def merge_yaml(yaml_a, yaml_b):
 
 
 def verify_path(path):
-    if not os.path.exists(os.path.expanduser(path)):
-
-        os.makedirs(os.path.expanduser(path))
+    os.makedirs(os.path.expanduser(path), exist_ok=True)
 
 def copy(rc, dst,   follow_symlinks=True):
     if  rc is None or not os.path.exists(rc):
         return
 
-    parent_path=(os.path.dirname(dst))
-    if not os.path.exists(parent_path):
-        os.makedirs(parent_path)
+    parent_path = os.path.dirname(dst)
+    if parent_path:
+        os.makedirs(parent_path, exist_ok=True)
     if os.path.isdir(rc):
         shutil.copytree(rc, dst ,dirs_exist_ok=True)
     else:
@@ -133,8 +131,7 @@ def cat(files,out_file):
         for filename in file_list:
 
             with open(filename, 'rb') as infile:
-                # 读取文件内容并写入到目标文件
-                outfile.write(infile.read())
+                shutil.copyfileobj(infile, outfile)
 
 
 @contextmanager
@@ -175,6 +172,8 @@ def iter_path_to_atoms(glob_strs: list,show_progress=True,fail_fast=False,**kkwa
                 try:
                     atoms=ase_read(i.as_posix(),index=":")
                 except Exception as e:
+                    if fail_fast:
+                        raise
                     print_warning(f"文件：{i.as_posix()}读取错误!报错原因：{e}")
                     continue
                 if isinstance(atoms,list):
@@ -198,7 +197,7 @@ def iter_path_to_atoms(glob_strs: list,show_progress=True,fail_fast=False,**kkwa
                 try:
                     result.append(func(i, *args, **kwargs))
                 except KeyboardInterrupt:
-                    return result
+                    raise
                 except Exception as e:
                     if fail_fast:
                         raise

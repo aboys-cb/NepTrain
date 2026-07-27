@@ -5,8 +5,9 @@
 # @email    : 1747193328@qq.com
 import numpy as np
 from ase import Atoms
-from ase.data import atomic_numbers,covalent_radii,chemical_symbols
-from joblib import Parallel, delayed
+from ase.data import covalent_radii
+from ase.geometry import get_distances
+from ase.neighborlist import neighbor_list
 from tqdm import tqdm
 
 def calculate_pairwise_distances(lattice_params:np.ndarray, atom_coords:np.ndarray, fractional=True):
@@ -23,16 +24,22 @@ def calculate_pairwise_distances(lattice_params:np.ndarray, atom_coords:np.ndarr
     """
 
 
+    lattice = np.asarray(lattice_params, dtype=np.float64)
+    coordinates = np.asarray(atom_coords, dtype=np.float64)
     if fractional:
-        atom_coords = np.dot(atom_coords, lattice_params)
-
-    diff = atom_coords[np.newaxis, :, :] - atom_coords[:, np.newaxis, :]
-    shifts = np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1]), dtype=np.int8).T.reshape(-1, 3)
-    lattice_shifts = np.dot(shifts, lattice_params)
-    all_diffs = diff[:, :, np.newaxis, :] + lattice_shifts[np.newaxis, np.newaxis, :, :]
-    all_distances = np.sqrt(np.sum(all_diffs ** 2, axis=-1))
-    distances = np.min(all_distances, axis=-1)
-    np.fill_diagonal(distances, 0)
+        coordinates = coordinates @ lattice
+    atom_count = len(coordinates)
+    distances = np.empty((atom_count, atom_count), dtype=np.float64)
+    # The result itself is O(N²), but block the temporary displacement vectors
+    # so this helper no longer materializes N×N×27×3 (or even N×N×3) data.
+    for start in range(0, atom_count, 256):
+        stop = min(start + 256, atom_count)
+        _, distances[start:stop] = get_distances(
+            coordinates[start:stop],
+            coordinates,
+            cell=lattice,
+            pbc=True,
+        )
     return distances
 
 
@@ -40,7 +47,7 @@ def get_mini_distance_info(atoms:Atoms):
     """
     返回原子对之间的最小距离
     """
-    dist_matrix = calculate_pairwise_distances(atoms.cell, atoms.positions, False)
+    dist_matrix = atoms.get_all_distances(mic=True)
     symbols = atoms.get_chemical_symbols()
     # 提取上三角矩阵（排除对角线）
     i, j = np.triu_indices(len(atoms), k=1)
@@ -75,17 +82,15 @@ def adjust_reasonable(atoms, coefficient=0.7):
     :return:
 
     """
-    distance_info = get_mini_distance_info(atoms)
-    for elems, bond_length in distance_info.items():
-
-        r1=covalent_radii[chemical_symbols.index(elems[0])]
-        r2=covalent_radii[chemical_symbols.index(elems[1])]
-        if isinstance(r1,float) and isinstance(r2,float):
-
-            # 相邻原子距离小于共价半径之和×系数就选中
-            if (r1 + r2) * coefficient > bond_length :
-                return False
-    return True
+    if coefficient < 0:
+        raise ValueError("bond-distance coefficient must be non-negative")
+    if not len(atoms) or coefficient == 0:
+        return True
+    radii = np.asarray(covalent_radii[atoms.numbers], dtype=np.float64)
+    if not np.all(np.isfinite(radii)) or np.any(radii <= 0):
+        raise ValueError("all atoms must have finite positive covalent radii")
+    pair_i, _ = neighbor_list("ij", atoms, radii * coefficient)
+    return len(pair_i) == 0
 
 
 
@@ -97,6 +102,8 @@ def process_atom(atoms, filter_func):
 
 def parallel_filter_trajectory(trajectory, filter_func, n_jobs=-1):
     """使用 joblib 并行处理"""
+    from joblib import Parallel, delayed
+
     results = Parallel(n_jobs=n_jobs)(
         delayed(process_atom)(atoms, filter_func)
         for atoms in tqdm(trajectory, desc="Filtering structures")
@@ -106,5 +113,3 @@ def parallel_filter_trajectory(trajectory, filter_func, n_jobs=-1):
     filter_structures = [atoms for atoms, is_reasonable in results if not is_reasonable]
 
     return trajectory_structures, filter_structures
-
-

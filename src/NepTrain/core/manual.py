@@ -1125,16 +1125,7 @@ def _deploy_remote(operation: ManualOperation) -> str:
     try:
         if remote.startswith("~/"):
             _progress(f"{operation.kind}: resolving remote home on {target.name}")
-            home_result = transport.run_script(
-                'printf %s "$HOME"',
-                check=True,
-            )
-            remote_home = home_result.stdout.strip()
-            if not remote_home.startswith("/"):
-                raise ManualTaskError(
-                    f"remote target {target.name} returned an invalid home directory"
-                )
-            remote = remote_home.rstrip("/") + "/" + remote[2:]
+            remote = transport.resolve_remote_path(remote)
         _progress(f"{operation.kind}: packing portable task inputs")
         with tarfile.open(archive, "w:gz") as handle:
             handle.add(operation.root, arcname=operation.operation_id)

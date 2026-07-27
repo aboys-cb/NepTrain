@@ -29,6 +29,9 @@ def get_dump_interval(run_in_file="run.in"):
                     try:
                         dump_interval = int(line.split()[1])
                         break
-                    except (IndexError, ValueError):
-                        pass
+                    except (IndexError, ValueError) as error:
+                        raise ValueError(
+                            f"invalid dump_thermo interval in {run_in_file}: "
+                            f"{line.strip()}"
+                        ) from error
     return dump_interval

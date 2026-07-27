@@ -134,7 +134,7 @@ def _controller_command() -> list[str]:
 def _process_matches(pid: int, project: Path) -> bool:
     try:
         completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             check=False,

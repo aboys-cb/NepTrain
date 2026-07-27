@@ -53,6 +53,7 @@ from NepTrain.core.scientific_data import (
 )
 from NepTrain.core.workflow_workspace import WorkflowWorkspace
 import NepTrain.core.controller as controller_module
+import NepTrain.core.execution as execution_module
 
 
 def _write(path: Path, text: str = "fixture\n") -> Path:
@@ -336,7 +337,7 @@ def test_remote_deploy_atomically_replaces_only_an_incomplete_exact_task(
         "remote",
         "slurm",
         host="fixture",
-        work_root=str(remote_root),
+        work_root="~/remote",
         partition="cpu",
         command=(
             f"env PYTHONPATH={Path(__file__).resolve().parents[1] / 'src'} "
@@ -380,6 +381,7 @@ def test_remote_deploy_atomically_replaces_only_an_incomplete_exact_task(
                 text=True,
                 check=False,
                 timeout=timeout,
+                env={**os.environ, "HOME": str(tmp_path)},
             )
             if check and completed.returncode:
                 raise ExecutionError(completed.stderr)
@@ -418,6 +420,22 @@ def test_remote_deploy_atomically_replaces_only_an_incomplete_exact_task(
     (destination / "task.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ExecutionError, match="conflicts with local"):
         transport.deploy(task)
+
+
+def test_process_identity_checks_request_untruncated_commands(monkeypatch):
+    calls = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "controller /long/task/path\n", "")
+
+    monkeypatch.setattr(execution_module.subprocess, "run", fake_run)
+    assert execution_module._pid_matches_bundle(123, "/long/task/path")
+    assert calls[-1] == ["ps", "-ww", "-p", "123", "-o", "command="]
+
+    monkeypatch.setattr(controller_module.subprocess, "run", fake_run)
+    assert controller_module._process_matches(456, Path("/long/task/path"))
+    assert calls[-1] == ["ps", "-ww", "-p", "456", "-o", "command="]
 
 
 def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
@@ -1975,8 +1993,17 @@ def test_remote_slurm_cancel_runs_on_the_target_host(tmp_path):
     def runner(args, **_kwargs):
         args = list(args)
         calls.append(args)
-        if args[:6] == ["ssh", "remote", "bash", "-s", "--", "/remote/task"]:
-            command = args[6:]
+        if args[:8] == [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "remote",
+            "bash",
+            "-s",
+            "--",
+            "/remote/task",
+        ]:
+            command = args[8:]
             if not command:
                 return subprocess.CompletedProcess(args, 3, "", "")
             if command[0] == "squeue":

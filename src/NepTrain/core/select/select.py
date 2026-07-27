@@ -97,7 +97,7 @@ def select_structures(train, new_atoms ,descriptor, max_selected=20, min_distanc
 # 加速计算每对元素的最小键长
 def compute_min_bond_lengths(atoms ):
     # 获取原子符号
-    dist_matrix = atoms.get_all_distances()
+    dist_matrix = atoms.get_all_distances(mic=True)
     symbols = atoms.get_chemical_symbols()
     # 提取上三角矩阵（排除对角线）
     i, j = np.triu_indices(len(atoms), k=1)
@@ -151,7 +151,13 @@ def filter_by_bonds(trajectory,model):
         # print(bond)
         # condition = [utils.radius_table[a]+utils.radius_table[b] > a_b for (a,b),a_b in bond.items()]
 
-        condition = [base_bond.get(key,0)*0.6 > a_b for key,a_b in bond.items()]
+        # A candidate containing an element pair absent from the reference
+        # cannot be validated against that reference and must not be silently
+        # accepted.
+        condition = [
+            key not in base_bond or base_bond[key] * 0.6 > a_b
+            for key, a_b in bond.items()
+        ]
         # print(condition)
         if any(condition):
             bad_structure.append(trajectory[index])

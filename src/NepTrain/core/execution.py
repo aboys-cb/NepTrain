@@ -1110,6 +1110,8 @@ class ExecutionTransport:
             raise ExecutionError("remote script requires an SSH execution target")
         command = [
             "ssh",
+            "-o",
+            "BatchMode=yes",
             str(self.target.host),
             "bash",
             "-s",
@@ -1134,6 +1136,42 @@ class ExecutionTransport:
             raise ExecutionError(f"execution command failed: {detail}")
         return completed
 
+    def resolve_remote_path(self, path: str | Path) -> str:
+        """Return an absolute remote path, expanding a leading ``~/`` safely."""
+
+        raw = str(path)
+        if raw.startswith("/"):
+            return raw
+        if not raw.startswith("~/"):
+            raise ExecutionError(
+                "remote path must be absolute or start with ~/"
+            )
+        completed = self.run_script(
+            """set -eo pipefail
+path=$1
+case "$path" in
+  '~/'*) path="$HOME/${path:2}" ;;
+  *) exit 2 ;;
+esac
+case "$path" in
+  /*) printf '%s\n' "$path" ;;
+  *) exit 2 ;;
+esac
+""",
+            raw,
+            check=True,
+        )
+        resolved = completed.stdout.strip()
+        if (
+            not resolved.startswith("/")
+            or "\n" in resolved
+            or "\r" in resolved
+        ):
+            raise ExecutionError(
+                f"remote target {self.target.name} returned an invalid path"
+            )
+        return resolved
+
     def copy(
         self,
         source: str | Path,
@@ -1145,7 +1183,7 @@ class ExecutionTransport:
     ) -> subprocess.CompletedProcess[str]:
         if not self.remote:
             raise ExecutionError("remote copy requires an SSH execution target")
-        command = ["scp"]
+        command = ["scp", "-o", "BatchMode=yes"]
         if recursive:
             command.append("-r")
         command.extend([str(source), str(destination)])
@@ -1195,7 +1233,7 @@ class ExecutionTransport:
         destination.mkdir(parents=True, exist_ok=True)
         token = f"{os.getpid()}-{time.time_ns()}"
         archive_name = f".neptrain-fetch-{token}.tar.gz"
-        remote_base = str(remote_root).rstrip("/")
+        remote_base = self.resolve_remote_path(remote_root).rstrip("/")
         remote_archive = f"{remote_base}/{archive_name}"
         local_archive = destination / archive_name
         prepared = self.run_script(
@@ -1283,6 +1321,8 @@ fi
         if self.remote:
             command = [
                 "ssh",
+                "-o",
+                "BatchMode=yes",
                 str(self.target.host),
                 "bash",
                 "-s",
@@ -1328,7 +1368,7 @@ exec "$@"
         descriptor = _verify_task_bundle(task.bundle)
         if descriptor["task_id"] != task.task_id:
             raise ExecutionError("stage task object does not match its bundle")
-        root = str(self.target.work_root)
+        root = self.resolve_remote_path(str(self.target.work_root))
         remote_name = task.bundle.name
         remote_bundle = (
             f"{root.rstrip('/')}/{task.workflow_id}/jobs/{remote_name}"
@@ -1592,7 +1632,7 @@ def _worker_command(target: ExecutionTarget, bundle: str) -> str:
 
 def _pid_matches_bundle(pid: int, bundle: str) -> bool:
     completed = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "command="],
         capture_output=True,
         text=True,
         check=False,
@@ -1752,7 +1792,7 @@ if [ -f execution.json ] && grep -q '"state": "COMPLETED"' execution.json; then
   exit 0
 fi
 if [ -f worker.pid ] && kill -0 "$(cat worker.pid)" 2>/dev/null && \
-   ps -p "$(cat worker.pid)" -o args= | grep -F -- "$bundle" >/dev/null; then
+   ps -ww -p "$(cat worker.pid)" -o args= | grep -F -- "$bundle" >/dev/null; then
   cat worker.pid
   exit 0
 fi
@@ -1818,7 +1858,7 @@ bundle=$1
 if [ -f "$bundle/execution.json" ]; then cat "$bundle/execution.json"; exit 0; fi
 if [ -f "$bundle/worker.pid" ] && \
    kill -0 "$(cat "$bundle/worker.pid")" 2>/dev/null && \
-   ps -p "$(cat "$bundle/worker.pid")" -o args= | grep -F -- "$bundle" >/dev/null; then
+   ps -ww -p "$(cat "$bundle/worker.pid")" -o args= | grep -F -- "$bundle" >/dev/null; then
   echo '{"state":"RUNNING"}'
 else
   echo '{"state":"FAILED","error":"remote worker exited without a result"}'
@@ -1898,7 +1938,7 @@ fi
 bundle=$1
 pid=$2
 kill -0 "$pid" 2>/dev/null || exit 3
-ps -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
+ps -ww -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
 pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
 [ "$pgid" = "$pid" ]
 kill -TERM -- "-$pgid"
@@ -1906,7 +1946,7 @@ for _ in $(seq 1 30); do
   kill -0 "$pid" 2>/dev/null || exit 0
   sleep 0.1
 done
-ps -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
+ps -ww -p "$pid" -o args= | grep -F -- "$bundle" >/dev/null
 kill -KILL -- "-$pgid"
 for _ in $(seq 1 20); do
   kill -0 "$pid" 2>/dev/null || exit 0
