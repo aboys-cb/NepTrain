@@ -735,51 +735,59 @@ def run_doctor(args):
     print("Doctor completed successfully.")
 
 def build_perturb(subparsers):
-    parser_perturb = subparsers.add_parser(
+    parser = subparsers.add_parser(
         "perturb",
         help="Generate perturbed structures.",
     )
-
-    parser_perturb.set_defaults(func=run_perturb)
-
-    parser_perturb.add_argument("model_path",
-                             type=str,
-
-                             help="The structure path or structure file required for calculation only supports files in xyz and vasp formats.")
-    parser_perturb.add_argument("--num","-n",
-                             type=int,
-                                default=20,
-                             help="The number of perturbations for each structure, if a folder is input, the final number generated should be the number of structures multiplied by num.default 20.")
-
-    parser_perturb.add_argument("--cell", "-c",
-                                dest="cell_pert_fraction",
-                                type=float,
-                                default=0.03,
-                                help="The deformation ratio,default 0.03.")
-
-    parser_perturb.add_argument("--distance", "-d",
-                                type=float,
-                                dest="min_distance",
-                                default=0.1,
-                                help="Maximum Cartesian displacement amplitude in Å, default 0.1.")
-    parser_perturb.add_argument(
+    parser.set_defaults(func=run_perturb)
+    parser.add_argument(
+        "model_path",
+        help="Structure file or directory containing XYZ/VASP structures.",
+    )
+    parser.add_argument(
+        "--num",
+        "-n",
+        type=int,
+        default=20,
+        help="Number of perturbations generated per input structure.",
+    )
+    parser.add_argument(
+        "--cell-perturbation",
+        "--cell",
+        "-c",
+        dest="cell_pert_fraction",
+        type=float,
+        default=0.03,
+        help="Maximum cell deformation fraction, default 0.03.",
+    )
+    parser.add_argument(
+        "--max-displacement",
+        "--distance",
+        "-d",
+        type=float,
+        dest="max_displacement",
+        default=0.1,
+        help="Maximum Cartesian displacement amplitude in Å, default 0.1.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="Random seed for reproducible perturbations, default 42.",
     )
-
-    parser_perturb.add_argument("--out", "-o",
-                             dest="out_file_path",
-                             type=str,
-                             help="Output file for perturbed structures, default ./perturb.xyz.",
-                             default="./perturb.xyz"
-                             )
-    parser_perturb.add_argument("--append", "-a",
-                             dest="append", action='store_true', default=False,
-                             help="Write to out_file_path in append mode, default False.",
-
-                             )
+    parser.add_argument(
+        "--out",
+        "-o",
+        dest="out_file_path",
+        default="./perturb.xyz",
+        help="Output extxyz path, default ./perturb.xyz.",
+    )
+    parser.add_argument(
+        "--append",
+        "-a",
+        action="store_true",
+        help="Append to an existing output file.",
+    )
 
 def build_doctor(subparsers):
     parser = subparsers.add_parser("doctor", help="Check selected runtime capabilities.")

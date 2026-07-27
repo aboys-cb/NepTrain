@@ -109,6 +109,14 @@ def test_md_cli_keeps_template_owned_parameters_out_of_the_interface():
         assert removed not in completed.stdout
 
 
+def test_perturb_cli_names_the_two_physical_amplitudes_explicitly():
+    completed = _help("perturb", "--help")
+    assert completed.returncode == 0
+    assert "--cell-perturbation" in completed.stdout
+    assert "--max-displacement" in completed.stdout
+    assert "--seed" in completed.stdout
+
+
 def test_label_cli_rejects_competing_kpoint_overrides():
     completed = _help(
         "label",
