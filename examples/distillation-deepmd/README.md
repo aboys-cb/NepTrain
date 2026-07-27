@@ -1,3 +1,7 @@
+<div align="center">
+<a href="README.en.md">English</a> | <strong>简体中文</strong>
+</div>
+
 # 用 DPA-3 Teacher 蒸馏一个 NEP Student
 
 这个教程从一个公开 DPA-3 模型开始，先完成独立标注和 Student 冒烟训练，再跑一

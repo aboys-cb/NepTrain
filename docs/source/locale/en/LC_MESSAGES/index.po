@@ -1,0 +1,48 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2024-2026, NepTrain Team
+# This file is distributed under the same license as the NepTrain package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: NepTrain \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-27 19:45+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: en\n"
+"Language-Team: en <LL@li.org>\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/index.rst:7
+msgid "安装"
+msgstr "Installation"
+
+#: ../../source/index.rst:7
+msgid "教程与示例"
+msgstr "Tutorials and examples"
+
+#: ../../source/index.rst:7
+msgid "命令行"
+msgstr "Command line"
+
+#: ../../source/index.rst:7
+msgid "使用文档"
+msgstr "User guide"
+
+#: ../../source/index.rst:2 951e8945d7864f9ebe3aa2c7513d23b4
+msgid "NepTrain 文档"
+msgstr "NepTrain documentation"
+
+#: ../../source/index.rst:4 c540ea6b2cd0403c88eeee99a2456ebf
+msgid ""
+"NepTrain 同时提供可组合的训练、MD、结构标注、采样命令和可恢复的主动学习 workflow。 手动步骤与自动流程使用相同的科学 Adapter 和执行 "
+"target。"
+msgstr ""
+"NepTrain provides composable commands for training, MD, structure labeling, and "
+"sampling, together with a resumable active-learning workflow. Standalone steps and "
+"automated workflows use the same scientific adapters and execution targets."

@@ -1,0 +1,858 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2024-2026, NepTrain Team
+# This file is distributed under the same license as the NepTrain package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: NepTrain \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-27 19:45+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: en\n"
+"Language-Team: en <LL@li.org>\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/command/workflow.md:1 907be292975c4e8881e309f888236b59
+msgid "自动迭代"
+msgstr "Automated workflows"
+
+#: ../../source/command/workflow.md:3 68b2aea38470476fa82f39c7ad41cace
+msgid "第一次运行建议先从标注后端对应的完整教程开始："
+msgstr "For your first run, start with the complete tutorial for your labeling backend:"
+
+#: ../../source/command/workflow.md:5 bd813410ac514c3092d4bbe6371021a2
+msgid ""
+"[VASP + Slurm](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-"
+"vasp-slurm)"
+msgstr ""
+"[VASP + Slurm](https://github.com/aboys-cb/NepTrain/blob/master/examples/workflow-"
+"vasp-slurm/README.en.md)"
+
+#: ../../source/command/workflow.md:6 6d1f4a02c2764d5bba2ea1ca6e0cbd86
+msgid ""
+"[ABACUS + Slurm](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-"
+"abacus-slurm)"
+msgstr ""
+"[ABACUS + Slurm](https://github.com/aboys-cb/NepTrain/blob/master/examples/workflow-"
+"abacus-slurm/README.en.md)"
+
+#: ../../source/command/workflow.md:7 ce8e857ecbe7443cbd6a03d134d7a35e
+msgid ""
+"[DeepMD / DPA 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples"
+"/distillation-deepmd)"
+msgstr ""
+"[DeepMD / DPA distillation](https://github.com/aboys-cb/NepTrain/blob/master/examples"
+"/distillation-deepmd/README.en.md)"
+
+#: ../../source/command/workflow.md:8 75e0d9f4b18c42d48d82ae786a6e67a1
+msgid "[MACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-mace)"
+msgstr ""
+"[MACE distillation](https://github.com/aboys-cb/NepTrain/blob/master/examples"
+"/distillation-mace/README.en.md)"
+
+#: ../../source/command/workflow.md:10 552d7d7718a04a26833d852dc767becf
+msgid "创建项目"
+msgstr "Create a project"
+
+#: ../../source/command/workflow.md:12 f4874162073049519bc67bf5665213ec
+msgid ""
+"neptrain workflow init \\\n"
+"  --profile slurm \\\n"
+"  --ensemble npt \\\n"
+"  --dft-backend vasp \\\n"
+"  --directory fe-project\n"
+"cd fe-project\n"
+"neptrain doctor --project project.yaml\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:22 630b2a18bbce4c31883e3560650d9a93
+msgid ""
+"项目只接受 `schema_version: 8`。自动采样只读取 `sampling.routes`，不再接受 全局 "
+"`md.structures`、`md.template_path`、`sampling.conditions` 或 "
+"`sampling.progression`，也不在运行时迁移旧配置。"
+msgstr ""
+"Projects accept only `schema_version: 8`. Automated sampling reads only "
+"`sampling.routes`; global `md.structures`, `md.template_path`, `sampling.conditions`,"
+" and `sampling.progression` are no longer accepted, and legacy configuration is not "
+"migrated at runtime."
+
+#: ../../source/command/workflow.md:26 c0024f147c9649abb95a3ff15d1dec18
+msgid "当前配置职责如下："
+msgstr "Configuration responsibilities are:"
+
+#: ../../source/command/workflow.md:28 5fa4eaf763fb485497f2d41ceddecbaa
+msgid "`md`：选择 LAMMPS/GPUMD 和推理后端。"
+msgstr "`md`: select LAMMPS or GPUMD and the inference backend."
+
+#: ../../source/command/workflow.md:29 b07235359e174ebfb1fe20648e65cc1c
+msgid "`labeling`：选择 VASP、ABACUS 或微调后的等变 Teacher 模型。"
+msgstr "`labeling`: select VASP, ABACUS, or a fine-tuned equivariant teacher model."
+
+#: ../../source/command/workflow.md:30 196ccca05961406693a20155e2d1ddf4
+msgid "`sampling.routes`：每条采样路径显式绑定结构、模板和温度路径。"
+msgstr ""
+"`sampling.routes`: bind structures, a template, and a temperature path explicitly for"
+" each sampling route."
+
+#: ../../source/command/workflow.md:31 4509c65209214937971b90e7af44bccf
+msgid "`sampling.candidate_pool` / `sampling.selection`：可选的高级覆盖项。"
+msgstr "`sampling.candidate_pool` / `sampling.selection`: optional advanced overrides."
+
+#: ../../source/command/workflow.md:32 d98de9d515b94ac98dcfc3563699ae29
+msgid "LAMMPS 模板：物理过程、`timestep`、阻尼、spin 积分参数和 dump 频率。"
+msgstr ""
+"LAMMPS template: physical process, `timestep`, damping, spin integration parameters, "
+"and dump frequency."
+
+#: ../../source/command/workflow.md:33 46df7d4a61664c75bba975c8f62d9caa
+msgid "`execution.targets.*.setup_script`：module、Python 环境和 LAMMPS plugin。"
+msgstr ""
+"`execution.targets.*.setup_script`: modules, Python environment, and the LAMMPS "
+"plugin."
+
+#: ../../source/command/workflow.md:35 95315c119cb44e6588dd7c7a41babaa0
+msgid ""
+"`workflow init` 默认只生成当前选择的 `lammps.in` 和标注后端输入，不再生成四套 LAMMPS 模板及两种第一性原理输入。Spin 流程使用 "
+"`--spin --dft-backend abacus`。"
+msgstr ""
+"By default, `workflow init` generates only the selected `lammps.in` and labeling-"
+"backend input instead of four LAMMPS templates and both first-principles inputs. For "
+"a spin workflow, use `--spin --dft-backend abacus`."
+
+#: ../../source/command/workflow.md:39 7840c9198999403e955357069dbea7cd
+msgid "最小 route 只需要："
+msgstr "A minimal route needs only:"
+
+#: ../../source/command/workflow.md:41 d5dc3dfb00864463bf3f6f00e081aa8b
+msgid ""
+"sampling:\n"
+"  routes:\n"
+"    - id: default\n"
+"      structures: [./structures]\n"
+"      template_path: ./lammps.in\n"
+"      conditions:\n"
+"        temperature_path: [300, 600, 900]\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:51 50da29545eed4d9bac8f905c4f912603
+msgid "省略项采用一套固定默认值：压强为 `0`，全部温度都是生产温度，FPS 每轮最多 选择 `100` 个结构，炸前帧和坏尾帧分别为 `2` 和 `1`。默认递进策略为："
+msgstr ""
+"Omitted settings use fixed defaults: pressure is `0`, every temperature is a "
+"production temperature, FPS selects at most `100` structures per round, and the pre-"
+"failure and bad-tail windows are `2` and `1` frames. The default progression is:"
+
+#: ../../source/command/workflow.md:54 584cedc6056d430a9bb9e6295b6b5497
+msgid ""
+"progression:\n"
+"  steps:\n"
+"    smoke_passed: 10000\n"
+"    short_stable: 40000\n"
+"    long_stable: 160000\n"
+"    production_ready: 640000\n"
+"  replicas:\n"
+"    smoke_passed: 1\n"
+"    short_stable: 1\n"
+"    long_stable: 2\n"
+"    production_ready: 3\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:68 7dc318d7d28d4b1cb5ce173bab3de877
+msgid "只有需要改变这些值时才写进项目。一个 workflow 也可以配置多条 route："
+msgstr ""
+"Add these values to the project only when you need to change them. A workflow may "
+"also define multiple routes:"
+
+#: ../../source/command/workflow.md:70 257373534db8472a904b5be86f58e6ad
+msgid ""
+"sampling:\n"
+"  routes:\n"
+"    - id: route_a\n"
+"      structures: [./structures/a.xyz]\n"
+"      template_path: ./templates/a.in\n"
+"      conditions:\n"
+"        temperature_path: [300, 600, 900]\n"
+"    - id: route_b\n"
+"      structures: [./structures/b.xyz]\n"
+"      template_path: ./templates/b.in\n"
+"      conditions:\n"
+"        temperature_path: [500, 1000, 1500]\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:85 8afe6e57d3f1444d92444619434a7259
+msgid ""
+"一个 workflow 会调度全部 route。同一个结构可以显式出现在多条 route 中； `route_id` 和内容指纹会隔离场景成熟度与恢复结果。高级 "
+"route 可以显式覆盖 `production_temperatures`、`pressure` 和整套 `progression`。"
+msgstr ""
+"One workflow schedules every route. A structure may explicitly appear in multiple "
+"routes; `route_id` and the content fingerprint isolate scenario maturity and recovery"
+" results. Advanced routes may override `production_temperatures`, `pressure`, and the"
+" complete `progression`."
+
+#: ../../source/command/workflow.md:89 dd2c4fdd64544e818c16b026b401cd92
+msgid ""
+"默认情况下，全部 route 使用 `execution.stage_targets.sampling`。需要把某条 route 送到另一台 Slurm "
+"平台时，只写例外映射："
+msgstr ""
+"By default, every route uses `execution.stage_targets.sampling`. To send one route to"
+" another Slurm platform, add only the exception mapping:"
+
+#: ../../source/command/workflow.md:92 86da54035147458e8e11cb3210a1869a
+msgid ""
+"execution:\n"
+"  stage_targets:\n"
+"    training: train\n"
+"    sampling: md-default\n"
+"    labeling: label\n"
+"    analysis: cpu\n"
+"  sampling_route_targets:\n"
+"    route_b: md-remote\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:103 5c8122b5ab7042ed8c50e3fb975f4ae1
+msgid ""
+"NepTrain 只向 LAMMPS 模板注入 `temperature`、`pressure`、`steps`、`seed`、 "
+"`replica`、`model_file`、`structure_file` 和输出路径等变量，不管理 `plugin_path`，也不判断模板是 "
+"FIRE、NVT/NPT、spin MD、MC+MD 还是 chemical swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。"
+msgstr ""
+"NepTrain injects only variables such as `temperature`, `pressure`, `steps`, `seed`, "
+"`replica`, `model_file`, `structure_file`, and output paths into a LAMMPS template. "
+"It does not manage `plugin_path` or decide whether the template implements FIRE, "
+"NVT/NPT, spin MD, MC+MD, or chemical swaps. The template owns the physical process, "
+"damping, integrator, and spin parameters."
+
+#: ../../source/command/workflow.md:108 16d4fe5a9adc4fb48363da96795df389
+msgid ""
+"选择 `md.backend: gpumd` 时，route 的 `template_path` 指向 GPUMD `run.in`。 NepTrain 支持模板中的 "
+"`nve`，并保留模板选择的 `nvt_*`/`npt_*` 方法、耦合 常数、`time_step` 和 dump 间隔，更新本轮模型、初始温度、步数与确定性 "
+"velocity seed；对 `npt_ber` 和 `npt_scr` 还会按模板的 isotropic、orthorhombic 或 triclinic "
+"形式写入目标压强 （GPa）。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。Spin workflow 仍明确使用 LAMMPS DynSpin。"
+msgstr ""
+"With `md.backend: gpumd`, the route’s `template_path` points to a GPUMD `run.in`. "
+"NepTrain supports `nve` and preserves the template-selected `nvt_*`/`npt_*` method, "
+"coupling constants, `time_step`, and dump interval while updating the current model, "
+"initial temperature, step count, and deterministic velocity seed. For `npt_ber` and "
+"`npt_scr`, it also writes the target pressure in GPa using the template’s isotropic, "
+"orthorhombic, or triclinic form. GPUMD and LAMMPS share the trajectory-health and "
+"failure-window contract. Spin workflows still use LAMMPS DynSpin explicitly."
+
+#: ../../source/command/workflow.md:116 9d2445bf883b4adc9d9675ece4f7af21
+msgid ""
+"每条 route 的 `conditions.temperature_path` 是有顺序的温度探路路径。例如 `[300, 500, 700, 900]` 会先验证 "
+"300 K，只有通过后才解锁 500 K。 默认全部温度都会跑到最长时长。显式设置 `production_temperatures` 后，未列入 "
+"其中的中间温度只做低成本 smoke 探路。"
+msgstr ""
+"Each route’s `conditions.temperature_path` is an ordered temperature-probing path. "
+"For example, `[300, 500, 700, 900]` validates 300 K first and unlocks 500 K only "
+"after it passes. By default every temperature proceeds to the longest duration. When "
+"`production_temperatures` is set explicitly, intermediate temperatures not in that "
+"list run only the low-cost smoke probe."
+
+#: ../../source/command/workflow.md:121 e14f123d1f694c91836ff01bb45fa39d
+msgid ""
+"场景通过后，Controller 会同时解锁下一个温度和当前生产温度的下一档时长。 失败场景保留在原位置，采集稳定段和炸前帧，经 FPS、标注和重训后重试，不会 "
+"越过失败温度。`progression.replicas` 控制各时长需要的独立 MD 次数。"
+msgstr ""
+"After a scenario passes, the Controller unlocks both the next temperature and the "
+"next duration for the current production temperature. A failed scenario remains at "
+"its position; NepTrain collects the stable segment and pre-failure frames, then "
+"retries after FPS, labeling, and retraining without skipping the failed temperature. "
+"`progression.replicas` controls the number of independent MD runs required at each "
+"duration."
+
+#: ../../source/command/workflow.md:125 b8fec3f77dc74947bec4bde8a2716adf
+msgid ""
+"所有通过健康检查的 dump 帧都会参与全局选择。FPS 先按精确元素集合分组，按 组大小平方根分配初始名额；组内再按 route、温压条件和轨迹窗口做软平衡，并且 "
+"只用相同元素集合的训练结构 warm-start。未用完的名额会确定性转给仍有新颖候选 的元素组。当前使用结构级 NEP "
+"descriptor，不把它描述成逐原子局域新颖度。"
+msgstr ""
+"Every dump frame that passes health checks participates in global selection. FPS "
+"first groups frames by exact element set and assigns initial quotas proportional to "
+"the square root of group size. Within each group it softly balances route, "
+"thermodynamic condition, and trajectory window, and warm-starts only from training "
+"structures with the same element set. Unused quota is transferred deterministically "
+"to element groups that still contain novel candidates. The current implementation "
+"uses structure-level NEP descriptors and is not presented as per-atom local novelty."
+
+#: ../../source/command/workflow.md:130 bc357644f080406fa5d75abfe7f2ddb2
+msgid ""
+"NepTrain 只在 FPS 前去除训练集已有结构和同一 route 内的完全重复结构，不按固定 stride 抽帧，也不使用候选数量上限提前裁剪。 "
+"`sampling.selection.max_selected` 是每个采样轮最多送去 Label Adapter 的结构 数。常规标注下限由系统自动取其一半，例如上限"
+" 100 时优先积累至少 50 个；若当前 场景 frontier 已经耗尽，或出现物理失败需要抢救，则允许较小批次提前提交。"
+msgstr ""
+"Before FPS, NepTrain removes only structures already in the training set and exact "
+"duplicates within the same route. It does not subsample by a fixed stride or truncate"
+" candidates before descriptor calculation. `sampling.selection.max_selected` is the "
+"maximum number of structures sent to the Label Adapter in one sampling round. The "
+"system sets the normal labeling floor to half that value—for example, a limit of 100 "
+"normally accumulates at least 50 structures. A smaller batch may be submitted early "
+"when the current scenario frontier is exhausted or a physical failure requires "
+"recovery."
+
+#: ../../source/command/workflow.md:136 d76dbfc8e53847f395d88c897b4a96f5
+msgid ""
+"这里的“一代”严格绑定一个模型哈希。Controller 会枚举该模型下所有已解锁 scenario attempt，并把它们作为独立 process/Slurm "
+"任务一次性提交；全部进入终态后 再合并候选并执行 FPS。不同 route 可通过 `execution.sampling_route_targets` "
+"送到不同平台。所有候选必须由同一个模型产生；候选池 manifest 和每个 extxyz 帧都会记录 `sampling_model_sha256`。诊断超过阈值或 "
+"MD 发生物理失败时才更新模型；新模型 完成 evaluate 并写入 lineage 后，下一轮 MD 才能开始。旧模型轨迹不能混入新模型 候选池。"
+msgstr ""
+"A “generation” is strictly bound to one model hash. The Controller enumerates all "
+"unlocked scenario attempts for that model and submits them together as independent "
+"process or Slurm tasks. It merges candidates and runs FPS only after every task "
+"reaches a terminal state. Routes may use different platforms through "
+"`execution.sampling_route_targets`. Every candidate must come from the same model; "
+"the candidate-pool manifest and each extxyz frame record `sampling_model_sha256`. The"
+" model is updated only when diagnostics exceed a threshold or MD fails physically. "
+"The next MD round starts only after the new model completes evaluation and enters the"
+" lineage. Trajectories from an old model cannot enter a new model’s candidate pool."
+
+#: ../../source/command/workflow.md:144 3d4f445f2ac6437999c9bf8d17e1fd93
+msgid ""
+"route 指纹由 route id、模板内容哈希、结构输入内容哈希、规范化 conditions 和 progression "
+"共同生成。场景身份还包含具体结构哈希、温度、压强和采样模型哈希。 因此修改模板或 route 条件后不能复用旧结果；完全相同的配置和内容可以确定性恢复。"
+msgstr ""
+"A route fingerprint combines the route ID, template-content hash, structure-input "
+"content hash, normalized conditions, and progression. Scenario identity also includes"
+" the structure hash, temperature, pressure, and sampling-model hash. Results from an "
+"old template or route condition therefore cannot be reused after a change; identical "
+"configuration and content remain deterministically resumable."
+
+#: ../../source/command/workflow.md:148 adabdfb470454554b5a9b6649061da3d
+msgid "第一性原理标注与 k 点"
+msgstr "First-principles labeling and k points"
+
+#: ../../source/command/workflow.md:150 79d3fbd959d443fb8314ad5ff2fe0518
+msgid "默认让用户输入文件管理 k 点："
+msgstr "By default, let the user input file manage k points:"
+
+#: ../../source/command/workflow.md:152 ef5dd21275a44d8c9d6d87ed2b4e8353
+msgid ""
+"labeling:\n"
+"  backend: vasp\n"
+"  input_path: ./INCAR\n"
+"  resource_path: /shared/potpaw_PBE\n"
+"  potcar_manifest_path: ./vasp-resources.json\n"
+"  kpoint_mode: auto\n"
+"  structures_per_job: 1\n"
+"  max_concurrent: 20\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:163 e1f134edee8847ff967f2c5751b3f46d
+msgid ""
+"`auto` 会优先保留 VASP INCAR 中的 `KSPACING`/`KGAMMA`，或 ABACUS INPUT 中的 "
+"`kspacing`。输入中没有这些设置时，适配器才按默认参数生成网格。"
+msgstr ""
+"`auto` preserves `KSPACING`/`KGAMMA` in a VASP INCAR or `kspacing` in an ABACUS "
+"INPUT. The adapter generates a grid from default parameters only when those settings "
+"are absent."
+
+#: ../../source/command/workflow.md:166 e43684984f8840ccbcf5a76639dfcdc2
+msgid ""
+"`structures_per_job` 决定每个 VASP/ABACUS 调度任务包含多少个 FPS 选中结构； `max_concurrent` 限制 "
+"workflow 同时运行的标注任务数。默认值分别为 `1` 和 `20`。例如 FPS 选中 100 个结构时，默认生成 100 个单结构任务，最多同时运行 20 "
+"个。Controller 保留已完成结构，只重试失败或尚未提交的结构，最后按原始 FPS 顺序校验并合并为 `selected-labels.xyz`。"
+msgstr ""
+"`structures_per_job` controls how many FPS-selected structures go into each scheduled"
+" VASP or ABACUS task; `max_concurrent` limits the number of labeling tasks running at"
+" once. Their defaults are `1` and `20`. If FPS selects 100 structures, the default "
+"creates 100 single-structure tasks with at most 20 running concurrently. The "
+"Controller retains completed structures, retries only failed or unsubmitted "
+"structures, then validates and merges them in the original FPS order into `selected-"
+"labels.xyz`."
+
+#: ../../source/command/workflow.md:172 6b26457837754b638e8823a3d307c379
+msgid ""
+"VASP 的 `potcar_manifest_path` 和 ABACUS 的 `resource_manifest_path` 是 必填 "
+"provenance。它们固定逐元素资源相对路径与 SHA256；VASP 还固定精确 `TITEL`、family 和 release。prepare 会先验证所有 "
+"sampling route 的元素覆盖， 本地 target 同时验证真实文件。远程资源库不打包上传，远程 labeling target 必须给出自己的绝对 "
+"`labeling_resource_path`，并用 `doctor` 在提交前逐文件验证。 manifest 中 `Fe/POTCAR` 或 "
+"`Fe_pv/POTCAR` 的 setup 目录会直接驱动 ASE 的 POTCAR 选择，校验路径和计算路径是同一个文件。"
+msgstr ""
+"VASP `potcar_manifest_path` and ABACUS `resource_manifest_path` are required "
+"provenance. They pin per-element relative resource paths and SHA256 hashes; VASP "
+"additionally pins the exact `TITEL`, family, and release. Preparation first validates"
+" element coverage for every sampling route, and a local target also validates the "
+"real files. Remote resource libraries are not uploaded. A remote labeling target must"
+" provide its own absolute `labeling_resource_path`, and `doctor` validates every file"
+" before submission. A setup directory such as `Fe/POTCAR` or `Fe_pv/POTCAR` in the "
+"manifest directly drives ASE POTCAR selection, so the validated and calculated paths "
+"identify the same file."
+
+#: ../../source/command/workflow.md:180 9e5904d719824d4c828a586034f1fd95
+msgid "确实需要 NepTrain 接管时再显式配置："
+msgstr "Configure an explicit override only when NepTrain must take control:"
+
+#: ../../source/command/workflow.md:182 eebe855c3fd9417f95cba7808a20ba09
+msgid ""
+"# 按间距设置\n"
+"labeling:\n"
+"  kpoint_mode: kspacing\n"
+"  kspacing: 0.2\n"
+"  gamma_centered: true\n"
+"\n"
+"# 或按网格密度参数设置\n"
+"labeling:\n"
+"  kpoint_mode: kpoints\n"
+"  kpoints: [4, 4, 4]\n"
+"  gamma_centered: true\n"
+msgstr ""
+"# Set by spacing\n"
+"labeling:\n"
+"  kpoint_mode: kspacing\n"
+"  kspacing: 0.2\n"
+"  gamma_centered: true\n"
+"\n"
+"# Or set by grid-density parameters\n"
+"labeling:\n"
+"  kpoint_mode: kpoints\n"
+"  kpoints: [4, 4, 4]\n"
+"  gamma_centered: true\n"
+
+#: ../../source/command/workflow.md:196 0638229985874f67924e6b89521ecfc8
+msgid ""
+"`kspacing` 和 `kpoints` 不能同时配置。手动命令保持同样规则： `neptrain label --kspacing 0.2 ...` 或 "
+"`neptrain label --ka 4,4,4 ...`； 两者互斥。当前输入接口读取 INCAR/ABACUS INPUT 内的 k 点间距，不把同目录下 单独的"
+" VASP `KPOINTS` 或 ABACUS `KPT` 文件作为自动 workflow 输入。"
+msgstr ""
+"`kspacing` and `kpoints` cannot be configured together. Standalone commands follow "
+"the same rule: `neptrain label --kspacing 0.2 ...` and `neptrain label --ka 4,4,4 "
+"...` are mutually exclusive. The current input interface reads k-point spacing from "
+"INCAR or ABACUS INPUT; it does not treat a separate VASP `KPOINTS` or ABACUS `KPT` "
+"file in the same directory as automatic workflow input."
+
+#: ../../source/command/workflow.md:201 2e5153477f23497c87ca354b9eacab00
+msgid "等变 Teacher 模型"
+msgstr "Equivariant teacher models"
+
+#: ../../source/command/workflow.md:203 eb8b777f2cef47b097a3c5a1eda341d5
+msgid "当预训练或微调后的大模型直接替代 DFT 时，workflow stage 不变，只切换 Label Adapter："
+msgstr ""
+"When a pretrained or fine-tuned large model replaces DFT directly, keep the workflow "
+"stages unchanged and switch only the Label Adapter:"
+
+#: ../../source/command/workflow.md:206 c79f36192eb5428b9c914e1c99307507
+msgid ""
+"labeling:\n"
+"  backend: model\n"
+"  model_path: ./mace-small.model\n"
+"  model_name: mace-mp-0-small\n"
+"  runner: neptrain model-worker mace\n"
+"  device: cuda\n"
+"  precision: float32\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:216 1f1e9391125240b8a1d82f9f4fa4157c
+msgid ""
+"`model_path` 会作为内容寻址输入进入 label task；`model_name`、模型 SHA256、 runner、device 和 precision"
+" 会写入 `label-provenance.json`；extxyz 帧本身保留 标签来源、后端、模型名称和模型 SHA256。runner 在 "
+"`execution.stage_targets.labeling` 指定的环境执行，因此 Teacher 框架的 PyTorch/CUDA 依赖不需要安装到 "
+"Controller 环境。"
+msgstr ""
+"`model_path` enters the label task as content-addressed input. `model_name`, the "
+"model SHA256, runner, device, and precision are written to `label-provenance.json`; "
+"each extxyz frame retains its label source, backend, model name, and model SHA256. "
+"The runner executes in the environment selected by "
+"`execution.stage_targets.labeling`, so the Controller environment does not need the "
+"teacher framework’s PyTorch/CUDA dependencies."
+
+#: ../../source/command/workflow.md:222 4111d56243884ef295520deb3f65b4e3
+msgid ""
+"MACE 适配器由 `NepTrain[mace]` 提供，要求本地 checkpoint 文件和正体积周期 晶胞；它输出 energy、forces 和按 "
+"`-stress × volume` 转换的 virial。MACE 不输出磁力，所以这个 runner 不支持 spin workflow。"
+msgstr ""
+"The MACE adapter is provided by `NepTrain[mace]` and requires a local checkpoint plus"
+" a periodic cell with positive volume. It outputs energy, forces, and virial "
+"converted as `-stress × volume`. MACE does not emit magnetic forces, so this runner "
+"does not support spin workflows."
+
+#: ../../source/command/workflow.md:226 298c8755d2fd4a628c30c50389d29c5a
+msgid "DeepMD 适配器由 `NepTrain[deepmd]` 提供。DPA-3 多任务模型可写成："
+msgstr ""
+"The DeepMD adapter is provided by `NepTrain[deepmd]`. A multitask DPA-3 model can be "
+"configured as:"
+
+#: ../../source/command/workflow.md:228 3b21f7e0f6d34e8fafd7767c33307ba8
+msgid ""
+"labeling:\n"
+"  backend: model\n"
+"  model_path: ./DPA-3.2-5M.pt\n"
+"  model_name: dpa-3.2-5m-omol25\n"
+"  runner: neptrain model-worker deepmd --head OMol25\n"
+"  device: cuda\n"
+"  precision: float32\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:238 7e8c6108e87640e09c98d07b0ea0cedf
+msgid ""
+"DPA-4 使用相同 runner 和本地 `.pt2` 模型；不新增 workflow backend。模型格式、 head 和推理后端由 DeePMD-kit "
+"处理，NepTrain 仍按本地文件内容记录 SHA256。 当前 DPA-4 要求 DeePMD-kit 3.2 或更新版本。DeepMD runner 同样不生成 "
+"`mforce`，因此不支持 spin workflow。"
+msgstr ""
+"DPA-4 uses the same runner with a local `.pt2` model; it does not add another "
+"workflow backend. DeePMD-kit handles model format, head, and inference backend, while"
+" NepTrain records the local file’s SHA256. DPA-4 currently requires DeePMD-kit 3.2 or"
+" later. The DeepMD runner also does not emit `mforce` and therefore does not support "
+"spin workflows."
+
+#: ../../source/command/workflow.md:243 ca05ccc9d8de482289518ba80a1cce0d
+msgid ""
+"这里的 `model-worker` 是 label stage 的内部协议，不是独立产品入口；用户仍通过 `neptrain label` 或 workflow "
+"启动标注。"
+msgstr ""
+"`model-worker` is an internal protocol for the label stage, not a separate product "
+"entry point. Users still start labeling through `neptrain label` or a workflow."
+
+#: ../../source/command/workflow.md:246 131ce27ac7c6471392200bdd2ce768cc
+msgid ""
+"这一路径在调度上完全替代 DFT，但报告会保留 `teacher_model` 来源，避免把蒸馏 标签误称为 DFT 标签。若配置独立 "
+"`evaluation.validation_path`，最终验收仍以该 参考集为准。"
+msgstr ""
+"This path replaces DFT at scheduling time, but reports retain the `teacher_model` "
+"source so distilled labels are not mislabeled as DFT labels. If an independent "
+"`evaluation.validation_path` is configured, final acceptance still uses that "
+"reference set."
+
+#: ../../source/command/workflow.md:250 d6d2b8850a2448e3934aa6f8f4d28371
+msgid "准备和运行"
+msgstr "Prepare and run"
+
+#: ../../source/command/workflow.md:252 d78f54d8c37d417db550dfb7d35431df
+msgid ""
+"neptrain workflow run project.yaml --prepare-only\n"
+"neptrain workflow run fe-workflow\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:257 6754ee66ce7a4a3c8dda368311b647a7
+msgid ""
+"第一条命令只创建不可变输入快照，返回的 `next_action` 可以直接复制执行。 不需要人工检查快照时，也可以直接运行 `neptrain workflow run"
+" project.yaml`，一次完成创建和启动。"
+msgstr ""
+"The first command creates only an immutable input snapshot, and its returned "
+"`next_action` can be copied and run directly. If manual snapshot inspection is "
+"unnecessary, run `neptrain workflow run project.yaml` to create and start the "
+"workflow in one step."
+
+#: ../../source/command/workflow.md:261 1a32954ef99f4bb2a61c4e07e3f57bbe
+msgid "输出目录默认使用 `workflow.id`。Controller 默认脱离终端，按 ledger 推进："
+msgstr ""
+"The output directory defaults to `workflow.id`. The Controller detaches from the "
+"terminal by default and advances from the ledger:"
+
+#: ../../source/command/workflow.md:263 43f7e7c79b8149eea660b2d14721a553
+msgid "train → explore → select → label → diagnose → merge → retrain → evaluate\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:267 90d30f8355704b4382826a3075bd6e40
+msgid "训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。"
+msgstr ""
+"Training, MD, and labeling stages use the same adapters and execution targets as "
+"standalone commands."
+
+#: ../../source/command/workflow.md:269 f0bfc98e955a45d1b9a00e5a368c2001
+msgid ""
+"`workflow run <目录>` 只允许状态为 `prepared` 的目录第一次启动。 `workflow resume <目录>` "
+"只用于已经启动过的暂停、失败、中断或可修复损坏状态； 对 prepared 目录会明确要求使用 `run`。失败目录再次执行 `run` 也会被拒绝并指向 "
+"`resume`，因此“首次启动”和“恢复”不会共享一条含糊路径。"
+msgstr ""
+"`workflow run <directory>` starts a directory only when its state is `prepared`. "
+"`workflow resume <directory>` is only for workflows that have already started and are"
+" paused, failed, interrupted, or repairably damaged; a prepared directory explicitly "
+"directs you to `run`. Running `run` again on a failed directory is also rejected and "
+"points to `resume`, so first start and recovery do not share an ambiguous path."
+
+#: ../../source/command/workflow.md:274 c26716ec4ce9421593f914130f247b9f
+msgid "状态与恢复"
+msgstr "Status and recovery"
+
+#: ../../source/command/workflow.md:276 3feb3d8a6a634147afa4f1fa3d69aae3
+msgid ""
+"neptrain workflow status fe-workflow\n"
+"neptrain workflow status fe-workflow --jobs\n"
+"neptrain workflow resume fe-workflow\n"
+"neptrain workflow stop fe-workflow\n"
+"neptrain workflow extend fe-workflow 5\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:284 9e982c1b005d4bd08530b535f3e16dba
+msgid ""
+"`workflow status --json` 的 stdout 使用 `neptrain.workflow-status.v1`；run/resume、stop 和 "
+"extend 分别使用稳定的 `workflow-control.v1`、`workflow-stop.v1` 和 `workflow-extend.v1`。诊断不混入 "
+"JSON stdout。`workflow-control.v1` 始终包含 `workflow_id`、`project`、 `manifest` 和 "
+"`action`；`action` 明确区分 `prepare`、`start`、`resume`、 `repair` 与 `noop`，不再另写一份重复的 "
+"`started` 布尔状态。"
+msgstr ""
+"`workflow status --json` writes `neptrain.workflow-status.v1` to stdout. Run/resume, "
+"stop, and extend use the stable `workflow-control.v1`, `workflow-stop.v1`, and "
+"`workflow-extend.v1` protocols. Diagnostics never contaminate JSON stdout. `workflow-"
+"control.v1` always includes `workflow_id`, `project`, `manifest`, and `action`; "
+"`action` distinguishes `prepare`, `start`, `resume`, `repair`, and `noop`, replacing "
+"a redundant `started` Boolean."
+
+#: ../../source/command/workflow.md:291 fe12ab3f7bda44ed94bb574ad7c308fe
+msgid ""
+"Controller 不依赖 Slurm `afterok`。失败后只重跑 ledger 中未完成的阶段；已完成 workflow 使用 `resume` 是安全 no-"
+"op。`workflow run` 接受项目 YAML 或 workflow 目录：对尚未启动的准备目录返回 `action: start`；`workflow "
+"resume` 用于暂停、 失败或中断后的恢复。"
+msgstr ""
+"The Controller does not depend on Slurm `afterok`. After failure, it reruns only "
+"stages not committed in the ledger; `resume` on a completed workflow is a safe no-op."
+" `workflow run` accepts a project YAML or workflow directory and returns `action: "
+"start` for a prepared directory that has not started. Use `workflow resume` after "
+"pause, failure, or interruption."
+
+#: ../../source/command/workflow.md:296 686b9d5409364476912bdb0f32d31167
+msgid "状态语义如下："
+msgstr "State semantics are:"
+
+#: ../../source/command/workflow.md:298 bb43630f43174fdbb2bdaeb6465de978
+msgid "`prepared`：只有不可变输入快照，下一步是 `workflow run`。"
+msgstr "`prepared`: only the immutable input snapshot exists; run `workflow run` next."
+
+#: ../../source/command/workflow.md:299 17509f15401b49f69cde7c342ec903a2
+msgid "`running`：Controller lock 存在且当前任务可观察。"
+msgstr "`running`: the Controller lock exists and the current task is observable."
+
+#: ../../source/command/workflow.md:300 331b7983ba9645a68d913f8ee4da97c0
+msgid "`degraded`：临时 SSH/scheduler 查询失败，Controller 仍保留原 handle 并重试。"
+msgstr ""
+"`degraded`: a temporary SSH or scheduler query failed; the Controller retains the "
+"original handle and retries."
+
+#: ../../source/command/workflow.md:301 6eec7308ecef4c528a3e995450d9a24f
+msgid "`paused`：Controller 已停止或 PID/lock 不在，但远端工作和 current intent 保留。"
+msgstr ""
+"`paused`: the Controller stopped or its PID/lock is absent, but remote work and "
+"current intent remain."
+
+#: ../../source/command/workflow.md:302 93ac19daec6641ab81dae78ff41a2ede
+msgid "`failed` / `rejected`：执行失败或科学验收失败，可按记录创建新 attempt 恢复。"
+msgstr ""
+"`failed` / `rejected`: execution or scientific acceptance failed; recovery may create"
+" a new recorded attempt."
+
+#: ../../source/command/workflow.md:303 466cdb163ee941a182d7c18639ff02e4
+msgid ""
+"`damaged`：已提交 artifact、ledger 或 publication 不满足 hash/身份契约。 resume 只修复 hash "
+"一致的冗余副本和可见投影；无法证明来源时在提交新任务前 fail closed。"
+msgstr ""
+"`damaged`: a committed artifact, ledger, or publication violates its hash or identity"
+" contract. Resume repairs only hash-identical redundant copies and visible "
+"projections; when provenance cannot be proven, it fails closed before submitting any "
+"new task."
+
+#: ../../source/command/workflow.md:306 945e2a2d9cf142b0a7417511e0e2ec0a
+msgid "`budget_exhausted`：模型代数预算耗尽，先 `workflow extend`，不是成功。"
+msgstr ""
+"`budget_exhausted`: the model-generation budget is exhausted. Run `workflow extend`; "
+"this is not success."
+
+#: ../../source/command/workflow.md:307 ae68c9b1b64b4818bb93e77e7bb7ba82
+msgid "`stalled`：相同模型与策略继续运行不会增加证据；必须修改科学策略并新建 workflow，不能原样 retry。"
+msgstr ""
+"`stalled`: continuing with the same model and policy cannot add evidence. Change the "
+"scientific policy and create a new workflow instead of retrying unchanged."
+
+#: ../../source/command/workflow.md:309 9f750ce6e3cd4cc4812adc103611edcf
+msgid "`complete`：完整 stage 链和（若配置）独立 validation 已验收。"
+msgstr ""
+"`complete`: the full stage chain and independent validation, when configured, have "
+"passed acceptance."
+
+#: ../../source/command/workflow.md:311 4bb1982c36c84b0ebeec5e7b1ee5d465
+msgid ""
+"`workflow.max_model_generations` 是最大模型代数预算，不是成功条件。配置 `evaluation` "
+"时，所有生产温度、最长时长、replica、轨迹标签诊断和独立 validation 同时通过 后才会提前结束。预算用尽但仍未收敛时状态为 "
+"`budget_exhausted`，连续两轮没有 新覆盖或模型改进时状态为 `stalled`，都不会伪装成 `complete`。"
+msgstr ""
+"`workflow.max_model_generations` is a maximum generation budget, not a success "
+"condition. With `evaluation` configured, the workflow finishes early only after all "
+"production temperatures, longest durations, replicas, trajectory-label diagnostics, "
+"and independent validation pass together. If the budget ends before convergence, the "
+"state is `budget_exhausted`; if two consecutive rounds add no coverage or model "
+"improvement, it is `stalled`. Neither is presented as `complete`."
+
+#: ../../source/command/workflow.md:316 f045acb94e6a48279e30c2670e743689
+msgid ""
+"`evaluation` 可以整块省略。此时 workflow 仍可采样、标注、重训和记录场景证据， 但 `validation_accepted` "
+"保持为空，流程不会伪造 validation passed，也不会把 该模型标成已完成独立验证。"
+msgstr ""
+"The entire `evaluation` section is optional. Without it, the workflow can still "
+"sample, label, retrain, and record scenario evidence, but `validation_accepted` "
+"remains empty; the workflow neither fabricates a validation pass nor marks the model "
+"as independently validated."
+
+#: ../../source/command/workflow.md:320 c0f94c606f2444a78cb63c60a7e8a7f1
+msgid "默认停止 Controller，并取消当前 process 或 Slurm 作业："
+msgstr "By default, stop the Controller and cancel the current process or Slurm jobs:"
+
+#: ../../source/command/workflow.md:322 ea48e2ec410743bc97c95aad3a6cfe73
+msgid "neptrain workflow stop fe-workflow\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:326 1bda64bf3cc84fea85b97b6ed65a000c
+msgid "如果只想暂时退出 Controller，并让当前计算任务继续运行："
+msgstr "To stop only the Controller while allowing current compute jobs to continue:"
+
+#: ../../source/command/workflow.md:328 c09d60bb83e74e4ab4669213b3499979
+msgid "neptrain workflow stop fe-workflow --keep-jobs\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:332 6abcac7f34af4a4f9a00dbda805a6d67
+msgid ""
+"取消动作会记录到 workflow 历史；后续恢复会创建新的 stage attempt。 对 task group，已完成且通过校验的 shard 保留原 task "
+"id；只有未完成、取消或 缺失 shard 生成新 attempt。`--keep-jobs` 仅停止 Controller，下一次 resume 先重新观察原 job "
+"handle，不重复提交。作业已离开 `squeue` 时还会查询 accounting； 超过有界 grace 仍不存在才按 LOST 处理。"
+msgstr ""
+"Cancellation is recorded in workflow history, and a later recovery creates a new "
+"stage attempt. In a task group, completed and verified shards retain their task IDs; "
+"only unfinished, cancelled, or missing shards receive a new attempt. `--keep-jobs` "
+"stops only the Controller, so the next resume observes the existing job handle before"
+" considering resubmission. Jobs that leave `squeue` are still checked through "
+"accounting and become LOST only after a bounded grace period."
+
+#: ../../source/command/workflow.md:338 c43c6844454f43e58f12baa58fb6282f
+msgid "每代目录直接对应用户关心的阶段："
+msgstr "Each generation directory maps directly to the stages users inspect:"
+
+#: ../../source/command/workflow.md:340 baef258585744b3188e31534afef78d3
+msgid ""
+"generations/0001/\n"
+"├── train/\n"
+"├── md/\n"
+"├── select/\n"
+"├── label/\n"
+"├── diagnose/\n"
+"├── dataset/\n"
+"├── retrain/\n"
+"└── evaluate/\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:352 315453b79f634e1c82e1d9f702e23733
+msgid ""
+"训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录； `calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 "
+"Matplotlib 从 `loss.out` 自动生成 `training-convergence.png` 和可审计的 `training-"
+"report.json`。配置独立验证集时，evaluate 还会生成按验收阈值归一化的 `evaluation-metrics.png` 与 `evaluation-"
+"report.json`；图中 1× 线就是配置阈值。 同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction "
+"parity 图 `evaluation-parity.png`，spin 模型会增加 magnetic-force 面板。对应报告记录 validation/model"
+" hash、总点数、实际绘制点数和 RMSE；大数组只对显示点做确定性 抽样，RMSE 仍使用全部有限数据。"
+msgstr ""
+"Trained models, loss, stdout/stderr, and other key artifacts are published to their "
+"stage directories; a `calculation` symlink points to the actual execution directory "
+"for direct diagnosis. After training, Matplotlib reads `loss.out` and writes "
+"`training-convergence.png` plus an auditable `training-report.json`. With independent"
+" validation configured, evaluation also writes threshold-normalized `evaluation-"
+"metrics.png` and `evaluation-report.json`; the 1× line is the configured threshold. "
+"The same predictions produce an Energy, Force, and Virial reference/prediction parity"
+" plot in `evaluation-parity.png`, with a magnetic-force panel for spin models. "
+"Reports record validation/model hashes, total points, displayed points, and RMSE. "
+"Large arrays are sampled deterministically for display only; RMSE still uses all "
+"finite values."
+
+#: ../../source/command/workflow.md:362 bc76ff358ecb461cba312c64f49c9c1d
+msgid "内部 job 也只保留一层输入和一层输出。job 名称已经包含代数、阶段、route、 attempt 和任务指纹，因此输出目录不再重复这些信息："
+msgstr ""
+"Internal jobs also keep only one input layer and one output layer. Job names already "
+"include generation, stage, route, attempt, and task fingerprint, so output paths do "
+"not repeat them:"
+
+#: ../../source/command/workflow.md:365 b2621b8d1f4446f99f2304eb5bdb61be
+msgid ""
+".neptrain/jobs/g0001-md-default-.../\n"
+"├── input/\n"
+"├── output/\n"
+"│   ├── log.lammps\n"
+"│   ├── trajectory.xyz\n"
+"│   ├── candidates.xyz\n"
+"│   └── md-attempts.json\n"
+"├── task.json\n"
+"├── execution.json\n"
+"└── result.json\n"
+msgstr ""
+
+#: ../../source/command/workflow.md:378 4b27cfcbb5f94d59bc2ee62d1e21b051
+msgid ""
+"训练的 `nep.txt`、`loss.out`、checkpoint 和训练日志同样直接位于该 job 的 `output/`。默认的单结构 VASP/ABACUS "
+"job 也把输入、原生输出、后端日志和 `selected-labels.xyz` 直接放在 `output/`；只有发生真实重试时才出现 "
+"`retry-0002/`。每代 `label/` 直接发布 `000001-Ce8Fe16` 等软链及最终合并文件， 不再增加 "
+"`teacher/`、`attempt-0001/` 或 `calculations/` 层。`input/` 也只携带当前阶段真正消费的文件：训练任务不再 复制 MD "
+"route，MD 和标注任务不再复制初始训练集及 validation 数据。"
+msgstr ""
+"The training `nep.txt`, `loss.out`, checkpoint, and logs live directly in that job’s "
+"`output/`. A default single-structure VASP or ABACUS job likewise keeps inputs, "
+"native outputs, backend logs, and `selected-labels.xyz` directly in `output/`; "
+"`retry-0002/` appears only after a real retry. Each generation’s `label/` publishes "
+"symlinks such as `000001-Ce8Fe16` and the final merged file directly, without extra "
+"`teacher/`, `attempt-0001/`, or `calculations/` layers. `input/` carries only files "
+"consumed by that stage: training tasks no longer copy MD routes, and MD or labeling "
+"tasks no longer copy the initial training set or validation data."
+
+#: ../../source/command/workflow.md:385 988ad2841ca1408098917ae5a56436b5
+msgid ""
+"远端 task 使用内容寻址协议：本地先在临时目录完整生成 `task.json` 和全部输入， 校验 manifest 后打包；远端在独占 lock 下解包、复核 "
+"hash，再用一次 rename 发布，worker 不会看到半上传 bundle。结果先写到临时 `output`，完成后原子切换并 发布绑定 task id/spec"
+" hash 的 `result.json`；收集端只接受属于当前 workflow instance 的完整结果。旧 workflow 目录删除后重新创建会得到新的随机 "
+"`instance_id`，即使配置相同也不能复用旧远端结果。"
+msgstr ""
+"Remote tasks use a content-addressed protocol. Locally, NepTrain first creates "
+"`task.json` and every input in a temporary directory, validates the manifest, and "
+"archives it. Remotely, it extracts under an exclusive lock, verifies hashes, and "
+"publishes with one rename, so a worker never sees a partially uploaded bundle. "
+"Results are written to a temporary `output`, switched atomically, and published with "
+"a `result.json` bound to the task ID and specification hash. Collection accepts only "
+"complete results belonging to the current workflow instance. Recreating a deleted "
+"workflow directory produces a new random `instance_id`; even identical configuration "
+"cannot reuse results from the old remote workflow."
+
+#: ../../source/command/workflow.md:392 b1eb30e899d24373856c3c4c17273377
+msgid "状态权威与目录恢复"
+msgstr "Authoritative state and directory recovery"
+
+#: ../../source/command/workflow.md:394 426090256c69430fafe1c697cdc7b914
+msgid "`.neptrain/manifest.json` 只固定 prepare 输入、计划和 workflow instance。"
+msgstr "`.neptrain/manifest.json` pins only prepared inputs, plans, and the workflow instance."
+
+#: ../../source/command/workflow.md:395 73850eebad0a44549c25cb40f5f2e761
+msgid "`.neptrain/ledger.json` 是已提交科学阶段的唯一权威和 commit point。"
+msgstr ""
+"`.neptrain/ledger.json` is the sole authority and commit point for committed "
+"scientific stages."
+
+#: ../../source/command/workflow.md:396 f58cd92a996249cf86e2927f8955664f
+msgid "`.neptrain/controller.json` 只保存 attempt、current execution、job handle、 取消与恢复 intent。"
+msgstr ""
+"`.neptrain/controller.json` stores only attempts, current execution, job handles, "
+"cancellation, and recovery intent."
+
+#: ../../source/command/workflow.md:398 ce09b0150861417888c5c1bcddfd44ea
+msgid "job 内 `task.json` 是不可变输入；`execution.json` 是运行观察； `result.json` 是通过收集校验前的候选结果。"
+msgstr ""
+"Within a job, `task.json` is immutable input, `execution.json` is runtime "
+"observation, and `result.json` is a candidate result before collection validation."
+
+#: ../../source/command/workflow.md:400 06d753e12a8d432188939ed0b088694c
+msgid ""
+"`results/accepted/` 保存不可变发布；`results/current`、根部结果链接和 `generations/*/calculation` "
+"是相对链接投影，可由权威记录重建。"
+msgstr ""
+"`results/accepted/` stores immutable publications. `results/current`, root result "
+"links, and `generations/*/calculation` are relative-link projections that can be "
+"rebuilt from authoritative records."
+
+#: ../../source/command/workflow.md:403 5a5c7bc0b50d41e3bd19d14327a56676
+msgid ""
+"因此，删除可见链接不会丢失科学状态，`resume` 可修复。删除一个有 hash 冗余副本 的 stage artifact 时，resume "
+"只会复制完全相同的已验证内容；找不到一致副本、 ledger 缺失、publication 唯一副本损坏或 artifact 路径逃出 workflow 时，状态保持 "
+"`damaged`，不会自动回退成 prepared 或启动下游阶段。要彻底重跑请创建新目录， 不要删除 `.neptrain` 或手工编辑 JSON 来“重置”。"
+msgstr ""
+"Deleting visible links therefore does not lose scientific state; `resume` can repair "
+"them. If a stage artifact with a hash-identical redundant copy is removed, resume "
+"copies only the exact verified content. If no identical copy exists, the ledger is "
+"missing, the only publication copy is damaged, or an artifact path escapes the "
+"workflow, the state remains `damaged`; it never falls back to prepared or starts "
+"downstream work. To rerun from scratch, create a new directory instead of deleting "
+"`.neptrain` or editing JSON by hand to “reset” the workflow."

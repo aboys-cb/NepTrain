@@ -1,0 +1,460 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2024-2026, NepTrain Team
+# This file is distributed under the same license as the NepTrain package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: NepTrain \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-27 19:45+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: en\n"
+"Language-Team: en <LL@li.org>\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/command/manual.md:1 ec05bdfbd77040fe8aafa2bd431661bc
+msgid "独立步骤"
+msgstr "Standalone steps"
+
+#: ../../source/command/manual.md:3 761e092d74ef47959dc9c3ce145ffbf0
+msgid ""
+"NepTrain 的训练、MD 和标注命令既可在本机运行，也可通过 `project.yaml` 中的 target 提交到 Slurm。上传、提交、等待和收集进度写到 "
+"stderr；最终结果默认是 适合人阅读的摘要。"
+msgstr ""
+"NepTrain training, MD, and labeling commands can run locally or submit to a Slurm "
+"target defined in `project.yaml`. Upload, submission, waiting, and collection "
+"progress goes to stderr; the final result is a human-readable summary by default."
+
+#: ../../source/command/manual.md:7 061df1b098b24209a23fffaa0f0250b4
+msgid "使用 `--project` 时，backend、模板、温度、压强和步数默认读取项目配置；命令行参数 只覆盖本次需要改变的值。"
+msgstr ""
+"With `--project`, the backend, template, temperature, pressure, and step count "
+"default to project settings. Command-line options override only the values needed for"
+" this run."
+
+#: ../../source/command/manual.md:10 1f34a08e3e69489992ccc014b7cdfccb
+msgid "训练"
+msgstr "Training"
+
+#: ../../source/command/manual.md:12 9dd022375b674a1b98b15587508cfe89
+msgid ""
+"neptrain train train.xyz \\\n"
+"  --backend torchnep \\\n"
+"  --config nep.in \\\n"
+"  -o nep.txt\n"
+msgstr ""
+
+#: ../../source/command/manual.md:19 3a88d8537a8140b7863012b21b1207cb
+msgid "加入 target 后提交 GPU 作业："
+msgstr "Add a target to submit a GPU job:"
+
+#: ../../source/command/manual.md:21 7d5e20ac69a74ad39552d1625bd4145d
+msgid ""
+"neptrain train train.xyz \\\n"
+"  --backend torchnep \\\n"
+"  --config nep.in \\\n"
+"  --project project.yaml \\\n"
+"  --target v100 \\\n"
+"  -o nep.txt\n"
+msgstr ""
+
+#: ../../source/command/manual.md:30 d071e63201584405a3af32ff4d53e75c
+msgid "批量 MD"
+msgstr "Batch MD"
+
+#: ../../source/command/manual.md:32 a2efbbe87e604899b311fe2137d24c4b
+msgid ""
+"neptrain md structures/ \\\n"
+"  --backend lammps \\\n"
+"  --model nep.txt \\\n"
+"  --temperature 300 500 700 \\\n"
+"  --steps 100000 \\\n"
+"  --project project.yaml \\\n"
+"  --target cpu \\\n"
+"  --max-concurrent 12 \\\n"
+"  -o trajectories.xyz\n"
+msgstr ""
+
+#: ../../source/command/manual.md:44 7f28480a71194e47a8771bc7594194e0
+msgid "Slurm target 会将“结构 × 温度”展开成带并发上限的 job array。"
+msgstr ""
+"A Slurm target expands “structure × temperature” into a job array with a concurrency "
+"limit."
+
+#: ../../source/command/manual.md:46 e7171f8017f34290a3ffee6f267af80b
+msgid "GPUMD 使用同一个命令面："
+msgstr "Use the same CLI with the GPUMD backend:"
+
+#: ../../source/command/manual.md:48 2b845a252d0643e89186c41f63f1bddf
+msgid ""
+"neptrain md structures/ \\\n"
+"  --backend gpumd \\\n"
+"  --model nep.txt \\\n"
+"  --temperature 300 500 700 \\\n"
+"  --ensemble npt \\\n"
+"  --pressure 0 \\\n"
+"  --steps 100000 \\\n"
+"  --seed 20260727 \\\n"
+"  -o trajectories.xyz\n"
+msgstr ""
+
+#: ../../source/command/manual.md:60 526bc8ada6d0458aaa187408dcb18658
+msgid ""
+"不提供模板时会生成可直接运行的 NVE/NVT/NPT 输入。提供 `--template run.in` 时， ensemble、thermostat/barostat"
+" 类型、耦合常数、`time_step` 和 dump 间隔来自 模板；NepTrain 更新模型、初始温度、NPT 目标压强、步数和种子。GPUMD 压强单位 为 "
+"GPa。NVE 仍使用 `--temperature` 初始化速度，但不在运行中控温。 两种 backend 都会输出 `trajectory-health.json` "
+"并标注稳定段、炸前帧和坏尾帧； GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS DynSpin。"
+msgstr ""
+"Without a template, NepTrain generates runnable NVE/NVT/NPT input. With `--template "
+"run.in`, the template owns the ensemble, thermostat/barostat type, coupling "
+"constants, `time_step`, and dump interval; NepTrain updates the model, initial "
+"temperature, NPT target pressure, step count, and seed. GPUMD pressure is in GPa. NVE"
+" still uses `--temperature` to initialize velocities but does not thermostat the run."
+" Both backends write `trajectory-health.json` and identify the stable segment, pre-"
+"failure frames, and bad tail. If GPUMD exits nonzero after writing complete dump "
+"frames, NepTrain still recovers those frames. Spin MD is supported only through "
+"LAMMPS DynSpin."
+
+#: ../../source/command/manual.md:68 01cb13f765a54029aa3df83a8e919c41
+msgid "手动采样"
+msgstr "Structure selection"
+
+#: ../../source/command/manual.md:70 a1e461eefc004739b153f8da80bf181a
+msgid ""
+"neptrain select md-300.xyz md-600.xyz \\\n"
+"  --base train.xyz \\\n"
+"  --nep nep.txt \\\n"
+"  --backend auto \\\n"
+"  --max-selected 64 \\\n"
+"  --min-novelty 0.01 \\\n"
+"  --out selected.xyz \\\n"
+"  --report selected.selection.json\n"
+msgstr ""
+
+#: ../../source/command/manual.md:81 d9739113ce31449ba2c18b0f037269c4
+msgid ""
+"该命令与自动 workflow 共用同一套层级 FPS：先按精确元素集合分组，再按组规模的 "
+"平方根分配初始名额，并在组内平衡轨迹来源、route、温度和压强。`--base` 中只有 元素集合相同的结构会参与对应组的 warm start。`--min-"
+"novelty` 是归一化描述符 空间中的严格阈值；精确重复点在阈值为 `0` 时也不会重复入选。"
+msgstr ""
+"This command shares the workflow’s hierarchical FPS policy: candidates are grouped by"
+" exact element set, initial quotas scale with the square root of group size, and "
+"trajectory source, route, temperature, and pressure are balanced within each group. "
+"Only structures in `--base` with the same element set warm-start that group. `--min-"
+"novelty` is a strict threshold in normalized descriptor space; exact duplicates are "
+"not selected even when the threshold is `0`."
+
+#: ../../source/command/manual.md:86 d4cc8583198145eb88be389f67940065
+msgid ""
+"候选结构先按稳定的 structure ID 去重。提供 `--nep` 时通过 NEPAdapters 计算 NEP 描述符；未提供时使用 SOAP（需安装 "
+"`NepTrain[soap]`），可用 `--r-cut`、 `--n-max` 和 `--l-max` 调整参数。 需要先过滤异常短键时使用 `--filter "
+"0.6`，并可通过 `--rejected-out` 单独保存被拒 结构。选择报告默认写在输出文件旁，也可由 `--report` 指定路径。"
+msgstr ""
+"Candidates are first deduplicated by stable structure ID. With `--nep`, NEPAdapters "
+"computes NEP descriptors; otherwise NepTrain uses SOAP, which requires "
+"`NepTrain[soap]`, with `--r-cut`, `--n-max`, and `--l-max` available for tuning. Use "
+"`--filter 0.6` to reject abnormally short bonds first, and `--rejected-out` to save "
+"rejected structures separately. The selection report is written next to the output by"
+" default or to the path given by `--report`."
+
+#: ../../source/command/manual.md:92 4601f844638a4483b97116b45c7f9493
+msgid "批量标注"
+msgstr "Batch labeling"
+
+#: ../../source/command/manual.md:94 256dbdfe48954691a74700ab07efc92c
+msgid ""
+"neptrain label candidates.xyz \\\n"
+"  --backend vasp \\\n"
+"  --input-file INCAR \\\n"
+"  --resources /shared/potpaw_PBE \\\n"
+"  --potcar-manifest vasp-resources.json \\\n"
+"  --project project.yaml \\\n"
+"  --target label \\\n"
+"  --structures-per-job 1 \\\n"
+"  --max-concurrent 20 \\\n"
+"  -o labeled.xyz\n"
+msgstr ""
+
+#: ../../source/command/manual.md:107 92c2d7f5c7874761a5013b511ef52110
+msgid ""
+"`--resources` 只给出资源根目录，不足以锁定赝势版本。VASP 还必须提供 `--potcar-manifest`；ABACUS 必须提供 "
+"`--resource-manifest`。manifest 逐文件记录 相对路径和 SHA256，VASP 还记录精确 `TITEL`、family 和 "
+"release。例如："
+msgstr ""
+"`--resources` identifies only the resource root and cannot pin pseudopotential "
+"versions. VASP also requires `--potcar-manifest`; ABACUS requires `--resource-"
+"manifest`. Each manifest records relative paths and SHA256 hashes, and a VASP "
+"manifest additionally records the exact `TITEL`, family, and release. For example:"
+
+#: ../../source/command/manual.md:111 c86b1309f20c4e90946f3a70140964e7
+#, python-brace-format
+msgid ""
+"{\n"
+"  \"protocol\": \"neptrain.vasp-resources.v1\",\n"
+"  \"family\": \"PBE\",\n"
+"  \"release\": \"2025-01\",\n"
+"  \"elements\": {\n"
+"    \"Fe\": {\n"
+"      \"path\": \"Fe_pv/POTCAR\",\n"
+"      \"sha256\": \"<64 hex characters>\",\n"
+"      \"titel\": \"PAW_PBE Fe_pv 02Aug2007\"\n"
+"    }\n"
+"  }\n"
+"}\n"
+msgstr ""
+
+#: ../../source/command/manual.md:126 9c9154790c114a14ab882e3b05c2dbf9
+msgid ""
+"本地 target 在 prepare 时校验真实文件；远程 target 必须在 "
+"`execution.targets.<name>.labeling_resource_path` 写目标机绝对路径，并先运行 `neptrain doctor "
+"--project project.yaml`。worker 在真正启动 VASP/ABACUS 前会再校验一次。 VASP 路径只接受 `Fe/POTCAR` 或 "
+"`Fe_pv/POTCAR` 这样的单层 setup 目录，并由 NepTrain 显式写入 ASE `setups`；不会校验 manifest 中的一个文件，却让 "
+"ASE 按默认规则读取另一个文件。 VASP 的 `ISPIN=2` 只表示共线自旋极化电子计算，结果仍是普通 energy/force/virial 标签并记录 "
+"`dft_electronic_mode`；它不会生成 `spin/mforce`。非共线、SOC 或真正的 spin-force 标注必须使用 ABACUS "
+"DeltaSpin。"
+msgstr ""
+"A local target validates the real files during preparation. A remote target must set "
+"the target machine’s absolute path in "
+"`execution.targets.<name>.labeling_resource_path`, and you should run `neptrain "
+"doctor --project project.yaml` first. The worker validates again before starting VASP"
+" or ABACUS. VASP paths accept only one-level setup directories such as `Fe/POTCAR` or"
+" `Fe_pv/POTCAR`; NepTrain passes that setup explicitly to ASE so the validated POTCAR"
+" is the one used in the calculation. VASP `ISPIN=2` denotes a collinear spin-"
+"polarized electronic calculation, but still produces ordinary energy/force/virial "
+"labels and records `dft_electronic_mode`; it does not produce `spin/mforce`. Use "
+"ABACUS DeltaSpin for noncollinear, SOC, or genuine spin-force labels."
+
+#: ../../source/command/manual.md:136 32f291aed9494f3b97e96c6f2307fc98
+msgid "预训练或微调后的等变模型可以作为与 VASP/ABACUS 平级的 Label Adapter："
+msgstr ""
+"A pretrained or fine-tuned equivariant model can serve as a Label Adapter alongside "
+"VASP and ABACUS:"
+
+#: ../../source/command/manual.md:138 23492a967a5f49a2b3713c9f68935b49
+msgid ""
+"neptrain label candidates.xyz \\\n"
+"  --backend model \\\n"
+"  --model mace-small.model \\\n"
+"  --model-name mace-mp-0-small \\\n"
+"  --runner 'neptrain model-worker mace' \\\n"
+"  --device cuda \\\n"
+"  --precision float32 \\\n"
+"  --project project.yaml \\\n"
+"  --target teacher-gpu \\\n"
+"  -o labeled.xyz\n"
+msgstr ""
+
+#: ../../source/command/manual.md:151 25aeffcdcbdf416295e5e3f702e307d3
+msgid ""
+"`model-worker mace` 的运行时由 `NepTrain[mace]` 提供，读取本地 MACE checkpoint。 它复用一个 ASE "
+"calculator 批量计算结构，将 ASE stress 转成 `virial = -stress × volume`，并保持结构顺序、晶胞和 PBC 不变。当前 "
+"MACE runner 不输出磁力，所以明确拒绝含 `spin` 的输入。"
+msgstr ""
+"The runtime for `model-worker mace` is provided by `NepTrain[mace]` and reads a local"
+" MACE checkpoint. It reuses one ASE calculator for batched structures, converts ASE "
+"stress to `virial = -stress × volume`, and preserves structure order, cells, and PBC."
+" The current MACE runner does not emit magnetic forces and therefore rejects inputs "
+"containing `spin`."
+
+#: ../../source/command/manual.md:156 0db44835a3b448a18d00c048febaa92e
+msgid "DeepMD 使用同一个 runner 覆盖 DPA-3、DPA-4 和其它 DeepMD 模型："
+msgstr "One DeepMD runner covers DPA-3, DPA-4, and other DeepMD models:"
+
+#: ../../source/command/manual.md:158 e48a28ac69fc4c21897101a0bcfe41d3
+msgid ""
+"neptrain label candidates.xyz \\\n"
+"  --backend model \\\n"
+"  --model DPA-3.2-5M.pt \\\n"
+"  --model-name dpa-3.2-5m-omol25 \\\n"
+"  --runner 'neptrain model-worker deepmd --head OMol25' \\\n"
+"  --device cuda \\\n"
+"  --precision float32 \\\n"
+"  -o labeled.xyz\n"
+msgstr ""
+
+#: ../../source/command/manual.md:169 3e604fb491f8436688f43caed7af0665
+msgid ""
+"模型格式和后端由 DeePMD-kit 识别。多任务模型通过 runner 的 `--head` 选择 分支；DPA-4 仍使用这个 runner，只需把 "
+"`--model` 换成本地 `.pt2` 文件。 `model-worker deepmd` 的运行时由 `NepTrain[deepmd]` 提供；DPA-4 "
+"需要支持该格式的 DeePMD-kit 3.2 或更新版本。"
+msgstr ""
+"DeePMD-kit identifies the model format and backend. Select a branch of a multitask "
+"model with the runner’s `--head`. DPA-4 uses the same runner; replace `--model` with "
+"a local `.pt2` file. The `model-worker deepmd` runtime is provided by "
+"`NepTrain[deepmd]`; DPA-4 requires a DeePMD-kit 3.2 or later build that supports the "
+"format."
+
+#: ../../source/command/manual.md:174 0474bd5ba69242179c95175443d9871a
+msgid ""
+"所有模型 runner 都遵守五参数协议：`--model`、`--input`、`--output`、 `--device` 和 "
+"`--precision`。runner 必须输出顺序不变的规范 extxyz。 NepTrain 负责模型 "
+"hash、结构身份、energy/forces/virial、可选 spin/mforce 和最终原子发布；runner "
+"失败或标签不完整时不会产生部分结果。完整示例见仓库的 `examples/distillation-mace/` 和 `examples/distillation-"
+"deepmd/`。 `model-worker` 只承载 NepTrain 内部 runner 协议，不是需要用户单独学习的命令； 正常使用请始终从 `neptrain "
+"label` 进入。"
+msgstr ""
+"Every model runner follows a five-option protocol: `--model`, `--input`, `--output`, "
+"`--device`, and `--precision`. It must write canonical extxyz without reordering "
+"frames. NepTrain owns the model hash, structure identity, energy/forces/virial, "
+"optional spin/mforce, and final atomic publication; failed or incomplete runners "
+"never publish partial results. Complete examples live in `examples/distillation-"
+"mace/` and `examples/distillation-deepmd/`. `model-worker` only implements NepTrain’s"
+" internal runner protocol; normal users should always enter through `neptrain label`."
+
+#: ../../source/command/manual.md:182 7a714cadc547477888fe4156c1dc7020
+msgid "任务提交后通过统一 task 命令管理："
+msgstr "Manage a submitted task through the unified task commands:"
+
+#: ../../source/command/manual.md:184 8a1b52eade0a4d479bb51553aafc9bb6
+msgid ""
+"neptrain task status runs/label-...\n"
+"neptrain task logs runs/label-...\n"
+"neptrain task wait runs/label-...\n"
+"neptrain task retry runs/label-...\n"
+"neptrain task cancel runs/label-...\n"
+msgstr ""
+
+#: ../../source/command/manual.md:192 31231d525bb84db7aa7583823338e1a6
+msgid "`status` 只做一次有界查询和收集，不会永久等待。"
+msgstr ""
+"`status` performs one bounded query and collection pass; it does not wait "
+"indefinitely."
+
+#: ../../source/command/manual.md:193 3e4d66eaf7b74faaadc4ca6f51a9e3da
+msgid "`wait` 持续轮询到终态，并在状态变化时把进度写到 stderr。"
+msgstr ""
+"`wait` polls until a terminal state and writes progress to stderr when the state "
+"changes."
+
+#: ../../source/command/manual.md:194 b6bef0e8f41b43349e0c34125b6d7cfb
+msgid "`cancel` 取消当前 Slurm attempt，不删除已完成且校验通过的 shard。"
+msgstr ""
+"`cancel` cancels the current Slurm attempt without deleting completed, verified "
+"shards."
+
+#: ../../source/command/manual.md:195 275d69500b25472daf128812010784af
+msgid "`retry` 归档旧 metadata，创建新 attempt，只提交失败、取消、缺失或损坏的 shard。"
+msgstr ""
+"`retry` archives old metadata, creates a new attempt, and submits only failed, "
+"cancelled, missing, or damaged shards."
+
+#: ../../source/command/manual.md:197 899bc79a37f2404d996cdd16298c5ac2
+msgid "`logs` 获取日志，不改变 operation 或 scheduler 状态。"
+msgstr "`logs` retrieves logs without changing the operation or scheduler state."
+
+#: ../../source/command/manual.md:199 0dc70e7b753448eb8fe0e5d1ea29a297
+msgid ""
+"作业从 `prepared/submitted/running/cancelling` 进入 "
+"`complete/failed/cancelled/damaged`。作业已从 `squeue` 消失时会继续查询 `sacct`；在有界 accounting "
+"grace 之后仍不可见才标记 `LOST` 并允许 retry， 不会无限显示 RUNNING。"
+msgstr ""
+"A job moves from `prepared/submitted/running/cancelling` to "
+"`complete/failed/cancelled/damaged`. When a job disappears from `squeue`, NepTrain "
+"continues with `sacct`; only after a bounded accounting grace period does it mark an "
+"unseen job as `LOST` and allow retry instead of displaying RUNNING forever."
+
+#: ../../source/command/manual.md:204 b1e0732327df490baa59788460c4ca35
+msgid "手动任务目录只保留两层用户可见结构："
+msgstr "Manual task directories expose only two user-facing levels:"
+
+#: ../../source/command/manual.md:206 640fb9864d7e497581842756b718e7d0
+msgid ""
+"label-50/\n"
+"├── labeled.xyz -> ../50-labeled.xyz\n"
+"├── operation.json\n"
+"├── remote.txt\n"
+"├── job.sbatch\n"
+"├── logs/\n"
+"└── jobs/\n"
+"    └── 000000/\n"
+"        ├── input.xyz\n"
+"        ├── request.json\n"
+"        ├── execution.json\n"
+"        ├── result.json\n"
+"        ├── labeled.xyz\n"
+"        └── calculation/\n"
+msgstr ""
+
+#: ../../source/command/manual.md:223 a214a86ad3074356a165ca44b8c6cc94
+msgid ""
+"根目录的 `labeled.xyz`、`trajectory.xyz` 或 `nep.txt` 始终直达合并后的最终 结果；`remote.txt` "
+"记录跨平台任务的主机和真实计算路径。每个 array job 的 输入、状态和结果直接位于 `jobs/<index>/`，后端原始输出集中在其 "
+"`calculation/` 中。调度器输出统一放在 `logs/`。"
+msgstr ""
+"The root `labeled.xyz`, `trajectory.xyz`, or `nep.txt` always points directly to the "
+"merged final result; `remote.txt` records the host and actual compute path for cross-"
+"platform tasks. Each array job keeps its input, state, and result directly under "
+"`jobs/<index>/`, with raw backend files under its `calculation/` directory. Scheduler"
+" output is collected under `logs/`."
+
+#: ../../source/command/manual.md:228 7f90b1cdb4ed4ae8b87a8c3631e2ab52
+msgid "提交后会立即显示任务状态、作业号、运行目录和下一条建议命令。脚本需要稳定的 机器输出时，给训练、MD、label 或 task 子命令加 `--json`："
+msgstr ""
+"After submission, NepTrain immediately prints the task state, job ID, run directory, "
+"and suggested next command. For stable machine output, add `--json` to a train, MD, "
+"label, or task subcommand:"
+
+#: ../../source/command/manual.md:231 a040943d7e35434aba3463af796b8928
+msgid ""
+"neptrain label candidates.xyz --project project.yaml --target label --json\n"
+"neptrain task status runs/label-... --json\n"
+msgstr ""
+
+#: ../../source/command/manual.md:236 12c3fc0bd074463dbdb53e7e2ddb181b
+msgid ""
+"上传、提交、排队、运行、收集和合并进度只写 stderr。`--json` 的 stdout 只有 一个对象；状态使用 `neptrain.manual-"
+"status.v1`，日志使用 `neptrain.manual-logs.v1`。字段 `state`、`completed`、`failed`、`total`、 "
+"`jobs`、`errors`、`result` 和 `next_action` 是面向脚本的接口。"
+msgstr ""
+"Upload, submission, queue, execution, collection, and merge progress is written only "
+"to stderr. With `--json`, stdout contains one object: status uses `neptrain.manual-"
+"status.v1` and logs use `neptrain.manual-logs.v1`. The script-facing fields are "
+"`state`, `completed`, `failed`, `total`, `jobs`, `errors`, `result`, and "
+"`next_action`."
+
+#: ../../source/command/manual.md:241 1a80b0b3d49b42f792fe888a14c8b620
+msgid ""
+"只有全部 shard 成功后才会发布最终输出；已有输出默认拒绝覆盖，确认替换时使用 `--force`。 同一集群共享文件系统上的 array "
+"会自动完成发布；跨平台任务由 `task status` 或 `task wait` 同步并发布。一次状态检查会把尚未完整落盘的 shard 结果合并成一个 "
+"归档传回，因此任务数增加时不会逐个建立 SSH/SCP 连接；若上次同步中断， 再次执行相同命令会自动补齐缺少的 `result.json` 和实际结果文件。`task "
+"logs` 也以一次归档传回当前作业的全部调度器日志。"
+msgstr ""
+"NepTrain publishes the final output only after every shard succeeds and refuses to "
+"overwrite an existing output unless `--force` is given. Arrays on a shared filesystem"
+" publish automatically; cross-platform tasks are synchronized and published by `task "
+"status` or `task wait`. A status check bundles every shard result that is not fully "
+"local into one archive, so increasing the task count does not create one SSH/SCP "
+"connection per shard. If synchronization is interrupted, rerunning the same command "
+"fills in missing `result.json` and result files. `task logs` likewise retrieves all "
+"current scheduler logs in one archive."
+
+#: ../../source/command/manual.md:249 39ea0f414a7e46828f8965b8b59ccb5a
+msgid ""
+"平台程序默认从 `PATH` 查找。若平台要求 `srun vasp_std` 等命令，把 `NEPTRAIN_VASP_COMMAND`（或对应的 "
+"`NEPTRAIN_ABACUS_COMMAND`、 `NEPTRAIN_NEP_COMMAND`、`NEPTRAIN_GPUMD_COMMAND`）写入 target "
+"的 `environment`。"
+msgstr ""
+"Platform programs are resolved from `PATH` by default. If the platform requires a "
+"command such as `srun vasp_std`, put `NEPTRAIN_VASP_COMMAND` or the corresponding "
+"`NEPTRAIN_ABACUS_COMMAND`, `NEPTRAIN_NEP_COMMAND`, or `NEPTRAIN_GPUMD_COMMAND` in the"
+" target’s `environment`."
+
+#: ../../source/command/manual.md:254 880c9e7bd5954115a8a519efc7bf7e73
+msgid ""
+"`operation.json` 是手动任务身份、输入 manifest、shard 顺序和 attempt 列表的 "
+"权威；`jobs/<index>/execution.json` 只记录运行态，`result.json` 固定所属 operation、结构顺序和 artifact "
+"hash。最终文件只在全部 shard 均通过该契约后 原子发布。损坏 `execution.json`、缺少 `result.json` 或顺序不一致都会显示为 "
+"可诊断失败，不会把部分 `labeled.xyz` 当成完整结果。"
+msgstr ""
+"`operation.json` is authoritative for manual-task identity, input manifest, shard "
+"order, and attempt history. `jobs/<index>/execution.json` records runtime state only;"
+" `result.json` binds the operation, structure order, and artifact hash. The final "
+"file is published atomically only after every shard satisfies this contract. A "
+"damaged `execution.json`, missing `result.json`, or inconsistent order produces a "
+"diagnosable failure rather than exposing a partial `labeled.xyz` as complete."

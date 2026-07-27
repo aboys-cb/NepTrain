@@ -42,6 +42,4 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e . -r docs/requirements.txt
       - name: Build documentation
-        run: |
-          sphinx-build -W --keep-going -b html \
-            docs/source docs/_build/html
+        run: python tools/docs/i18n.py build

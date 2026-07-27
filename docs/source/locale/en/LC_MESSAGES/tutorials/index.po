@@ -1,0 +1,143 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2024-2026, NepTrain Team
+# This file is distributed under the same license as the NepTrain package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: NepTrain \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-27 19:45+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: en\n"
+"Language-Team: en <LL@li.org>\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/tutorials/index.md:1 8b958bb84f5140d8a05fbdb701a7db52
+msgid "教程与示例"
+msgstr "Tutorials and examples"
+
+#: ../../source/tutorials/index.md:3 a1c62291b3b24ff484faef999278f18f
+msgid "第一次使用 NepTrain 时，先按标注来源选择示例："
+msgstr "For your first NepTrain run, choose an example by labeling source:"
+
+#: ../../source/tutorials/index.md 89f5c8a99b5d43c19d4ca682c9533d9c
+msgid "标注来源"
+msgstr "Label source"
+
+#: ../../source/tutorials/index.md 7f142f8a956743f9bfcc8573182f591e
+msgid "教程"
+msgstr "Tutorial"
+
+#: ../../source/tutorials/index.md 79120c14c4c948f5a9ebb07d70789e2c
+msgid "适合先验证什么"
+msgstr "What to verify first"
+
+#: ../../source/tutorials/index.md 83c6b328281046b689fee0b31168d14e
+msgid "VASP"
+msgstr ""
+
+#: ../../source/tutorials/index.md a68c1ddd637d4c5b94b0ce23b35e5165
+msgid ""
+"[VASP + Slurm workflow](https://github.com/aboys-cb/NepTrain/tree/master/examples"
+"/workflow-vasp-slurm)"
+msgstr ""
+"[VASP + Slurm workflow](https://github.com/aboys-cb/NepTrain/blob/master/examples"
+"/workflow-vasp-slurm/README.en.md)"
+
+#: ../../source/tutorials/index.md bed4c973352742e2bb53610efec13b94
+msgid "POTCAR manifest、Slurm target、真实 VASP 标注"
+msgstr "POTCAR manifest, Slurm target, and real VASP labeling"
+
+#: ../../source/tutorials/index.md 3805747045b44bc68faf3e095face9eb
+msgid "ABACUS"
+msgstr ""
+
+#: ../../source/tutorials/index.md e99c259cee5e4085bb34ec09b8cba869
+msgid ""
+"[ABACUS + Slurm workflow](https://github.com/aboys-cb/NepTrain/tree/master/examples"
+"/workflow-abacus-slurm)"
+msgstr ""
+"[ABACUS + Slurm workflow](https://github.com/aboys-cb/NepTrain/blob/master/examples"
+"/workflow-abacus-slurm/README.en.md)"
+
+#: ../../source/tutorials/index.md d7e393b23d734670831ce6c34070398e
+msgid "UPF/ORB manifest、Slurm target、真实 ABACUS 标注"
+msgstr "UPF/ORB manifest, Slurm target, and real ABACUS labeling"
+
+#: ../../source/tutorials/index.md 77687dbadf564bdf8fa9650f50be55c9
+msgid "DPA-3/DPA-4"
+msgstr ""
+
+#: ../../source/tutorials/index.md fbe92a2bac644b698707f92e8c86c706
+msgid ""
+"[DeepMD 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-"
+"deepmd)"
+msgstr ""
+"[DeepMD distillation](https://github.com/aboys-cb/NepTrain/blob/master/examples"
+"/distillation-deepmd/README.en.md)"
+
+#: ../../source/tutorials/index.md 7e46f89d9c424c9a95d9398ef32346c0
+msgid "公开 DPA-3 下载、模型标注、Student 和完整 workflow"
+msgstr "Public DPA-3 download, model labeling, student training, and a complete workflow"
+
+#: ../../source/tutorials/index.md edcf53ec716f48fb9fda73f05be06f1d
+msgid "MACE"
+msgstr ""
+
+#: ../../source/tutorials/index.md c21e65b0e4fa42858b12920a55e8ed30
+msgid "[MACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-mace)"
+msgstr ""
+"[MACE distillation](https://github.com/aboys-cb/NepTrain/blob/master/examples"
+"/distillation-mace/README.en.md)"
+
+#: ../../source/tutorials/index.md 9c5e346d3d4b4e288e512ed778fcc659
+msgid "固定 checkpoint、模型标注、Student 和完整 workflow"
+msgstr "Pinned checkpoint, model labeling, student training, and a complete workflow"
+
+#: ../../source/tutorials/index.md:12 979ed63c4074482490e3ead0826948f5
+msgid "每个教程都按相同顺序组织："
+msgstr "Every tutorial follows the same sequence:"
+
+#: ../../source/tutorials/index.md:14 01767ef6216345888b95dff53e331c61
+msgid "安装并检查命令；"
+msgstr "Install dependencies and check commands."
+
+#: ../../source/tutorials/index.md:15 c4bdc065332f4b2298371cba690a51c2
+msgid "准备结构、标签和外部资源；"
+msgstr "Prepare structures, labels, and external resources."
+
+#: ../../source/tutorials/index.md:16 4393b609233a48d88804f207bbfa0b34
+msgid "先跑一次独立标注；"
+msgstr "Run one standalone labeling task first."
+
+#: ../../source/tutorials/index.md:17 9ef5da3014a54331be97a7ad96e38ed9
+msgid "检查 energy、forces、virial 和 provenance；"
+msgstr "Check energy, forces, virial, and provenance."
+
+#: ../../source/tutorials/index.md:18 991ee98468154fb1a9c59fa3f74c17af
+msgid "准备并启动一代 workflow；"
+msgstr "Prepare and start one workflow generation."
+
+#: ../../source/tutorials/index.md:19 24f8fce0b51e452aa74c08d92e6b3bb8
+msgid "查看 stage、日志、PNG 图和最终模型状态；"
+msgstr "Inspect stages, logs, PNG plots, and the final model state."
+
+#: ../../source/tutorials/index.md:20 4948d00c38fc4bd98c68775b8f0db791
+msgid "将教程参数替换为正式项目参数。"
+msgstr "Replace tutorial parameters with production project settings."
+
+#: ../../source/tutorials/index.md:22 28143c553cf1441e96aaa7695c8c3fb6
+msgid ""
+"VASP/ABACUS 示例的初始数据使用 ASE EMT，只用于跑通工作流机械过程。它不能与 "
+"正式第一性原理标签混合作为生产训练集。蒸馏示例的小数据和短训练同样只用于验证 接口。"
+msgstr ""
+"The VASP and ABACUS examples use ASE EMT data only to exercise workflow mechanics. Do"
+" not mix those labels with production first-principles training data. The small "
+"datasets and short training runs in the distillation examples likewise validate "
+"interfaces only."

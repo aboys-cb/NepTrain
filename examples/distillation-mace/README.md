@@ -1,3 +1,7 @@
+<div align="center">
+<a href="README.en.md">English</a> | <strong>简体中文</strong>
+</div>
+
 # 用 MACE Teacher 蒸馏一个 NEP Student
 
 这个教程先用固定的 MACE-MP-0 checkpoint 标注三个 Al 晶体结构，再训练

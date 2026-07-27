@@ -1,4 +1,5 @@
 from importlib.metadata import version as distribution_version
+import os
 
 
 project = "NepTrain"
@@ -30,7 +31,15 @@ myst_enable_extensions = [
 ]
 
 templates_path = ["_templates"]
-language = "zh_CN"
+locale_dirs = ["locale/"]
+gettext_compact = False
+gettext_uuid = True
+gettext_additional_targets = {"image", "literal-block"}
+_rtd_language = os.environ.get("READTHEDOCS_LANGUAGE", "").lower()
+language = {
+    "zh-cn": "zh_CN",
+    "zh_cn": "zh_CN",
+}.get(_rtd_language, _rtd_language or "zh_CN")
 
 
 html_theme = "sphinx_rtd_theme"

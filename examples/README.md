@@ -1,3 +1,7 @@
+<div align="center">
+<a href="README.en.md">English</a> | <strong>简体中文</strong>
+</div>
+
 # NepTrain 示例入口
 
 第一次使用时，先按标注来源选择一条路线。不要从源码目录结构猜应该运行哪个

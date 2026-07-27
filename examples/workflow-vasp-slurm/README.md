@@ -1,3 +1,7 @@
+<div align="center">
+<a href="README.en.md">English</a> | <strong>简体中文</strong>
+</div>
+
 # 从 VASP 开始跑一代 NepTrain workflow
 
 这个教程面向第一次使用 NepTrain 的 Slurm 用户。完成后你会得到一条真实的：
