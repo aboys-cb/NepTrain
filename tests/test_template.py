@@ -6,12 +6,12 @@ from NepTrain.core.config import load_config
 from NepTrain.core.template import init_project
 
 
-def test_init_project_writes_a_valid_narrow_schema_v7(tmp_path):
+def test_init_project_writes_a_valid_narrow_schema_v8(tmp_path):
     project = init_project("local", tmp_path)
     config, changes = load_config(project)
 
     assert changes == []
-    assert config["schema_version"] == 7
+    assert config["schema_version"] == 8
     assert config["training"]["backend"] == "torchnep"
     assert config["md"]["backend"] == "lammps"
     route = config["sampling"]["routes"][0]
@@ -28,13 +28,13 @@ def test_init_project_writes_a_valid_narrow_schema_v7(tmp_path):
     assert "structures" not in config["md"]
     assert "template_path" not in config["md"]
     assert "plugin_path" not in config["md"]
-    assert config["dft"]["kpoint_mode"] == "auto"
-    assert config["dft"]["resource_path"] == "./resources"
-    assert config["dft"]["potcar_manifest_path"] == "./vasp-resources.json"
-    assert config["dft"]["structures_per_job"] == 1
-    assert config["dft"]["max_concurrent"] == 20
-    assert "kspacing" not in config["dft"]
-    assert "kpoints" not in config["dft"]
+    assert config["labeling"]["kpoint_mode"] == "auto"
+    assert config["labeling"]["resource_path"] == "./resources"
+    assert config["labeling"]["potcar_manifest_path"] == "./vasp-resources.json"
+    assert config["labeling"]["structures_per_job"] == 1
+    assert config["labeling"]["max_concurrent"] == 20
+    assert "kspacing" not in config["labeling"]
+    assert "kpoints" not in config["labeling"]
     template = (tmp_path / "lammps.in").read_text(encoding="utf-8")
     assert "{{ temperature }}" in template
     assert "{{ steps }}" in template
@@ -60,9 +60,9 @@ def test_init_selects_only_the_requested_spin_abacus_templates(tmp_path):
     config, _ = load_config(project)
 
     assert config["md"]["spin"] is True
-    assert config["dft"]["backend"] == "abacus"
-    assert config["dft"]["input_path"] == "./INPUT"
-    assert config["dft"]["resource_manifest_path"] == "./abacus-resources.json"
+    assert config["labeling"]["backend"] == "abacus"
+    assert config["labeling"]["input_path"] == "./INPUT"
+    assert config["labeling"]["resource_manifest_path"] == "./abacus-resources.json"
     assert (tmp_path / "lammps.in").is_file()
     assert (tmp_path / "INPUT").is_file()
     assert (tmp_path / "abacus-resources.json").is_file()

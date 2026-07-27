@@ -110,9 +110,10 @@ _STAGE_CONFIG_PATH_FIELDS = {
     "explore": (),
     "select": (),
     "label": (
-        "dft.input_path",
-        "dft.potcar_manifest_path",
-        "dft.resource_manifest_path",
+        "labeling.input_path",
+        "labeling.potcar_manifest_path",
+        "labeling.resource_manifest_path",
+        "labeling.model_path",
     ),
     "diagnose": (),
     "merge": (),
@@ -137,6 +138,7 @@ _STAGE_ARTIFACTS = {
         "training_set",
         "model",
         "checkpoint",
+        "label_provenance",
         "acquisition_signals",
         "md_attempts",
     ),
@@ -187,7 +189,7 @@ _STAGE_DIRECTORY_LABELS = {
     "train": "train",
     "explore": "md",
     "select": "select",
-    "label": "dft",
+    "label": "label",
     "diagnose": "diagnose",
     "merge": "merge",
     "retrain": "retrain",
@@ -348,7 +350,7 @@ class ExecutionTarget:
     cpus_per_task: int | None = None
     gpus_per_node: int | None = None
     directives: tuple[str, ...] = ()
-    dft_resource_path: str | None = None
+    labeling_resource_path: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -407,27 +409,28 @@ class ExecutionTarget:
             raise ExecutionError(f"execution target {name} has invalid cpus_per_task")
         if gpus is not None and int(gpus) < 0:
             raise ExecutionError(f"execution target {name} has invalid gpus_per_node")
-        dft_resource_path = value.get("dft_resource_path")
-        if dft_resource_path is not None and any(
-            character in str(dft_resource_path) for character in "\r\n"
+        labeling_resource_path = value.get("labeling_resource_path")
+        if labeling_resource_path is not None and any(
+            character in str(labeling_resource_path) for character in "\r\n"
         ):
             raise ExecutionError(
-                f"execution target {name}.dft_resource_path cannot contain newlines"
+                f"execution target {name}.labeling_resource_path cannot "
+                "contain newlines"
             )
-        if dft_resource_path is not None:
-            resource_text = str(dft_resource_path)
+        if labeling_resource_path is not None:
+            resource_text = str(labeling_resource_path)
             if not (
                 Path(resource_text).is_absolute()
                 or resource_text.startswith("~/")
             ):
                 raise ExecutionError(
-                    f"execution target {name}.dft_resource_path must be absolute "
-                    "or start with ~/"
+                    f"execution target {name}.labeling_resource_path must be "
+                    "absolute or start with ~/"
                 )
             if ".." in Path(resource_text.removeprefix("~/")).parts:
                 raise ExecutionError(
-                    f"execution target {name}.dft_resource_path cannot contain "
-                    "parent traversal"
+                    f"execution target {name}.labeling_resource_path cannot "
+                    "contain parent traversal"
                 )
         environment = dict(value.get("environment", {}))
         invalid_environment = [
@@ -465,8 +468,10 @@ class ExecutionTarget:
             cpus_per_task=int(cpus) if cpus is not None else None,
             gpus_per_node=int(gpus) if gpus is not None else None,
             directives=directives,
-            dft_resource_path=(
-                str(dft_resource_path) if dft_resource_path is not None else None
+            labeling_resource_path=(
+                str(labeling_resource_path)
+                if labeling_resource_path is not None
+                else None
             ),
             environment={
                 str(key): str(item)
@@ -603,14 +608,16 @@ def build_stage_task(
             raise ExecutionError(
                 f"explore task refers to unknown route {requested_route_id}"
             )
-    if stage == "label" and target.dft_resource_path:
-        portable_config.setdefault("dft", {})["resource_path"] = (
-            target.dft_resource_path
+    if stage == "label" and target.labeling_resource_path:
+        portable_config.setdefault("labeling", {})["resource_path"] = (
+            target.labeling_resource_path
         )
     elif stage == "label":
-        resource_path = portable_config.get("dft", {}).get("resource_path")
+        resource_path = portable_config.get("labeling", {}).get(
+            "resource_path"
+        )
         if resource_path:
-            portable_config["dft"]["resource_path"] = str(
+            portable_config["labeling"]["resource_path"] = str(
                 _resolve_path(resource_path, workflow_root)
             )
 
@@ -630,13 +637,13 @@ def build_stage_task(
         for fields in _STAGE_CONFIG_PATH_FIELDS.values()
         for dotted in fields
     } | {
-        "dft.resource_path",
+        "labeling.resource_path",
         "evaluation.validation_path",
         "training.initial_path",
     }
     retained_path_fields = set(path_fields)
     if stage == "label":
-        retained_path_fields.add("dft.resource_path")
+        retained_path_fields.add("labeling.resource_path")
     for dotted in sorted(all_path_fields - retained_path_fields):
         _delete_dotted(portable_config, dotted)
     if stage not in {"explore", "evaluate"}:
@@ -645,7 +652,10 @@ def build_stage_task(
         value = _get_dotted(portable_config, dotted)
         if value in {None, "", "auto"}:
             continue
-        if dotted == "dft.resource_path" and target.dft_resource_path:
+        if (
+            dotted == "labeling.resource_path"
+            and target.labeling_resource_path
+        ):
             continue
         source = _resolve_path(value, workflow_root)
         suffix = source.suffix if source.is_file() else ""

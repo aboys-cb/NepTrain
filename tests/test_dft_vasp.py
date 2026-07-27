@@ -10,7 +10,7 @@ import pytest
 from ase import Atoms
 from ase.io import read, write
 
-from NepTrain.core.dft import LabelRequest, label
+from NepTrain.core.labeling import LabelRequest, label
 from NepTrain.core.dft.vasp.io import VaspInput
 from NepTrain.core.dft.vasp.native import NativeVaspError
 from NepTrain.core.dft.vasp.resources import (
@@ -103,11 +103,13 @@ def _request(tmp_path: Path) -> LabelRequest:
         source=source,
         output_file=tmp_path / "labeled.xyz",
         work_dir=tmp_path / "work",
-        input_file=incar,
-        resource_dir=resources,
-        resource_manifest=resource_manifest,
-        use_gamma=True,
-        ka=(4, 4, 4),
+        settings={
+            "input_file": incar,
+            "resource_dir": resources,
+            "resource_manifest": resource_manifest,
+            "use_gamma": True,
+            "ka": (4, 4, 4),
+        },
     )
 
 
@@ -204,7 +206,7 @@ def test_vasp_resource_hash_drift_fails_before_calculator_launch(
     tmp_path: Path, monkeypatch
 ):
     request = _request(tmp_path)
-    (request.resource_dir / "Al" / "POTCAR").write_text(
+    (request.settings["resource_dir"] / "Al" / "POTCAR").write_text(
         "TITEL = PAW_PBE Al changed\nVRHFIN =Al: s2p1\n",
         encoding="utf-8",
     )
@@ -223,9 +225,9 @@ def test_vasp_resource_titel_pins_the_exact_variant_and_release(
     tmp_path: Path, monkeypatch
 ):
     request = _request(tmp_path)
-    manifest = json.loads(request.resource_manifest.read_text())
+    manifest = json.loads(request.settings["resource_manifest"].read_text())
     manifest["elements"]["Al"]["titel"] = "PAW_PBE Al_h 04Jan2001"
-    request.resource_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    request.settings["resource_manifest"].write_text(json.dumps(manifest), encoding="utf-8")
     native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
     monkeypatch.setattr(
         native,
@@ -242,10 +244,11 @@ def test_vasp_single_structure_workflow_job_uses_flat_output(
 ):
     native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
+    base_request = _request(tmp_path)
     request = replace(
-        _request(tmp_path),
+        base_request,
         output_file=tmp_path / "work" / "selected-labels.xyz",
-        options={"flat_single_case": True},
+        settings={**base_request.settings, "flat_single_case": True},
     )
 
     label(request, "vasp")
@@ -263,7 +266,7 @@ def test_vasp_auto_mode_honors_template_kspacing(tmp_path: Path, monkeypatch):
     native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
     request = _request(tmp_path)
-    request.input_file.write_text(
+    request.settings["input_file"].write_text(
         "IBRION = -1\nNSW = 0\nISPIN = 1\n"
         "KSPACING = 0.25\nKGAMMA = .TRUE.\n",
         encoding="utf-8",
@@ -280,7 +283,7 @@ def test_vasp_rejects_relaxation_template_before_launch(tmp_path: Path, monkeypa
     native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
     request = _request(tmp_path)
-    request.input_file.write_text("IBRION = 2\nNSW = 5\nISPIN = 1\n", encoding="utf-8")
+    request.settings["input_file"].write_text("IBRION = 2\nNSW = 5\nISPIN = 1\n", encoding="utf-8")
 
     with pytest.raises(NativeVaspError, match="fixed-geometry single point"):
         label(request, "vasp")
@@ -313,7 +316,7 @@ def test_vasp_accepts_collinear_spin_polarized_as_ordinary_labels(
     native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
     request = _request(tmp_path)
-    request.input_file.write_text("IBRION = -1\nNSW = 0\nISPIN = 2\n", encoding="utf-8")
+    request.settings["input_file"].write_text("IBRION = -1\nNSW = 0\nISPIN = 2\n", encoding="utf-8")
 
     result = label(request, "vasp")
 
@@ -346,7 +349,7 @@ def test_vasp_requires_ispin2_for_nonzero_initial_magnetic_moments(
     ):
         label(request, "vasp")
 
-    request.input_file.write_text(
+    request.settings["input_file"].write_text(
         "IBRION = -1\nNSW = 0\nISPIN = 2\n",
         encoding="utf-8",
     )

@@ -53,13 +53,13 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
 
     assert summary.accepted is True
     assert workspace.ledger == workspace.root / ".neptrain" / "ledger.json"
-    assert workspace.version == 3
+    assert workspace.version == 4
     assert workspace.tasks_dir == workspace.root / ".neptrain" / "jobs"
     assert not (workspace.internal_dir / "tasks").exists()
     assert not (workspace.internal_dir / "locks").exists()
     assert workspace.generation_dir(1).name == "0001"
     assert (workspace.generation_dir(1) / "md/explore.txt").is_file()
-    assert (workspace.generation_dir(1) / "dft/label.txt").is_file()
+    assert (workspace.generation_dir(1) / "label/label.txt").is_file()
     assert (workspace.generation_dir(1) / "retrain/retrain.txt").is_file()
     assert json.loads((workspace.results_dir / "nep.txt").read_text()) == "evaluate"
     assert (workspace.results_dir / "train.xyz").read_text() == "merge\n"

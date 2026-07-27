@@ -63,11 +63,11 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
     _write_labeled(tmp_path / "validation.xyz")
     _write(tmp_path / "gpu-env.sh", "module load cuda\n")
     _write(tmp_path / "cpu-env.sh", "module load lammps\n")
-    _write(tmp_path / "dft-env.sh", "module load vasp\n")
+    _write(tmp_path / "label-env.sh", "module load vasp\n")
     config = _write(
         tmp_path / "job.yaml",
         """
-schema_version: 7
+schema_version: 8
 training:
   backend: torchnep
   initial_path: ./initial.xyz
@@ -104,7 +104,7 @@ sampling:
   selection:
     max_selected: 100
     novelty: auto
-dft:
+labeling:
   backend: toy
 evaluation:
   validation_path: ./validation.xyz
@@ -120,7 +120,7 @@ execution:
   stage_targets:
     training: training
     sampling: cpu
-    labeling: dft
+    labeling: label
     analysis: cpu
   sampling_route_targets: {}
   targets:
@@ -136,12 +136,12 @@ execution:
       qos: rush-cpu
       cpus_per_task: 4
       setup_script: ./cpu-env.sh
-    dft:
+    label:
       executor: slurm
       partition: 16V100
       qos: flood-1o2gpu
       gpus_per_node: 1
-      setup_script: ./dft-env.sh
+      setup_script: ./label-env.sh
 """,
     )
     return config, initial
@@ -169,7 +169,7 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert "scripts" not in manifest
 
     project_text = result.config_file.read_text()
-    assert "schema_version: 7" in project_text
+    assert "schema_version: 8" in project_text
     assert "workflow.slurm" not in project_text
     assert "execution:" in project_text
     assert "inputs/training/nep.in" in project_text

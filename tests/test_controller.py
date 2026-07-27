@@ -138,7 +138,7 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
             "training": {"config_path": str(training_config), "initial_path": str(initial)},
             "evaluation": {"validation_path": str(validation), "max_rmse": {"energy_rmse": 1, "force_rmse": 1}},
             "md": {"backend": "lammps", "spin": False},
-            "dft": {"software": "toy"},
+            "labeling": {"software": "toy"},
             "workflow": {},
             "execution": {},
         },
@@ -192,7 +192,7 @@ def test_stage_task_identity_covers_bundle_content_and_workflow_instance(tmp_pat
         "training": {},
         "evaluation": {},
         "md": {"spin": False},
-        "dft": {},
+        "labeling": {},
         "workflow": {},
         "execution": {},
     }
@@ -271,7 +271,7 @@ def test_label_task_identity_includes_the_resource_manifest_content(tmp_path):
         "training": {},
         "evaluation": {},
         "md": {"spin": False},
-        "dft": {
+        "labeling": {
             "backend": "vasp",
             "resource_path": "/remote/potpaw",
             "potcar_manifest_path": str(manifest),
@@ -280,12 +280,12 @@ def test_label_task_identity_includes_the_resource_manifest_content(tmp_path):
         "execution": {},
     }
     target = ExecutionTarget(
-        "dft",
+        "label",
         "slurm",
         host="fixture",
         work_root="/remote/work",
         partition="cpu",
-        dft_resource_path="/remote/potpaw",
+        labeling_resource_path="/remote/potpaw",
     )
     first = build_stage_task(
         tmp_path / "tasks",
@@ -321,7 +321,7 @@ def test_label_task_identity_includes_the_resource_manifest_content(tmp_path):
     first_descriptor = json.loads(first.descriptor.read_text())
     bundled_manifest = (
         first.bundle
-        / first_descriptor["config"]["dft"]["potcar_manifest_path"]
+        / first_descriptor["config"]["labeling"]["potcar_manifest_path"]
     )
     assert bundled_manifest.read_text(encoding="utf-8") == '{"release":"one"}\n'
 
@@ -357,7 +357,7 @@ def test_remote_deploy_atomically_replaces_only_an_incomplete_exact_task(
             "training": {},
             "evaluation": {},
             "md": {"spin": False},
-            "dft": {},
+            "labeling": {},
             "workflow": {},
             "execution": {},
         },
@@ -447,7 +447,7 @@ def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
         config={
             "training": {"initial_path": str(initial)},
             "md": {"structures": str(initial), "spin": False},
-            "dft": {"resource_path": str(dft_resource)},
+            "labeling": {"resource_path": str(dft_resource)},
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {"energy_rmse": 1, "force_rmse": 1},
@@ -465,7 +465,7 @@ def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
 
     descriptor = json.loads(task.descriptor.read_text())
     assert set(descriptor["artifacts"]) == {"model"}
-    assert "resource_path" not in descriptor["config"]["dft"]
+    assert "resource_path" not in descriptor["config"]["labeling"]
     assert descriptor["initial_training"] is None
     assert "routes" not in descriptor["config"].get("sampling", {})
     assert "validation_path" not in descriptor["config"]["evaluation"]
@@ -672,7 +672,7 @@ def test_stage_result_rejects_paths_outside_the_bundle(tmp_path):
             "training": {},
             "evaluation": {},
             "md": {"spin": False},
-            "dft": {},
+            "labeling": {},
             "workflow": {},
             "execution": {},
         },
@@ -719,7 +719,7 @@ _STAGE_ARTIFACTS = {
     "train": ("training_input", "model"),
     "explore": ("candidates",),
     "select": ("selected_input", "selection_result"),
-    "label": ("labeled",),
+    "label": ("labeled", "label_provenance"),
     "diagnose": ("acquisition_signals",),
     "merge": ("training_set",),
     "retrain": ("retrained_model",),
@@ -781,6 +781,19 @@ class ImmediateExecutor:
                     frames,
                     format="extxyz",
                 )
+            elif name == "label_provenance":
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "backend": descriptor["config"]["labeling"][
+                                "backend"
+                            ],
+                            "origin": "development",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
             elif name == "md_attempts":
                 model_path = task.bundle / descriptor["artifacts"]["model"]
                 path.write_text(
@@ -817,7 +830,7 @@ class ImmediateExecutor:
             metrics = {"accepted": True, "workflow_converged": True}
         elif task.stage == "label":
             metrics = {
-                "backend": descriptor["config"]["dft"]["backend"],
+                "backend": descriptor["config"]["labeling"]["backend"],
                 "labeled_count": len(
                     ase_read(
                         task.bundle / descriptor["artifacts"]["selected_input"],
@@ -874,7 +887,7 @@ def _controller_inputs(tmp_path: Path):
     config = _write(
         tmp_path / "project.yaml",
         """
-schema_version: 7
+schema_version: 8
 training:
   backend: gpumd
   initial_path: ./initial.xyz
@@ -909,7 +922,7 @@ sampling:
   selection:
     max_selected: 2
     novelty: auto
-dft:
+labeling:
   backend: toy
 evaluation:
   validation_path: ./validation.xyz
@@ -924,13 +937,13 @@ execution:
   stage_targets:
     training: gpu
     sampling: md
-    labeling: dft
+    labeling: label
     analysis: cpu
   sampling_route_targets: {}
   targets:
     gpu: {executor: process}
     md: {executor: process}
-    dft: {executor: process}
+    label: {executor: process}
     cpu: {executor: process}
 """,
     )
@@ -957,7 +970,7 @@ def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
         ("train", "gpu"),
         ("explore", "md"),
         ("select", "cpu"),
-        ("label", "dft"),
+        ("label", "label"),
         ("diagnose", "cpu"),
         ("merge", "cpu"),
         ("retrain", "gpu"),
@@ -1194,8 +1207,8 @@ def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
         "  sampling_route_targets:\n    second: md2\n",
     )
     text = text.replace(
-        "    dft: {executor: process}\n",
-        "    dft: {executor: process}\n    md2: {executor: process}\n",
+        "    label: {executor: process}\n",
+        "    label: {executor: process}\n    md2: {executor: process}\n",
     )
     config.write_text(text, encoding="utf-8")
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -1225,9 +1238,9 @@ def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
     _write_vasp_resources(tmp_path)
     text = config.read_text(encoding="utf-8").replace(
-        "dft:\n  backend: toy\n",
+        "labeling:\n  backend: toy\n",
         (
-            "dft:\n"
+            "labeling:\n"
             "  backend: vasp\n"
             "  input_path: ./INCAR\n"
             "  resource_path: ./potpaw\n"
@@ -1280,7 +1293,7 @@ def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
     label = ledger["generations"]["1"]["stages"]["label"]
     assert label["metrics"]["labeled_count"] == 3
     assert label["metrics"]["batch_count"] == 3
-    dft_root = preparation.output_dir / "generations" / "0001" / "dft"
+    dft_root = preparation.output_dir / "generations" / "0001" / "label"
     assert len(list(dft_root.glob("00000*-Fe"))) == 3
     assert not (dft_root / "calculations").exists()
 
@@ -1290,9 +1303,9 @@ def test_label_oom_is_not_retried_and_does_not_stop_sibling_tasks(tmp_path):
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
     _write_vasp_resources(tmp_path)
     text = config.read_text(encoding="utf-8").replace(
-        "dft:\n  backend: toy\n",
+        "labeling:\n  backend: toy\n",
         (
-            "dft:\n"
+            "labeling:\n"
             "  backend: vasp\n"
             "  input_path: ./INCAR\n"
             "  resource_path: ./potpaw\n"
@@ -1361,7 +1374,7 @@ def test_label_oom_is_not_retried_and_does_not_stop_sibling_tasks(tmp_path):
     assert label["metrics"]["failed_frame_indices"] == [0]
     failure_file = (
         preparation.output_dir
-        / "generations/0001/dft/label-failures.json"
+        / "generations/0001/label/label-failures.json"
     )
     failures = json.loads(failure_file.read_text(encoding="utf-8"))
     assert failures["failures"][0]["failure_kind"] == "out_of_memory"
@@ -1429,8 +1442,8 @@ def test_md_wave_retry_preserves_completed_attempts(tmp_path):
         "  candidate_pool:\n", second_route + "  candidate_pool:\n"
     )
     text = text.replace(
-        "    dft: {executor: process}\n",
-        "    dft: {executor: process}\n    md2: {executor: process}\n",
+        "    label: {executor: process}\n",
+        "    label: {executor: process}\n    md2: {executor: process}\n",
     )
     text = text.replace(
         "  sampling_route_targets: {}\n",
@@ -1599,7 +1612,7 @@ def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
         "gpu",
         "md",
         "cpu",
-        "dft",
+        "label",
         "cpu",
         "cpu",
         "gpu",
@@ -1613,7 +1626,7 @@ def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
         "gpu/train",
         "md/explore",
         "cpu/select",
-        "dft/label",
+        "label/label",
         "cpu/diagnose",
         "cpu/merge",
         "gpu/retrain",
@@ -2164,9 +2177,9 @@ def test_group_stop_preserves_completed_shards_and_rebuilds_only_cancelled_shard
     _write_vasp_resources(tmp_path)
     config.write_text(
         config.read_text(encoding="utf-8").replace(
-            "dft:\n  backend: toy\n",
+            "labeling:\n  backend: toy\n",
             (
-                "dft:\n"
+                "labeling:\n"
                 "  backend: vasp\n"
                 "  input_path: ./INCAR\n"
                 "  resource_path: ./potpaw\n"

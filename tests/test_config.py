@@ -8,7 +8,7 @@ from NepTrain.core.config import ConfigError, load_config
 
 def _project(**overrides):
     value = {
-        "schema_version": 7,
+        "schema_version": 8,
         "training": {
             "backend": "torchnep",
             "initial_path": "./train.xyz",
@@ -55,7 +55,7 @@ def _project(**overrides):
                 "novelty": "auto",
             },
         },
-        "dft": {"backend": "toy"},
+        "labeling": {"backend": "toy"},
         "evaluation": {
             "validation_path": "./validation.xyz",
             "max_rmse": {"energy_rmse": 1, "force_rmse": 1},
@@ -74,15 +74,15 @@ def _project(**overrides):
     }
     for section, replacement in overrides.items():
         value[section].update(replacement)
-    if value["dft"].get("backend") == "vasp":
-        value["dft"].setdefault("resource_path", "./potpaw")
-        value["dft"].setdefault(
+    if value["labeling"].get("backend") == "vasp":
+        value["labeling"].setdefault("resource_path", "./potpaw")
+        value["labeling"].setdefault(
             "potcar_manifest_path",
             "./vasp-resources.json",
         )
-    if value["dft"].get("backend") == "abacus":
-        value["dft"].setdefault("resource_path", "./abacus-resources")
-        value["dft"].setdefault(
+    if value["labeling"].get("backend") == "abacus":
+        value["labeling"].setdefault("resource_path", "./abacus-resources")
+        value["labeling"].setdefault(
             "resource_manifest_path",
             "./abacus-resources.json",
         )
@@ -96,9 +96,9 @@ def _write(tmp_path: Path, value: dict) -> Path:
     return path
 
 
-def test_schema_v7_loads_without_migration(tmp_path):
+def test_schema_v8_loads_without_migration(tmp_path):
     config, changes = load_config(_write(tmp_path, _project()))
-    assert config["schema_version"] == 7
+    assert config["schema_version"] == 8
     assert config["sampling"]["routes"][0]["conditions"]["temperature_path"] == [300]
     assert changes == []
 
@@ -143,53 +143,90 @@ def test_workflow_id_is_a_safe_directory_component(tmp_path, workflow_id):
     ],
 )
 def test_dft_parallelism_requires_positive_integers(tmp_path, field, value):
-    with pytest.raises(ConfigError, match=rf"dft\.{field}"):
+    with pytest.raises(ConfigError, match=rf"labeling\.{field}"):
         load_config(
             _write(
                 tmp_path,
-                _project(dft={field: value}),
+                _project(labeling={field: value}),
             )
         )
 
 
 def test_vasp_requires_content_addressed_potcar_manifest(tmp_path):
-    value = _project(dft={"backend": "vasp"})
-    value["dft"].pop("potcar_manifest_path")
-    with pytest.raises(ConfigError, match=r"dft\.potcar_manifest_path"):
+    value = _project(labeling={"backend": "vasp"})
+    value["labeling"].pop("potcar_manifest_path")
+    with pytest.raises(ConfigError, match=r"labeling\.potcar_manifest_path"):
         load_config(_write(tmp_path, value))
 
 
 def test_abacus_requires_content_addressed_resource_manifest(tmp_path):
-    value = _project(dft={"backend": "abacus"})
-    value["dft"].pop("resource_manifest_path")
-    with pytest.raises(ConfigError, match=r"dft\.resource_manifest_path"):
+    value = _project(labeling={"backend": "abacus"})
+    value["labeling"].pop("resource_manifest_path")
+    with pytest.raises(ConfigError, match=r"labeling\.resource_manifest_path"):
         load_config(_write(tmp_path, value))
 
 
+def test_teacher_model_labeling_has_a_narrow_resource_contract(tmp_path):
+    config, _ = load_config(
+        _write(
+            tmp_path,
+            _project(
+                labeling={
+                    "backend": "model",
+                    "model_path": "./teacher.model",
+                    "model_name": "mace-foundation-finetune",
+                    "runner": "mace-neptrain-label",
+                    "device": "cuda",
+                    "precision": "float32",
+                }
+            ),
+        )
+    )
+
+    assert config["labeling"]["backend"] == "model"
+    assert "resource_path" not in config["labeling"]
+
+
+@pytest.mark.parametrize("field", ["model_path", "model_name", "runner"])
+def test_teacher_model_labeling_requires_provenance_inputs(tmp_path, field):
+    labeling = {
+        "backend": "model",
+        "model_path": "./teacher.model",
+        "model_name": "mace-foundation-finetune",
+        "runner": "mace-neptrain-label",
+    }
+    labeling.pop(field)
+
+    with pytest.raises(ConfigError, match=rf"labeling\.{field}"):
+        load_config(
+            _write(tmp_path, _project(labeling=labeling))
+        )
+
+
 def test_remote_labeling_requires_a_remote_resource_root(tmp_path):
-    value = _project(dft={"backend": "vasp"})
-    value["execution"]["stage_targets"]["labeling"] = "remote-dft"
-    value["execution"]["targets"]["remote-dft"] = {
+    value = _project(labeling={"backend": "vasp"})
+    value["execution"]["stage_targets"]["labeling"] = "remote-labeling"
+    value["execution"]["targets"]["remote-labeling"] = {
         "executor": "slurm",
         "host": "cluster",
         "work_root": "/scratch/work",
         "partition": "cpu",
     }
 
-    with pytest.raises(ConfigError, match="remote labeling target.*dft_resource_path"):
+    with pytest.raises(ConfigError, match="remote labeling target.*labeling_resource_path"):
         load_config(_write(tmp_path, value))
 
-    value["execution"]["targets"]["remote-dft"][
-        "dft_resource_path"
+    value["execution"]["targets"]["remote-labeling"][
+        "labeling_resource_path"
     ] = "/shared/potpaw"
     config, _ = load_config(_write(tmp_path, value))
     assert (
-        config["execution"]["targets"]["remote-dft"]["dft_resource_path"]
+        config["execution"]["targets"]["remote-labeling"]["labeling_resource_path"]
         == "/shared/potpaw"
     )
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 9])
 def test_legacy_and_future_schemas_are_rejected(tmp_path, version):
     value = _project()
     value["schema_version"] = version
@@ -279,7 +316,7 @@ def test_torchnep_finetune_learning_rate_must_be_positive(tmp_path):
 def test_spin_md_uses_lattice_temperature_by_default(tmp_path):
     value = _project(
         md={"spin": True},
-        dft={"backend": "abacus"},
+        labeling={"backend": "abacus"},
         evaluation={
             "max_rmse": {
                 "energy_rmse": 1,
@@ -295,7 +332,7 @@ def test_spin_md_uses_lattice_temperature_by_default(tmp_path):
 def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
     value = _project(
         md={"spin": True},
-        dft={"backend": "abacus"},
+        labeling={"backend": "abacus"},
         evaluation={
             "max_rmse": {
                 "energy_rmse": 1,
@@ -307,27 +344,27 @@ def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
     config, _ = load_config(
         _write(tmp_path, value)
     )
-    assert config["dft"]["backend"] == "abacus"
+    assert config["labeling"]["backend"] == "abacus"
 
 
 def test_spin_workflow_rejects_vasp(tmp_path):
-    value = _project(md={"spin": True}, dft={"backend": "vasp"})
+    value = _project(md={"spin": True}, labeling={"backend": "vasp"})
     with pytest.raises(ConfigError, match=r"VASP.*spin/mforce"):
         load_config(_write(tmp_path, value))
 
 
 def test_dft_kpoints_default_to_input_authoritative_auto_mode(tmp_path):
-    value = _project(dft={"backend": "vasp"})
+    value = _project(labeling={"backend": "vasp"})
 
     config, _ = load_config(_write(tmp_path, value))
 
-    assert config["dft"].get("kpoint_mode", "auto") == "auto"
-    assert "kspacing" not in config["dft"]
-    assert "kpoints" not in config["dft"]
+    assert config["labeling"].get("kpoint_mode", "auto") == "auto"
+    assert "kspacing" not in config["labeling"]
+    assert "kpoints" not in config["labeling"]
 
 
 @pytest.mark.parametrize(
-    "dft",
+    "labeling",
     [
         {"backend": "vasp", "kpoint_mode": "auto", "kspacing": 0.2},
         {"backend": "vasp", "kpoint_mode": "auto", "kpoints": [4, 4, 4]},
@@ -345,18 +382,18 @@ def test_dft_kpoints_default_to_input_authoritative_auto_mode(tmp_path):
         },
     ],
 )
-def test_dft_kpoint_modes_reject_competing_authorities(tmp_path, dft):
+def test_dft_kpoint_modes_reject_competing_authorities(tmp_path, labeling):
     with pytest.raises(ConfigError, match="kspacing|kpoints"):
-        load_config(_write(tmp_path, _project(dft=dft)))
+        load_config(_write(tmp_path, _project(labeling=labeling)))
 
 
 def test_explicit_dft_kpoint_modes_are_valid(tmp_path):
-    for dft in (
+    for labeling in (
         {"backend": "vasp", "kpoint_mode": "kspacing", "kspacing": 0.2},
         {"backend": "abacus", "kpoint_mode": "kpoints", "kpoints": [4, 4, 4]},
     ):
-        config, _ = load_config(_write(tmp_path, _project(dft=dft)))
-        assert config["dft"]["kpoint_mode"] == dft["kpoint_mode"]
+        config, _ = load_config(_write(tmp_path, _project(labeling=labeling)))
+        assert config["labeling"]["kpoint_mode"] == labeling["kpoint_mode"]
 
 
 @pytest.mark.parametrize(
@@ -400,14 +437,14 @@ def test_sampling_routes_are_the_only_automatic_sampling_authority(tmp_path):
             4,
         ),
         (("sampling", "selection", "min_novelty"), 0.0),
-        (("dft", "n_cpu"), 4),
-        (("dft", "use_k_stype"), "kspacing"),
+        (("labeling", "n_cpu"), 4),
+        (("labeling", "use_k_stype"), "kspacing"),
         (("workflow", "max_iterations"), 4),
         (("execution", "routes"), {}),
         (("execution", "targets", "local", "overrides"), {}),
     ],
 )
-def test_schema_v7_rejects_removed_duplicate_controls(tmp_path, path, value):
+def test_schema_v8_rejects_removed_duplicate_controls(tmp_path, path, value):
     project = _project()
     target = project
     for key in path[:-1]:

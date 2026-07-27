@@ -1,6 +1,6 @@
 # 独立步骤
 
-NepTrain 的训练、MD 和 DFT 命令既可在本机运行，也可通过 `project.yaml` 中的
+NepTrain 的训练、MD 和标注命令既可在本机运行，也可通过 `project.yaml` 中的
 target 提交到 Slurm。上传、提交、等待和收集进度写到 stderr；最终结果默认是
 适合人阅读的摘要。
 
@@ -43,16 +43,16 @@ neptrain md structures/ \
 
 Slurm target 会将“结构 × 温度”展开成带并发上限的 job array。
 
-## 批量 DFT
+## 批量标注
 
 ```bash
-neptrain dft candidates.xyz \
+neptrain label candidates.xyz \
   --backend vasp \
   --input-file INCAR \
   --resources /shared/potpaw_PBE \
   --potcar-manifest vasp-resources.json \
   --project project.yaml \
-  --target dft \
+  --target label \
   --structures-per-job 1 \
   --max-concurrent 20 \
   -o labeled.xyz
@@ -78,8 +78,8 @@ neptrain dft candidates.xyz \
 ```
 
 本地 target 在 prepare 时校验真实文件；远程 target 必须在
-`execution.targets.<name>.dft_resource_path` 写目标机绝对路径，并先运行
-`neptrain doctor --project project.yaml`。worker 在真正启动 DFT 前会再校验一次。
+`execution.targets.<name>.labeling_resource_path` 写目标机绝对路径，并先运行
+`neptrain doctor --project project.yaml`。worker 在真正启动 VASP/ABACUS 前会再校验一次。
 VASP 路径只接受 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这样的单层 setup 目录，并由
 NepTrain 显式写入 ASE `setups`；不会校验 manifest 中的一个文件，却让 ASE
 按默认规则读取另一个文件。
@@ -87,14 +87,33 @@ VASP 的 `ISPIN=2` 只表示共线自旋极化电子计算，结果仍是普通
 energy/force/virial 标签并记录 `dft_electronic_mode`；它不会生成
 `spin/mforce`。非共线、SOC 或真正的 spin-force 标注必须使用 ABACUS DeltaSpin。
 
+微调后的等变模型可以作为与 VASP/ABACUS 平级的 Label Adapter：
+
+```bash
+neptrain label candidates.xyz \
+  --backend model \
+  --model teacher.model \
+  --model-name mace-foundation-finetune \
+  --runner mace-neptrain-label \
+  --device cuda \
+  --precision float32 \
+  --project project.yaml \
+  --target teacher-gpu \
+  -o labeled.xyz
+```
+
+runner 必须实现固定的五参数协议，并输出顺序不变的规范 extxyz。NepTrain 负责模型
+hash、结构身份、energy/forces/virial、可选 spin/mforce 和最终原子发布；runner
+失败或标签不完整时不会产生部分结果。
+
 任务提交后通过统一 task 命令管理：
 
 ```bash
-neptrain task status runs/dft-...
-neptrain task logs runs/dft-...
-neptrain task wait runs/dft-...
-neptrain task retry runs/dft-...
-neptrain task cancel runs/dft-...
+neptrain task status runs/label-...
+neptrain task logs runs/label-...
+neptrain task wait runs/label-...
+neptrain task retry runs/label-...
+neptrain task cancel runs/label-...
 ```
 
 - `status` 只做一次有界查询和收集，不会永久等待。
@@ -112,7 +131,7 @@ neptrain task cancel runs/dft-...
 手动任务目录只保留两层用户可见结构：
 
 ```text
-dft-50/
+label-50/
 ├── labeled.xyz -> ../50-labeled.xyz
 ├── operation.json
 ├── remote.txt
@@ -134,11 +153,11 @@ dft-50/
 `calculation/` 中。调度器输出统一放在 `logs/`。
 
 提交后会立即显示任务状态、作业号、运行目录和下一条建议命令。脚本需要稳定的
-机器输出时，给训练、MD、DFT 或 task 子命令加 `--json`：
+机器输出时，给训练、MD、label 或 task 子命令加 `--json`：
 
 ```bash
-neptrain dft candidates.xyz --project project.yaml --target dft --json
-neptrain task status runs/dft-... --json
+neptrain label candidates.xyz --project project.yaml --target label --json
+neptrain task status runs/label-... --json
 ```
 
 上传、提交、排队、运行、收集和合并进度只写 stderr。`--json` 的 stdout 只有

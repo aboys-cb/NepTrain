@@ -22,7 +22,7 @@ from .candidate_pool import (
     write_candidate_pool,
 )
 from .fps import hierarchical_farthest_point_sampling
-from .dft import LabelRequest, LabelResult, label
+from .labeling import LabelRequest, LabelResult, label
 from .iteration import (
     StageContext,
     StageOutcome,
@@ -332,7 +332,9 @@ class WorkflowIterationAdapter:
         return self._path(value)
 
     @staticmethod
-    def _dft_kpoints(options: Mapping[str, Any]) -> tuple[int, int, int]:
+    def _labeling_kpoints(
+        options: Mapping[str, Any],
+    ) -> tuple[int, int, int]:
         if options.get("kpoint_mode", "auto") != "kpoints":
             return (1, 1, 1)
         raw = options.get("kpoints", (1, 1, 1))
@@ -340,7 +342,9 @@ class WorkflowIterationAdapter:
         if len(values) == 1:
             values *= 3
         if len(values) != 3 or any(value < 1 for value in values):
-            raise WorkflowIterationError("dft.kpoints must contain one or three positive integers")
+            raise WorkflowIterationError(
+                "labeling.kpoints must contain one or three positive integers"
+            )
         return tuple(values)
 
     def run_stage(self, stage: str, context: StageContext) -> StageOutcome:
@@ -1232,7 +1236,7 @@ class WorkflowIterationAdapter:
                 )
             current = unique_candidates.get(identifier)
             if current is None or preference(frame) < preference(current):
-                # DFT labels depend on the physical input state, not on which
+                # Labels depend on the physical input state, not on which
                 # sampling route happened to encounter it.  Keep one stable
                 # provenance representative so the label stage never receives
                 # duplicate structures.
@@ -1362,7 +1366,7 @@ class WorkflowIterationAdapter:
         )
 
     def _label(self, context: StageContext) -> StageOutcome:
-        options = self.config.get("dft", {})
+        options = self.config.get("labeling", {})
         backend = str(options.get("backend", "toy"))
         kpoint_mode = str(options.get("kpoint_mode", "auto"))
         frame_indices = context.stage_input.get("frame_indices", ())
@@ -1382,24 +1386,37 @@ class WorkflowIterationAdapter:
                     if flat_single_case
                     else context.work_dir / "calculation"
                 ),
-                input_file=self._optional_path(
-                    options.get("input_path")
-                ),
-                resource_dir=self._optional_path(options.get("resource_path")),
-                resource_manifest=self._optional_path(
-                    options.get("potcar_manifest_path")
-                    or options.get("resource_manifest_path")
-                ),
-                n_cpu=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
-                use_gamma=bool(options.get("gamma_centered", False)),
-                kpoint_mode=kpoint_mode,
-                kspacing=(
-                    float(options["kspacing"])
-                    if kpoint_mode == "kspacing"
-                    else None
-                ),
-                ka=self._dft_kpoints(options),
-                options={
+                settings={
+                    "input_file": self._optional_path(
+                        options.get("input_path")
+                    ),
+                    "resource_dir": self._optional_path(
+                        options.get("resource_path")
+                    ),
+                    "resource_manifest": self._optional_path(
+                        options.get("potcar_manifest_path")
+                        or options.get("resource_manifest_path")
+                    ),
+                    "n_cpu": int(
+                        os.environ.get("SLURM_CPUS_PER_TASK", "1")
+                    ),
+                    "use_gamma": bool(
+                        options.get("gamma_centered", False)
+                    ),
+                    "kpoint_mode": kpoint_mode,
+                    "kspacing": (
+                        float(options["kspacing"])
+                        if kpoint_mode == "kspacing"
+                        else None
+                    ),
+                    "ka": self._labeling_kpoints(options),
+                    "model_file": self._optional_path(
+                        options.get("model_path")
+                    ),
+                    "model_name": options.get("model_name"),
+                    "runner": options.get("runner"),
+                    "device": options.get("device", "cuda"),
+                    "precision": options.get("precision", "float32"),
                     "profile": (
                         "spin"
                         if self.config.get("md", {}).get("spin", False)
@@ -1419,15 +1436,37 @@ class WorkflowIterationAdapter:
             actual_ids = labeled_input_structure_ids(result.frames)
         except ScientificDataError as error:
             raise WorkflowIterationError(
-                f"DFT backend produced invalid scientific labels: {error}"
+                f"labeling backend produced invalid scientific labels: {error}"
             ) from error
         if actual_ids != expected_ids:
             raise WorkflowIterationError(
-                "DFT backend changed or reordered selected structures"
+                "labeling backend changed or reordered selected structures"
             )
+        provenance_path = context.work_dir / "label-provenance.json"
+        provenance_path.write_text(
+            json.dumps(
+                {
+                    **dict(result.provenance),
+                    "input_structure_ids": expected_ids,
+                    "labeled_count": len(result.frames),
+                    "labels_sha256": _file_sha256(result.output_file),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         return StageOutcome(
-            artifacts={"labeled": result.output_file},
-            metrics={"backend": result.backend, "labeled_count": len(result.frames)},
+            artifacts={
+                "labeled": result.output_file,
+                "label_provenance": provenance_path,
+            },
+            metrics={
+                "backend": result.backend,
+                "origin": result.provenance.get("origin"),
+                "labeled_count": len(result.frames),
+            },
         )
 
     def merge_label_outcomes(
@@ -1456,6 +1495,7 @@ class WorkflowIterationAdapter:
         expected = [requested[index] for index in indices]
         frames: list[Atoms] = []
         backends = set()
+        provenances = []
         for outcome in outcomes:
             path = outcome.artifacts.get("labeled")
             if path is None:
@@ -1466,6 +1506,14 @@ class WorkflowIterationAdapter:
             backend = outcome.metrics.get("backend")
             if backend:
                 backends.add(str(backend))
+            provenance_path = outcome.artifacts.get("label_provenance")
+            if provenance_path is None:
+                raise WorkflowIterationError(
+                    "label batch result is missing label provenance"
+                )
+            provenances.append(
+                json.loads(provenance_path.read_text(encoding="utf-8"))
+            )
         if len(frames) != len(expected):
             raise WorkflowIterationError(
                 f"label batches returned {len(frames)} structures for "
@@ -1485,15 +1533,56 @@ class WorkflowIterationAdapter:
             )
         if len(backends) > 1:
             raise WorkflowIterationError(
-                "label batches reported inconsistent DFT backends"
+                "label batches reported inconsistent labeling backends"
             )
         output = context.work_dir / "selected-labels.xyz"
         ase_write(output, frames, format="extxyz")
         backend = next(
             iter(backends),
-            str(self.config.get("dft", {}).get("backend", "toy")),
+            str(self.config.get("labeling", {}).get("backend", "toy")),
         )
-        artifacts = {"labeled": output}
+        provenance_keys = {
+            (
+                value.get("backend"),
+                value.get("origin"),
+                value.get("engine"),
+                value.get("model_sha256"),
+            )
+            for value in provenances
+        }
+        if len(provenance_keys) != 1:
+            raise WorkflowIterationError(
+                "label batches reported inconsistent provenance"
+            )
+        combined_provenance = {
+            **{
+                key: value
+                for key, value in provenances[0].items()
+                if key
+                not in {
+                    "input_structure_ids",
+                    "labeled_count",
+                    "labels_sha256",
+                }
+            },
+            "input_structure_ids": actual_ids,
+            "labeled_count": len(frames),
+            "labels_sha256": _file_sha256(output),
+        }
+        provenance_output = context.work_dir / "label-provenance.json"
+        provenance_output.write_text(
+            json.dumps(
+                combined_provenance,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        artifacts = {
+            "labeled": output,
+            "label_provenance": provenance_output,
+        }
         failed_frame_indices = sorted(
             {
                 int(index)
@@ -1607,12 +1696,12 @@ class WorkflowIterationAdapter:
             )
         if len(set(labeled_ids)) != len(labeled_ids):
             raise WorkflowIterationError(
-                "new DFT labels contain duplicate physical structures"
+                "new labels contain duplicate physical structures"
             )
         overlap = set(original_ids) & set(labeled_ids)
         if overlap:
             raise WorkflowIterationError(
-                "new DFT labels overlap the existing training set; refusing "
+                "new labels overlap the existing training set; refusing "
                 "to silently keep one of two labels"
             )
         merged = [*original, *labeled]
@@ -1684,6 +1773,9 @@ class WorkflowIterationAdapter:
                 "training_count": training_count,
                 "pending_label_count": added_count,
                 "trained_on_current_labels": False,
+                "label_provenance_sha256": _file_sha256(
+                    context.artifacts["label_provenance"]
+                ),
             }
             artifacts = {
                 "retrained_model": context.artifacts["model"],
@@ -1738,7 +1830,7 @@ class WorkflowIterationAdapter:
                 "MD recovery required"
                 if failed_md
                 else (
-                    "trajectory DFT diagnostics exceeded thresholds"
+                    "trajectory label diagnostics exceeded thresholds"
                     if not diagnostic.get("diagnostic_accepted", False)
                     else "new labels require a new model generation"
                 )
@@ -1759,6 +1851,9 @@ class WorkflowIterationAdapter:
             "training_count": frame_count,
             "pending_label_count": 0,
             "trained_on_current_labels": True,
+            "label_provenance_sha256": _file_sha256(
+                context.artifacts["label_provenance"]
+            ),
         }
         artifacts["model_lineage"] = _write_json(
             context.work_dir / "model-lineage.json", lineage

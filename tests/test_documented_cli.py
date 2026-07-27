@@ -79,7 +79,7 @@ def test_direct_vasp_examples_pin_the_potcar_manifest():
     for document in DOCUMENTS:
         for command in _bash_commands(document.read_text(encoding="utf-8")):
             if (
-                "neptrain dft " in command
+                "neptrain label " in command
                 and "--backend vasp" in command
                 and "--resources" in command
                 and "--project" not in command

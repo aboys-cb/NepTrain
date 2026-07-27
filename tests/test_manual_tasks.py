@@ -29,7 +29,7 @@ from NepTrain.core.manual import (
     ManualTaskError,
     cancel_operation,
     load_operation,
-    prepare_dft,
+    prepare_labeling,
     prepare_md,
     operation_logs,
     refresh_operation,
@@ -58,7 +58,7 @@ def _structures(path: Path, count: int = 3) -> Path:
 def test_local_manual_dft_splits_and_publishes_in_input_order(tmp_path):
     source = _structures(tmp_path / "input.xyz")
     output = tmp_path / "labeled.xyz"
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=output,
@@ -118,7 +118,7 @@ def test_manual_spin_dft_uses_input_ownership_when_final_spin_relaxes(
         "NepTrain.core.dft.toy.run_toy_teacher",
         relaxed_spin_teacher,
     )
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=output,
@@ -140,7 +140,7 @@ def test_manual_dft_defaults_to_input_authoritative_kpoints(tmp_path):
     source = _structures(tmp_path / "input.xyz", count=1)
     dft_input = tmp_path / "INPUT"
     dft_input.write_text("INPUT_PARAMETERS\nkspacing 0.25\n", encoding="utf-8")
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -171,7 +171,7 @@ def test_manual_dft_rejects_mixed_ordinary_and_spin_inputs(tmp_path):
     write(source, [ordinary, spin], format="extxyz")
 
     with pytest.raises(ManualTaskError, match="ordinary and spin frames cannot be mixed"):
-        prepare_dft(
+        prepare_labeling(
             source,
             backend="toy",
             output=tmp_path / "labeled.xyz",
@@ -186,7 +186,7 @@ def test_manual_step_refuses_to_overwrite_an_existing_result(tmp_path):
     output.write_text("keep me\n", encoding="utf-8")
 
     with pytest.raises(ManualTaskError, match="--force"):
-        prepare_dft(
+        prepare_labeling(
             source,
             backend="toy",
             output=output,
@@ -207,7 +207,7 @@ def test_slurm_manual_dft_uses_one_throttled_job_array(tmp_path, monkeypatch):
         cpus_per_task=4,
         command="neptrain",
     )
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -240,7 +240,7 @@ def test_slurm_manual_dft_materializes_one_hundred_ordered_shards_with_limit(
     tmp_path, monkeypatch
 ):
     source = _structures(tmp_path / "input.xyz", count=100)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -433,7 +433,7 @@ def test_execution_transport_collects_stage_artifacts_in_one_fetch(
             "training": {},
             "evaluation": {},
             "md": {"spin": False},
-            "dft": {},
+            "labeling": {},
             "workflow": {},
             "execution": {},
         },
@@ -533,7 +533,7 @@ def test_remote_manual_dft_uses_shared_execution_transport(
         partition="cpu",
         command="neptrain",
     )
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -596,7 +596,7 @@ def test_remote_status_bulk_sync_resumes_partial_job_results(
     tmp_path, monkeypatch
 ):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -681,7 +681,7 @@ def test_remote_status_uses_one_result_transfer_for_fifty_jobs(
     tmp_path, monkeypatch
 ):
     source = _structures(tmp_path / "input.xyz", count=50)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -743,7 +743,7 @@ def test_remote_status_uses_one_result_transfer_for_fifty_jobs(
 
 def test_remote_logs_are_fetched_in_one_archive(tmp_path, monkeypatch):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -887,7 +887,7 @@ def test_manual_md_runtime_options_are_explicit_request_inputs(tmp_path):
 
 def test_array_results_can_be_collected_after_workers_finish(tmp_path):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -908,7 +908,7 @@ def test_array_results_can_be_collected_after_workers_finish(tmp_path):
 
 def test_corrupt_job_execution_is_reported_as_invalid_and_retryable(tmp_path):
     source = _structures(tmp_path / "input.xyz", count=1)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -930,7 +930,7 @@ def test_corrupt_job_execution_is_reported_as_invalid_and_retryable(tmp_path):
 
 def test_wait_reports_state_changes_to_stderr(tmp_path, capsys):
     source = _structures(tmp_path / "input.xyz", count=1)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -945,7 +945,7 @@ def test_wait_reports_state_changes_to_stderr(tmp_path, capsys):
 
     assert status["state"] == "complete"
     progress = capsys.readouterr().err
-    assert "[NepTrain] dft: state=complete" in progress
+    assert "[NepTrain] label: state=complete" in progress
     assert "completed=1/1" in progress
 
 
@@ -953,7 +953,7 @@ def test_scheduler_failure_marks_every_missing_shard_retryable(
     tmp_path, monkeypatch
 ):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -987,7 +987,7 @@ def test_retry_archives_failed_metadata_and_submits_only_failed_indices(
     tmp_path, monkeypatch
 ):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -1038,7 +1038,7 @@ def test_manual_dft_rejects_a_hash_consistent_but_duplicated_result(
     tmp_path,
 ):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -1075,7 +1075,7 @@ def test_manual_complete_result_is_audited_and_rebuilt_from_valid_jobs(
 ):
     source = _structures(tmp_path / "input.xyz", count=2)
     output = tmp_path / "labeled.xyz"
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=output,
@@ -1105,7 +1105,7 @@ def test_cancel_preserves_completed_jobs_and_retry_selects_only_unfinished(
     monkeypatch,
 ):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -1180,7 +1180,7 @@ def test_missing_slurm_job_becomes_retryable_after_bounded_grace(
     monkeypatch,
 ):
     source = _structures(tmp_path / "input.xyz", count=2)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -1213,7 +1213,7 @@ def test_missing_slurm_job_becomes_retryable_after_bounded_grace(
 
 def test_legacy_manual_operation_is_refused_without_unsafe_collection(tmp_path):
     source = _structures(tmp_path / "input.xyz", count=1)
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",
@@ -1238,7 +1238,7 @@ def test_remote_manual_bundle_is_published_atomically(tmp_path, monkeypatch):
         work_root=str(remote_root),
         partition="cpu",
     )
-    operation = prepare_dft(
+    operation = prepare_labeling(
         source,
         backend="toy",
         output=tmp_path / "labeled.xyz",

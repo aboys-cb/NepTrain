@@ -12,7 +12,7 @@ import pytest
 from ase import Atoms
 from ase.io import read, write
 
-from NepTrain.core.dft import LabelRequest, label
+from NepTrain.core.labeling import LabelRequest, label
 from NepTrain.core.dft.abacus.io import StructureVar, read_input_file
 from NepTrain.core.dft.abacus.native import (
     NativeAbacusError,
@@ -20,7 +20,7 @@ from NepTrain.core.dft.abacus.native import (
     validate_abacus_spin_contract,
 )
 from NepTrain.core.dft.abacus.resources import AbacusResourceError
-from NepTrain.core.dft.interface import LabelingError
+from NepTrain.core.labeling import LabelingError
 from NepTrain.core.scientific_data import (
     INPUT_STRUCTURE_ID_KEY,
     structure_id,
@@ -233,10 +233,12 @@ def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
             source=source,
             output_file=tmp_path / "spin-labeled.xyz",
             work_dir=tmp_path / "work",
-            input_file=Path(arguments.incar),
-            resource_dir=resources,
-            use_gamma=True,
-            kpoint_mode="kpoints",
+            settings={
+                "input_file": Path(arguments.incar),
+                "resource_dir": resources,
+                "use_gamma": True,
+                "kpoint_mode": "kpoints",
+            },
         ),
         "abacus",
     )
@@ -293,10 +295,12 @@ def test_native_abacus_spin_reports_vector_rms_per_atom(tmp_path: Path, monkeypa
             source=source,
             output_file=tmp_path / "spin-labeled.xyz",
             work_dir=tmp_path / "work",
-            input_file=Path(arguments.incar),
-            resource_dir=resources,
-            use_gamma=True,
-            kpoint_mode="kpoints",
+            settings={
+                "input_file": Path(arguments.incar),
+                "resource_dir": resources,
+                "use_gamma": True,
+                "kpoint_mode": "kpoints",
+            },
         ),
         "abacus",
     )
@@ -410,8 +414,12 @@ def test_native_abacus_rejects_unconverged_result(tmp_path: Path, monkeypatch):
                 source=source,
                 output_file=tmp_path / "labeled.xyz",
                 work_dir=tmp_path / "work",
-                input_file=Path(_arguments(tmp_path, source, resources).incar),
-                resource_dir=resources,
+                settings={
+                    "input_file": Path(
+                        _arguments(tmp_path, source, resources).incar
+                    ),
+                    "resource_dir": resources,
+                },
             ),
             "abacus",
         )

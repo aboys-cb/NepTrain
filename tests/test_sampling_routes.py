@@ -120,7 +120,7 @@ def test_one_explore_stage_schedules_two_explicit_routes(tmp_path: Path):
                 ),
             ]
         ),
-        "dft": {"backend": "toy"},
+        "labeling": {"backend": "toy"},
     }
     adapter = WorkflowIterationAdapter(
         config,
@@ -289,7 +289,7 @@ def test_preparation_reuses_identical_routes_and_rejects_template_drift(
     project = tmp_path / "project.yaml"
     project.write_text(
         f"""
-schema_version: 7
+schema_version: 8
 training:
   backend: gpumd
   initial_path: {initial}
@@ -311,7 +311,7 @@ sampling:
         replicas: {{smoke_passed: 1, short_stable: 1, long_stable: 2, production_ready: 3}}
   candidate_pool: {{pre_failure_frames: 2, bad_tail_frames: 1, health: {{}}}}
   selection: {{max_selected: 4, novelty: auto}}
-dft:
+labeling:
   backend: toy
 workflow:
   id: route-resume
@@ -390,7 +390,7 @@ def test_workflow_generation_runs_without_evaluation(tmp_path: Path):
                 [_route("route", structure, template, [300])],
                 maximum=2,
             ),
-            "dft": {"backend": "toy"},
+            "labeling": {"backend": "toy"},
         },
         initial_training=initial,
         runtime=WorkflowRuntime(

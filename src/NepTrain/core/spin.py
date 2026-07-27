@@ -45,7 +45,7 @@ def canonicalize_spin_arrays(atoms: Atoms) -> Atoms:
     """Explicitly migrate legacy aliases to singular canonical array names.
 
     Normal validation deliberately does not call this function.  A migration
-    must be written back to disk before a trainer or DFT task can consume it;
+    must be written back to disk before a trainer or labeling task can consume it;
     otherwise the validated in-memory object and the file actually submitted
     can disagree.
     """

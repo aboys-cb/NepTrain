@@ -23,7 +23,7 @@ from .workflow_workspace import WorkflowWorkspace
 from .config import (
     ConfigError,
     DEFAULT_MAX_CONCURRENT,
-    DEFAULT_STRUCTURES_PER_DFT_JOB,
+    DEFAULT_STRUCTURES_PER_LABEL_JOB,
     load_config,
 )
 from .execution import (
@@ -189,9 +189,9 @@ class PersistentController:
         executor_factory: ExecutorFactory = executor_for,
     ):
         self.workspace = WorkflowWorkspace.locate(project)
-        if self.workspace.version != 3:
+        if self.workspace.version != 4:
             raise ControllerError(
-                "persistent controllers require workflow layout v3"
+                "persistent controllers require workflow layout v4"
             )
         from .workflow import WorkflowError, _normalise_manifest
 
@@ -959,20 +959,20 @@ class PersistentController:
             return self.tick()
         if (
             stage == "label"
-            and self.config.get("dft", {}).get("backend", "vasp")
+            and self.config.get("labeling", {}).get("backend", "vasp")
             in {"vasp", "abacus"}
         ):
             frames = ase_read(context.artifacts["selected_input"], index=":")
             if not isinstance(frames, list):
                 frames = [frames]
             structures_per_job = int(
-                self.config.get("dft", {}).get(
+                self.config.get("labeling", {}).get(
                     "structures_per_job",
-                    DEFAULT_STRUCTURES_PER_DFT_JOB,
+                    DEFAULT_STRUCTURES_PER_LABEL_JOB,
                 )
             )
             maximum = int(
-                self.config.get("dft", {}).get(
+                self.config.get("labeling", {}).get(
                     "max_concurrent",
                     DEFAULT_MAX_CONCURRENT,
                 )

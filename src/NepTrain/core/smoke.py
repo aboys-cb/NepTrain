@@ -13,7 +13,7 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
-from .dft import LabelRequest, label
+from .labeling import LabelRequest, label
 from .dft.toy import ToyTeacher
 from .select.select import farthest_point_sampling
 from .spin import SpinDataError, validate_spin_dataset
@@ -116,7 +116,7 @@ def _recovery_probe(root: Path, frames: list[Atoms], profile: str) -> bool:
     resumed_output = root / "recovery-resumed.xyz"
     ase_write(direct_input, frames, format="extxyz")
     label(
-        LabelRequest(direct_input, direct_output, root / "direct", options={"profile": profile}),
+        LabelRequest(direct_input, direct_output, root / "direct", settings={"profile": profile}),
         "toy",
     )
 
@@ -126,7 +126,7 @@ def _recovery_probe(root: Path, frames: list[Atoms], profile: str) -> bool:
     ase_write(first, frames[:midpoint], format="extxyz")
     ase_write(second, frames[midpoint:], format="extxyz")
     label(
-        LabelRequest(first, resumed_output, root / "resumed-1", options={"profile": profile}),
+        LabelRequest(first, resumed_output, root / "resumed-1", settings={"profile": profile}),
         "toy",
     )
     checkpoint = root / "recovery.json"
@@ -135,7 +135,7 @@ def _recovery_probe(root: Path, frames: list[Atoms], profile: str) -> bool:
     if completed != midpoint:
         return False
     label(
-        LabelRequest(second, resumed_output, root / "resumed-2", append=True, options={"profile": profile}),
+        LabelRequest(second, resumed_output, root / "resumed-2", append=True, settings={"profile": profile}),
         "toy",
     )
     return _hash_file(direct_output) == _hash_file(resumed_output)
@@ -167,7 +167,7 @@ def run_smoke(
     ase_write(candidate_file, candidates, format="extxyz")
     truth_file = root / "teacher-truth.xyz"
     truth = label(
-        LabelRequest(candidate_file, truth_file, root / "teacher", options={"profile": teacher_profile}),
+        LabelRequest(candidate_file, truth_file, root / "teacher", settings={"profile": teacher_profile}),
         "toy",
     ).frames
 
@@ -186,7 +186,7 @@ def run_smoke(
     selected_output = root / "selected-labels.xyz"
     ase_write(selected_input, selected_frames, format="extxyz")
     selected_result = label(
-        LabelRequest(selected_input, selected_output, root / "selected", options={"profile": teacher_profile}),
+        LabelRequest(selected_input, selected_output, root / "selected", settings={"profile": teacher_profile}),
         "toy",
     )
     restored = ase_read(selected_output, index=":", format="extxyz")

@@ -1,4 +1,4 @@
-"""Create one strict schema-v7 project without touching existing files."""
+"""Create one strict schema-v8 project without touching existing files."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import shutil
 from ruamel.yaml import YAML
 
 from NepTrain import utils
-from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_DFT_JOB
+from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_LABEL_JOB
 
 
 def _project(
@@ -44,22 +44,22 @@ def _project(
                 "cpus_per_task": 4,
                 "setup_script": "./env-cpu.sh",
             },
-            "dft": {
+            "label": {
                 "executor": "slurm",
                 "partition": "cpu",
                 "time": "24:00:00",
                 "cpus_per_task": 4,
-                "setup_script": "./env-dft.sh",
+                "setup_script": "./env-label.sh",
             },
         }
         routes = {
             "training": "v100",
             "sampling": "cpu",
-            "labeling": "dft",
+            "labeling": "label",
             "analysis": "cpu",
         }
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "training": {
             "backend": "torchnep",
             "initial_path": "./train.xyz",
@@ -83,7 +83,7 @@ def _project(
                 },
             ],
         },
-        "dft": {
+        "labeling": {
             "backend": dft_backend,
             "input_path": "./INCAR" if dft_backend == "vasp" else "./INPUT",
             "resource_path": "./resources",
@@ -93,7 +93,7 @@ def _project(
                 else {"resource_manifest_path": "./abacus-resources.json"}
             ),
             "kpoint_mode": "auto",
-            "structures_per_job": DEFAULT_STRUCTURES_PER_DFT_JOB,
+            "structures_per_job": DEFAULT_STRUCTURES_PER_LABEL_JOB,
             "max_concurrent": DEFAULT_MAX_CONCURRENT,
         },
         "workflow": {
@@ -211,9 +211,9 @@ def init_project(
                 "# module load lammps/nep-release\n"
                 "# export LAMMPS_PLUGIN_PATH=/path/to/nepadapters/lib\n"
             ),
-            "env-dft.sh": (
+            "env-label.sh": (
                 "#!/bin/bash\n"
-                "# Load VASP or ABACUS and activate the NepTrain environment here.\n"
+                "# Load the selected labeling Adapter and activate NepTrain here.\n"
             ),
         }
         for name, content in scripts.items():

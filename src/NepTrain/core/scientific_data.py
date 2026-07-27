@@ -1,8 +1,8 @@
 """Versioned scientific-data identity and label validation.
 
 This module is the authority for deciding whether two input structures are the
-same and whether a DFT result is safe to publish.  Execution metadata must not
-invent weaker, backend-specific versions of these checks.
+same and whether labels are safe to publish. Execution metadata must not invent
+weaker, backend-specific versions of these checks.
 """
 
 from __future__ import annotations
@@ -80,14 +80,15 @@ def bind_labeled_frames_to_inputs(
     output_frames = list(outputs)
     if len(input_frames) != len(output_frames):
         raise ScientificDataError(
-            f"DFT returned {len(output_frames)} frames for "
+            f"labeling returned {len(output_frames)} frames for "
             f"{len(input_frames)} inputs"
         )
     identifiers = []
     for index, (source, result) in enumerate(zip(input_frames, output_frames)):
         if geometry_id(source) != geometry_id(result):
             raise ScientificDataError(
-                f"frame {index}: DFT changed atom order, geometry, cell, or PBC"
+                f"frame {index}: labeling changed atom order, geometry, "
+                "cell, or PBC"
             )
         identifier = structure_id(source)
         result.info[INPUT_STRUCTURE_ID_KEY] = identifier

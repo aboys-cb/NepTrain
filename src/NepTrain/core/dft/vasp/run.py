@@ -26,7 +26,7 @@ def calculate_vasp(atoms: Atoms, args):
     global atoms_index
     if not getattr(args, "resource_dir", None):
         raise FileNotFoundError(
-            "VASP labeling requires dft.resource_path or --resources"
+            "VASP labeling requires labeling.resource_path or --resources"
         )
     resource_dir = Path(args.resource_dir).expanduser().resolve()
     raw_manifest = getattr(args, "resource_manifest", None)
@@ -72,7 +72,7 @@ def run_vasp(args):
     raw_resource = getattr(args, "resource_dir", None)
     if not raw_resource:
         raise FileNotFoundError(
-            "VASP labeling requires dft.resource_path or --resources"
+            "VASP labeling requires labeling.resource_path or --resources"
         )
     resource = Path(raw_resource).expanduser()
     if not resource.is_dir():

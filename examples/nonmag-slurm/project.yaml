@@ -1,4 +1,4 @@
-schema_version: 7
+schema_version: 8
 
 training:
   backend: torchnep
@@ -50,11 +50,11 @@ sampling:
       max_spin_magnitude: 20.0
 
   selection:
-    # Maximum DFT selections per active-model round; the regular floor is 50.
+    # Maximum label selections per active-model round; the regular floor is 50.
     max_selected: 100
     novelty: auto
 
-dft:
+labeling:
   backend: vasp
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
@@ -79,7 +79,7 @@ execution:
   stage_targets:
     training: gpu
     sampling: cpu
-    labeling: dft
+    labeling: label
     analysis: cpu
   sampling_route_targets: {}
   targets:
@@ -95,11 +95,11 @@ execution:
       time: 04:00:00
       cpus_per_task: 4
       setup_script: ./env-cpu.sh
-    dft:
+    label:
       executor: slurm
       partition: cpu
       time: 24:00:00
       cpus_per_task: 32
-      setup_script: ./env-dft.sh
+      setup_script: ./env-label.sh
       environment:
         NEPTRAIN_VASP_COMMAND: srun vasp_std

@@ -242,7 +242,7 @@ class StageContext:
         """Directory owned by the current stage.
 
         Direct controller users keep writing to ``generation_dir``; workflow
-        layout v3 gives each stage a focused subdirectory.
+        layout v4 gives each stage a focused subdirectory.
         """
 
         return self.stage_dir or self.generation_dir
@@ -284,7 +284,7 @@ class GenerationController:
             workspace = WorkflowWorkspace.locate(self.root)
         except FileNotFoundError:
             workspace = None
-        if workspace is not None and workspace.version == 3:
+        if workspace is not None and workspace.version == 4:
             self.workspace = workspace
             self.ledger_path = workspace.ledger
             self.lock_path = workspace.ledger_lock
