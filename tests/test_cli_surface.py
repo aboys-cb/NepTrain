@@ -18,7 +18,7 @@ from ruamel.yaml import YAML
 from NepTrain.cli.cli import (
     _doctor_resource_probe,
     _print_manual_status,
-    run_manual_dft_command,
+    run_manual_label_command,
     run_manual_md_command,
 )
 
@@ -71,7 +71,7 @@ def test_doctor_resource_probe_checks_every_pinned_file(tmp_path):
 def test_primary_help_only_shows_the_new_product_surface():
     completed = _help("--help")
     assert completed.returncode == 0
-    assert "{train,md,dft,select,perturb,workflow,task,data,doctor,smoke}" in completed.stdout
+    assert "{train,md,label,select,perturb,workflow,task,data,doctor,smoke}" in completed.stdout
     for removed in ("vasp", "gpumd", "migrate"):
         assert f"    {removed} " not in completed.stdout
     assert "stage-worker" not in completed.stdout
@@ -108,9 +108,9 @@ def test_md_cli_keeps_template_owned_parameters_out_of_the_interface():
         assert removed not in completed.stdout
 
 
-def test_dft_cli_rejects_competing_kpoint_overrides():
+def test_label_cli_rejects_competing_kpoint_overrides():
     completed = _help(
-        "dft",
+        "label",
         "input.xyz",
         "--kspacing",
         "0.2",
@@ -145,7 +145,7 @@ def test_workflow_run_recognizes_directory_as_prepared_workflow(tmp_path):
 
 
 def test_manual_commands_offer_human_output_and_explicit_json():
-    for command in ("train", "md", "dft"):
+    for command in ("train", "md", "label"):
         completed = _help(command, "--help")
         assert completed.returncode == 0
         assert "--json" in completed.stdout
@@ -157,7 +157,7 @@ def test_manual_commands_offer_human_output_and_explicit_json():
 def test_manual_status_is_human_readable_by_default(capsys):
     value = {
         "operation_id": "dft-abc",
-        "kind": "dft",
+        "kind": "label",
         "state": "submitted",
         "job_id": "123",
         "completed": 0,
@@ -170,7 +170,7 @@ def test_manual_status_is_human_readable_by_default(capsys):
     _print_manual_status(value)
 
     output = capsys.readouterr().out
-    assert "Task: dft (dft-abc)" in output
+    assert "Task: label (dft-abc)" in output
     assert "State: submitted" in output
     assert "Progress: 0/4" in output
     assert "Next: neptrain task wait /tmp/dft-run" in output
@@ -178,7 +178,7 @@ def test_manual_status_is_human_readable_by_default(capsys):
 
 
 def test_manual_status_json_is_opt_in(capsys):
-    value = {"kind": "dft", "state": "complete"}
+    value = {"kind": "label", "state": "complete"}
 
     _print_manual_status(value, json_output=True)
 
@@ -189,7 +189,7 @@ def _manual_project(tmp_path: Path) -> Path:
     (tmp_path / "route-a.in").write_text("run {{ steps }}\n", encoding="utf-8")
     (tmp_path / "route-b.in").write_text("run {{ steps }}\n", encoding="utf-8")
     value = {
-        "schema_version": 7,
+        "schema_version": 8,
         "training": {
             "backend": "torchnep",
             "initial_path": "./train.xyz",
@@ -229,7 +229,7 @@ def _manual_project(tmp_path: Path) -> Path:
                 },
             ]
         },
-        "dft": {
+        "labeling": {
             "backend": "toy",
             "kpoint_mode": "kpoints",
             "kpoints": 4,
@@ -322,12 +322,12 @@ def test_manual_dft_inherits_project_parallelism_and_normalizes_scalar_kpoints(
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr("NepTrain.core.manual.prepare_dft", fake_prepare)
+    monkeypatch.setattr("NepTrain.core.manual.prepare_labeling", fake_prepare)
     monkeypatch.setattr(
         "NepTrain.core.manual.submit_operation",
-        lambda *_args, **_kwargs: {"kind": "dft", "state": "complete"},
+        lambda *_args, **_kwargs: {"kind": "label", "state": "complete"},
     )
-    run_manual_dft_command(
+    run_manual_label_command(
         SimpleNamespace(
             project=str(project),
             target=None,
@@ -346,6 +346,11 @@ def test_manual_dft_inherits_project_parallelism_and_normalizes_scalar_kpoints(
             structures_per_job=None,
             max_concurrent=None,
             teacher_profile=None,
+            model=None,
+            model_name=None,
+            runner=None,
+            device=None,
+            precision=None,
             force=False,
             wait=False,
             poll_interval=10,
@@ -359,7 +364,7 @@ def test_manual_dft_inherits_project_parallelism_and_normalizes_scalar_kpoints(
     assert json.loads(capsys.readouterr().out)["state"] == "complete"
 
 
-def test_local_toy_dft_json_stdout_is_one_clean_document(tmp_path):
+def test_local_toy_label_json_stdout_is_one_clean_document(tmp_path):
     source = tmp_path / "input.xyz"
     ase_write(
         source,
@@ -367,7 +372,7 @@ def test_local_toy_dft_json_stdout_is_one_clean_document(tmp_path):
         format="extxyz",
     )
     completed = _help(
-        "dft",
+        "label",
         str(source),
         "--backend",
         "toy",

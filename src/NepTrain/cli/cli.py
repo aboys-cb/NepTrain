@@ -11,7 +11,8 @@ import shlex
 from NepTrain import __version__
 from NepTrain.core.config import (
     DEFAULT_MAX_CONCURRENT,
-    DEFAULT_STRUCTURES_PER_DFT_JOB,
+    DEFAULT_STRUCTURES_PER_LABEL_JOB,
+    DEFAULT_STRUCTURES_PER_MODEL_JOB,
 )
 
 
@@ -107,7 +108,7 @@ def _print_scientific_progress(generations):
         if sampling["selected_count"] is not None:
             flow.append(f"FPS {sampling['selected_count']}")
         if sampling["labeled_count"] is not None:
-            flow.append(f"DFT {sampling['labeled_count']}")
+            flow.append(f"labels {sampling['labeled_count']}")
         before = training["before_count"]
         after = training["after_count"]
         if before is not None or after is not None:
@@ -410,26 +411,31 @@ def run_stage_verify_command(args):
 
 
 def _doctor_resource_contract(config, project):
-    """Resolve the one authoritative DFT resource contract for doctor."""
+    """Resolve the authoritative resource contract for a labeling Adapter."""
 
-    backend = str(config.get("dft", {}).get("backend", "vasp"))
-    if backend == "toy":
+    backend = str(config.get("labeling", {}).get("backend", "vasp"))
+    if backend in {"model", "toy"}:
         return None
-    dft = config["dft"]
+    labeling = config["labeling"]
     execution = config["execution"]
     target_name = str(execution["stage_targets"]["labeling"])
     target = execution["targets"][target_name]
-    resource_root = target.get("dft_resource_path") or dft.get("resource_path")
+    resource_root = (
+        target.get("labeling_resource_path")
+        or labeling.get("resource_path")
+    )
     if not resource_root:
-        raise ValueError("real DFT has no configured resource root")
-    if not target.get("dft_resource_path"):
+        raise ValueError("labeling Adapter has no configured resource root")
+    if not target.get("labeling_resource_path"):
         candidate = Path(str(resource_root)).expanduser()
         if not candidate.is_absolute():
             resource_root = str((project.parent / candidate).resolve())
     if backend == "vasp":
         from NepTrain.core.dft.vasp.resources import vasp_resource_files
 
-        manifest = Path(str(dft["potcar_manifest_path"])).expanduser()
+        manifest = Path(
+            str(labeling["potcar_manifest_path"])
+        ).expanduser()
         label = "VASP POTCAR"
         records = vasp_resource_files(
             manifest if manifest.is_absolute() else project.parent / manifest
@@ -437,13 +443,15 @@ def _doctor_resource_contract(config, project):
     elif backend == "abacus":
         from NepTrain.core.dft.abacus.resources import abacus_resource_files
 
-        manifest = Path(str(dft["resource_manifest_path"])).expanduser()
+        manifest = Path(
+            str(labeling["resource_manifest_path"])
+        ).expanduser()
         label = "ABACUS pseudopotential/orbital"
         records = abacus_resource_files(
             manifest if manifest.is_absolute() else project.parent / manifest
         )
     else:  # validated schema owns this invariant
-        raise ValueError(f"unsupported DFT backend: {backend}")
+        raise ValueError(f"unsupported labeling backend: {backend}")
     return target_name, str(resource_root), label, records
 
 
@@ -515,8 +523,23 @@ def run_doctor(args):
             resource_contract = _doctor_resource_contract(config, project)
         except (KeyError, OSError, RuntimeError, ValueError) as error:
             raise SystemExit(
-                f"NepTrain: error: invalid DFT resource contract: {error}"
+                f"NepTrain: error: invalid labeling resource contract: {error}"
             ) from error
+        labeling = config.get("labeling", {})
+        labeling_backend = str(labeling.get("backend", "vasp"))
+        labeling_target_name = str(
+            config["execution"]["stage_targets"]["labeling"]
+        )
+        if labeling_backend == "model":
+            teacher = Path(str(labeling["model_path"])).expanduser()
+            if not teacher.is_absolute():
+                teacher = (project.parent / teacher).resolve()
+            available = teacher.is_file()
+            print(
+                f"{'OK' if available else 'FAIL'} teacher model {teacher}"
+            )
+            if not available:
+                failures.append(f"teacher model {teacher}")
         resolved_targets = {}
         for name, raw_target in config.get("execution", {}).get("targets", {}).items():
             value = dict(raw_target)
@@ -534,6 +557,11 @@ def run_doctor(args):
             if target.executor == "slurm":
                 required.extend(["sbatch", "squeue", "sacct"])
             required.append(shlex.split(target.command)[0])
+            if (
+                labeling_backend == "model"
+                and str(name) == labeling_target_name
+            ):
+                required.append(shlex.split(str(labeling["runner"]))[0])
             setup_line = ""
             path_check = ""
             if target.setup_script and target.executor == "process":
@@ -1060,19 +1088,19 @@ def run_manual_md_command(args):
     )
 
 
-def run_manual_dft_command(args):
+def run_manual_label_command(args):
     from NepTrain.core.manual import (
-        prepare_dft,
+        prepare_labeling,
         submit_operation,
         target_from_project,
     )
 
     project, base = _manual_project(args.project)
-    settings = project.get("dft", {})
+    settings = project.get("labeling", {})
     target = target_from_project(args.project, args.target, route="labeling")
     if args.resources is not None:
         resource_dir = args.resources
-    elif target.dft_resource_path:
+    elif target.labeling_resource_path:
         resource_dir = None
     else:
         resource_dir = _project_path(base, settings.get("resource_path"))
@@ -1096,9 +1124,10 @@ def run_manual_dft_command(args):
         ka = list(raw_ka)
         if len(ka) == 1:
             ka *= 3
-    operation = prepare_dft(
+    backend = args.backend or settings.get("backend", "vasp")
+    operation = prepare_labeling(
         args.input,
-        backend=args.backend or settings.get("backend", "vasp"),
+        backend=backend,
         output=args.output,
         workdir=args.workdir,
         target=target,
@@ -1110,7 +1139,7 @@ def run_manual_dft_command(args):
                 args.potcar_manifest
                 or _project_path(base, settings.get("potcar_manifest_path"))
             )
-            if (args.backend or settings.get("backend", "vasp")) == "vasp"
+            if backend == "vasp"
             else (
                 args.resource_manifest
                 or _project_path(base, settings.get("resource_manifest_path"))
@@ -1131,7 +1160,9 @@ def run_manual_dft_command(args):
             else int(
                 settings.get(
                     "structures_per_job",
-                    DEFAULT_STRUCTURES_PER_DFT_JOB,
+                    DEFAULT_STRUCTURES_PER_MODEL_JOB
+                    if backend == "model"
+                    else DEFAULT_STRUCTURES_PER_LABEL_JOB,
                 )
             )
         ),
@@ -1143,6 +1174,13 @@ def run_manual_dft_command(args):
             )
         ),
         teacher_profile=args.teacher_profile or "ordinary",
+        model_file=args.model
+        or _project_path(base, settings.get("model_path")),
+        model_name=args.model_name or settings.get("model_name"),
+        runner=args.runner or settings.get("runner"),
+        device=args.device or settings.get("device", "cuda"),
+        precision=args.precision
+        or settings.get("precision", "float32"),
         force=args.force,
     )
     _print_manual_status(
@@ -1212,7 +1250,7 @@ def run_spin_migration_command(args):
 def _add_execution_options(parser):
     parser.add_argument(
         "--project",
-        help="Schema-v7 project providing reusable execution targets.",
+        help="Schema-v8 project providing reusable execution targets.",
     )
     parser.add_argument("--target", help="Execution target name from project.yaml.")
     parser.add_argument("--workdir", help="Durable run directory.")
@@ -1310,13 +1348,21 @@ def build_manual_md(subparsers):
     _add_execution_options(parser)
 
 
-def build_manual_dft(subparsers):
+def build_manual_label(subparsers):
     parser = subparsers.add_parser(
-        "dft", help="Label structures with VASP, ABACUS, or the development teacher."
+        "label",
+        aliases=["dft"],
+        help=(
+            "Label structures with VASP, ABACUS, a teacher model, or the "
+            "development Adapter."
+        ),
     )
-    parser.set_defaults(func=run_manual_dft_command)
+    parser.set_defaults(func=run_manual_label_command)
     parser.add_argument("input", help="Structure file, extxyz, or directory.")
-    parser.add_argument("--backend", choices=["vasp", "abacus", "toy"])
+    parser.add_argument(
+        "--backend",
+        choices=["vasp", "abacus", "model", "toy"],
+    )
     parser.add_argument("--teacher-profile", choices=["ordinary", "spin"])
     parser.add_argument("--input-file", dest="dft_input")
     parser.add_argument("--resources")
@@ -1343,6 +1389,20 @@ def build_manual_dft(subparsers):
     kpoints.add_argument("--ka", type=_parse_ka)
     parser.add_argument("--structures-per-job", type=int)
     parser.add_argument("--max-concurrent", type=int)
+    parser.add_argument("--model", help="Fine-tuned teacher model file.")
+    parser.add_argument(
+        "--model-name",
+        help="Stable teacher family/name recorded in label provenance.",
+    )
+    parser.add_argument(
+        "--runner",
+        help=(
+            "Installed runner command implementing the NepTrain model-label "
+            "protocol."
+        ),
+    )
+    parser.add_argument("--device", choices=["cpu", "cuda"])
+    parser.add_argument("--precision", choices=["float32", "float64"])
     parser.add_argument("--output", "-o", default="./labeled.xyz")
     parser.add_argument("--force", action="store_true")
     _add_execution_options(parser)
@@ -1395,7 +1455,7 @@ def build_workflow_commands(subparsers):
         "workflow", help="Prepare and control an automated active-learning workflow."
     )
     actions = parser.add_subparsers(dest="workflow_action", required=True)
-    init = actions.add_parser("init", help="Create a strict schema-v7 project.")
+    init = actions.add_parser("init", help="Create a strict schema-v8 project.")
     init.set_defaults(func=init_template)
     init.add_argument("--profile", choices=["local", "slurm"], default="slurm")
     init.add_argument("--ensemble", choices=["npt", "nvt"], default="npt")
@@ -1488,19 +1548,21 @@ def main():
     parser = argparse.ArgumentParser(
         prog="neptrain",
         description=(
-            "Run individual NEP training, MD, DFT and sampling steps, or compose "
-            "the same steps into an automated workflow."
+            "Run individual NEP training, MD, labeling and sampling steps, "
+            "or compose the same steps into an automated workflow."
         ),
     )
     parser.add_argument("-v", "--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{train,md,dft,select,perturb,workflow,task,data,doctor,smoke}",
+        metavar=(
+            "{train,md,label,select,perturb,workflow,task,data,doctor,smoke}"
+        ),
     )
     build_manual_train(subparsers)
     build_manual_md(subparsers)
-    build_manual_dft(subparsers)
+    build_manual_label(subparsers)
     build_select(subparsers)
     build_perturb(subparsers)
     build_workflow_commands(subparsers)

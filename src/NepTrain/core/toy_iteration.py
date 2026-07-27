@@ -15,7 +15,7 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
-from .dft import LabelRequest, label
+from .labeling import LabelRequest, label
 from .dft.toy import ToyTeacher
 from .iteration import (
     GenerationController,
@@ -282,7 +282,7 @@ class ToyIterationAdapter:
                 context.artifacts["selected_input"],
                 output,
                 context.generation_dir / "teacher",
-                options={"profile": self.profile},
+                settings={"profile": self.profile},
             ),
             "toy",
         )

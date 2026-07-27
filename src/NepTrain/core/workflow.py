@@ -220,15 +220,16 @@ def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any
             route["template_path"] = _absolute_path(
                 route["template_path"], base_dir
             )
-    dft = resolved.get("dft", {})
+    labeling = resolved.get("labeling", {})
     for key in (
         "input_path",
         "resource_path",
         "potcar_manifest_path",
         "resource_manifest_path",
+        "model_path",
     ):
-        if dft.get(key):
-            dft[key] = _absolute_path(dft[key], base_dir)
+        if labeling.get(key):
+            labeling[key] = _absolute_path(labeling[key], base_dir)
     evaluation = resolved.get("evaluation", {})
     if evaluation.get("validation_path"):
         evaluation["validation_path"] = _absolute_path(
@@ -342,7 +343,7 @@ def _validate_vasp_preparation(
     labeling_target: Mapping[str, Any],
     sampling_frames: list[Any],
 ) -> None:
-    if config.get("dft", {}).get("backend") != "vasp":
+    if config.get("labeling", {}).get("backend") != "vasp":
         return
     from .dft.vasp.resources import (
         VaspResourceError,
@@ -356,14 +357,14 @@ def _validate_vasp_preparation(
         validate_vasp_structure,
     )
 
-    dft = config["dft"]
-    manifest_path = Path(str(dft["potcar_manifest_path"]))
+    labeling = config["labeling"]
+    manifest_path = Path(str(labeling["potcar_manifest_path"]))
     frames_by_order = _sampling_frames_by_order(
         sampling_frames,
         vasp_element_order,
     )
     try:
-        input_path = dft.get("input_path")
+        input_path = labeling.get("input_path")
         electronic_mode = (
             validate_vasp_input_file(input_path)
             if input_path
@@ -377,8 +378,8 @@ def _validate_vasp_preparation(
         validate_vasp_manifest_elements(manifest_path, frames_by_order)
         if not labeling_target.get("host"):
             resource_root = (
-                labeling_target.get("dft_resource_path")
-                or dft.get("resource_path")
+                labeling_target.get("labeling_resource_path")
+                or labeling.get("resource_path")
             )
             for frame in frames_by_order.values():
                 validate_vasp_resources(
@@ -396,7 +397,7 @@ def _validate_abacus_preparation(
     labeling_target: Mapping[str, Any],
     sampling_frames: list[Any],
 ) -> None:
-    if config.get("dft", {}).get("backend") != "abacus":
+    if config.get("labeling", {}).get("backend") != "abacus":
         return
     from .dft.abacus.io import read_input_file
     from .dft.abacus.native import (
@@ -409,13 +410,13 @@ def _validate_abacus_preparation(
         validate_abacus_resources,
     )
 
-    dft = config["dft"]
-    manifest_path = Path(str(dft["resource_manifest_path"]))
+    labeling = config["labeling"]
+    manifest_path = Path(str(labeling["resource_manifest_path"]))
     frames_by_order = _sampling_frames_by_order(
         sampling_frames,
         lambda frame: tuple(dict.fromkeys(frame.get_chemical_symbols())),
     )
-    input_path = dft.get("input_path")
+    input_path = labeling.get("input_path")
     parameters = read_input_file(str(input_path)) if input_path else {}
     require_orbitals = (
         str(parameters.get("basis_type", "pw")).strip().lower() == "lcao"
@@ -428,8 +429,8 @@ def _validate_abacus_preparation(
         validate_abacus_manifest_elements(manifest_path, frames_by_order)
         if not labeling_target.get("host"):
             resource_root = (
-                labeling_target.get("dft_resource_path")
-                or dft.get("resource_path")
+                labeling_target.get("labeling_resource_path")
+                or labeling.get("resource_path")
             )
             for frame in frames_by_order.values():
                 validate_abacus_resources(
@@ -446,14 +447,21 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     paths: list[tuple[str, Path]] = []
     training = config.get("training", {})
     sampling = config.get("sampling", {})
-    dft = config.get("dft", {})
+    labeling = config.get("labeling", {})
     evaluation = config.get("evaluation", {})
     for role, value in (
         ("training_config", training.get("config_path")),
         ("training_test", training.get("test_path")),
-        ("dft_input", dft.get("input_path")),
-        ("dft_potcar_manifest", dft.get("potcar_manifest_path")),
-        ("dft_resource_manifest", dft.get("resource_manifest_path")),
+        ("labeling_input", labeling.get("input_path")),
+        (
+            "labeling_potcar_manifest",
+            labeling.get("potcar_manifest_path"),
+        ),
+        (
+            "labeling_resource_manifest",
+            labeling.get("resource_manifest_path"),
+        ),
+        ("labeling_model", labeling.get("model_path")),
         ("evaluation_validation", evaluation.get("validation_path")),
     ):
         if value and value != "auto":
@@ -547,14 +555,18 @@ def prepare_workflow(
             )
     labeling_target_name = config["execution"]["stage_targets"]["labeling"]
     labeling_target = config["execution"]["targets"][labeling_target_name]
-    dft_backend = config["dft"]["backend"]
-    dft_resource = labeling_target.get(
-        "dft_resource_path", config["dft"].get("resource_path")
+    labeling_backend = config["labeling"]["backend"]
+    labeling_resource = labeling_target.get(
+        "labeling_resource_path",
+        config["labeling"].get("resource_path"),
     )
-    if dft_backend in {"vasp", "abacus"} and not dft_resource:
+    if (
+        labeling_backend in {"vasp", "abacus"}
+        and not labeling_resource
+    ):
         raise WorkflowError(
-            f"{dft_backend} workflows require dft.resource_path or "
-            "execution.targets.<labeling>.dft_resource_path"
+            f"{labeling_backend} workflows require labeling.resource_path or "
+            "execution.targets.<labeling>.labeling_resource_path"
         )
     sampling_frames = _sampling_frames(config)
     from .spin import SpinDataError, validate_spin_dataset

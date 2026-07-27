@@ -30,7 +30,7 @@ from NepTrain.core.workflow_iteration import (
     _batched_descriptors,
 )
 from NepTrain.core.dft.toy import ToyTeacher
-from NepTrain.core.dft import LabelResult
+from NepTrain.core.labeling import LabelResult
 from NepTrain.core.candidate_pool import (
     CandidatePoolError,
     regular_batch_minimum,
@@ -523,7 +523,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
             steps=(40, 160, 640, 2560),
             max_selected=3,
         ),
-        "dft": {"software": "toy", "teacher_profile": "spin"},
+        "labeling": {"backend": "toy"},
         "evaluation": {
             "inference_backend": "cpu",
             "validation_path": str(validation),
@@ -692,7 +692,7 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
             template=config_file,
             max_selected=20,
         ),
-        "dft": {"software": "toy", "teacher_profile": "spin"},
+        "labeling": {"backend": "toy"},
         "evaluation": {
             "validation_path": str(validation),
             "max_rmse": {
@@ -827,7 +827,7 @@ def test_workflow_selection_describes_every_unique_valid_dump_frame(
                 template=initial,
                 max_selected=4,
             ),
-            "dft": {"backend": "toy"},
+            "labeling": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(initial),
                 "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
@@ -911,7 +911,7 @@ def test_explore_accumulates_same_model_md_waves_to_the_derived_floor(
                 template=config_file,
                 max_selected=4,
             ),
-            "dft": {"backend": "toy"},
+            "labeling": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
@@ -1016,7 +1016,7 @@ def test_next_md_round_uses_the_newly_published_model(tmp_path: Path):
                 template=config_file,
                 max_selected=2,
             ),
-            "dft": {"backend": "toy"},
+            "labeling": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
@@ -1109,7 +1109,7 @@ def test_candidate_model_must_pass_activation_before_the_next_round(
                 structures=initial,
                 template=config_file,
             ),
-            "dft": {"backend": "toy"},
+            "labeling": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
@@ -1277,7 +1277,7 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
                 structures=initial,
                 template=config_file,
             ),
-            "dft": {"backend": "toy"},
+            "labeling": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {
@@ -1299,6 +1299,11 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
     attempts.write_text(
         json.dumps({"attempts": [{"completed": True}]}), encoding="utf-8"
     )
+    label_provenance = tmp_path / "label-provenance.json"
+    label_provenance.write_text(
+        json.dumps({"backend": "toy", "origin": "development"}),
+        encoding="utf-8",
+    )
     work_dir = tmp_path / "retrain"
     work_dir.mkdir()
     outcome = adapter.run_stage(
@@ -1313,6 +1318,7 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
                 "model": model,
                 "acquisition_signals": diagnostic,
                 "md_attempts": attempts,
+                "label_provenance": label_provenance,
             },
             previous_artifacts={},
             stage_dir=work_dir,
@@ -1370,6 +1376,7 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
                 "model": model,
                 "acquisition_signals": diagnostic,
                 "md_attempts": attempts,
+                "label_provenance": label_provenance,
             },
             previous_artifacts={},
             stage_dir=update_dir,
@@ -1481,7 +1488,7 @@ def test_workflow_label_routes_production_dft_through_label_interface(
                 structures=initial,
                 template=config_file,
             ),
-            "dft": dft_options,
+            "labeling": dft_options,
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
@@ -1505,13 +1512,17 @@ def test_workflow_label_routes_production_dft_through_label_interface(
 
     request, selected_backend = calls[0]
     assert selected_backend == backend
-    assert request.input_file == input_file
-    assert request.resource_dir == resource_dir
-    assert request.n_cpu == 4
-    assert request.use_gamma is True
-    assert request.kpoint_mode == kpoint_mode
-    assert request.ka == (
+    assert request.settings["input_file"] == input_file
+    assert request.settings["resource_dir"] == resource_dir
+    assert request.settings["n_cpu"] == 4
+    assert request.settings["use_gamma"] is True
+    assert request.settings["kpoint_mode"] == kpoint_mode
+    assert request.settings["ka"] == (
         (2, 3, 4) if kpoint_mode == "kpoints" else (1, 1, 1)
     )
-    assert request.kspacing is None
-    assert outcome.metrics == {"backend": backend, "labeled_count": 2}
+    assert request.settings["kspacing"] is None
+    assert outcome.metrics == {
+        "backend": backend,
+        "origin": None,
+        "labeled_count": 2,
+    }

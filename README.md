@@ -1,14 +1,15 @@
 # NepTrain
 
-NepTrain 是 NEP 模型生命周期的统一命令行工具。它既能独立运行训练、MD、DFT
+NepTrain 是 NEP 模型生命周期的统一命令行工具。它既能独立运行训练、MD、结构
 标注和采样，也能把同一套步骤组合成可恢复的主动学习 workflow。
 
 ```text
-train → md → select → dft → merge → retrain → evaluate
+train → md → select → label → merge → retrain → evaluate
 ```
 
-手动命令和自动 workflow 使用相同的训练、MD、DFT Adapter 和执行 target；workflow
-只负责计划、状态推进和验收，不复制科学计算逻辑。
+手动命令和自动 workflow 使用相同的训练、MD、Label Adapter 和执行 target；
+workflow 只负责计划、状态推进和验收，不复制科学计算逻辑。Label Adapter 可以
+是 VASP、ABACUS，也可以是已经微调并用于替代 DFT 的等变 Teacher 模型。
 
 ## 安装
 
@@ -30,7 +31,7 @@ LAMMPS、VASP 和 ABACUS 由用户或计算平台提供。使用 NEPAdapters LAM
 export LAMMPS_PLUGIN_PATH=/path/to/nepadapters/lib
 ```
 
-NepTrain 只接受 `schema_version: 7`。旧 `train/vasp/gpumd/nep` 命令和旧配置不再
+NepTrain 只接受 `schema_version: 8`。旧 `train/vasp/gpumd/nep` 命令和旧配置不再
 兼容，也不会被静默迁移。
 
 ## 独立运行一个步骤
@@ -64,10 +65,10 @@ neptrain md structures/ \
 输入会按“结构 × 温度”展开成独立任务。使用 Slurm target 时，它们会成为一个带并发
 上限的 job array，而不是在登录终端串行运行。
 
-### 批量 VASP 或 ABACUS
+### 批量标注
 
 ```bash
-neptrain dft candidates.xyz \
+neptrain label candidates.xyz \
   --backend vasp \
   --input-file INCAR \
   --resources /shared/potpaw_PBE \
@@ -90,32 +91,50 @@ VASP manifest 的路径必须是 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这一层形式�
 NepTrain 会把该路径反向写入 ASE `setups`，保证“校验的 POTCAR”就是实际拼接
 进计算的 POTCAR。
 
+微调后的等变模型使用 `model` Adapter。runner 是安装在 labeling target 环境中的
+小型命令，接收 `--model`、`--input`、`--output`、`--device` 和
+`--precision`，并输出具有 energy、forces、virial 的 extxyz：
+
+```bash
+neptrain label candidates.xyz \
+  --backend model \
+  --model teacher.model \
+  --model-name mace-foundation-finetune \
+  --runner mace-neptrain-label \
+  --device cuda \
+  --structures-per-job 64 \
+  -o labeled.xyz
+```
+
+NepTrain 会记录 Teacher 模型 SHA256 和运行配置，并在发布前校验结构身份、顺序和
+标签完整性。Spin 输入还必须由 runner 真实输出 `mforce`，不会自动补零。
+
 ### Slurm target
 
 手动命令不要求项目文件；只有复用 Slurm 或远端环境时才需要 `--project` 和
 `--target`：
 
 ```bash
-neptrain dft candidates.xyz \
+neptrain label candidates.xyz \
   --backend vasp \
   --project project.yaml \
-  --target dft \
+  --target label \
   --structures-per-job 1 \
   --max-concurrent 20 \
   -o labeled.xyz
 ```
 
 提供 `--project` 后，未在命令行覆盖的 backend、输入模板、温度、压强、步数和
-运行参数会直接读取 schema-v7 项目；命令行只需要写本次确实要改的值。
+运行参数会直接读取 schema-v8 项目；命令行只需要写本次确实要改的值。
 
 本地 `process` target 前台执行。Slurm target 提交后立即返回：
 
 ```bash
-neptrain task status runs/dft-...
-neptrain task logs runs/dft-...
-neptrain task wait runs/dft-...
-neptrain task retry runs/dft-...
-neptrain task cancel runs/dft-...
+neptrain task status runs/label-...
+neptrain task logs runs/label-...
+neptrain task wait runs/label-...
+neptrain task retry runs/label-...
+neptrain task cancel runs/label-...
 ```
 
 加 `--wait` 可以在提交后等待并自动收集结果。
@@ -138,7 +157,7 @@ neptrain task cancel runs/dft-...
 
 ## 自动 workflow
 
-创建一个严格的 schema-v7 项目：
+创建一个严格的 schema-v8 项目：
 
 ```bash
 neptrain workflow init \
@@ -149,7 +168,7 @@ neptrain workflow init \
 cd fe-project
 ```
 
-补齐 `train.xyz`、`validation.xyz`、`nep.in`、`structures/`、DFT 输入和环境脚本，
+补齐 `train.xyz`、`validation.xyz`、`nep.in`、`structures/`、标注输入和环境脚本，
 然后检查：
 
 ```bash
@@ -198,13 +217,13 @@ neptrain workflow stop workflow --keep-jobs
 `--prepare-only` 的目录优先使用 `workflow run`；`workflow resume` 用于恢复
 暂停、失败或中断过的流程。
 
-## schema v7
+## schema v8
 
 自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、LAMMPS
 模板和温度路径。默认压强、递进策略、轨迹帧策略和 FPS 上限无需重复填写：
 
 ```yaml
-schema_version: 7
+schema_version: 8
 
 training:
   backend: torchnep
@@ -225,7 +244,7 @@ sampling:
       conditions:
         temperature_path: [300, 500, 700]
 
-dft:
+labeling:
   backend: vasp
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
@@ -248,7 +267,7 @@ execution:
   stage_targets:
     training: v100
     sampling: cpu
-    labeling: dft
+    labeling: label
     analysis: cpu
   targets:
     v100:
@@ -265,12 +284,12 @@ execution:
       time: 04:00:00
       cpus_per_task: 4
       setup_script: ./env-cpu.sh
-    dft:
+    label:
       executor: slurm
       partition: compute
       time: 24:00:00
       cpus_per_task: 32
-      setup_script: ./env-dft.sh
+      setup_script: ./env-label.sh
       environment:
         NEPTRAIN_VASP_COMMAND: srun vasp_std
 ```
@@ -280,13 +299,13 @@ execution:
 轨迹健康检查和 FPS 批量上限统一放在 `sampling`。`timestep`、`tdamp`、`pdamp`、
 `spin_alpha` 和 dump 频率直接写在用户的 LAMMPS 模板中。
 
-`dft.kpoint_mode: auto` 优先保留 INCAR 中的 `KSPACING`/`KGAMMA`
+`labeling.kpoint_mode: auto` 优先保留 INCAR 中的 `KSPACING`/`KGAMMA`
 或 ABACUS INPUT 中的 `kspacing`；生成的默认输入已给出可直接修改的
 `0.2`。只有显式选择 `kspacing` 或 `kpoints` 模式时，NepTrain 才接管
 k 点设置。
 
 远程 SSH labeling target 必须设置该目标机自己的绝对
-`dft_resource_path`；本地 `dft.resource_path` 不会被假定为远端同一路径。
+`labeling_resource_path`；本地 `labeling.resource_path` 不会被假定为远端同一路径。
 大型资源库不进入 task archive，只有小型内容寻址 manifest 会进入任务身份。
 
 `temperature_path` 是严格有序的温度探路路径，只有前一个温度通过才解锁下一个。
@@ -294,13 +313,13 @@ k 点设置。
 `production_temperatures` 后，其余温度只做便宜的 smoke 探路。所有通过健康检查
 的 dump 帧都会参与全局 FPS；系统只会去除
 训练集已有结构和完全重复结构，不会在描述符计算前按 stride 或数量上限抽帧。
-`max_selected` 是一个采样轮最多选去 DFT 的结构数。系统自动把常规积累下限设为
-它的一半（默认 100 对应 50）；当前场景 frontier 耗尽或物理失败抢救时可以提前
-flush，不需要用户再维护一组批量阈值。
+`max_selected` 是一个采样轮最多送去 Label Adapter 的结构数。系统自动把常规
+积累下限设为它的一半（默认 100 对应 50）；当前场景 frontier 耗尽或物理失败
+抢救时可以提前 flush，不需要用户再维护一组批量阈值。
 
 模型版本之间是硬边界：每轮候选只允许来自该轮激活模型，候选文件和 manifest
-都会记录模型哈希。误差超阈值或 MD 发生物理失败时才更新模型；只有新模型完成
-evaluate 并写入 lineage，下一轮 MD 才会启动。若当前模型已通过新 DFT 诊断，则
+都会记录模型哈希。标签诊断超阈值或 MD 发生物理失败时才更新模型；只有新模型完成
+evaluate 并写入 lineage，下一轮 MD 才会启动。若当前模型已通过新标签诊断，则
 保持该模型继续做长时认证，避免无意义更新反复清零稳定性证据。因此不会把旧模型
 轨迹误当成新模型的采样证据。
 
@@ -327,24 +346,24 @@ LAMMPS plugin 由 `execution.targets.*.setup_script` 加载，例如在
 `NEPTRAIN_NEP_COMMAND`、`NEPTRAIN_GPUMD_COMMAND`、
 `NEPTRAIN_LMP_COMMAND`、`NEPTRAIN_MPIEXEC`、`NEPTRAIN_VASP_COMMAND` 或
 `NEPTRAIN_ABACUS_COMMAND`，不再读取用户目录下的隐式配置。自动 MD 的 MPI
-rank 数和 DFT 的 CPU 数取当前任务的 `SLURM_CPUS_PER_TASK`；手动命令仍可用
+rank 数和 VASP/ABACUS 的 CPU 数取当前任务的 `SLURM_CPUS_PER_TASK`；手动命令仍可用
 `--mpi-ranks` 或 `--cpus` 显式指定。
 
-如果 DFT 位于另一台 Slurm 超算：
+如果第一性原理标注位于另一台 Slurm 超算：
 
 ```yaml
-    remote-dft:
+    remote-label:
       executor: slurm
       host: other-cluster
       work_root: ~/neptrain-runs
       command: /path/to/python -m NepTrain.cli.cli
       partition: compute
       cpus_per_task: 32
-      dft_resource_path: /shared/pseudopotentials/PBE
+      labeling_resource_path: /shared/pseudopotentials/PBE
 ```
 
 大型赝势库不会跨平台复制；远端路径必须通过 target 的
-`dft_resource_path` 明确给出。target 不能覆盖温度、DFT 精度或 validation 等
+`labeling_resource_path` 明确给出。target 不能覆盖温度、DFT 精度或 validation 等
 科学配置。
 
 ## Spin 数据契约
@@ -417,7 +436,7 @@ workflow/
 需要重新开始时创建新的 workflow 目录，它会得到新的随机 instance id，不会复用
 旧 task/result。
 
-每代目录直接是 `train/`、`md/`、`select/`、`dft/`、`diagnose/`、
+每代目录直接是 `train/`、`md/`、`select/`、`label/`、`diagnose/`、
 `dataset/`、`retrain/` 和 `evaluate/`。训练输出、loss 和模型发布到对应阶段
 目录，`calculation` 软链指向真实执行目录。
 

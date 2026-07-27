@@ -15,7 +15,7 @@ from ase.io import write as ase_write
 from ..spin import validate_spin_dataset, validate_spin_structure
 
 if TYPE_CHECKING:
-    from .interface import LabelRequest
+    from ..labeling import LabelRequest
 
 
 @dataclass(frozen=True)
@@ -121,7 +121,7 @@ def _read_frames(source: Path) -> list[Atoms]:
 
 
 def run_toy_teacher(request: "LabelRequest") -> list[Atoms]:
-    profile = str(request.options.get("profile", "ordinary"))
+    profile = str(request.settings.get("profile", "ordinary"))
     teacher = ToyTeacher(profile)
     frames = _read_frames(request.source)
     if not frames:

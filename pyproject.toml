@@ -13,7 +13,7 @@ authors = [{ name = "Chen Cheng bing", email = "1747193328@qq.com" }]
 dynamic = ["version"]
 
 description = """
-Composable NEP training, MD, DFT labeling, sampling, and active-learning workflows
+Composable NEP training, MD, structure labeling, sampling, and active-learning workflows
 """
 readme = "README.md"
 requires-python = ">=3.10"

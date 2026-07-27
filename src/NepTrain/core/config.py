@@ -13,9 +13,10 @@ from ruamel.yaml.error import YAMLError
 from .sampling_route import MATURITY_STAGES
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 DEFAULT_MAX_CONCURRENT = 20
-DEFAULT_STRUCTURES_PER_DFT_JOB = 1
+DEFAULT_STRUCTURES_PER_LABEL_JOB = 1
+DEFAULT_STRUCTURES_PER_MODEL_JOB = 64
 
 
 class ConfigError(ValueError):
@@ -47,7 +48,7 @@ _FIELDS: dict[str, set[str]] = {
         "candidate_pool",
         "selection",
     },
-    "dft": {
+    "labeling": {
         "backend",
         "gamma_centered",
         "input_path",
@@ -59,6 +60,11 @@ _FIELDS: dict[str, set[str]] = {
         "kspacing",
         "structures_per_job",
         "max_concurrent",
+        "model_path",
+        "model_name",
+        "runner",
+        "device",
+        "precision",
     },
     "evaluation": {
         "validation_path",
@@ -113,7 +119,7 @@ _TARGET_FIELDS = {
     "cpus_per_task",
     "gpus_per_node",
     "directives",
-    "dft_resource_path",
+    "labeling_resource_path",
     "environment",
 }
 
@@ -359,7 +365,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
     training = _mapping(config, "training")
     md = _mapping(config, "md")
     sampling = _mapping(config, "sampling")
-    dft = _mapping(config, "dft")
+    labeling = _mapping(config, "labeling")
     workflow = _mapping(config, "workflow")
     evaluation = _mapping(config, "evaluation")
     execution = _mapping(config, "execution")
@@ -432,38 +438,61 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 "sampling.selection.novelty thresholds must be finite and non-negative"
             )
 
-    if dft.get("backend", "vasp") not in {"vasp", "abacus", "toy"}:
-        raise ConfigError("dft.backend must be vasp, abacus, or toy")
-    if dft.get("backend", "vasp") == "vasp":
-        manifest_path = dft.get("potcar_manifest_path")
+    backend = labeling.get("backend", "vasp")
+    if backend not in {"vasp", "abacus", "model", "toy"}:
+        raise ConfigError(
+            "labeling.backend must be vasp, abacus, model, or toy"
+        )
+    if backend == "vasp":
+        manifest_path = labeling.get("potcar_manifest_path")
         if not isinstance(manifest_path, str) or not manifest_path.strip():
             raise ConfigError(
-                "dft.potcar_manifest_path is required for VASP so POTCAR "
+                "labeling.potcar_manifest_path is required for VASP so POTCAR "
                 "versions and hashes are part of task identity"
             )
-    if dft.get("backend") == "abacus":
-        manifest_path = dft.get("resource_manifest_path")
+    if backend == "abacus":
+        manifest_path = labeling.get("resource_manifest_path")
         if not isinstance(manifest_path, str) or not manifest_path.strip():
             raise ConfigError(
-                "dft.resource_manifest_path is required for ABACUS so "
+                "labeling.resource_manifest_path is required for ABACUS so "
                 "pseudopotential and orbital hashes are part of task identity"
             )
-    kpoint_mode = dft.get("kpoint_mode", "auto")
-    if kpoint_mode not in {"auto", "kspacing", "kpoints"}:
+    if backend == "model":
+        for field in ("model_path", "model_name", "runner"):
+            value = labeling.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(
+                    f"labeling.{field} is required when labeling.backend=model"
+                )
+        if labeling.get("device", "cuda") not in {"cpu", "cuda"}:
+            raise ConfigError("labeling.device must be cpu or cuda")
+        if labeling.get("precision", "float32") not in {
+            "float32",
+            "float64",
+        }:
+            raise ConfigError(
+                "labeling.precision must be float32 or float64"
+            )
+    kpoint_mode = labeling.get("kpoint_mode", "auto")
+    if backend in {"vasp", "abacus"} and kpoint_mode not in {
+        "auto",
+        "kspacing",
+        "kpoints",
+    }:
         raise ConfigError(
-            "dft.kpoint_mode must be auto, kspacing, or kpoints"
+            "labeling.kpoint_mode must be auto, kspacing, or kpoints"
         )
-    if not isinstance(dft.get("gamma_centered", False), bool):
-        raise ConfigError("dft.gamma_centered must be boolean")
+    if not isinstance(labeling.get("gamma_centered", False), bool):
+        raise ConfigError("labeling.gamma_centered must be boolean")
     for field, default in (
-        ("structures_per_job", DEFAULT_STRUCTURES_PER_DFT_JOB),
+        ("structures_per_job", DEFAULT_STRUCTURES_PER_LABEL_JOB),
         ("max_concurrent", DEFAULT_MAX_CONCURRENT),
     ):
-        value = dft.get(field, default)
+        value = labeling.get(field, default)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ConfigError(f"dft.{field} must be a positive integer")
-    if dft.get("backend", "vasp") != "toy" and kpoint_mode == "kspacing":
-        kspacing = dft.get("kspacing")
+            raise ConfigError(f"labeling.{field} must be a positive integer")
+    if backend in {"vasp", "abacus"} and kpoint_mode == "kspacing":
+        kspacing = labeling.get("kspacing")
         if (
             kspacing is None
             or isinstance(kspacing, bool)
@@ -472,14 +501,16 @@ def validate_config(config: Mapping[str, Any]) -> None:
             or float(kspacing) <= 0
         ):
             raise ConfigError(
-                "dft.kspacing must be positive when dft.kpoint_mode=kspacing"
+                "labeling.kspacing must be positive when "
+                "labeling.kpoint_mode=kspacing"
             )
-        if "kpoints" in dft:
+        if "kpoints" in labeling:
             raise ConfigError(
-                "dft.kpoints cannot be combined with dft.kpoint_mode=kspacing"
+                "labeling.kpoints cannot be combined with "
+                "labeling.kpoint_mode=kspacing"
             )
-    elif dft.get("backend", "vasp") != "toy" and kpoint_mode == "kpoints":
-        raw_kpoints = dft.get("kpoints")
+    elif backend in {"vasp", "abacus"} and kpoint_mode == "kpoints":
+        raw_kpoints = labeling.get("kpoints")
         values = (
             [raw_kpoints]
             if isinstance(raw_kpoints, int)
@@ -496,29 +527,32 @@ def validate_config(config: Mapping[str, Any]) -> None:
             )
         ):
             raise ConfigError(
-                "dft.kpoints must contain one or three positive integers "
-                "when dft.kpoint_mode=kpoints"
+                "labeling.kpoints must contain one or three positive integers "
+                "when labeling.kpoint_mode=kpoints"
             )
-        if "kspacing" in dft:
+        if "kspacing" in labeling:
             raise ConfigError(
-                "dft.kspacing cannot be combined with dft.kpoint_mode=kpoints"
+                "labeling.kspacing cannot be combined with "
+                "labeling.kpoint_mode=kpoints"
             )
-    elif dft.get("backend", "vasp") != "toy":
-        if "kspacing" in dft or "kpoints" in dft:
+    elif backend in {"vasp", "abacus"}:
+        if "kspacing" in labeling or "kpoints" in labeling:
             raise ConfigError(
-                "dft.kspacing and dft.kpoints require an explicit "
-                "dft.kpoint_mode; auto reads k-point settings from the DFT input"
+                "labeling.kspacing and labeling.kpoints require an explicit "
+                "labeling.kpoint_mode; auto reads k-point settings from the "
+                "backend input"
             )
 
     if md.get("spin", False):
         if md.get("backend") != "lammps":
             raise ConfigError("spin MD currently requires md.backend=lammps")
-        if dft.get("backend", "vasp") not in {"abacus", "toy"}:
-                raise ConfigError(
-                    "spin workflows require dft.backend=abacus or toy; "
-                    "VASP collinear ISPIN=2 produces ordinary energy/force "
-                    "labels, not spin/mforce labels"
-                )
+        if backend not in {"abacus", "model", "toy"}:
+            raise ConfigError(
+                "spin workflows require labeling.backend=abacus, model, "
+                "or toy; "
+                "VASP collinear ISPIN=2 produces ordinary energy/force "
+                "labels, not spin/mforce labels"
+            )
 
     if workflow:
         workflow_id = workflow.get("id")
@@ -604,25 +638,27 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "execution.stage_targets refers to unknown targets: "
             + ", ".join(str(value) for value in unknown_targets)
         )
-    dft_backend = str(dft.get("backend", "vasp"))
-    if dft_backend in {"vasp", "abacus"}:
+    if backend in {"vasp", "abacus"}:
         labeling_target = parsed_targets[str(routes["labeling"])]
         if not (
-            labeling_target.dft_resource_path
+            labeling_target.labeling_resource_path
             or (
-                isinstance(dft.get("resource_path"), str)
-                and str(dft["resource_path"]).strip()
+                isinstance(labeling.get("resource_path"), str)
+                and str(labeling["resource_path"]).strip()
             )
         ):
             raise ConfigError(
-                "real DFT requires dft.resource_path or "
-                "execution.targets.<labeling>.dft_resource_path"
+                "VASP/ABACUS labeling requires labeling.resource_path or "
+                "execution.targets.<labeling>.labeling_resource_path"
             )
-        if labeling_target.host and not labeling_target.dft_resource_path:
+        if (
+            labeling_target.host
+            and not labeling_target.labeling_resource_path
+        ):
             raise ConfigError(
                 "a remote labeling target requires its own absolute "
-                "dft_resource_path; a local project resource path is not "
-                "portable over SSH"
+                "labeling_resource_path; a local project resource path is "
+                "not portable over SSH"
             )
     route_targets = _mapping(execution, "sampling_route_targets")
     invalid_route_targets = sorted(

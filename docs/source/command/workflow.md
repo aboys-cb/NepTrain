@@ -12,20 +12,21 @@ cd fe-project
 neptrain doctor --project project.yaml
 ```
 
-项目只接受 `schema_version: 7`。自动采样只读取 `sampling.routes`，不再接受
+项目只接受 `schema_version: 8`。自动采样只读取 `sampling.routes`，不再接受
 全局 `md.structures`、`md.template_path`、`sampling.conditions` 或
 `sampling.progression`，也不在运行时迁移旧配置。
 
 当前配置职责如下：
 
 - `md`：选择 LAMMPS/GPUMD 和推理后端。
+- `labeling`：选择 VASP、ABACUS 或微调后的等变 Teacher 模型。
 - `sampling.routes`：每条采样路径显式绑定结构、模板和温度路径。
 - `sampling.candidate_pool` / `sampling.selection`：可选的高级覆盖项。
 - LAMMPS 模板：物理过程、`timestep`、阻尼、spin 积分参数和 dump 频率。
 - `execution.targets.*.setup_script`：module、Python 环境和 LAMMPS plugin。
 
-`workflow init` 默认只生成当前选择的 `lammps.in` 和 DFT 输入，不再生成四套
-LAMMPS 模板及两种 DFT 输入。Spin 流程使用
+`workflow init` 默认只生成当前选择的 `lammps.in` 和标注后端输入，不再生成四套
+LAMMPS 模板及两种第一性原理输入。Spin 流程使用
 `--spin --dft-backend abacus`。
 
 最小 route 只需要：
@@ -86,7 +87,7 @@ execution:
   stage_targets:
     training: train
     sampling: md-default
-    labeling: dft
+    labeling: label
     analysis: cpu
   sampling_route_targets:
     route_b: md-remote
@@ -103,7 +104,7 @@ swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。
 其中的中间温度只做低成本 smoke 探路。
 
 场景通过后，Controller 会同时解锁下一个温度和当前生产温度的下一档时长。
-失败场景保留在原位置，采集稳定段和炸前帧，经 FPS、DFT 和重训后重试，不会
+失败场景保留在原位置，采集稳定段和炸前帧，经 FPS、标注和重训后重试，不会
 越过失败温度。`progression.replicas` 控制各时长需要的独立 MD 次数。
 
 所有通过健康检查的 dump 帧都会参与全局选择。FPS 先按精确元素集合分组，按
@@ -113,9 +114,9 @@ swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。
 
 NepTrain 只在 FPS 前去除训练集已有结构和同一 route 内的完全重复结构，不按固定
 stride 抽帧，也不使用候选数量上限提前裁剪。
-`sampling.selection.max_selected` 是每个采样轮最多送去 DFT 的结构数。常规标注
-下限由系统自动取其一半，例如上限 100 时优先积累至少 50 个；若当前场景 frontier
-已经耗尽，或出现物理失败需要抢救，则允许较小批次提前提交。
+`sampling.selection.max_selected` 是每个采样轮最多送去 Label Adapter 的结构
+数。常规标注下限由系统自动取其一半，例如上限 100 时优先积累至少 50 个；若当前
+场景 frontier 已经耗尽，或出现物理失败需要抢救，则允许较小批次提前提交。
 
 这里的“一代”严格绑定一个模型哈希。Controller 会枚举该模型下所有已解锁
 scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交；全部进入终态后
@@ -129,12 +130,12 @@ route 指纹由 route id、模板内容哈希、结构输入内容哈希、规�
 progression 共同生成。场景身份还包含具体结构哈希、温度、压强和采样模型哈希。
 因此修改模板或 route 条件后不能复用旧结果；完全相同的配置和内容可以确定性恢复。
 
-## DFT k 点
+## 第一性原理标注与 k 点
 
 默认让用户输入文件管理 k 点：
 
 ```yaml
-dft:
+labeling:
   backend: vasp
   input_path: ./INCAR
   resource_path: /shared/potpaw_PBE
@@ -147,8 +148,8 @@ dft:
 `auto` 会优先保留 VASP INCAR 中的 `KSPACING`/`KGAMMA`，或 ABACUS INPUT
 中的 `kspacing`。输入中没有这些设置时，适配器才按默认参数生成网格。
 
-`structures_per_job` 决定每个 DFT 调度任务包含多少个 FPS 选中结构；
-`max_concurrent` 限制 workflow 同时运行的 DFT 任务数。默认值分别为 `1` 和
+`structures_per_job` 决定每个 VASP/ABACUS 调度任务包含多少个 FPS 选中结构；
+`max_concurrent` 限制 workflow 同时运行的标注任务数。默认值分别为 `1` 和
 `20`。例如 FPS 选中 100 个结构时，默认生成 100 个单结构任务，最多同时运行
 20 个。Controller 保留已完成结构，只重试失败或尚未提交的结构，最后按原始
 FPS 顺序校验并合并为 `selected-labels.xyz`。
@@ -157,7 +158,7 @@ VASP 的 `potcar_manifest_path` 和 ABACUS 的 `resource_manifest_path` 是
 必填 provenance。它们固定逐元素资源相对路径与 SHA256；VASP 还固定精确
 `TITEL`、family 和 release。prepare 会先验证所有 sampling route 的元素覆盖，
 本地 target 同时验证真实文件。远程资源库不打包上传，远程 labeling target
-必须给出自己的绝对 `dft_resource_path`，并用 `doctor` 在提交前逐文件验证。
+必须给出自己的绝对 `labeling_resource_path`，并用 `doctor` 在提交前逐文件验证。
 manifest 中 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 的 setup 目录会直接驱动 ASE 的
 POTCAR 选择，校验路径和计算路径是同一个文件。
 
@@ -165,22 +166,46 @@ POTCAR 选择，校验路径和计算路径是同一个文件。
 
 ```yaml
 # 按间距设置
-dft:
+labeling:
   kpoint_mode: kspacing
   kspacing: 0.2
   gamma_centered: true
 
 # 或按网格密度参数设置
-dft:
+labeling:
   kpoint_mode: kpoints
   kpoints: [4, 4, 4]
   gamma_centered: true
 ```
 
 `kspacing` 和 `kpoints` 不能同时配置。手动命令保持同样规则：
-`neptrain dft --kspacing 0.2 ...` 或 `neptrain dft --ka 4,4,4 ...`；
+`neptrain label --kspacing 0.2 ...` 或 `neptrain label --ka 4,4,4 ...`；
 两者互斥。当前输入接口读取 INCAR/ABACUS INPUT 内的 k 点间距，不把同目录下
 单独的 VASP `KPOINTS` 或 ABACUS `KPT` 文件作为自动 workflow 输入。
+
+## 等变 Teacher 模型
+
+当微调后的大模型直接替代 DFT 时，workflow stage 不变，只切换 Label Adapter：
+
+```yaml
+labeling:
+  backend: model
+  model_path: ./teacher.model
+  model_name: mace-foundation-finetune
+  runner: mace-neptrain-label
+  device: cuda
+  precision: float32
+```
+
+`model_path` 会作为内容寻址输入进入 label task；`model_name`、模型 SHA256、
+runner、device 和 precision 会写入 `label-provenance.json`；extxyz 帧本身保留
+标签来源、后端、模型名称和模型 SHA256。runner 在
+`execution.stage_targets.labeling` 指定的环境执行，因此 Teacher 框架的
+PyTorch/CUDA 依赖不需要安装到 Controller 环境。
+
+这一路径在调度上完全替代 DFT，但报告会保留 `teacher_model` 来源，避免把蒸馏
+标签误称为 DFT 标签。若配置独立 `evaluation.validation_path`，最终验收仍以该
+参考集为准。
 
 ## 准备和运行
 
@@ -199,7 +224,7 @@ neptrain workflow run fe-workflow
 train → explore → select → label → diagnose → merge → retrain → evaluate
 ```
 
-训练、MD 和 DFT stage 使用与独立命令相同的 Adapter 和 execution target。
+训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。
 
 `workflow run <目录>` 只允许状态为 `prepared` 的目录第一次启动。
 `workflow resume <目录>` 只用于已经启动过的暂停、失败、中断或可修复损坏状态；
@@ -244,7 +269,7 @@ workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 
 - `complete`：完整 stage 链和（若配置）独立 validation 已验收。
 
 `workflow.max_model_generations` 是最大模型代数预算，不是成功条件。配置 `evaluation`
-时，所有生产温度、最长时长、replica、轨迹 DFT 诊断和独立 validation 同时通过
+时，所有生产温度、最长时长、replica、轨迹标签诊断和独立 validation 同时通过
 后才会提前结束。预算用尽但仍未收敛时状态为 `budget_exhausted`，连续两轮没有
 新覆盖或模型改进时状态为 `stalled`，都不会伪装成 `complete`。
 
@@ -277,7 +302,7 @@ generations/0001/
 ├── train/
 ├── md/
 ├── select/
-├── dft/
+├── label/
 ├── diagnose/
 ├── dataset/
 ├── retrain/
@@ -304,11 +329,11 @@ attempt 和任务指纹，因此输出目录不再重复这些信息：
 ```
 
 训练的 `nep.txt`、`loss.out`、checkpoint 和训练日志同样直接位于该 job 的
-`output/`。默认的单结构 DFT job 也把 INCAR/POSCAR/OUTCAR、VASP 日志和
+`output/`。默认的单结构 VASP/ABACUS job 也把输入、原生输出、后端日志和
 `selected-labels.xyz` 直接放在 `output/`；只有发生真实重试时才出现
-`retry-0002/`。每代 `dft/` 直接发布 `000001-Ce8Fe16` 等软链及最终合并文件，
+`retry-0002/`。每代 `label/` 直接发布 `000001-Ce8Fe16` 等软链及最终合并文件，
 不再增加 `teacher/`、`attempt-0001/` 或 `calculations/` 层。`input/` 也只携带当前阶段真正消费的文件：训练任务不再
-复制 MD route，MD 和 DFT 任务不再复制初始训练集及 validation 数据。
+复制 MD route，MD 和标注任务不再复制初始训练集及 validation 数据。
 
 远端 task 使用内容寻址协议：本地先在临时目录完整生成 `task.json` 和全部输入，
 校验 manifest 后打包；远端在独占 lock 下解包、复核 hash，再用一次 rename

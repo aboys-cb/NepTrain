@@ -12,12 +12,12 @@ import tempfile
 from typing import Any, Mapping
 
 
-_LAYOUT_VERSION = 3
+_LAYOUT_VERSION = 4
 _STAGE_DIRECTORIES = {
     "train": "train",
     "explore": "md",
     "select": "select",
-    "label": "dft",
+    "label": "label",
     "diagnose": "diagnose",
     "merge": "dataset",
     "retrain": "retrain",
@@ -291,17 +291,18 @@ class WorkflowWorkspace:
                     str(target.relative_to(self.root))
                 )
             route["structures"] = copied_structures
-        copy_path("dft", "input_path", "dft/input")
+        copy_path("labeling", "input_path", "labeling/input")
         copy_path(
-            "dft",
+            "labeling",
             "potcar_manifest_path",
-            "dft/vasp-resources",
+            "labeling/vasp-resources",
         )
         copy_path(
-            "dft",
+            "labeling",
             "resource_manifest_path",
-            "dft/abacus-resources",
+            "labeling/abacus-resources",
         )
+        copy_path("labeling", "model_path", "labeling/teacher-model")
         copy_path("evaluation", "validation_path", "validation/validation")
         for name, profile in snapshot.get("execution", {}).get(
             "targets", {}

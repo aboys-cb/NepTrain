@@ -28,7 +28,7 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from .execution import ExecutionError, ExecutionTarget, ExecutionTransport
-from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_DFT_JOB
+from .config import DEFAULT_MAX_CONCURRENT, DEFAULT_STRUCTURES_PER_LABEL_JOB
 from .scientific_data import (
     ScientificDataError,
     labeled_input_structure_ids,
@@ -412,7 +412,7 @@ def prepare_training(
     )
 
 
-def prepare_dft(
+def prepare_labeling(
     source: str | Path,
     *,
     backend: str,
@@ -427,15 +427,22 @@ def prepare_dft(
     kpoint_mode: str = "auto",
     kspacing: float | None = None,
     ka: Sequence[int] = (1, 1, 1),
-    structures_per_job: int = DEFAULT_STRUCTURES_PER_DFT_JOB,
+    structures_per_job: int = DEFAULT_STRUCTURES_PER_LABEL_JOB,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     teacher_profile: str = "ordinary",
+    model_file: str | Path | None = None,
+    model_name: str | None = None,
+    runner: str | None = None,
+    device: str = "cuda",
+    precision: str = "float32",
     force: bool = False,
 ) -> ManualOperation:
     if structures_per_job < 1:
         raise ManualTaskError("structures_per_job must be at least 1")
     selected_resource = (
-        resource_dir if resource_dir is not None else target.dft_resource_path
+        resource_dir
+        if resource_dir is not None
+        else target.labeling_resource_path
     )
     effective_resource = None
     if selected_resource is not None:
@@ -443,15 +450,16 @@ def prepare_dft(
         if target.host:
             if not resource_path.is_absolute():
                 raise ManualTaskError(
-                    "remote DFT resource paths must be absolute on the target"
+                    "remote labeling resource paths must be absolute on the target"
                 )
             effective_resource = str(resource_path)
         else:
             effective_resource = str(resource_path.resolve())
     if backend in {"vasp", "abacus"} and not effective_resource:
         raise ManualTaskError(
-            f"{backend} labeling requires --resources, dft.resource_path, "
-            "or execution.targets.<name>.dft_resource_path"
+            f"{backend} labeling requires --resources, "
+            "labeling.resource_path, "
+            "or execution.targets.<name>.labeling_resource_path"
         )
     if (
         backend in {"vasp", "abacus"}
@@ -466,7 +474,16 @@ def prepare_dft(
         if n_cpu is not None
         else target.cpus_per_task or 1
     )
-    _progress(f"dft: reading structures from {Path(source).expanduser()}")
+    if backend == "model":
+        if model_file is None or not Path(model_file).expanduser().is_file():
+            raise ManualTaskError(
+                "model labeling requires an existing --model"
+            )
+        if not model_name or not str(model_name).strip():
+            raise ManualTaskError("model labeling requires --model-name")
+        if not runner or not shlex.split(str(runner)):
+            raise ManualTaskError("model labeling requires --runner")
+    _progress(f"label: reading structures from {Path(source).expanduser()}")
     output_path = _output_path(output, force=force)
     frames = _frames(Path(source))
     try:
@@ -475,7 +492,9 @@ def prepare_dft(
             require_mforce=False,
         )
     except SpinDataError as error:
-        raise ManualTaskError(f"DFT input spin contract is invalid: {error}") from error
+        raise ManualTaskError(
+            f"labeling input spin contract is invalid: {error}"
+        ) from error
     frame_ids = [structure_id(frame) for frame in frames]
     resource_provenance = None
     resource_manifest_source = None
@@ -495,7 +514,7 @@ def prepare_dft(
         if resource_manifest is None:
             raise ManualTaskError(
                 "VASP labeling requires --potcar-manifest or "
-                "dft.potcar_manifest_path"
+                "labeling.potcar_manifest_path"
             )
         resource_manifest_source = Path(resource_manifest).expanduser().resolve()
         orders = sorted({vasp_element_order(frame) for frame in frames})
@@ -544,7 +563,7 @@ def prepare_dft(
         if resource_manifest is None:
             raise ManualTaskError(
                 "ABACUS labeling requires --resource-manifest or "
-                "dft.resource_manifest_path"
+                "labeling.resource_manifest_path"
             )
         resource_manifest_source = Path(resource_manifest).expanduser().resolve()
         orders = sorted(
@@ -596,11 +615,11 @@ def prepare_dft(
     if duplicates:
         first, duplicate = duplicates[0]
         raise ManualTaskError(
-            "DFT input contains duplicate physical structures at indices "
+            "labeling input contains duplicate physical structures at indices "
             f"{first} and {duplicate}; deduplicate before submission"
         )
     _progress(
-        f"dft: read {len(frames)} structure(s); "
+        f"label: read {len(frames)} structure(s); "
         f"{structures_per_job} structure(s) per Slurm task"
     )
     payload = {
@@ -609,7 +628,7 @@ def prepare_dft(
         "frames": len(frames),
         "target": target.name,
     }
-    root, operation_id = _prepare_root("dft", workdir, payload)
+    root, operation_id = _prepare_root("label", workdir, payload)
     common = root / "inputs"
     copied_input = (
         str(Path(_copy(Path(input_file), common / Path(input_file).name)).relative_to(root))
@@ -626,6 +645,18 @@ def prepare_dft(
             ).relative_to(root)
         )
         if resource_manifest_source is not None
+        else None
+    )
+    copied_model = (
+        str(
+            Path(
+                _copy(
+                    Path(model_file),
+                    common / Path(model_file).name,
+                )
+            ).relative_to(root)
+        )
+        if model_file is not None
         else None
     )
     jobs = []
@@ -649,6 +680,11 @@ def prepare_dft(
             "kspacing": kspacing,
             "ka": [int(value) for value in ka],
             "teacher_profile": teacher_profile,
+            "model_file": copied_model,
+            "model_name": model_name,
+            "runner": runner,
+            "device": device,
+            "precision": precision,
         }
         _write_json(job / "request.json", request)
         jobs.append(
@@ -665,7 +701,7 @@ def prepare_dft(
     return _write_operation(
         root,
         operation_id=operation_id,
-        kind="dft",
+        kind="label",
         target=target,
         output=output_path,
         jobs=jobs,
@@ -674,7 +710,7 @@ def prepare_dft(
             "structure_id_version": "neptrain.structure-id.v2",
             "frame_count": len(frame_ids),
             "frame_ids": frame_ids,
-            "dft_resources": resource_provenance,
+            "labeling_resources": resource_provenance,
         },
     )
 
@@ -890,29 +926,45 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 )
                 shutil.copy2(result.best_model, result_file)
                 metrics = {"backend": result.backend}
-            elif operation.kind == "dft":
-                from .dft import LabelRequest, label
+            elif operation.kind == "label":
+                from .labeling import LabelRequest, label
 
                 result = label(
                     LabelRequest(
                         source=_resolve(operation.root, request["source"]),
                         output_file=result_file,
                         work_dir=calculation_dir,
-                        input_file=_resolve(
-                            operation.root, request.get("input_file")
-                        ),
-                        resource_dir=_resolve(
-                            operation.root, request.get("resource_dir")
-                        ),
-                        resource_manifest=_resolve(
-                            operation.root, request.get("resource_manifest")
-                        ),
-                        n_cpu=int(request["n_cpu"]),
-                        use_gamma=bool(request["use_gamma"]),
-                        kpoint_mode=request["kpoint_mode"],
-                        kspacing=request.get("kspacing"),
-                        ka=tuple(request["ka"]),
-                        options={"profile": request["teacher_profile"]},
+                        settings={
+                            "input_file": _resolve(
+                                operation.root,
+                                request.get("input_file"),
+                            ),
+                            "resource_dir": _resolve(
+                                operation.root,
+                                request.get("resource_dir"),
+                            ),
+                            "resource_manifest": _resolve(
+                                operation.root,
+                                request.get("resource_manifest"),
+                            ),
+                            "n_cpu": int(request["n_cpu"]),
+                            "use_gamma": bool(request["use_gamma"]),
+                            "kpoint_mode": request["kpoint_mode"],
+                            "kspacing": request.get("kspacing"),
+                            "ka": tuple(request["ka"]),
+                            "profile": request["teacher_profile"],
+                            "model_file": _resolve(
+                                operation.root,
+                                request.get("model_file"),
+                            ),
+                            "model_name": request.get("model_name"),
+                            "runner": request.get("runner"),
+                            "device": request.get("device", "cuda"),
+                            "precision": request.get(
+                                "precision",
+                                "float32",
+                            ),
+                        },
                     ),
                     request["backend"],
                 )
@@ -925,16 +977,18 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                     frame_ids = labeled_input_structure_ids(written_frames)
                 except ScientificDataError as error:
                     raise ManualTaskError(
-                        f"DFT job {index} produced invalid labels: {error}"
+                        f"label job {index} produced invalid labels: {error}"
                     ) from error
                 expected_ids = [str(value) for value in job_meta["frame_ids"]]
                 if frame_ids != expected_ids:
                     raise ManualTaskError(
-                        f"DFT job {index} result structures do not match its "
+                        f"label job {index} result structures do not match its "
                         "input frame identities and order"
                     )
                 metrics = {
                     "backend": result.backend,
+                    "origin": result.provenance.get("origin"),
+                    "provenance": dict(result.provenance),
                     "frames": len(written_frames),
                 }
             elif operation.kind == "md":
@@ -991,7 +1045,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 "artifact": artifact,
                 "metrics": metrics,
             }
-            if operation.kind == "dft":
+            if operation.kind == "label":
                 result_descriptor["frame_ids"] = frame_ids
                 result_descriptor["frame_count"] = len(frame_ids)
             elif operation.kind == "md":
@@ -1343,7 +1397,7 @@ sbatch --parsable "$2"
 def _result_filename(kind: str) -> str:
     return {
         "train": "nep.txt",
-        "dft": "labeled.xyz",
+        "label": "labeled.xyz",
         "md": "trajectory.xyz",
     }[kind]
 
@@ -1396,7 +1450,7 @@ def _validate_job_result(
         or _sha256(artifact) != record.get("sha256")
     ):
         raise ManualTaskError(f"job {index} result artifact drifted or is missing")
-    if operation.kind == "dft":
+    if operation.kind == "label":
         loaded = ase_read(artifact, index=":")
         frames = loaded if isinstance(loaded, list) else [loaded]
         try:
@@ -1411,7 +1465,7 @@ def _validate_job_result(
             or actual_ids != expected_ids
         ):
             raise ManualTaskError(
-                f"job {index} has missing, duplicate, or reordered DFT frames"
+                f"job {index} has missing, duplicate, or reordered label frames"
             )
     return result
 
@@ -1529,14 +1583,14 @@ def _final_result_error(
         or _sha256(output) != record.get("sha256")
     ):
         return f"final result drifted or is missing: {output}"
-    if operation.kind == "dft":
+    if operation.kind == "label":
         try:
             loaded = ase_read(output, index=":")
             frames = loaded if isinstance(loaded, list) else [loaded]
             validate_labeled_frames(frames)
             actual_ids = labeled_input_structure_ids(frames)
         except (OSError, ScientificDataError, ValueError) as error:
-            return f"final DFT result is invalid: {error}"
+            return f"final labeling result is invalid: {error}"
         expected_ids = list(
             descriptor.get("scientific_input", {}).get("frame_ids", [])
         )
@@ -1545,7 +1599,10 @@ def _final_result_error(
             or list(record.get("frame_ids", [])) != expected_ids
             or int(record.get("frame_count", -1)) != len(expected_ids)
         ):
-            return "final DFT result has missing, duplicate, or reordered frames"
+            return (
+                "final labeling result has missing, duplicate, or reordered "
+                "frames"
+            )
     return None
 
 
@@ -1575,25 +1632,25 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
             )
             loaded = ase_read(path, index=":")
             frames.extend(loaded if isinstance(loaded, list) else [loaded])
-        if operation.kind == "dft":
+        if operation.kind == "label":
             try:
                 validate_labeled_frames(frames)
                 actual_ids = labeled_input_structure_ids(frames)
             except ScientificDataError as error:
                 raise ManualTaskError(
-                    f"cannot merge invalid DFT labels: {error}"
+                    f"cannot merge invalid labels: {error}"
                 ) from error
             expected_ids = list(
                 descriptor.get("scientific_input", {}).get("frame_ids", [])
             )
             if actual_ids != expected_ids:
                 raise ManualTaskError(
-                    "DFT merge detected missing, duplicate, or reordered frames"
+                    "label merge detected missing, duplicate, or reordered frames"
                 )
         elif not frames:
             raise ManualTaskError("cannot merge an empty MD trajectory")
         ase_write(temporary, frames, format="extxyz")
-        if operation.kind == "dft":
+        if operation.kind == "label":
             restored = ase_read(temporary, index=":", format="extxyz")
             restored_frames = (
                 restored if isinstance(restored, list) else [restored]
@@ -1602,7 +1659,7 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
             restored_ids = labeled_input_structure_ids(restored_frames)
             if restored_ids != expected_ids:
                 raise ManualTaskError(
-                    "DFT merge did not survive the final extxyz round trip"
+                    "label merge did not survive the final extxyz round trip"
                 )
     if output.exists() or output.is_symlink():
         archive = (
@@ -1621,7 +1678,7 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
         "sha256": _sha256(output),
         "size": output.stat().st_size,
     }
-    if operation.kind == "dft":
+    if operation.kind == "label":
         descriptor["result"]["frame_count"] = len(expected_ids)
         descriptor["result"]["frame_ids"] = expected_ids
     descriptor.pop("collection_error", None)
@@ -2185,7 +2242,7 @@ __all__ = [
     "cancel_operation",
     "load_operation",
     "operation_logs",
-    "prepare_dft",
+    "prepare_labeling",
     "prepare_md",
     "prepare_training",
     "refresh_operation",

@@ -21,4 +21,4 @@ neptrain doctor --project project.yaml
 ```
 
 NepTrain 不再读取 `~/.NepTrain` 中的旧环境配置。所有可复现执行环境都应进入
-schema-v7 `project.yaml` 的 target 或对应环境脚本。
+schema-v8 `project.yaml` 的 target 或对应环境脚本。
