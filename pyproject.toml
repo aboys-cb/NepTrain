@@ -1,7 +1,7 @@
 [build-system]
 requires = [
 "wheel",
-"setuptools>=68.0.0",
+"setuptools>=77.0.0",
 "setuptools-scm>=7"
 ]
 build-backend = "setuptools.build_meta"
@@ -12,17 +12,17 @@ name = "NepTrain"
 authors = [{ name = "Chen Cheng bing", email = "1747193328@qq.com" }]
 dynamic = ["version"]
 
-description = """
-Composable NEP training, MD, structure labeling, sampling, and active-learning workflows
-"""
+description = "Composable NEP training, MD, structure labeling, sampling, and active-learning workflows"
 readme = "README.md"
 requires-python = ">=3.10"
-license= { "file"="LICENSE" }
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
 
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -38,7 +38,7 @@ dependencies = [
 "argcomplete",
 "ruamel.yaml",
 "matplotlib>=3.8",
-"nep-adapters>=0.1.0"
+"nep-adapters>=1.0,<2"
 ]
 
 [project.optional-dependencies]
