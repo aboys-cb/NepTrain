@@ -45,6 +45,10 @@ class ExecutionError(RuntimeError):
     """Raised when a stage cannot be transported, launched, or collected."""
 
 
+class PermanentExecutionError(ExecutionError):
+    """Raised when retrying the same execution operation cannot succeed."""
+
+
 class SubmissionDeferred(ExecutionError):
     """Raised when a scheduler temporarily refuses additional submissions."""
 
@@ -64,6 +68,8 @@ def _failure_kind(detail: str) -> str | None:
         )
     ):
         return "out_of_memory"
+    if "scf did not converge" in normalized:
+        return "non_convergence"
     return None
 
 
@@ -1471,9 +1477,12 @@ verify_bundle "$destination"
         if not self.remote:
             return local
         remote = str(handle.remote_bundle)
-        descriptor = _verify_task_bundle(local)
+        try:
+            descriptor = _verify_task_bundle(local)
+        except ExecutionError as error:
+            raise PermanentExecutionError(str(error)) from error
         if handle.task_id != descriptor["task_id"]:
-            raise ExecutionError(
+            raise PermanentExecutionError(
                 "execution handle does not belong to the local task bundle"
             )
         temporary = Path(
@@ -1490,16 +1499,19 @@ verify_bundle "$destination"
             )
             for name in ("result.json", "execution.json"):
                 if not (temporary / name).is_file():
-                    raise ExecutionError(
+                    raise PermanentExecutionError(
                         f"remote stage result is missing required file: {name}"
                     )
-            _load_stage_result_payload(temporary, descriptor)
+            try:
+                _load_stage_result_payload(temporary, descriptor)
+            except ExecutionError as error:
+                raise PermanentExecutionError(str(error)) from error
             try:
                 execution = json.loads(
                     (temporary / "execution.json").read_text(encoding="utf-8")
                 )
             except (OSError, json.JSONDecodeError) as error:
-                raise ExecutionError(
+                raise PermanentExecutionError(
                     "remote stage execution descriptor is unreadable"
                 ) from error
             if (
@@ -1508,7 +1520,7 @@ verify_bundle "$destination"
                 or execution.get("task_spec_sha256")
                 != descriptor["spec_sha256"]
             ):
-                raise ExecutionError(
+                raise PermanentExecutionError(
                     "remote execution state does not belong to the requested task"
                 )
 
@@ -1532,7 +1544,10 @@ verify_bundle "$destination"
             (temporary / "output").replace(local / "output")
             (temporary / "result.json").replace(local / "result.json")
             (temporary / "execution.json").replace(local / "execution.json")
-            load_stage_result(local)
+            try:
+                load_stage_result(local)
+            except ExecutionError as error:
+                raise PermanentExecutionError(str(error)) from error
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
         return local
@@ -1602,9 +1617,8 @@ def _local_execution_status(path: Path) -> ExecutionStatus | None:
     if state == "COMPLETED":
         return ExecutionStatus("completed")
     if state == "FAILED":
-        return ExecutionStatus(
-            "failed", str(value.get("error", "worker failed"))
-        )
+        detail = str(value.get("error", "worker failed"))
+        return ExecutionStatus("failed", detail, _failure_kind(detail))
     if state == "RUNNING":
         return None
     return ExecutionStatus(
@@ -1809,7 +1823,8 @@ fi
         if value.get("state") == "COMPLETED":
             return ExecutionStatus("completed")
         if value.get("state") == "FAILED":
-            return ExecutionStatus("failed", str(value.get("error", "worker failed")))
+            detail = str(value.get("error", "worker failed"))
+            return ExecutionStatus("failed", detail, _failure_kind(detail))
         if value.get("state") == "RUNNING":
             return ExecutionStatus("running")
         return ExecutionStatus(
@@ -2037,7 +2052,7 @@ cat "$bundle/execution.json"
             raise SubmissionDeferred(str(error)) from error
         except SlurmSubmissionError as error:
             if not error.accepted:
-                raise ExecutionError(str(error)) from error
+                raise PermanentExecutionError(str(error)) from error
             recovered = self._find_job(name, bundle)
             if recovered is None:
                 raise ExecutionError(
@@ -2059,11 +2074,6 @@ cat "$bundle/execution.json"
         worker_status = self._worker_status(bundle)
         if worker_status is not None and worker_status.state == "completed":
             return worker_status
-        if (
-            worker_status is not None
-            and worker_status.failure_kind == "out_of_memory"
-        ):
-            return worker_status
         observation = query_job(
             lambda command: self.transport.run(
                 [bundle, *command] if self.target.host else command,
@@ -2080,6 +2090,17 @@ cat "$bundle/execution.json"
         exit_code = observation.exit_code
         if state in _ACTIVE:
             return ExecutionStatus("running", state)
+        if worker_status is not None and worker_status.state == "failed":
+            scheduler_detail = f"Slurm {state} exit={exit_code}"
+            detail = worker_status.detail
+            if scheduler_detail not in detail:
+                detail = f"{detail}; {scheduler_detail}"
+            return ExecutionStatus(
+                "failed",
+                detail,
+                worker_status.failure_kind
+                or ("out_of_memory" if state == "OUT_OF_MEMORY" else None),
+            )
         if state in _TERMINAL_SUCCESS and exit_code.startswith("0:0"):
             return ExecutionStatus("completed", state)
         if state in _TERMINAL_FAILURE or state in _TERMINAL_SUCCESS:
@@ -2184,6 +2205,7 @@ def executor_for(
 __all__ = [
     "ExecutionError",
     "ExecutionHandle",
+    "PermanentExecutionError",
     "ExecutionStatus",
     "ExecutionTarget",
     "ExecutionTransport",

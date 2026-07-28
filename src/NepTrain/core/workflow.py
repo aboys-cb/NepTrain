@@ -1177,9 +1177,8 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             elif (
                 task_record.get("terminal_failure")
                 and not task_record.get("retryable", True)
-                and task_record.get("failure_kind") == "out_of_memory"
             ):
-                execution_state = "SKIPPED_OOM"
+                execution_state = "SKIPPED"
             elif item.get("cancelled_at"):
                 execution_state = "CANCELLED"
             elif item.get("completed_at"):
@@ -1226,9 +1225,8 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             elif (
                 task_record.get("terminal_failure")
                 and not task_record.get("retryable", True)
-                and task_record.get("failure_kind") == "out_of_memory"
             ):
-                observed = "SKIPPED_OOM"
+                observed = "SKIPPED"
             elif task_record.get("terminal_failure"):
                 observed = "FAILED"
             else:

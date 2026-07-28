@@ -41,6 +41,7 @@ from NepTrain.core.execution import (
     ExecutionStatus,
     ExecutionTarget,
     ExecutionTransport,
+    PermanentExecutionError,
     ProcessExecutor,
     SlurmExecutor,
     StageTask,
@@ -1454,7 +1455,443 @@ def test_label_oom_is_not_retried_and_does_not_stop_sibling_tasks(tmp_path):
     failures = json.loads(failure_file.read_text(encoding="utf-8"))
     assert failures["failures"][0]["failure_kind"] == "out_of_memory"
     status = workflow_status(preparation.output_dir)
-    assert any(job["state"] == "SKIPPED_OOM" for job in status.jobs)
+    assert any(job["state"] == "SKIPPED" for job in status.jobs)
+
+
+def test_failed_labels_are_skipped_without_blocking_successful_siblings(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    text = config.read_text(encoding="utf-8").replace(
+        "labeling:\n  backend: toy\n",
+        (
+            "labeling:\n"
+            "  backend: vasp\n"
+            "  input_path: ./INCAR\n"
+            "  resource_path: ./potpaw\n"
+            "  potcar_manifest_path: ./vasp-resources.json\n"
+            "  structures_per_job: 1\n"
+            "  max_concurrent: 2\n"
+        ),
+    )
+    config.write_text(text, encoding="utf-8")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class PartiallyFailingExecutor(ImmediateExecutor):
+        def launch(self, task):
+            descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+            batch_index = descriptor.get("stage_input", {}).get("batch_index")
+            if task.stage == "label" and batch_index in {1, 2}:
+                self.launches.append((task.stage, task.target))
+                return ExecutionHandle(
+                    task.task_id,
+                    task.target,
+                    "slurm",
+                    f"failed-label-{batch_index}",
+                    str(task.bundle),
+                )
+            return super().launch(task)
+
+        def inspect(self, handle):
+            if handle.execution_id == "failed-label-1":
+                return ExecutionStatus(
+                    "failed",
+                    "VASP electronic SCF did not converge",
+                    "non_convergence",
+                )
+            if handle.execution_id == "failed-label-2":
+                return ExecutionStatus(
+                    "failed",
+                    "MPI process exited after segmentation fault",
+                )
+            return super().inspect(handle)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: PartiallyFailingExecutor(
+            target, launches
+        ),
+    )
+
+    for _ in range(40):
+        tick = controller.tick()
+        if tick.state == "complete":
+            break
+    else:
+        raise AssertionError(
+            "controller did not finish after partial label failures"
+        )
+
+    state = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    label = next(item for item in state["history"] if item["stage"] == "label")
+    assert [item.get("retryable", True) for item in label["tasks"]] == [
+        False,
+        False,
+        True,
+    ]
+    assert [item["failure_kind"] for item in label["tasks"][:2]] == [
+        "non_convergence",
+        "execution_failure",
+    ]
+    assert [stage for stage, _ in launches].count("label") == 3
+    assert label["metrics"]["requested_count"] == 3
+    assert label["metrics"]["labeled_count"] == 1
+    assert label["metrics"]["failed_batch_count"] == 2
+    assert label["metrics"]["failed_frame_indices"] == [0, 1]
+    failure_file = (
+        preparation.output_dir
+        / "generations/0001/label/label-failures.json"
+    )
+    failures = json.loads(failure_file.read_text(encoding="utf-8"))
+    assert [
+        item["failure_kind"] for item in failures["failures"]
+    ] == ["non_convergence", "execution_failure"]
+    status = workflow_status(preparation.output_dir)
+    assert [job["state"] for job in status.jobs].count("SKIPPED") == 2
+
+
+def test_controller_stalls_when_every_label_fails(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    text = config.read_text(encoding="utf-8").replace(
+        "labeling:\n  backend: toy\n",
+        (
+            "labeling:\n"
+            "  backend: vasp\n"
+            "  input_path: ./INCAR\n"
+            "  resource_path: ./potpaw\n"
+            "  potcar_manifest_path: ./vasp-resources.json\n"
+            "  structures_per_job: 1\n"
+            "  max_concurrent: 2\n"
+        ),
+    )
+    config.write_text(text, encoding="utf-8")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class AllLabelsFailExecutor(ImmediateExecutor):
+        def launch(self, task):
+            if task.stage == "label":
+                descriptor = json.loads(
+                    task.descriptor.read_text(encoding="utf-8")
+                )
+                batch_index = descriptor["stage_input"]["batch_index"]
+                self.launches.append((task.stage, task.target))
+                return ExecutionHandle(
+                    task.task_id,
+                    task.target,
+                    "slurm",
+                    f"failed-label-{batch_index}",
+                    str(task.bundle),
+                )
+            return super().launch(task)
+
+        def inspect(self, handle):
+            if handle.execution_id.startswith("failed-label-"):
+                return ExecutionStatus("cancelled", "scheduler cancelled job")
+            return super().inspect(handle)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: AllLabelsFailExecutor(
+            target, launches
+        ),
+    )
+
+    for _ in range(40):
+        tick = controller.tick()
+        if tick.state == "stalled":
+            break
+    else:
+        raise AssertionError("controller did not stall after all labels failed")
+
+    assert tick.detail == (
+        "all 3 label tasks failed, were cancelled, or returned invalid "
+        "labels; failure evidence was preserved"
+    )
+    assert [stage for stage, _ in launches].count("label") == 3
+    current = controller.state["current"]
+    assert current["stage"] == "label"
+    assert all(item["terminal_failure"] for item in current["tasks"])
+    assert all(not item["retryable"] for item in current["tasks"])
+    assert all(
+        item["failure_kind"] == "cancelled" for item in current["tasks"]
+    )
+    assert not (
+        preparation.output_dir
+        / "generations/0001/label/selected-labels.xyz"
+    ).exists()
+    with pytest.raises(
+        ControllerError, match="has no failed or unfinished tasks to retry"
+    ):
+        controller.retry()
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "stalled"
+    assert [job["state"] for job in status.jobs].count("SKIPPED") == 3
+
+
+def test_invalid_collected_label_is_skipped_without_blocking_siblings(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "labeling:\n  backend: toy\n",
+            (
+                "labeling:\n"
+                "  backend: vasp\n"
+                "  input_path: ./INCAR\n"
+                "  resource_path: ./potpaw\n"
+                "  potcar_manifest_path: ./vasp-resources.json\n"
+                "  structures_per_job: 1\n"
+                "  max_concurrent: 2\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class OneInvalidCollection(ImmediateExecutor):
+        def launch(self, task):
+            handle = super().launch(task)
+            descriptor = json.loads(
+                task.descriptor.read_text(encoding="utf-8")
+            )
+            if (
+                task.stage == "label"
+                and descriptor["stage_input"]["batch_index"] == 1
+            ):
+                return ExecutionHandle(
+                    handle.task_id,
+                    handle.target,
+                    handle.executor,
+                    "invalid-label-result",
+                    handle.local_bundle,
+                )
+            return handle
+
+        def collect(self, handle):
+            if handle.execution_id == "invalid-label-result":
+                raise PermanentExecutionError(
+                    "remote label result failed hash validation"
+                )
+            return super().collect(handle)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: OneInvalidCollection(
+            target, launches
+        ),
+    )
+
+    for _ in range(40):
+        tick = controller.tick()
+        if tick.state == "complete":
+            break
+    else:
+        raise AssertionError(
+            "controller did not finish after one invalid label result"
+        )
+
+    label = next(
+        item
+        for item in controller.state["history"]
+        if item["stage"] == "label"
+    )
+    assert label["metrics"]["labeled_count"] == 2
+    assert label["metrics"]["failed_frame_indices"] == [0]
+    assert label["tasks"][0]["failure_kind"] == "result_validation_failure"
+    assert label["tasks"][0]["retryable"] is False
+
+
+def test_label_submission_rejection_fails_before_submitting_siblings(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "labeling:\n  backend: toy\n",
+            (
+                "labeling:\n"
+                "  backend: vasp\n"
+                "  input_path: ./INCAR\n"
+                "  resource_path: ./potpaw\n"
+                "  potcar_manifest_path: ./vasp-resources.json\n"
+                "  structures_per_job: 1\n"
+                "  max_concurrent: 2\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class RejectedLabelSubmission(ImmediateExecutor):
+        def launch(self, task):
+            if task.stage == "label":
+                raise PermanentExecutionError(
+                    "Slurm rejected the labeling target"
+                )
+            return super().launch(task)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: RejectedLabelSubmission(
+            target, launches
+        ),
+    )
+
+    for _ in range(20):
+        tick = controller.tick()
+        if tick.state == "failed":
+            break
+    else:
+        raise AssertionError("label submission rejection was not terminal")
+
+    tasks = controller.state["current"]["tasks"]
+    assert tasks[0]["failure_kind"] == "submission_failure"
+    assert tasks[0]["retryable"] is True
+    assert all(item["handle"] is None for item in tasks[1:])
+
+
+def test_permanent_single_stage_collection_error_is_terminal(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class InvalidTrainingCollection(ImmediateExecutor):
+        def collect(self, _handle):
+            raise PermanentExecutionError(
+                "remote training result failed validation"
+            )
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: InvalidTrainingCollection(
+            target, launches
+        ),
+    )
+
+    assert controller.tick().state == "running"
+    failed = controller.tick()
+
+    assert failed.state == "failed"
+    assert failed.stage == "train"
+    assert controller.state["current"]["terminal_failure"] is True
+    assert (
+        controller.state["current"]["failure_kind"]
+        == "result_validation_failure"
+    )
+
+
+def test_controller_stalls_when_md_wave_has_no_safe_candidate_frames(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class EmptyExploreExecutor(ImmediateExecutor):
+        def launch(self, task):
+            handle = super().launch(task)
+            if task.stage == "explore":
+                result_path = task.bundle / "result.json"
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                result["artifacts"].pop("candidates")
+                result["metrics"]["candidate_count"] = 0
+                result_path.write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+            return handle
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: EmptyExploreExecutor(
+            target, launches
+        ),
+    )
+
+    for _ in range(10):
+        tick = controller.tick()
+        if tick.state == "stalled":
+            break
+    else:
+        raise AssertionError("empty MD wave did not enter stalled")
+
+    assert tick.detail.startswith(
+        "MD exploration produced no safe candidate frames"
+    )
+    assert controller.state["current"]["stage"] == "explore"
+    assert all(
+        item.get("collected_bundle")
+        for item in controller.state["current"]["tasks"]
+    )
+
+
+def test_group_merge_failure_can_retry_collected_results(
+    tmp_path,
+    monkeypatch,
+):
+    from NepTrain.core.workflow_iteration import (
+        WorkflowIterationAdapter,
+        WorkflowIterationError,
+    )
+
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    original_merge = WorkflowIterationAdapter.merge_explore_outcomes
+    failures = {"remaining": 1}
+
+    def fail_once(self, context, outcomes):
+        if failures["remaining"]:
+            failures["remaining"] -= 1
+            raise WorkflowIterationError("temporary merge failure")
+        return original_merge(self, context, outcomes)
+
+    monkeypatch.setattr(
+        WorkflowIterationAdapter,
+        "merge_explore_outcomes",
+        fail_once,
+    )
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(
+            target, launches
+        ),
+    )
+
+    for _ in range(10):
+        tick = controller.tick()
+        if tick.state == "failed":
+            break
+    else:
+        raise AssertionError("injected group merge failure was not observed")
+
+    assert all(
+        item.get("collected_bundle")
+        for item in controller.state["current"]["tasks"]
+    )
+    controller.retry()
+    assert controller.state["state"] == "launching"
+    assert controller.state["current"]["merge_retry_count"] == 1
+
+    controller.tick()
+    assert any(
+        item["stage"] == "explore"
+        for item in controller.state["history"]
+    )
 
 
 def test_controller_waits_and_reuses_task_after_submission_throttle(tmp_path):
@@ -1964,6 +2401,47 @@ def test_slurm_executor_classifies_out_of_memory_as_non_retryable_kind(tmp_path)
     assert status.detail == "Slurm OUT_OF_MEMORY exit=0:0"
 
 
+def test_execution_failure_kind_classifies_scf_nonconvergence():
+    assert (
+        execution_module._failure_kind(
+            "VASP electronic SCF did not converge in /tmp/calculation"
+        )
+        == "non_convergence"
+    )
+
+
+def test_slurm_executor_preserves_worker_failure_detail(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    (bundle / "execution.json").write_text(
+        json.dumps(
+            {
+                "state": "FAILED",
+                "error": (
+                    "VASP electronic SCF did not converge in calculation"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = SlurmRunner()
+    runner.state = "FAILED"
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="gpu"),
+        runner=runner,
+    )
+    handle = ExecutionHandle("abc", "slurm", "slurm", "123", str(bundle))
+
+    status = executor.inspect(handle)
+
+    assert status.state == "failed"
+    assert status.failure_kind == "non_convergence"
+    assert status.detail == (
+        "VASP electronic SCF did not converge in calculation; "
+        "Slurm FAILED exit=0:0"
+    )
+
+
 def test_slurm_submission_limit_is_deferred_instead_of_failed(tmp_path):
     bundle = tmp_path / "task"
     bundle.mkdir()
@@ -1988,6 +2466,35 @@ def test_slurm_submission_limit_is_deferred_instead_of_failed(tmp_path):
     )
 
     with pytest.raises(SubmissionDeferred, match="QOSMaxSubmitJobPerUserLimit"):
+        executor.launch(task)
+
+
+def test_slurm_permanent_submission_rejection_is_terminal(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    task = StageTask("abc", "demo", 1, "train", "slurm", bundle)
+
+    class RejectedRunner(SlurmRunner):
+        def __call__(self, args, **kwargs):
+            args = list(args)
+            if args[0] == "sbatch":
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    "",
+                    "sbatch: error: invalid partition specified",
+                )
+            return super().__call__(args, **kwargs)
+
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="missing"),
+        runner=RejectedRunner(),
+    )
+
+    with pytest.raises(
+        PermanentExecutionError,
+        match="invalid partition specified",
+    ):
         executor.launch(task)
 
 
@@ -2253,7 +2760,7 @@ def test_stop_workflow_preserves_current_until_cancellation_is_terminal(
     assert stop_event["current_execution"]["action"] == "cancelling"
 
 
-def test_group_stop_preserves_completed_shards_and_rebuilds_only_cancelled_shard(
+def test_group_stop_preserves_completed_labels_and_skips_cancelled_shard(
     tmp_path,
 ):
     config, initial = _controller_inputs(tmp_path)
@@ -2343,13 +2850,23 @@ def test_group_stop_preserves_completed_shards_and_rebuilds_only_cancelled_shard
     )
     resumed.resume_stopped()
     current = resumed.state["current"]
-    assert current["attempt"] == 2
-    assert [item["task_id"] for item in current["tasks"][:2]] == original_ids[:2]
-    assert current["tasks"][2]["task_id"] != original_ids[2]
-    assert current["tasks"][2]["handle"] is None
+    assert current["attempt"] == 1
+    assert [item["task_id"] for item in current["tasks"]] == original_ids
     assert all(
         item.get("collected_bundle") for item in current["tasks"][:2]
     )
+    assert current["tasks"][2]["terminal_failure"] is True
+    assert current["tasks"][2]["retryable"] is False
+    assert current["tasks"][2]["failure_kind"] == "cancelled"
+
+    resumed.tick()
+    label = next(
+        item
+        for item in resumed.state["history"]
+        if item["stage"] == "label"
+    )
+    assert label["metrics"]["labeled_count"] == 2
+    assert label["metrics"]["failed_frame_indices"] == [2]
 
 
 class FailingExecutor:
@@ -2440,6 +2957,67 @@ def test_controller_turns_persistently_unknown_execution_into_retryable_failure(
     assert "recovery grace period" in failed.detail
     controller.retry()
     assert controller.state["current"] is None
+
+
+def test_controller_escalates_repeated_transport_errors(tmp_path, monkeypatch):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    task_id = "preserved-task"
+
+    def fail_transport(controller):
+        if controller.state.get("current") is None:
+            controller.state["current"] = {
+                "task_id": task_id,
+                "generation": 1,
+                "stage": "train",
+                "resource": "training",
+                "target": "gpu",
+                "attempt": 1,
+                "bundle": str(
+                    preparation.output_dir / ".neptrain/jobs/preserved-task"
+                ),
+                "handle": {
+                    "task_id": task_id,
+                    "target": "gpu",
+                    "executor": "slurm",
+                    "execution_id": "701234",
+                    "local_bundle": str(
+                        preparation.output_dir
+                        / ".neptrain/jobs/preserved-task"
+                    ),
+                },
+            }
+            controller._save()
+            return ControllerTick("running")
+        raise ExecutionError("SSH transport is unavailable")
+
+    monkeypatch.setattr(PersistentController, "tick", fail_transport)
+
+    assert (
+        run_controller(preparation.output_dir, poll_interval=0.2)
+        == 2
+    )
+    state = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert state["state"] == "failed"
+    assert state["transport_failures"] == 3
+    assert state["reason"] == (
+        "execution transport failed 3 consecutive times: "
+        "SSH transport is unavailable"
+    )
+    assert state["current"]["task_id"] == task_id
+    assert state["preserve_current_on_retry"] is True
+
+    monkeypatch.undo()
+    controller = PersistentController(preparation.output_dir)
+    controller.retry()
+    assert controller.state["state"] == "launching"
+    assert controller.state["current"]["task_id"] == task_id
+    assert (
+        controller.state["current"]["handle"]["execution_id"]
+        == "701234"
+    )
 
 
 def test_detached_controller_completes_a_real_multi_process_workflow(tmp_path):

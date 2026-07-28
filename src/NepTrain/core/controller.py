@@ -31,6 +31,7 @@ from .execution import (
     ExecutionError,
     ExecutionHandle,
     ExecutionTarget,
+    PermanentExecutionError,
     StageExecutor,
     SubmissionDeferred,
     build_stage_task,
@@ -55,6 +56,7 @@ _RESOURCE_FOR_STAGE = {
     "evaluate": "analysis",
 }
 _EXECUTION_UNKNOWN_GRACE_SECONDS = 300.0
+_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3
 
 
 def _now() -> str:
@@ -486,6 +488,19 @@ class PersistentController:
             >= _EXECUTION_UNKNOWN_GRACE_SECONDS
         )
 
+    @staticmethod
+    def _mark_group_task_failure(
+        item: dict[str, Any],
+        *,
+        stage: str,
+        detail: str,
+        failure_kind: str,
+    ) -> None:
+        item["terminal_failure"] = True
+        item["failure_kind"] = failure_kind
+        item["retryable"] = stage != "label"
+        item["failure"] = detail
+
     def _tick_task_group(self, current: dict[str, Any]) -> ControllerTick:
         from .execution import StageTask
 
@@ -530,6 +545,17 @@ class PersistentController:
                     self.state["last_submission_error"] = str(error)
                     self._save()
                     continue
+                except PermanentExecutionError as error:
+                    self._mark_group_task_failure(
+                        item,
+                        stage=stage,
+                        detail=str(error),
+                        failure_kind="submission_failure",
+                    )
+                    item["retryable"] = True
+                    group_failed = True
+                    self._save()
+                    continue
                 item["handle"] = asdict(handle)
                 item["submitted_at"] = _now()
                 self.state.pop("last_submission_error", None)
@@ -547,14 +573,26 @@ class PersistentController:
             item["detail"] = status.detail
             lost = self._unknown_became_lost(item, status.state)
             if status.state in {"failed", "cancelled"} or lost:
-                item["terminal_failure"] = True
-                item["failure_kind"] = status.failure_kind
-                non_retryable_oom = (
-                    stage == "label"
-                    and status.failure_kind == "out_of_memory"
+                failure_kind = status.failure_kind
+                if failure_kind is None:
+                    failure_kind = (
+                        "cancelled"
+                        if status.state == "cancelled"
+                        else "execution_failure"
+                    )
+                self._mark_group_task_failure(
+                    item,
+                    stage=stage,
+                    detail=(
+                        "execution remained unknown beyond the recovery grace "
+                        f"period: {status.detail}"
+                        if lost
+                        else status.detail
+                    )
+                    or f"{stage} task {item['task_id']} failed",
+                    failure_kind=failure_kind,
                 )
-                item["retryable"] = not non_retryable_oom
-                if not non_retryable_oom:
+                if stage != "label":
                     group_failed = True
                 else:
                     collect_failure = getattr(executor, "collect_failure", None)
@@ -565,15 +603,6 @@ class PersistentController:
                             )
                         except ExecutionError as error:
                             item["failure_collection_error"] = str(error)
-                item["failure"] = (
-                    (
-                        "execution remained unknown beyond the recovery grace "
-                        f"period: {status.detail}"
-                        if lost
-                        else status.detail
-                    )
-                    or f"{stage} task {item['task_id']} failed"
-                )
                 self._save()
                 continue
             if status.state in {"running", "unknown"}:
@@ -582,7 +611,28 @@ class PersistentController:
                 else:
                     running += 1
                 continue
-            collected = executor.collect(handle)
+            try:
+                collected = executor.collect(handle)
+            except PermanentExecutionError as error:
+                self._mark_group_task_failure(
+                    item,
+                    stage=stage,
+                    detail=str(error),
+                    failure_kind="result_validation_failure",
+                )
+                if stage != "label":
+                    group_failed = True
+                elif hasattr(executor, "collect_failure"):
+                    try:
+                        item["failure_bundle"] = str(
+                            executor.collect_failure(handle)
+                        )
+                    except ExecutionError as collection_error:
+                        item["failure_collection_error"] = str(
+                            collection_error
+                        )
+                self._save()
+                continue
             item["collected_bundle"] = str(collected)
             self._publish_calculation_link(
                 generation=int(current["generation"]),
@@ -600,7 +650,7 @@ class PersistentController:
             if item.get("terminal_failure")
             and item.get("retryable", True)
         ]
-        non_retryable_failures = [
+        skipped_failures = [
             item
             for item in current["tasks"]
             if item.get("terminal_failure")
@@ -656,14 +706,56 @@ class PersistentController:
             if item.generation == int(current["generation"])
         )
         _, context = self.generation_controller.stage_context(plan, stage)
-        successful_items = [
+        collected_items = [
             item for item in current["tasks"] if item.get("collected_bundle")
         ]
+        outcomes: list[StageOutcome] = []
+        successful_items = []
+        invalid_results = []
+        for item in collected_items:
+            try:
+                _, outcome = load_stage_result(item["collected_bundle"])
+            except ExecutionError as error:
+                invalid_bundle = item.pop("collected_bundle")
+                item.pop("completed_at", None)
+                item["invalid_bundle"] = invalid_bundle
+                self._mark_group_task_failure(
+                    item,
+                    stage=stage,
+                    detail=str(error),
+                    failure_kind="result_validation_failure",
+                )
+                invalid_results.append(item)
+                continue
+            outcomes.append(outcome)
+            successful_items.append(item)
+        if invalid_results:
+            self._save()
+            if stage != "label":
+                self.state["state"] = "failed"
+                self.state["reason"] = (
+                    f"{len(invalid_results)} collected {stage} task results "
+                    "failed validation"
+                )
+                self._save()
+                return ControllerTick(
+                    "failed",
+                    int(current["generation"]),
+                    stage,
+                    detail=self.state["reason"],
+                )
+            skipped_failures = [
+                item
+                for item in current["tasks"]
+                if item.get("terminal_failure")
+                and not item.get("retryable", True)
+            ]
         if not successful_items:
             self.state["state"] = "stalled"
             self.state["reason"] = (
-                f"all {len(non_retryable_failures)} label tasks ended in "
-                "non-retryable OOM; failure evidence was preserved"
+                f"all {len(skipped_failures)} label tasks failed, were "
+                "cancelled, or returned invalid labels; failure evidence "
+                "was preserved"
             )
             self._save()
             return ControllerTick(
@@ -672,47 +764,82 @@ class PersistentController:
                 stage,
                 detail=self.state["reason"],
             )
-        outcomes: list[StageOutcome] = []
-        for item in successful_items:
-            _, outcome = load_stage_result(item["collected_bundle"])
-            outcomes.append(outcome)
-        from .workflow_iteration import WorkflowIterationAdapter
+        from .workflow_iteration import (
+            WorkflowIterationAdapter,
+            WorkflowIterationError,
+        )
 
         adapter = WorkflowIterationAdapter(
             self.config,
             initial_training=self.initial_training,
             base_dir=self.workspace.root,
         )
-        if stage == "explore":
-            merged = adapter.merge_explore_outcomes(context, outcomes)
-        elif stage == "label":
-            merged = adapter.merge_label_outcomes(
-                context,
-                outcomes,
-                successful_frame_indices=[
-                    int(index)
-                    for item in successful_items
-                    for index in item["frame_indices"]
-                ],
-                failures=[
-                    {
-                        "task_id": str(item["task_id"]),
-                        "batch_index": int(item["batch_index"]),
-                        "frame_indices": list(item["frame_indices"]),
-                        "failure_kind": str(
-                            item.get("failure_kind", "unknown")
-                        ),
-                        "detail": str(item.get("failure", "")),
-                        "failure_bundle": item.get("failure_bundle"),
-                        "failure_collection_error": item.get(
-                            "failure_collection_error"
-                        ),
-                    }
-                    for item in non_retryable_failures
-                ],
+        try:
+            if stage == "explore":
+                merged = adapter.merge_explore_outcomes(context, outcomes)
+            elif stage == "label":
+                merged = adapter.merge_label_outcomes(
+                    context,
+                    outcomes,
+                    successful_frame_indices=[
+                        int(index)
+                        for item in successful_items
+                        for index in item["frame_indices"]
+                    ],
+                    failures=[
+                        {
+                            "task_id": str(item["task_id"]),
+                            "batch_index": int(item["batch_index"]),
+                            "frame_indices": list(item["frame_indices"]),
+                            "failure_kind": str(
+                                item.get("failure_kind", "unknown")
+                            ),
+                            "detail": str(item.get("failure", "")),
+                            "failure_bundle": item.get("failure_bundle")
+                            or item.get("invalid_bundle"),
+                            "failure_collection_error": item.get(
+                                "failure_collection_error"
+                            ),
+                        }
+                        for item in skipped_failures
+                    ],
+                )
+            else:
+                raise ControllerError(f"unsupported grouped stage: {stage}")
+        except WorkflowIterationError as error:
+            current["merge_failure"] = str(error)
+            if stage == "explore" and str(error).startswith(
+                "MD exploration produced no safe candidate frames"
+            ):
+                self.state["state"] = "stalled"
+                self.state["reason"] = str(error)
+            elif stage == "label":
+                for item in successful_items:
+                    item["invalid_bundle"] = item.pop("collected_bundle")
+                    item.pop("completed_at", None)
+                    self._mark_group_task_failure(
+                        item,
+                        stage=stage,
+                        detail=str(error),
+                        failure_kind="label_validation_failure",
+                    )
+                self.state["state"] = "stalled"
+                self.state["reason"] = (
+                    f"label batch results could not be validated: {error}; "
+                    "failure evidence was preserved"
+                )
+            else:
+                self.state["state"] = "failed"
+                self.state["reason"] = (
+                    f"{stage} results could not be merged: {error}"
+                )
+            self._save()
+            return ControllerTick(
+                str(self.state["state"]),
+                int(current["generation"]),
+                stage,
+                detail=self.state["reason"],
             )
-        else:
-            raise ControllerError(f"unsupported grouped stage: {stage}")
         summary = self._install_outcome(
             plan=plan,
             stage=stage,
@@ -733,7 +860,7 @@ class PersistentController:
             stage,
             detail=(
                 f"merged {len(outcomes)} {stage} tasks; "
-                f"{len(non_retryable_failures)} non-retryable failures"
+                f"{len(skipped_failures)} failed tasks skipped"
             ),
         )
 
@@ -778,6 +905,20 @@ class PersistentController:
                         task.stage,
                         task.target,
                         detail=self.state["reason"],
+                    )
+                except PermanentExecutionError as error:
+                    current["terminal_failure"] = True
+                    current["failure_kind"] = "submission_failure"
+                    current["failure"] = str(error)
+                    self.state["state"] = "failed"
+                    self.state["reason"] = str(error)
+                    self._save()
+                    return ControllerTick(
+                        "failed",
+                        task.generation,
+                        task.stage,
+                        task.target,
+                        detail=str(error),
                     )
                 current["handle"] = asdict(handle)
                 current["submitted_at"] = _now()
@@ -835,7 +976,23 @@ class PersistentController:
                     handle.execution_id,
                     self.state["reason"],
                 )
-            collected = executor.collect(handle)
+            try:
+                collected = executor.collect(handle)
+            except PermanentExecutionError as error:
+                current["terminal_failure"] = True
+                current["failure_kind"] = "result_validation_failure"
+                current["failure"] = str(error)
+                self.state["state"] = "failed"
+                self.state["reason"] = str(error)
+                self._save()
+                return ControllerTick(
+                    "failed",
+                    int(current["generation"]),
+                    str(current["stage"]),
+                    str(current["target"]),
+                    handle.execution_id,
+                    str(error),
+                )
             plan = next(
                 item for item in self.plans if item.generation == int(current["generation"])
             )
@@ -1046,6 +1203,13 @@ class PersistentController:
         state = str(self.state.get("state", "idle"))
         if state == "complete":
             raise ControllerError("workflow is already complete")
+        if state == "failed" and self.state.pop(
+            "preserve_current_on_retry", False
+        ):
+            self.state["state"] = "launching"
+            self.state.pop("reason", None)
+            self._save()
+            return
         if state == "rejected":
             if not recover_rejected:
                 raise ControllerError("workflow is rejected; explicit recovery is required")
@@ -1140,6 +1304,17 @@ class PersistentController:
                     item.pop("cancellation_requested_at", None)
                     retried += 1
                 if not retried:
+                    if any(
+                        item.get("collected_bundle")
+                        for item in current["tasks"]
+                    ):
+                        current["merge_retry_count"] = int(
+                            current.get("merge_retry_count", 0)
+                        ) + 1
+                        self.state["state"] = "launching"
+                        self.state.pop("reason", None)
+                        self._save()
+                        return
                     raise ControllerError(
                         f"{current['stage']} task group has no failed or "
                         "unfinished tasks to retry"
@@ -1171,6 +1346,7 @@ class PersistentController:
             self._save()
             return
         if current.get("kind") == "task_group":
+            stage = str(current["stage"])
             cancellation_seen = False
             for item in current["tasks"]:
                 if item.get("collected_bundle"):
@@ -1181,8 +1357,12 @@ class PersistentController:
                 cancellation_seen = True
                 handle_value = item.get("handle")
                 if handle_value is None:
-                    item["terminal_failure"] = True
-                    item["failure"] = "task was stopped before launch"
+                    self._mark_group_task_failure(
+                        item,
+                        stage=stage,
+                        detail="task was stopped before launch",
+                        failure_kind="cancelled",
+                    )
                     continue
                 executor = self.executor_factory(
                     self.targets[str(item["target"])]
@@ -1193,7 +1373,16 @@ class PersistentController:
                 item["observed_at"] = _now()
                 item["detail"] = status.detail
                 if status.state == "completed":
-                    collected = executor.collect(handle)
+                    try:
+                        collected = executor.collect(handle)
+                    except PermanentExecutionError as error:
+                        self._mark_group_task_failure(
+                            item,
+                            stage=stage,
+                            detail=str(error),
+                            failure_kind="result_validation_failure",
+                        )
+                        continue
                     item["collected_bundle"] = str(collected)
                     item["completed_at"] = _now()
                     self._publish_calculation_link(
@@ -1204,9 +1393,14 @@ class PersistentController:
                         link_name_override=item.get("display_name"),
                     )
                 elif status.state in {"failed", "cancelled"}:
-                    item["terminal_failure"] = True
-                    item["failure"] = (
-                        status.detail or "cancelled execution is terminal"
+                    self._mark_group_task_failure(
+                        item,
+                        stage=stage,
+                        detail=(
+                            status.detail
+                            or "cancelled execution is terminal"
+                        ),
+                        failure_kind=status.failure_kind or "cancelled",
                     )
                 else:
                     self._save()
@@ -1217,6 +1411,11 @@ class PersistentController:
             if cancellation_seen and any(
                 item.get("terminal_failure") for item in current["tasks"]
             ):
+                if stage == "label":
+                    self.state["state"] = "launching"
+                    self.state.pop("reason", None)
+                    self._save()
+                    return
                 self.state["state"] = "failed"
                 self.state["reason"] = (
                     "stopped task group is terminal; retrying only unfinished "
@@ -1329,9 +1528,24 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         )
                         controller.state["transport_failures"] = failures
                         controller.state["last_transport_error"] = str(error)
-                        controller.state["state"] = "degraded"
+                        if failures >= _MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+                            controller.state["state"] = "failed"
+                            controller.state[
+                                "preserve_current_on_retry"
+                            ] = True
+                            controller.state["reason"] = (
+                                "execution transport failed "
+                                f"{failures} consecutive times: {error}"
+                            )
+                        else:
+                            controller.state["state"] = "degraded"
                         controller._save()
-                        tick = ControllerTick("degraded", detail=str(error))
+                        tick = ControllerTick(
+                            str(controller.state["state"]),
+                            detail=str(
+                                controller.state.get("reason", error)
+                            ),
+                        )
                     if tick.state in {
                         "complete",
                         "rejected",

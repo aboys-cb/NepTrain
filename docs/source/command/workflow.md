@@ -166,8 +166,10 @@ labeling:
 `structures_per_job` 决定每个 VASP/ABACUS 调度任务包含多少个 FPS 选中结构；
 `max_concurrent` 限制 workflow 同时运行的标注任务数。默认值分别为 `1` 和
 `20`。例如 FPS 选中 100 个结构时，默认生成 100 个单结构任务，最多同时运行
-20 个。Controller 保留已完成结构，只重试失败或尚未提交的结构，最后按原始
-FPS 顺序校验并合并为 `selected-labels.xyz`。
+20 个。Controller 只合并正常完成并通过标签校验的结构。任何失败或取消的标注任务
+都会保存诊断后跳过，不再重试，也不会阻塞其余任务；最终结果仍按原始 FPS 顺序写入
+`selected-labels.xyz`。如果本轮没有任何标注通过，workflow 会进入 `stalled`，
+不会用空数据继续训练。
 
 VASP 的 `potcar_manifest_path` 和 ABACUS 的 `resource_manifest_path` 是
 必填 provenance。它们固定逐元素资源相对路径与 SHA256；VASP 还固定精确
@@ -297,7 +299,8 @@ workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 
 
 - `prepared`：只有不可变输入快照，下一步是 `workflow run`。
 - `running`：Controller lock 存在且当前任务可观察。
-- `degraded`：临时 SSH/scheduler 查询失败，Controller 仍保留原 handle 并重试。
+- `degraded`：临时 SSH/scheduler 查询失败，Controller 保留原 handle 并重试；
+  连续 3 次失败后进入 `failed`，保留 current intent 供 `resume`。
 - `paused`：Controller 已停止或 PID/lock 不在，但远端工作和 current intent 保留。
 - `failed` / `rejected`：执行失败或科学验收失败，可按记录创建新 attempt 恢复。
 - `damaged`：已提交 artifact、ledger 或 publication 不满足 hash/身份契约。
