@@ -31,6 +31,7 @@ from .config import (
 from .execution import (
     ExecutionError,
     ExecutionHandle,
+    ExecutionStatus,
     ExecutionTarget,
     PermanentExecutionError,
     StageExecutor,
@@ -59,6 +60,7 @@ _RESOURCE_FOR_STAGE = {
 _EXECUTION_UNKNOWN_GRACE_SECONDS = 300.0
 _MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3
 _MAX_PARALLEL_OBSERVATIONS = 4
+_MAX_PARALLEL_LAUNCHES = 4
 
 
 def _now() -> str:
@@ -113,12 +115,15 @@ def _controller_command() -> list[str]:
 
 
 def _process_matches(pid: int, project: Path) -> bool:
+    environment = os.environ.copy()
+    environment["COLUMNS"] = "10000"
     try:
         completed = subprocess.run(
             ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             check=False,
+            env=environment,
         )
     except OSError:
         return False
@@ -503,7 +508,12 @@ class PersistentController:
         item["retryable"] = stage != "label"
         item["failure"] = detail
 
-    def _tick_task_group(self, current: dict[str, Any]) -> ControllerTick:
+    def _tick_task_group(
+        self,
+        current: dict[str, Any],
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ControllerTick:
         from .execution import StageTask
 
         stage = str(current["stage"])
@@ -535,26 +545,7 @@ class PersistentController:
             executor = self.executor_factory(target)
             handle = ExecutionHandle.from_mapping(item["handle"])
             status = executor.inspect(handle)
-            collected = None
-            collection_error = None
-            if status.state not in {
-                "failed",
-                "cancelled",
-                "running",
-                "unknown",
-            }:
-                try:
-                    collected = executor.collect(handle)
-                except PermanentExecutionError as error:
-                    collection_error = error
-            return (
-                item,
-                executor,
-                handle,
-                status,
-                collected,
-                collection_error,
-            )
+            return item, executor, handle, status
 
         def apply_observation(observation):
             nonlocal group_failed, running, unknown
@@ -651,14 +642,118 @@ class PersistentController:
                     len(observed_items),
                 )
             ) as pool:
-                for observation in pool.map(observe, observed_items):
-                    apply_observation(observation)
+                observations = list(pool.map(observe, observed_items))
 
-        for item in current["tasks"]:
-            if item.get("handle") is not None:
-                continue
-            if group_failed or submission_deferred or inflight >= maximum:
-                continue
+            completed = [
+                observation
+                for observation in observations
+                if observation[3].state
+                not in {
+                    "failed",
+                    "cancelled",
+                    "running",
+                    "unknown",
+                }
+            ]
+            collections: dict[
+                int,
+                tuple[Path | None, PermanentExecutionError | None],
+            ] = {}
+            grouped: dict[str, list[tuple[Any, ...]]] = {}
+            for observation in completed:
+                grouped.setdefault(
+                    str(observation[0]["target"]),
+                    [],
+                ).append(observation)
+            for target_observations in grouped.values():
+                executor = target_observations[0][1]
+                collect_many = getattr(executor, "collect_many", None)
+                if callable(collect_many):
+                    outputs = collect_many(
+                        [
+                            observation[2]
+                            for observation in target_observations
+                        ]
+                    )
+                    if len(outputs) != len(target_observations):
+                        raise ControllerError(
+                            "batch executor returned the wrong number of "
+                            "collection results"
+                        )
+                    for observation, output in zip(
+                        target_observations,
+                        outputs,
+                        strict=True,
+                    ):
+                        if isinstance(output, Path):
+                            collections[id(observation[0])] = (
+                                output,
+                                None,
+                            )
+                        elif isinstance(
+                            output,
+                            PermanentExecutionError,
+                        ):
+                            collections[id(observation[0])] = (
+                                None,
+                                output,
+                            )
+                        else:
+                            raise ControllerError(
+                                "batch executor returned an invalid "
+                                "collection result"
+                            )
+                    continue
+
+                def collect_one(observation):
+                    try:
+                        return (
+                            observation,
+                            observation[1].collect(observation[2]),
+                            None,
+                        )
+                    except PermanentExecutionError as error:
+                        return observation, None, error
+
+                with ThreadPoolExecutor(
+                    max_workers=min(
+                        _MAX_PARALLEL_OBSERVATIONS,
+                        len(target_observations),
+                    )
+                ) as pool:
+                    for observation, collected, error in pool.map(
+                        collect_one,
+                        target_observations,
+                    ):
+                        collections[id(observation[0])] = (
+                            collected,
+                            error,
+                        )
+
+            for item, executor, handle, status in observations:
+                collected, collection_error = collections.get(
+                    id(item),
+                    (None, None),
+                )
+                apply_observation(
+                    (
+                        item,
+                        executor,
+                        handle,
+                        status,
+                        collected,
+                        collection_error,
+                    )
+                )
+
+        launch_candidates = [
+            item
+            for item in current["tasks"]
+            if item.get("handle") is None
+            and not item.get("terminal_failure")
+        ][: max(0, maximum - inflight)]
+
+        def launch(item):
             target = self.targets[str(item["target"])]
             executor = self.executor_factory(target)
             task = StageTask(
@@ -670,35 +765,117 @@ class PersistentController:
                 Path(item["bundle"]),
             )
             try:
-                handle = executor.launch(task)
+                return item, executor.launch(task), None
             except SubmissionDeferred as error:
-                submission_deferred = True
-                self.state["state"] = "waiting"
-                self.state["reason"] = (
-                    "Slurm submission capacity is temporarily exhausted; "
-                    "the same task will be submitted again"
-                )
-                self.state["last_submission_error"] = str(error)
-                self._save()
-                continue
+                return item, None, error
             except PermanentExecutionError as error:
-                self._mark_group_task_failure(
-                    item,
-                    stage=stage,
-                    detail=str(error),
-                    failure_kind="submission_failure",
-                )
-                item["retryable"] = True
-                group_failed = True
-                self._save()
-                continue
-            item["handle"] = asdict(handle)
-            item["submitted_at"] = _now()
-            self.state.pop("last_submission_error", None)
-            self.state.pop("reason", None)
+                return item, None, error
+            except Exception as error:
+                return item, None, error
+
+        def record_launch_results(results):
+            nonlocal inflight, running, submission_deferred, group_failed
+            transport_error: Exception | None = None
+            for item, handle, error in results:
+                if handle is None and error is None:
+                    continue
+                if error is None:
+                    item["handle"] = asdict(handle)
+                    item["submitted_at"] = _now()
+                    self.state.pop("last_submission_error", None)
+                    self.state.pop("reason", None)
+                    inflight += 1
+                    running += 1
+                elif isinstance(error, SubmissionDeferred):
+                    submission_deferred = True
+                    self.state["state"] = "waiting"
+                    self.state["reason"] = (
+                        "Slurm submission capacity is temporarily exhausted; "
+                        "the same task will be submitted again"
+                    )
+                    self.state["last_submission_error"] = str(error)
+                elif isinstance(error, PermanentExecutionError):
+                    self._mark_group_task_failure(
+                        item,
+                        stage=stage,
+                        detail=str(error),
+                        failure_kind="submission_failure",
+                    )
+                    item["retryable"] = True
+                    group_failed = True
+                elif transport_error is None:
+                    transport_error = error
             self._save()
-            inflight += 1
-            running += 1
+            if transport_error is not None:
+                raise transport_error
+
+        used_bulk_launch = False
+        if (
+            launch_candidates
+            and not group_failed
+            and not submission_deferred
+            and not (should_stop is not None and should_stop())
+            and len(
+                {str(item["target"]) for item in launch_candidates}
+            )
+            == 1
+        ):
+            target = self.targets[str(launch_candidates[0]["target"])]
+            executor = self.executor_factory(target)
+            launch_many = getattr(executor, "launch_many", None)
+            if callable(launch_many):
+                tasks = [
+                    StageTask(
+                        str(item["task_id"]),
+                        self.workflow_id,
+                        int(current["generation"]),
+                        str(current["stage"]),
+                        str(item["target"]),
+                        Path(item["bundle"]),
+                    )
+                    for item in launch_candidates
+                ]
+                outputs = launch_many(tasks)
+                if len(outputs) != len(tasks):
+                    raise ControllerError(
+                        "batch executor returned the wrong number of launch results"
+                    )
+                results = []
+                for item, output in zip(
+                    launch_candidates,
+                    outputs,
+                    strict=True,
+                ):
+                    if isinstance(output, ExecutionHandle):
+                        results.append((item, output, None))
+                    elif isinstance(output, Exception):
+                        results.append((item, None, output))
+                    elif output is None:
+                        results.append((item, None, None))
+                    else:
+                        raise ControllerError(
+                            "batch executor returned an invalid launch result"
+                        )
+                record_launch_results(results)
+                used_bulk_launch = True
+
+        for start in range(
+            0,
+            0 if used_bulk_launch else len(launch_candidates),
+            _MAX_PARALLEL_LAUNCHES,
+        ):
+            if (
+                group_failed
+                or submission_deferred
+                or (should_stop is not None and should_stop())
+            ):
+                break
+            batch = launch_candidates[
+                start : start + _MAX_PARALLEL_LAUNCHES
+            ]
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                results = list(pool.map(launch, batch))
+            record_launch_results(results)
 
         failures = [
             item
@@ -920,12 +1097,19 @@ class PersistentController:
             ),
         )
 
-    def tick(self) -> ControllerTick:
+    def tick(
+        self,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ControllerTick:
         self.state = _read_json(self.workspace.controller_file, self.state)
         current = self.state.get("current")
         if current is not None:
             if current.get("kind") == "task_group":
-                result = self._tick_task_group(current)
+                result = self._tick_task_group(
+                    current,
+                    should_stop=should_stop,
+                )
                 if self.state.get("current") is not None:
                     return result
                 current = None
@@ -1146,7 +1330,7 @@ class PersistentController:
             }
             self.state["state"] = "launching"
             self._save()
-            return self.tick()
+            return self.tick(should_stop=should_stop)
         if (
             stage == "label"
             and self.config.get("labeling", {}).get("backend", "vasp")
@@ -1220,7 +1404,7 @@ class PersistentController:
             }
             self.state["state"] = "launching"
             self._save()
-            return self.tick()
+            return self.tick(should_stop=should_stop)
         resource = _RESOURCE_FOR_STAGE[stage]
         target_name = self.stage_targets[resource]
         target = self.targets[target_name]
@@ -1253,7 +1437,7 @@ class PersistentController:
         self.state["state"] = "launching"
         self._save()
         # Launch in the same tick; the persisted intent makes this retry-safe.
-        return self.tick()
+        return self.tick(should_stop=should_stop)
 
     def retry(self, *, recover_rejected: bool = False) -> None:
         state = str(self.state.get("state", "idle"))
@@ -1424,7 +1608,15 @@ class PersistentController:
                     self.targets[str(item["target"])]
                 )
                 handle = ExecutionHandle.from_mapping(handle_value)
-                status = executor.inspect(handle)
+                recorded_state = item.get("observed_state")
+                if recorded_state in {"completed", "failed", "cancelled"}:
+                    status = ExecutionStatus(
+                        str(recorded_state),
+                        str(item.get("detail") or ""),
+                        item.get("failure_kind"),
+                    )
+                else:
+                    status = executor.inspect(handle)
                 item["observed_state"] = status.state
                 item["observed_at"] = _now()
                 item["detail"] = status.detail
@@ -1468,6 +1660,21 @@ class PersistentController:
                 item.get("terminal_failure") for item in current["tasks"]
             ):
                 if stage == "label":
+                    if not any(
+                        item.get("collected_bundle")
+                        for item in current["tasks"]
+                    ):
+                        for item in current["tasks"]:
+                            if item.get("cancellation") is not None:
+                                item["retryable"] = True
+                        self.state["state"] = "failed"
+                        self.state["reason"] = (
+                            "stopped label task group has no collected labels; "
+                            "retrying cancelled tasks with a new attempt"
+                        )
+                        self._save()
+                        self.retry()
+                        return
                     self.state["state"] = "launching"
                     self.state.pop("reason", None)
                     self._save()
@@ -1567,7 +1774,9 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
             try:
                 while not stop_event.is_set():
                     try:
-                        tick = controller.tick()
+                        tick = controller.tick(
+                            should_stop=stop_event.is_set,
+                        )
                         if tick.state != "degraded":
                             recovered = controller.state.pop(
                                 "last_transport_error", None
@@ -1706,12 +1915,22 @@ def stop_controller(project: str | Path) -> None:
     if not _process_matches(pid, workspace.root):
         raise ControllerError("refusing to signal a pid that is not this workflow controller")
     os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if not controller_running(workspace.root):
+            return
+        time.sleep(0.05)
+    if not _process_matches(pid, workspace.root):
+        raise ControllerError(
+            "controller did not stop gracefully and its pid identity changed"
+        )
+    os.kill(pid, signal.SIGKILL)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if not controller_running(workspace.root):
             return
         time.sleep(0.05)
-    raise ControllerError("controller did not stop within 5 seconds")
+    raise ControllerError("controller did not stop after SIGTERM and SIGKILL")
 
 
 def _append_execution_event(

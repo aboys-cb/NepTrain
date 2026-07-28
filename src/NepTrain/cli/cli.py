@@ -410,6 +410,13 @@ def run_stage_verify_command(args):
     return 0
 
 
+def run_stage_verify_many_command(args):
+    from NepTrain.core.execution import verify_stage_tasks
+
+    verify_stage_tasks(args.bundles)
+    return 0
+
+
 def _doctor_resource_contract(config, project):
     """Resolve the authoritative resource contract for a labeling Adapter."""
 
@@ -1808,6 +1815,14 @@ def build_internal_commands(subparsers):
     subparsers._choices_actions.pop()
     verifier.set_defaults(func=run_stage_verify_command)
     verifier.add_argument("bundle")
+
+    verifier_many = subparsers.add_parser(
+        "stage-verify-many",
+        help=argparse.SUPPRESS,
+    )
+    subparsers._choices_actions.pop()
+    verifier_many.set_defaults(func=run_stage_verify_many_command)
+    verifier_many.add_argument("bundles", nargs="+")
 
     manual = subparsers.add_parser("manual-worker", help=argparse.SUPPRESS)
     subparsers._choices_actions.pop()

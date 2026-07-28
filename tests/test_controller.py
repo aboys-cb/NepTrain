@@ -161,6 +161,7 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
     assert descriptor["protocol"] == "neptrain.stage-task.v3"
     assert descriptor["task_id"] == descriptor["spec_sha256"][:24]
     assert task.bundle.name.startswith("g0001-md-a1-")
+    assert task.bundle.stat().st_mode & 0o070 == 0o070
     assert (task.bundle / "input").is_dir()
     assert not (task.bundle / "inputs").exists()
     assert not (task.bundle / "manifest.json").exists()
@@ -427,20 +428,107 @@ def test_remote_deploy_atomically_replaces_only_an_incomplete_exact_task(
         transport.deploy(task)
 
 
+def test_remote_batch_deploy_uses_one_archive_transfer(tmp_path):
+    initial = _write(tmp_path / "initial.xyz")
+    model = _write(tmp_path / "model.txt")
+    remote_root = tmp_path / "remote"
+    target = ExecutionTarget(
+        "remote",
+        "slurm",
+        host="fixture",
+        work_root="~/remote",
+        partition="cpu",
+        command=(
+            f"env PYTHONPATH={Path(__file__).resolve().parents[1] / 'src'} "
+            f"{sys.executable} -m NepTrain.cli.cli"
+        ),
+    )
+    context = StageContext(
+        generation=1,
+        generation_dir=tmp_path / "generation",
+        plan=_plan(),
+        artifacts={"model": model},
+        previous_artifacts={},
+    )
+    config = {
+        "training": {},
+        "evaluation": {},
+        "md": {"spin": False},
+        "labeling": {},
+        "workflow": {},
+        "execution": {},
+    }
+    tasks = [
+        build_stage_task(
+            tmp_path / "tasks",
+            workflow_root=tmp_path,
+            workflow_id="batch-deploy",
+            workflow_instance_id="instance",
+            generation=1,
+            stage="explore",
+            attempt=attempt,
+            target=target,
+            plan=_plan(),
+            config=config,
+            initial_training=initial,
+            context=context,
+        )
+        for attempt in (1, 2)
+    ]
+    copies = []
+
+    class LocalRemoteTransport(ExecutionTransport):
+        def run_script(self, script, *arguments, check=False, timeout=60):
+            completed = subprocess.run(
+                ["bash", "-s", "--", *(str(value) for value in arguments)],
+                input=script,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+                env={**os.environ, "HOME": str(tmp_path)},
+            )
+            if check and completed.returncode:
+                raise ExecutionError(completed.stderr)
+            return completed
+
+        def copy(self, source, destination, **_kwargs):
+            copies.append((source, destination))
+            remote_path = Path(str(destination).split(":", 1)[1])
+            remote_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, remote_path)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    transport = LocalRemoteTransport(target)
+    deployed = transport.deploy_many(tasks)
+
+    assert len(copies) == 1
+    assert deployed == tuple(
+        str(remote_root / "batch-deploy" / "jobs" / task.bundle.name)
+        for task in tasks
+    )
+    for task, destination in zip(tasks, deployed, strict=True):
+        assert (
+            Path(destination) / "task.json"
+        ).read_bytes() == task.descriptor.read_bytes()
+
+
 def test_process_identity_checks_request_untruncated_commands(monkeypatch):
     calls = []
 
-    def fake_run(args, **_kwargs):
-        calls.append(list(args))
+    def fake_run(args, **kwargs):
+        calls.append((list(args), kwargs))
         return subprocess.CompletedProcess(args, 0, "controller /long/task/path\n", "")
 
     monkeypatch.setattr(execution_module.subprocess, "run", fake_run)
     assert execution_module._pid_matches_bundle(123, "/long/task/path")
-    assert calls[-1] == ["ps", "-ww", "-p", "123", "-o", "command="]
+    assert calls[-1][0] == ["ps", "-ww", "-p", "123", "-o", "command="]
+    assert calls[-1][1]["env"]["COLUMNS"] == "10000"
 
     monkeypatch.setattr(controller_module.subprocess, "run", fake_run)
     assert controller_module._process_matches(456, Path("/long/task/path"))
-    assert calls[-1] == ["ps", "-ww", "-p", "456", "-o", "command="]
+    assert calls[-1][0] == ["ps", "-ww", "-p", "456", "-o", "command="]
+    assert calls[-1][1]["env"]["COLUMNS"] == "10000"
 
 
 def test_stage_bundle_only_copies_inputs_consumed_by_that_stage(tmp_path):
@@ -999,7 +1087,8 @@ def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
 
     monkeypatch.setattr(controller_module.signal, "signal", record_signal)
 
-    def request_stop_on_first_tick(_controller):
+    def request_stop_on_first_tick(_controller, *, should_stop=None):
+        assert should_stop is not None
         installed_handlers[signal.SIGTERM](signal.SIGTERM, None)
         return ControllerTick("running")
 
@@ -1025,6 +1114,257 @@ def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
     assert not WorkflowWorkspace.locate(
         preparation.output_dir
     ).controller_pid.exists()
+
+
+def test_group_submission_checks_stop_between_parallel_launch_batches(
+    tmp_path: Path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "labeling:\n  backend: toy\n",
+            (
+                "labeling:\n"
+                "  backend: vasp\n"
+                "  input_path: ./INCAR\n"
+                "  resource_path: ./potpaw\n"
+                "  potcar_manifest_path: ./vasp-resources.json\n"
+                "  structures_per_job: 1\n"
+                "  max_concurrent: 20\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class ManySelectedExecutor(ImmediateExecutor):
+        def launch(self, task):
+            handle = super().launch(task)
+            if task.stage != "select":
+                return handle
+            result_path = task.bundle / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            record = result["artifacts"]["selected_input"]
+            selected = task.bundle / record["path"]
+            ase_write(
+                selected,
+                [
+                    Atoms("Fe", positions=[[0.01 * index, 0.0, 0.0]])
+                    for index in range(1, 11)
+                ],
+                format="extxyz",
+            )
+            record["sha256"] = _sha256(selected)
+            record["size"] = selected.stat().st_size
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return handle
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ManySelectedExecutor(target, launches),
+    )
+
+    for _ in range(20):
+        controller.tick(
+            should_stop=lambda: sum(
+                stage == "label" for stage, _ in launches
+            )
+            >= 4
+        )
+        current = controller.state.get("current") or {}
+        if current.get("stage") == "label":
+            break
+    else:
+        raise AssertionError("controller did not reach label submission")
+
+    label_launches = [item for item in launches if item[0] == "label"]
+    assert len(current["tasks"]) == 10
+    assert len(label_launches) == 4
+    assert sum(bool(item.get("handle")) for item in current["tasks"]) == 4
+    controller.tick(should_stop=lambda: True)
+    assert len([item for item in launches if item[0] == "label"]) == 4
+
+
+def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
+    tmp_path: Path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "labeling:\n  backend: toy\n",
+            (
+                "labeling:\n"
+                "  backend: vasp\n"
+                "  input_path: ./INCAR\n"
+                "  resource_path: ./potpaw\n"
+                "  potcar_manifest_path: ./vasp-resources.json\n"
+                "  structures_per_job: 1\n"
+                "  max_concurrent: 20\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    bulk_launches = []
+    bulk_collections = []
+
+    class BulkImmediateExecutor(ImmediateExecutor):
+        def launch_many(self, tasks):
+            bulk_launches.append(
+                [(task.stage, task.task_id) for task in tasks]
+            )
+            return tuple(self.launch(task) for task in tasks)
+
+        def collect_many(self, handles):
+            bulk_collections.append(
+                [Path(handle.local_bundle).name for handle in handles]
+            )
+            return tuple(self.collect(handle) for handle in handles)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: BulkImmediateExecutor(
+            target,
+            launches,
+        ),
+    )
+    for _ in range(40):
+        tick = controller.tick()
+        if tick.state in {"complete", "converged"}:
+            break
+    else:
+        raise AssertionError("controller did not complete the bulk fixture")
+
+    label_launch = next(
+        batch
+        for batch in bulk_launches
+        if batch and batch[0][0] == "label"
+    )
+    assert len(label_launch) == 3
+    assert any(
+        len(batch) == 3
+        and all(name.startswith("g0001-label-") for name in batch)
+        for batch in bulk_collections
+    ), bulk_collections
+
+
+def test_remote_batch_collection_uses_one_compact_archive(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "labeling:\n  backend: toy\n",
+            (
+                "labeling:\n"
+                "  backend: vasp\n"
+                "  input_path: ./INCAR\n"
+                "  resource_path: ./potpaw\n"
+                "  potcar_manifest_path: ./vasp-resources.json\n"
+                "  structures_per_job: 1\n"
+                "  max_concurrent: 20\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, launches),
+    )
+    for _ in range(30):
+        controller.tick()
+        label = next(
+            (
+                item
+                for item in controller.state.get("history", [])
+                if item.get("kind") == "task_group"
+                and item.get("stage") == "label"
+            ),
+            None,
+        )
+        if label is not None:
+            break
+    else:
+        raise AssertionError("controller did not complete the label fixture")
+
+    remote_root = tmp_path / "remote" / "workflow"
+    handles = []
+    for item in label["tasks"][:2]:
+        local = Path(item["bundle"])
+        remote = remote_root / "jobs" / local.name
+        shutil.copytree(local, remote)
+        descriptor = json.loads(
+            (local / "task.json").read_text(encoding="utf-8")
+        )
+        (remote / "execution.json").write_text(
+            json.dumps(
+                {
+                    "state": "COMPLETED",
+                    "task_id": descriptor["task_id"],
+                    "task_spec_sha256": descriptor["spec_sha256"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        shutil.rmtree(local / "output")
+        (local / "result.json").unlink()
+        (local / "execution.json").unlink(missing_ok=True)
+        handles.append(
+            ExecutionHandle(
+                descriptor["task_id"],
+                "remote",
+                "slurm",
+                f"job-{len(handles)}",
+                str(local),
+                remote_bundle=str(remote),
+            )
+        )
+
+    target = ExecutionTarget(
+        "remote",
+        "slurm",
+        host="fixture",
+        work_root=str(tmp_path / "remote"),
+        partition="cpu",
+    )
+    copies = []
+
+    class LocalRemoteTransport(ExecutionTransport):
+        def run_script(self, script, *arguments, check=False, timeout=60):
+            completed = subprocess.run(
+                ["bash", "-s", "--", *(str(value) for value in arguments)],
+                input=script,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            if check and completed.returncode:
+                raise ExecutionError(completed.stderr)
+            return completed
+
+        def copy(self, source, destination, **_kwargs):
+            copies.append((source, destination))
+            source_path = Path(str(source).split(":", 1)[1])
+            shutil.copy2(source_path, destination)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    transport = LocalRemoteTransport(target)
+    collected = transport.collect_many(handles)
+
+    assert len(copies) == 1
+    assert all(isinstance(path, Path) for path in collected)
+    for handle in handles:
+        _, outcome = load_stage_result(handle.local_bundle)
+        assert outcome.metrics["labeled_count"] == 1
 
 
 def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
@@ -2362,6 +2702,70 @@ def test_slurm_executor_is_idempotent_without_afterok(tmp_path):
     assert executor.inspect(first).state == "completed"
 
 
+def test_remote_slurm_executor_submits_a_group_through_one_remote_script(
+    tmp_path,
+):
+    target = ExecutionTarget(
+        "slurm",
+        "slurm",
+        host="remote",
+        work_root="/remote/work",
+        partition="cpu",
+    )
+    tasks = []
+    for index in range(2):
+        bundle = tmp_path / f"task-{index}"
+        bundle.mkdir()
+        tasks.append(
+            StageTask(
+                f"task-{index}",
+                "demo",
+                1,
+                "label",
+                "slurm",
+                bundle,
+            )
+        )
+    executor = SlurmExecutor(target)
+    calls = []
+
+    executor.transport.resolve_remote_path = lambda _path: "/remote/work"
+
+    def fake_deploy_many(received, *, resolved_root=None):
+        assert list(received) == tasks
+        assert resolved_root == "/remote/work"
+        assert all((task.bundle / "submit.sh").is_file() for task in tasks)
+        return tuple(
+            f"/remote/work/demo/jobs/{task.bundle.name}"
+            for task in tasks
+        )
+
+    def fake_run_script(script, *arguments, **_kwargs):
+        calls.append((script, arguments))
+        assert len(arguments) == 4
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            (
+                "JOB\tnt-task-0\t101\n"
+                "JOB\tnt-task-1\t102\n"
+            ),
+            "",
+        )
+
+    executor.transport.deploy_many = fake_deploy_many
+    executor.transport.run_script = fake_run_script
+
+    handles = executor.launch_many(tasks)
+
+    assert len(calls) == 1
+    assert [handle.execution_id for handle in handles] == ["101", "102"]
+    assert all(
+        isinstance(handle, ExecutionHandle)
+        for handle in handles
+    )
+
+
 def test_slurm_executor_does_not_claim_historical_same_name_job(tmp_path):
     bundle = tmp_path / "task"
     bundle.mkdir()
@@ -2869,9 +3273,11 @@ def test_group_stop_preserves_completed_labels_and_skips_cancelled_shard(
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     launches = []
     cancelled_ids = set()
+    inspected_ids = []
 
     class StopAwareExecutor(ImmediateExecutor):
         def inspect(self, handle):
+            inspected_ids.append(handle.execution_id)
             if handle.execution_id in cancelled_ids:
                 return ExecutionStatus("cancelled", "fixture cancellation")
             return ExecutionStatus("completed")
@@ -2928,6 +3334,7 @@ def test_group_stop_preserves_completed_labels_and_skips_cancelled_shard(
         "COMPLETED",
         "CANCELLED",
     ]
+    inspected_before_resume = list(inspected_ids)
 
     resumed = PersistentController(
         preparation.output_dir,
@@ -2935,6 +3342,7 @@ def test_group_stop_preserves_completed_labels_and_skips_cancelled_shard(
     )
     resumed.resume_stopped()
     current = resumed.state["current"]
+    assert inspected_ids == inspected_before_resume
     assert current["attempt"] == 1
     assert [item["task_id"] for item in current["tasks"]] == original_ids
     assert all(
@@ -2952,6 +3360,88 @@ def test_group_stop_preserves_completed_labels_and_skips_cancelled_shard(
     )
     assert label["metrics"]["labeled_count"] == 2
     assert label["metrics"]["failed_frame_indices"] == [2]
+
+
+def test_group_stop_retries_all_labels_when_none_were_collected(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    _write_vasp_resources(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "labeling:\n  backend: toy\n",
+            (
+                "labeling:\n"
+                "  backend: vasp\n"
+                "  input_path: ./INCAR\n"
+                "  resource_path: ./potpaw\n"
+                "  potcar_manifest_path: ./vasp-resources.json\n"
+                "  structures_per_job: 1\n"
+                "  max_concurrent: 2\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    cancelled_ids = set()
+    inspected_ids = []
+
+    class StopAwareExecutor(ImmediateExecutor):
+        def inspect(self, handle):
+            inspected_ids.append(handle.execution_id)
+            if handle.execution_id in cancelled_ids:
+                return ExecutionStatus("cancelled", "fixture cancellation")
+            return ExecutionStatus("completed")
+
+        def cancel(self, handle):
+            cancelled_ids.add(handle.execution_id)
+            return ExecutionStatus("cancelled", "fixture cancellation")
+
+    factory = lambda target: StopAwareExecutor(target, launches)
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=factory,
+    )
+    for _ in range(30):
+        controller.tick()
+        current = controller.state.get("current") or {}
+        if (
+            current.get("stage") == "label"
+            and sum(
+                bool(item.get("handle"))
+                for item in current.get("tasks", [])
+            )
+            == 2
+            and not any(
+                item.get("collected_bundle")
+                for item in current.get("tasks", [])
+            )
+        ):
+            break
+    else:
+        raise AssertionError("controller did not reach an active label group")
+
+    original_ids = [item["task_id"] for item in current["tasks"]]
+    stop_workflow(
+        preparation.output_dir,
+        executor_factory=factory,
+    )
+    inspected_before_resume = list(inspected_ids)
+
+    resumed = PersistentController(
+        preparation.output_dir,
+        executor_factory=factory,
+    )
+    resumed.resume_stopped()
+    current = resumed.state["current"]
+
+    assert inspected_ids == inspected_before_resume
+    assert resumed.state["state"] == "launching"
+    assert current["attempt"] == 2
+    assert [item["task_id"] for item in current["tasks"]] != original_ids
+    assert all(item.get("handle") is None for item in current["tasks"])
+    assert all(not item.get("terminal_failure") for item in current["tasks"])
+    assert all(len(item["retry_history"]) == 1 for item in current["tasks"])
 
 
 class FailingExecutor:
@@ -3049,7 +3539,8 @@ def test_controller_escalates_repeated_transport_errors(tmp_path, monkeypatch):
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     task_id = "preserved-task"
 
-    def fail_transport(controller):
+    def fail_transport(controller, *, should_stop=None):
+        assert should_stop is not None
         if controller.state.get("current") is None:
             controller.state["current"] = {
                 "task_id": task_id,
