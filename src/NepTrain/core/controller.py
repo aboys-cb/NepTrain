@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -57,6 +58,7 @@ _RESOURCE_FOR_STAGE = {
 }
 _EXECUTION_UNKNOWN_GRACE_SECONDS = 300.0
 _MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3
+_MAX_PARALLEL_OBSERVATIONS = 4
 
 
 def _now() -> str:
@@ -519,55 +521,51 @@ class PersistentController:
         running = 0
         unknown = 0
         submission_deferred = False
-        for item in current["tasks"]:
+
+        observed_items = [
+            item
+            for item in current["tasks"]
+            if item.get("handle") is not None
+            and not item.get("collected_bundle")
+            and not item.get("terminal_failure")
+        ]
+
+        def observe(item):
             target = self.targets[str(item["target"])]
             executor = self.executor_factory(target)
-            task = StageTask(
-                str(item["task_id"]),
-                self.workflow_id,
-                int(current["generation"]),
-                str(current["stage"]),
-                str(item["target"]),
-                Path(item["bundle"]),
-            )
-            if item.get("handle") is None:
-                if group_failed or submission_deferred or inflight >= maximum:
-                    continue
-                try:
-                    handle = executor.launch(task)
-                except SubmissionDeferred as error:
-                    submission_deferred = True
-                    self.state["state"] = "waiting"
-                    self.state["reason"] = (
-                        "Slurm submission capacity is temporarily exhausted; "
-                        "the same task will be submitted again"
-                    )
-                    self.state["last_submission_error"] = str(error)
-                    self._save()
-                    continue
-                except PermanentExecutionError as error:
-                    self._mark_group_task_failure(
-                        item,
-                        stage=stage,
-                        detail=str(error),
-                        failure_kind="submission_failure",
-                    )
-                    item["retryable"] = True
-                    group_failed = True
-                    self._save()
-                    continue
-                item["handle"] = asdict(handle)
-                item["submitted_at"] = _now()
-                self.state.pop("last_submission_error", None)
-                self.state.pop("reason", None)
-                self._save()
-                inflight += 1
-                running += 1
-                continue
             handle = ExecutionHandle.from_mapping(item["handle"])
-            if item.get("collected_bundle") or item.get("terminal_failure"):
-                continue
             status = executor.inspect(handle)
+            collected = None
+            collection_error = None
+            if status.state not in {
+                "failed",
+                "cancelled",
+                "running",
+                "unknown",
+            }:
+                try:
+                    collected = executor.collect(handle)
+                except PermanentExecutionError as error:
+                    collection_error = error
+            return (
+                item,
+                executor,
+                handle,
+                status,
+                collected,
+                collection_error,
+            )
+
+        def apply_observation(observation):
+            nonlocal group_failed, running, unknown
+            (
+                item,
+                executor,
+                handle,
+                status,
+                collected,
+                collection_error,
+            ) = observation
             item["observed_state"] = status.state
             item["observed_at"] = _now()
             item["detail"] = status.detail
@@ -604,20 +602,18 @@ class PersistentController:
                         except ExecutionError as error:
                             item["failure_collection_error"] = str(error)
                 self._save()
-                continue
+                return
             if status.state in {"running", "unknown"}:
                 if status.state == "unknown":
                     unknown += 1
                 else:
                     running += 1
-                continue
-            try:
-                collected = executor.collect(handle)
-            except PermanentExecutionError as error:
+                return
+            if collection_error is not None:
                 self._mark_group_task_failure(
                     item,
                     stage=stage,
-                    detail=str(error),
+                    detail=str(collection_error),
                     failure_kind="result_validation_failure",
                 )
                 if stage != "label":
@@ -632,7 +628,11 @@ class PersistentController:
                             collection_error
                         )
                 self._save()
-                continue
+                return
+            if collected is None:
+                raise ControllerError(
+                    f"{stage} task {item['task_id']} completed without a result"
+                )
             item["collected_bundle"] = str(collected)
             self._publish_calculation_link(
                 generation=int(current["generation"]),
@@ -643,6 +643,62 @@ class PersistentController:
             )
             item["completed_at"] = _now()
             self._save()
+
+        if observed_items:
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    _MAX_PARALLEL_OBSERVATIONS,
+                    len(observed_items),
+                )
+            ) as pool:
+                for observation in pool.map(observe, observed_items):
+                    apply_observation(observation)
+
+        for item in current["tasks"]:
+            if item.get("handle") is not None:
+                continue
+            if group_failed or submission_deferred or inflight >= maximum:
+                continue
+            target = self.targets[str(item["target"])]
+            executor = self.executor_factory(target)
+            task = StageTask(
+                str(item["task_id"]),
+                self.workflow_id,
+                int(current["generation"]),
+                str(current["stage"]),
+                str(item["target"]),
+                Path(item["bundle"]),
+            )
+            try:
+                handle = executor.launch(task)
+            except SubmissionDeferred as error:
+                submission_deferred = True
+                self.state["state"] = "waiting"
+                self.state["reason"] = (
+                    "Slurm submission capacity is temporarily exhausted; "
+                    "the same task will be submitted again"
+                )
+                self.state["last_submission_error"] = str(error)
+                self._save()
+                continue
+            except PermanentExecutionError as error:
+                self._mark_group_task_failure(
+                    item,
+                    stage=stage,
+                    detail=str(error),
+                    failure_kind="submission_failure",
+                )
+                item["retryable"] = True
+                group_failed = True
+                self._save()
+                continue
+            item["handle"] = asdict(handle)
+            item["submitted_at"] = _now()
+            self.state.pop("last_submission_error", None)
+            self.state.pop("reason", None)
+            self._save()
+            inflight += 1
+            running += 1
 
         failures = [
             item

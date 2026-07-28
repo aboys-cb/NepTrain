@@ -379,10 +379,18 @@ def test_execution_transport_sends_remote_scripts_via_stdin():
     transport.copy("source.tar.gz", "remote:/remote/work/source.tar.gz")
 
     assert completed.stdout == "ok\n"
-    assert calls[0][0] == [
+    assert calls[0][0][:8] == [
         "ssh",
         "-o",
         "BatchMode=yes",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=60",
+        "-o",
+    ]
+    assert calls[0][0][8].startswith("ControlPath=/tmp/neptrain-ssh-")
+    assert calls[0][0][9:] == [
         "remote",
         "bash",
         "-s",
@@ -392,10 +400,18 @@ def test_execution_transport_sends_remote_scripts_via_stdin():
     ]
     assert "-lc" not in calls[0][0]
     assert calls[0][1]["input"].endswith("\n")
-    assert calls[1][0] == [
+    assert calls[1][0][:8] == [
         "scp",
         "-o",
         "BatchMode=yes",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=60",
+        "-o",
+    ]
+    assert calls[1][0][8] == calls[0][0][8]
+    assert calls[1][0][9:] == [
         "source.tar.gz",
         "remote:/remote/work/source.tar.gz",
     ]
@@ -575,11 +591,33 @@ def test_execution_transport_collects_stage_artifacts_in_one_fetch(
     transport = ExecutionTransport(target)
     fetches = []
 
+    def fake_run_script(script, *arguments, **kwargs):
+        assert arguments == ("/remote/work/task",)
+        assert "result.json" in script
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=(remote / "result.json").read_text(encoding="utf-8"),
+            stderr="",
+        )
+
     def fake_fetch(remote_root, members, destination_root):
         fetches.append((str(remote_root), tuple(members)))
-        shutil.copytree(remote, destination_root, dirs_exist_ok=True)
-        return ("execution.json", "result.json", "output")
+        copied = []
+        for member in members:
+            source = remote / member
+            if not source.exists():
+                continue
+            destination = Path(destination_root) / member
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source, destination)
+            copied.append(str(member))
+        return tuple(copied)
 
+    monkeypatch.setattr(transport, "run_script", fake_run_script)
     monkeypatch.setattr(transport, "fetch_paths", fake_fetch)
     handle = ExecutionHandle(
         task_id=task.task_id,
@@ -596,8 +634,13 @@ def test_execution_transport_collects_stage_artifacts_in_one_fetch(
     assert fetches == [
         (
             "/remote/work/task",
-            ("result.json", "execution.json", "output"),
-        )
+            (
+                "result.json",
+                "execution.json",
+                "output/artifacts/model.nep",
+                "output/artifacts/loss.out",
+            ),
+        ),
     ]
     assert (local / "output" / "artifacts" / "model.nep").is_file()
     assert (local / "output" / "artifacts" / "loss.out").is_file()

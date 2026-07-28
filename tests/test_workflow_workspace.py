@@ -65,6 +65,8 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
     assert (workspace.results_dir / "train.xyz").read_text() == "merge\n"
     assert json.loads((workspace.results_dir / "metrics.json").read_text()) == "evaluate"
     assert "最新验收代：1" in (workspace.results_dir / "summary.md").read_text()
+    accepted = (workspace.results_dir / "current").resolve()
+    assert accepted.stat().st_mode & 0o070 == 0o070
 
 
 def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):

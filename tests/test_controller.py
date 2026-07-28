@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -1289,9 +1290,30 @@ def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
     config.write_text(text, encoding="utf-8")
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     launches = []
+    tracker = {"active": 0, "maximum": 0}
+    tracker_lock = threading.Lock()
+
+    class TrackingImmediateExecutor(ImmediateExecutor):
+        def inspect(self, handle):
+            with tracker_lock:
+                tracker["active"] += 1
+                tracker["maximum"] = max(
+                    tracker["maximum"],
+                    tracker["active"],
+                )
+            try:
+                time.sleep(0.03)
+                return super().inspect(handle)
+            finally:
+                with tracker_lock:
+                    tracker["active"] -= 1
+
     controller = PersistentController(
         preparation.output_dir,
-        executor_factory=lambda target: ImmediateExecutor(target, launches),
+        executor_factory=lambda target: TrackingImmediateExecutor(
+            target,
+            launches,
+        ),
     )
 
     controller.tick()
@@ -1307,6 +1329,8 @@ def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
     }
     assert all(item["handle"] is not None for item in current["tasks"])
     assert [stage for stage, _ in launches].count("explore") == 2
+    controller.tick()
+    assert tracker["maximum"] == 2
 
 
 def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
@@ -2410,6 +2434,70 @@ def test_execution_failure_kind_classifies_scf_nonconvergence():
     )
 
 
+def test_remote_slurm_failure_collection_is_compact(tmp_path):
+    executor = SlurmExecutor(
+        ExecutionTarget(
+            "dft",
+            "slurm",
+            host="remote",
+            work_root="/remote/work",
+            partition="cpu",
+        )
+    )
+    fetched = []
+
+    def fake_run_script(script, *arguments, **kwargs):
+        assert arguments == ("/remote/work/task",)
+        assert 'find "$path" -type f -print' in script
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout=(
+                ".output-building-123/retry-0002/OUTCAR\n"
+                ".output-building-123/retry-0002/vasp.out\n"
+                ".output-building-123/retry-0002/PROCAR\n"
+                "../outside/OUTCAR\n"
+            ),
+            stderr="",
+        )
+
+    def fake_fetch(remote_root, members, destination_root):
+        fetched.append(
+            (str(remote_root), tuple(members), Path(destination_root))
+        )
+        return tuple(str(member) for member in members)
+
+    executor.transport.run_script = fake_run_script
+    executor.transport.fetch_paths = fake_fetch
+    handle = ExecutionHandle(
+        task_id="abc",
+        target="dft",
+        executor="slurm",
+        execution_id="701234",
+        local_bundle=str(tmp_path / "task"),
+        remote_bundle="/remote/work/task",
+    )
+
+    evidence = executor.collect_failure(handle)
+
+    assert evidence == (
+        tmp_path / "task" / "failure-evidence" / "slurm-701234"
+    )
+    assert fetched == [
+        (
+            "/remote/work/task",
+            (
+                "execution.json",
+                "submit.sh",
+                "stdout-701234.log",
+                ".output-building-123/retry-0002/OUTCAR",
+                ".output-building-123/retry-0002/vasp.out",
+            ),
+            evidence,
+        )
+    ]
+
+
 def test_slurm_executor_preserves_worker_failure_detail(tmp_path):
     bundle = tmp_path / "task"
     bundle.mkdir()
@@ -2557,17 +2645,14 @@ def test_remote_slurm_cancel_runs_on_the_target_host(tmp_path):
     def runner(args, **_kwargs):
         args = list(args)
         calls.append(args)
-        if args[:8] == [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
+        if args[9:14] == [
             "remote",
             "bash",
             "-s",
             "--",
             "/remote/task",
         ]:
-            command = args[8:]
+            command = args[14:]
             if not command:
                 return subprocess.CompletedProcess(args, 3, "", "")
             if command[0] == "squeue":

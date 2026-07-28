@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import traceback
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -1023,6 +1024,21 @@ def load_stage_result(bundle_path: str | Path) -> tuple[dict[str, Any], StageOut
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+_SSH_CONTROL_DIRECTORY: tempfile.TemporaryDirectory | None = None
+_SSH_CONTROL_LOCK = threading.Lock()
+
+
+def _ssh_control_path(host: str) -> str:
+    global _SSH_CONTROL_DIRECTORY
+    with _SSH_CONTROL_LOCK:
+        if _SSH_CONTROL_DIRECTORY is None:
+            _SSH_CONTROL_DIRECTORY = tempfile.TemporaryDirectory(
+                prefix="neptrain-ssh-",
+                dir="/tmp",
+            )
+        directory = _SSH_CONTROL_DIRECTORY.name
+    host_id = canonical_sha256({"host": host})[:16]
+    return str(Path(directory) / host_id)
 
 
 class ExecutionTransport:
@@ -1036,6 +1052,20 @@ class ExecutionTransport:
     def remote(self) -> bool:
         return self.target.host is not None
 
+    def _ssh_options(self) -> list[str]:
+        if self.target.host is None:
+            raise ExecutionError("SSH options require a remote execution target")
+        return [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=60",
+            "-o",
+            f"ControlPath={_ssh_control_path(str(self.target.host))}",
+        ]
+
     def run_script(
         self,
         script: str,
@@ -1047,8 +1077,7 @@ class ExecutionTransport:
             raise ExecutionError("remote script requires an SSH execution target")
         command = [
             "ssh",
-            "-o",
-            "BatchMode=yes",
+            *self._ssh_options(),
             str(self.target.host),
             "bash",
             "-s",
@@ -1120,7 +1149,7 @@ esac
     ) -> subprocess.CompletedProcess[str]:
         if not self.remote:
             raise ExecutionError("remote copy requires an SSH execution target")
-        command = ["scp", "-o", "BatchMode=yes"]
+        command = ["scp", *self._ssh_options()]
         if recursive:
             command.append("-r")
         command.extend([str(source), str(destination)])
@@ -1258,8 +1287,7 @@ fi
         if self.remote:
             command = [
                 "ssh",
-                "-o",
-                "BatchMode=yes",
+                *self._ssh_options(),
                 str(self.target.host),
                 "bash",
                 "-s",
@@ -1492,9 +1520,46 @@ verify_bundle "$destination"
             )
         )
         try:
+            resolved_remote = self.resolve_remote_path(remote)
+            manifest = self.run_script(
+                """set -eo pipefail
+bundle=$1
+cat "$bundle/result.json"
+""",
+                resolved_remote,
+            )
+            if manifest.returncode != 0:
+                raise PermanentExecutionError(
+                    "remote stage result is missing required file: result.json"
+                )
+            try:
+                result_value = json.loads(manifest.stdout)
+                artifact_records = result_value.get("artifacts", {})
+                if not isinstance(artifact_records, Mapping):
+                    raise TypeError("artifacts must be an object")
+                artifact_paths = []
+                for record in artifact_records.values():
+                    if not isinstance(record, Mapping):
+                        raise TypeError("artifact record must be an object")
+                    artifact_path = str(record["path"])
+                    _safe_relative(
+                        temporary,
+                        artifact_path,
+                        "result artifact path",
+                    )
+                    artifact_paths.append(artifact_path)
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                json.JSONDecodeError,
+            ) as error:
+                raise PermanentExecutionError(
+                    "remote stage result artifact manifest is unreadable"
+                ) from error
             self.fetch_paths(
-                remote,
-                ("result.json", "execution.json", "output"),
+                resolved_remote,
+                ("result.json", "execution.json", *artifact_paths),
                 temporary,
             )
             for name in ("result.json", "execution.json"):
@@ -2122,24 +2187,45 @@ cat "$bundle/execution.json"
         if self.target.host is None:
             return local
         remote = str(handle.remote_bundle)
+        diagnostic_names = {
+            "OUTCAR",
+            "OSZICAR",
+            "INCAR",
+            "POSCAR",
+            "CONTCAR",
+            "KPOINTS",
+            "vasp.out",
+            "vasp-result.json",
+            "INPUT",
+            "STRU",
+            "KPT",
+            "running_scf.log",
+            "abacus.log",
+        }
         discovered = self.transport.run_script(
             """set -eo pipefail
 bundle=$1
 cd "$bundle"
 for path in .output-building-*; do
-  test -e "$path" && printf '%s\\n' "$path"
+  test -d "$path" || continue
+  find "$path" -type f -print
 done
 """,
             remote,
         )
-        building = []
+        diagnostics = []
         if discovered.returncode == 0:
-            building = [
-                line.strip()
-                for line in discovered.stdout.splitlines()
-                if line.strip().startswith(".output-building-")
-                and "/" not in line.strip()
-            ]
+            for line in discovered.stdout.splitlines():
+                relative = Path(line.strip())
+                if (
+                    not relative.parts
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or not relative.parts[0].startswith(".output-building-")
+                    or relative.name not in diagnostic_names
+                ):
+                    continue
+                diagnostics.append(relative.as_posix())
         evidence = local / "failure-evidence" / f"slurm-{handle.execution_id}"
         self.transport.fetch_paths(
             remote,
@@ -2147,7 +2233,7 @@ done
                 "execution.json",
                 "submit.sh",
                 f"stdout-{handle.execution_id}.log",
-                *building,
+                *diagnostics,
             ),
             evidence,
         )

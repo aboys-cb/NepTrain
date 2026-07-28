@@ -437,6 +437,9 @@ class WorkflowWorkspace:
                     dir=accepted_root,
                 )
             )
+            # Accepted publications are immutable, but shared workflow groups
+            # must still be able to inspect and recover the controller.
+            temporary.chmod(0o2770)
             try:
                 for artifact_name, filename in required.items():
                     _copy_file(
