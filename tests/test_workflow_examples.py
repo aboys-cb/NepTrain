@@ -20,6 +20,10 @@ ROOT = Path(__file__).parents[1]
             "neptrain model-worker deepmd --head OMol25",
         ),
         ("distillation-mace", "neptrain model-worker mace"),
+        (
+            "distillation-tace",
+            "neptrain model-worker tace --fidelity-index 0",
+        ),
     ],
 )
 def test_distillation_workflow_examples_are_schema_valid(example, runner):
@@ -34,7 +38,7 @@ def test_distillation_workflow_examples_are_schema_valid(example, runner):
 
 @pytest.mark.parametrize(
     "example",
-    ["distillation-deepmd", "distillation-mace"],
+    ["distillation-deepmd", "distillation-mace", "distillation-tace"],
 )
 def test_distillation_workflow_examples_use_adaptable_nve_template(
     example,

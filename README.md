@@ -21,7 +21,7 @@ acceptance; it does not duplicate the scientific calculation logic.
 
 - GPUMD or TorchNEP training with a canonical `nep.txt` result.
 - GPUMD or LAMMPS sampling, including LAMMPS DynSpin for spin MD.
-- VASP, ABACUS, MACE, or DeepMD/DPA labeling.
+- VASP, ABACUS, MACE, DeepMD/DPA, or TACE labeling.
 - Element-set-aware farthest-point sampling with deterministic provenance.
 - Local process, local Slurm, and SSH + Slurm execution targets.
 - Content-addressed task bundles, atomic publication, hash validation, and
@@ -49,6 +49,15 @@ pip install 'NepTrain[mace]'
 # DeepMD / DPA teacher labeling
 pip install 'NepTrain[deepmd]'
 
+# TACE teacher labeling (TACE is currently installed from its source repository)
+pip install \
+  'TACE @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
+
+# Optional cuEquivariance acceleration on Ampere-or-newer CUDA 12 GPUs
+pip install \
+  'TACE[cueq12] @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
+export TACE_USE_CUE=1
+
 # SOAP descriptors when manual selection has no NEP model
 pip install 'NepTrain[soap]'
 ```
@@ -74,7 +83,7 @@ neptrain doctor --project project.yaml
 
 `doctor` reads the project backends, stage targets, setup scripts, and target
 environment. It checks the actual GPUMD/TorchNEP, LAMMPS/GPUMD,
-VASP/ABACUS, or MACE/DeepMD runtime required by each target.
+VASP/ABACUS, or MACE/DeepMD/TACE runtime required by each target.
 
 ## Standalone steps
 
@@ -180,6 +189,7 @@ formats fail explicitly instead of being migrated silently.
 | ABACUS | User-provided ABACUS and pinned UPF/ORB manifest | Ordinary or DeltaSpin spin/mforce labels |
 | MACE | `NepTrain[mace]` | Ordinary structures; no `mforce` |
 | DeepMD / DPA | `NepTrain[deepmd]` | DPA-3 and supported DPA-4 formats; no `mforce` |
+| TACE | Official TACE source install | Checkpoints supported by `tace-eval`; spin requires real noncollinear magnetic-force output |
 
 Teacher-model labeling still enters through `neptrain label`. The hidden
 `model-worker` command is an internal runner protocol, not a second user-facing
@@ -193,6 +203,7 @@ CLI.
 - [ABACUS + Slurm workflow](examples/workflow-abacus-slurm/README.en.md)
 - [DeepMD / DPA distillation](examples/distillation-deepmd/README.en.md)
 - [MACE distillation](examples/distillation-mace/README.en.md)
+- [TACE distillation](examples/distillation-tace/README.en.md)
 
 The website documentation is built from one Chinese source tree with complete
 English translation catalogs. Both languages are checked with strict Sphinx

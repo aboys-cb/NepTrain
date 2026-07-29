@@ -586,6 +586,8 @@ def _doctor_target_requirements(config, target_name, target):
                     packages.append("mace.calculators")
                 elif runner[2] == "deepmd":
                     packages.append("deepmd.calculator")
+                elif runner[2] == "tace":
+                    tools.append("tace-eval")
     return (
         sorted(set(tools)),
         sorted(set(packages)),
@@ -1491,7 +1493,7 @@ def run_model_worker_command(args):
                 device=args.device,
                 precision=args.precision,
             )
-        else:
+        elif args.adapter == "deepmd":
             from NepTrain.runners.deepmd import label_frames
 
             label_frames(
@@ -1501,6 +1503,17 @@ def run_model_worker_command(args):
                 device=args.device,
                 precision=args.precision,
                 head=args.head,
+            )
+        else:
+            from NepTrain.runners.tace import label_frames
+
+            label_frames(
+                args.model,
+                args.input,
+                args.output,
+                device=args.device,
+                precision=args.precision,
+                fidelity_index=args.fidelity_index,
             )
     except (OSError, RuntimeError, ValueError) as error:
         raise LabelingError(str(error)) from error
@@ -1833,8 +1846,9 @@ def build_internal_commands(subparsers):
     model = subparsers.add_parser("model-worker", help=argparse.SUPPRESS)
     subparsers._choices_actions.pop()
     model.set_defaults(func=run_model_worker_command)
-    model.add_argument("adapter", choices=["mace", "deepmd"])
+    model.add_argument("adapter", choices=["mace", "deepmd", "tace"])
     model.add_argument("--head")
+    model.add_argument("--fidelity-index", type=int)
     model.add_argument("--model", required=True)
     model.add_argument("--input", required=True)
     model.add_argument("--output", required=True)

@@ -7,7 +7,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: NepTrain \n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-07-27 19:45+0800\n"
+"POT-Creation-Date: 2026-07-28 20:14+0800\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: en\n"
@@ -49,11 +49,13 @@ msgid "pip install 'NepTrain[mace]'\n"
 msgstr ""
 
 #: ../../source/install/index.md:22 d5da4472e7574059887346d272145781
-msgid "该 extra 提供 NepTrain 内部 MACE 标注适配器所需的运行时。请先按机器 CUDA 版本安装 PyTorch，再安装此 extra。"
+msgid ""
+"该 extra 提供 NepTrain 内部 MACE 标注适配器所需的运行时。请先按机器 CUDA 版本安装 PyTorch，再安装此 "
+"extra。"
 msgstr ""
-"This extra provides the runtime required by NepTrain’s internal MACE labeling "
-"adapter. Install the PyTorch build that matches your CUDA environment before "
-"installing this extra."
+"This extra provides the runtime required by NepTrain’s internal MACE "
+"labeling adapter. Install the PyTorch build that matches your CUDA "
+"environment before installing this extra."
 
 #: ../../source/install/index.md:25 4ea9a140c2c5401382626f1a7cf786b1
 msgid "DeepMD / DPA Teacher 蒸馏标注："
@@ -65,13 +67,14 @@ msgstr ""
 
 #: ../../source/install/index.md:31 fba5db4dd3664d55b9a9da9a0df670eb
 msgid ""
-"该 extra 安装 NepTrain 内部 DeepMD 标注适配器所需的稳定版 DeePMD-kit PyTorch 后端。它支持 DPA-3 和其它稳定版 "
-"DeepMD 模型。DPA-4 从 DeePMD-kit 3.2 开始提供；在 3.2 仍为预发布版时需显式安装："
+"该 extra 安装 NepTrain 内部 DeepMD 标注适配器所需的稳定版 DeePMD-kit PyTorch 后端。它支持 DPA-3"
+" 和其它稳定版 DeepMD 模型。DPA-4 从 DeePMD-kit 3.2 开始提供；在 3.2 仍为预发布版时需显式安装："
 msgstr ""
-"This extra installs the stable DeePMD-kit PyTorch backend required by NepTrain’s "
-"internal DeepMD labeling adapter. It supports DPA-3 and other models supported by "
-"stable DeePMD-kit releases. DPA-4 is available starting with DeePMD-kit 3.2; while "
-"3.2 remains a prerelease, install it explicitly:"
+"This extra installs the stable DeePMD-kit PyTorch backend required by "
+"NepTrain’s internal DeepMD labeling adapter. It supports DPA-3 and other "
+"models supported by stable DeePMD-kit releases. DPA-4 is available "
+"starting with DeePMD-kit 3.2; while 3.2 remains a prerelease, install it "
+"explicitly:"
 
 #: ../../source/install/index.md:35 3dcc5b85632844dd8956ce791804cdba
 msgid ""
@@ -79,43 +82,88 @@ msgid ""
 "pip install NepTrain\n"
 msgstr ""
 
-#: ../../source/install/index.md:40 0efc325d763f45a5b74213bfbebef403
+#: ../../source/install/index.md:40 c5ea13353268492e8241228f12ce9686
+msgid "TACE Teacher 蒸馏标注目前按官方仓库安装。本项目教程固定到已核对 `tace-eval` 接口的 commit："
+msgstr ""
+"TACE teacher distillation currently uses the official source repository. "
+"This tutorial pins the commit whose `tace-eval` interface was verified:"
+
+#: ../../source/install/index.md:43 427d040331d648ca94df334ca1e8a59d
+msgid ""
+"pip install \\\n"
+"  'TACE @ "
+"git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'"
+"\n"
+msgstr ""
+"pip install \\\n"
+"  'TACE @ "
+"git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'"
+"\n"
+
+#: ../../source/install/index.md:48 1bc45bc2d05d4ea5ac98157ac4845b9a
+msgid "CUDA 12 环境可选安装 cuEquivariance 加速依赖："
+msgstr "CUDA 12 environments can optionally install cuEquivariance acceleration:"
+
+#: ../../source/install/index.md:50 6b3b921fe40a40d69d5a40621fd6d78d
+msgid ""
+"pip install \\\n"
+"  'TACE[cueq12] @ "
+"git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'"
+"\n"
+"export TACE_USE_CUE=1\n"
+msgstr ""
+"pip install \\\n"
+"  'TACE[cueq12] @ "
+"git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'"
+"\n"
+"export TACE_USE_CUE=1\n"
+
+#: ../../source/install/index.md:56 48aca5cf680340d1b19903d494fcc01c
+msgid ""
+"官方二进制算子需要 Ampere 或更新的 GPU；Sai V100 实测会报 "
+"`cudaErrorNoKernelImageForDevice`，不要在 V100 上启用。"
+msgstr ""
+"The official binary operators require an Ampere-or-newer GPU. On a Sai "
+"V100 they fail with `cudaErrorNoKernelImageForDevice`; do not enable them "
+"on V100."
+
+#: ../../source/install/index.md:59 0efc325d763f45a5b74213bfbebef403
 msgid "手动采样不提供 NEP 模型、需要 SOAP 描述符时："
 msgstr "If manual sampling has no NEP model and must use SOAP descriptors:"
 
-#: ../../source/install/index.md:42 b8b57abae80a460db485c75d2858dfb7
+#: ../../source/install/index.md:61 b8b57abae80a460db485c75d2858dfb7
 msgid "pip install 'NepTrain[soap]'\n"
 msgstr ""
 
-#: ../../source/install/index.md:46 a20682bf0b7e4962aa93c4981328cd06
+#: ../../source/install/index.md:65 a20682bf0b7e4962aa93c4981328cd06
 msgid ""
-"LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和 `LAMMPS_PLUGIN_PATH` 写入 execution "
-"target 的 `setup_script`，然后运行："
+"LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和 `LAMMPS_PLUGIN_PATH` "
+"写入 execution target 的 `setup_script`，然后运行："
 msgstr ""
-"LAMMPS, VASP, ABACUS, and pseudopotentials are supplied by the user or computing "
-"platform. Put module commands, PATH changes, and `LAMMPS_PLUGIN_PATH` in the "
-"execution target’s `setup_script`, then run:"
+"LAMMPS, VASP, ABACUS, and pseudopotentials are supplied by the user or "
+"computing platform. Put module commands, PATH changes, and "
+"`LAMMPS_PLUGIN_PATH` in the execution target’s `setup_script`, then run:"
 
-#: ../../source/install/index.md:49 86779b39f6ec47f1963c730e556e0c49
+#: ../../source/install/index.md:68 86779b39f6ec47f1963c730e556e0c49
 msgid "neptrain doctor --project project.yaml\n"
 msgstr ""
 
-#: ../../source/install/index.md:53 c1ca08a6951b45b8a63d8a929f8536c9
+#: ../../source/install/index.md:72 c1ca08a6951b45b8a63d8a929f8536c9
 msgid ""
-"`doctor` 会从项目读取 training、MD、labeling backend、stage target、 `setup_script` 和 "
-"`environment`，分别在实际目标环境检查 `nep`/TorchNEP、 GPUMD/LAMMPS、VASP/ABACUS 或 "
-"MACE/DeepMD；通常不需要再手写 backend 参数。"
+"`doctor` 会从项目读取 training、MD、labeling backend、stage target、 `setup_script`"
+" 和 `environment`，分别在实际目标环境检查 `nep`/TorchNEP、 GPUMD/LAMMPS、VASP/ABACUS 或 "
+"MACE/DeepMD/TACE；通常不需要再手写 backend 参数。"
 msgstr ""
 "`doctor` reads the training, MD, and labeling backends, stage targets, "
-"`setup_script`, and `environment` from the project. It checks `nep`/TorchNEP, "
-"GPUMD/LAMMPS, VASP/ABACUS, or MACE/DeepMD in each actual target environment, so "
-"backend flags are normally unnecessary."
+"`setup_script`, and `environment` from the project. It checks "
+"`nep`/TorchNEP, GPUMD/LAMMPS, VASP/ABACUS, or MACE/DeepMD/TACE in each "
+"actual target environment, so backend flags are normally unnecessary."
 
-#: ../../source/install/index.md:57 459002b4e3504ebf92ccf1c501aa6ab7
+#: ../../source/install/index.md:77 459002b4e3504ebf92ccf1c501aa6ab7
 msgid ""
-"NepTrain 不再读取 `~/.NepTrain` 中的旧环境配置。所有可复现执行环境都应进入 schema-v8 `project.yaml` 的 target "
-"或对应环境脚本。"
+"NepTrain 不再读取 `~/.NepTrain` 中的旧环境配置。所有可复现执行环境都应进入 schema-v8 "
+"`project.yaml` 的 target 或对应环境脚本。"
 msgstr ""
-"NepTrain no longer reads legacy environment settings from `~/.NepTrain`. Put every "
-"reproducible execution setting in a schema-v8 `project.yaml` target or its setup "
-"script."
+"NepTrain no longer reads legacy environment settings from `~/.NepTrain`. "
+"Put every reproducible execution setting in a schema-v8 `project.yaml` "
+"target or its setup script."

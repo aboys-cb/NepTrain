@@ -1,0 +1,65 @@
+schema_version: 8
+
+training:
+  backend: torchnep
+  initial_path: ./labeled.xyz
+  config_path: ./nep-workflow.in
+  device: cuda
+  torch_backend: bmm
+  precision: float32
+  use_compile: false
+
+md:
+  backend: gpumd
+  inference_backend: auto
+  spin: false
+
+sampling:
+  routes:
+    - id: aluminum-nve
+      structures:
+        - ./candidates.xyz
+      template_path: ./gpumd-nve.in
+      conditions:
+        temperature_path:
+          - 50
+      progression:
+        steps:
+          smoke_passed: 2
+          short_stable: 4
+          long_stable: 8
+          production_ready: 16
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 1
+          production_ready: 1
+  selection:
+    max_selected: 2
+    novelty: auto
+
+labeling:
+  backend: model
+  model_path: ./TACE-OAM-7M.pt
+  model_name: TACE-OAM-7M
+  runner: neptrain model-worker tace --fidelity-index 0
+  device: cuda
+  precision: float32
+  structures_per_job: 2
+  max_concurrent: 1
+
+workflow:
+  id: tace-distillation-workflow
+  max_model_generations: 1
+  seed: 20260728
+
+execution:
+  poll_interval: 1
+  stage_targets:
+    training: local
+    sampling: local
+    labeling: local
+    analysis: local
+  targets:
+    local:
+      executor: process

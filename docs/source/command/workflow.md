@@ -6,6 +6,7 @@
 - [ABACUS + Slurm](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-abacus-slurm)
 - [DeepMD / DPA 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-deepmd)
 - [MACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-mace)
+- [TACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-tace)
 
 ## 创建项目
 
@@ -241,6 +242,25 @@ DPA-4 使用相同 runner 和本地 `.pt2` 模型；不新增 workflow backend�
 head 和推理后端由 DeePMD-kit 处理，NepTrain 仍按本地文件内容记录 SHA256。
 当前 DPA-4 要求 DeePMD-kit 3.2 或更新版本。DeepMD runner 同样不生成
 `mforce`，因此不支持 spin workflow。
+
+TACE runner 复用官方 `tace-eval` 批量推理，并把它写出的预测 extxyz 归一成
+NepTrain 标签：
+
+```yaml
+labeling:
+  backend: model
+  model_path: ./TACE-OAM-7M.pt
+  model_name: TACE-OAM-7M
+  runner: neptrain model-worker tace --fidelity-index 0
+  device: cuda
+  precision: float32
+```
+
+`--fidelity-index` 会写入传给 TACE 的临时输入结构；省略时保留模型或输入的默认
+fidelity。NepTrain 要求模型至少输出 energy、forces，以及 stress 或 virial。
+stress 会按 `-stress × volume` 转为 virial，TACE 直接输出的 virial 则原样保留。
+普通 TACE checkpoint 不能标注 spin 数据；只有真实输出
+`noncollinear_magnetic_forces` 的模型才会被映射为标准 `mforce`。
 
 这里的 `model-worker` 是 label stage 的内部协议，不是独立产品入口；用户仍通过
 `neptrain label` 或 workflow 启动标注。

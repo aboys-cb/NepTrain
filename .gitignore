@@ -18,3 +18,12 @@ outputs/
 tmp/
 log.lammps
 dump.lammpstrj
+
+# Tutorial downloads and generated TACE outputs
+examples/distillation-tace/TACE-OAM-7M.pt
+examples/distillation-tace/*.part
+examples/distillation-tace/candidates.xyz
+examples/distillation-tace/labeled.xyz
+examples/distillation-tace/student-nep.txt
+examples/distillation-tace/student-train/
+examples/distillation-tace/tace-distillation-workflow/

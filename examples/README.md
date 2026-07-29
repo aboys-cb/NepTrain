@@ -13,6 +13,7 @@
 | 用 ABACUS 做主动学习 | [`workflow-abacus-slurm`](workflow-abacus-slurm/README.md) | ABACUS 单点计算 | TorchNEP、GPUMD、ABACUS、Slurm |
 | 用 DPA-3/DPA-4 蒸馏 | [`distillation-deepmd`](distillation-deepmd/README.md) | DeepMD/DPA Teacher | TorchNEP、DeePMD-kit，可选 GPUMD |
 | 用 MACE 蒸馏 | [`distillation-mace`](distillation-mace/README.md) | MACE Teacher | TorchNEP、MACE，可选 GPUMD |
+| 用 TACE 蒸馏 | [`distillation-tace`](distillation-tace/README.md) | TACE Teacher | TorchNEP、TACE，可选 GPUMD |
 
 建议按下面的顺序学习：
 

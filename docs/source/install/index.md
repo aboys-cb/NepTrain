@@ -37,6 +37,25 @@ pip install --pre 'deepmd-kit[torch]>=3.2.0b0,<4'
 pip install NepTrain
 ```
 
+TACE Teacher 蒸馏标注目前按官方仓库安装。本项目教程固定到已核对
+`tace-eval` 接口的 commit：
+
+```bash
+pip install \
+  'TACE @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
+```
+
+CUDA 12 环境可选安装 cuEquivariance 加速依赖：
+
+```bash
+pip install \
+  'TACE[cueq12] @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
+export TACE_USE_CUE=1
+```
+
+官方二进制算子需要 Ampere 或更新的 GPU；Sai V100 实测会报
+`cudaErrorNoKernelImageForDevice`，不要在 V100 上启用。
+
 手动采样不提供 NEP 模型、需要 SOAP 描述符时：
 
 ```bash
@@ -52,7 +71,8 @@ neptrain doctor --project project.yaml
 
 `doctor` 会从项目读取 training、MD、labeling backend、stage target、
 `setup_script` 和 `environment`，分别在实际目标环境检查 `nep`/TorchNEP、
-GPUMD/LAMMPS、VASP/ABACUS 或 MACE/DeepMD；通常不需要再手写 backend 参数。
+GPUMD/LAMMPS、VASP/ABACUS 或 MACE/DeepMD/TACE；通常不需要再手写 backend
+参数。
 
 NepTrain 不再读取 `~/.NepTrain` 中的旧环境配置。所有可复现执行环境都应进入
 schema-v8 `project.yaml` 的 target 或对应环境脚本。

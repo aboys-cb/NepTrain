@@ -171,11 +171,29 @@ neptrain label candidates.xyz \
 `model-worker deepmd` 的运行时由 `NepTrain[deepmd]` 提供；DPA-4 需要支持该格式的
 DeePMD-kit 3.2 或更新版本。
 
+TACE 使用官方 `tace-eval` 批量预测接口：
+
+```bash
+neptrain label candidates.xyz \
+  --backend model \
+  --model TACE-OAM-7M.pt \
+  --model-name TACE-OAM-7M \
+  --runner 'neptrain model-worker tace --fidelity-index 0' \
+  --device cuda \
+  --precision float32 \
+  -o labeled.xyz
+```
+
+TACE 先写临时预测 extxyz，NepTrain 再校验并归一化
+`TACE_energy`、`TACE_forces` 和 stress/virial。含 `spin` 的输入还必须得到
+`TACE_noncollinear_magnetic_forces`，否则任务失败，不会补零。
+
 所有模型 runner 都遵守五参数协议：`--model`、`--input`、`--output`、
 `--device` 和 `--precision`。runner 必须输出顺序不变的规范 extxyz。
 NepTrain 负责模型 hash、结构身份、energy/forces/virial、可选 spin/mforce
 和最终原子发布；runner 失败或标签不完整时不会产生部分结果。完整示例见仓库的
-`examples/distillation-mace/` 和 `examples/distillation-deepmd/`。
+`examples/distillation-mace/`、`examples/distillation-deepmd/` 和
+`examples/distillation-tace/`。
 `model-worker` 只承载 NepTrain 内部 runner 协议，不是需要用户单独学习的命令；
 正常使用请始终从 `neptrain label` 进入。
 

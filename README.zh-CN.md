@@ -21,8 +21,9 @@ workflow 只负责计划、状态推进和验收，不复制科学计算逻辑�
 - [ABACUS + Slurm workflow](examples/workflow-abacus-slurm/README.md)
 - [DeepMD / DPA 蒸馏](examples/distillation-deepmd/README.md)
 - [MACE 蒸馏](examples/distillation-mace/README.md)
+- [TACE 蒸馏](examples/distillation-tace/README.md)
 
-四个教程都从环境检查和独立标注开始，再进入一代完整 workflow，并说明跑完看
+这些教程都从环境检查和独立标注开始，再进入一代完整 workflow，并说明跑完看
 哪些日志、标签、provenance 和 PNG 图。
 
 ## 安装
@@ -49,6 +50,24 @@ DeepMD / DPA Teacher 蒸馏标注需要安装：
 ```bash
 pip install 'NepTrain[deepmd]'
 ```
+
+TACE Teacher 蒸馏需要从官方源码安装 TACE。本教程固定到已核对的接口版本：
+
+```bash
+pip install \
+  'TACE @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
+```
+
+CUDA 12 环境可选安装 cuEquivariance 加速依赖：
+
+```bash
+pip install \
+  'TACE[cueq12] @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
+export TACE_USE_CUE=1
+```
+
+官方二进制算子需要 Ampere 或更新的 GPU；Sai V100 实测会报
+`cudaErrorNoKernelImageForDevice`，不要在 V100 上启用。
 
 不提供 `--nep`、需要用 SOAP 做手动采样时安装：
 
@@ -169,6 +188,24 @@ neptrain label candidates.xyz \
 DPA-4 使用同一个适配器和本地 `.pt2` 文件，不增加 workflow backend。当前
 DPA-4 需要 DeePMD-kit 3.2 预发布版；完整下载、标注、Student 冒烟训练和版本边界见
 [`examples/distillation-deepmd`](examples/distillation-deepmd/README.md)。
+
+TACE 复用官方 `tace-eval` 批量推理。它先写临时预测 extxyz，NepTrain 再把
+`TACE_energy`、`TACE_forces` 和 stress/virial 字段校验并归一化后发布：
+
+```bash
+neptrain label candidates.xyz \
+  --backend model \
+  --model TACE-OAM-7M.pt \
+  --model-name TACE-OAM-7M \
+  --runner 'neptrain model-worker tace --fidelity-index 0' \
+  --device cuda \
+  -o labeled.xyz
+```
+
+只有真实输出非共线磁力的 TACE checkpoint 才能标注 spin 数据；NepTrain 会将
+`noncollinear_magnetic_forces` 映射为 `mforce`，缺失时直接失败。固定模型下载、
+独立标注和完整 workflow 见
+[`examples/distillation-tace`](examples/distillation-tace/README.md)。
 
 `model-worker` 是 workflow/手动 `label` 调用的内部协议，不作为第二套用户命令；
 用户入口始终是 `neptrain label`。

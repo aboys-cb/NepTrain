@@ -8,6 +8,7 @@
 | ABACUS | [ABACUS + Slurm workflow](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-abacus-slurm) | UPF/ORB manifest、Slurm target、真实 ABACUS 标注 |
 | DPA-3/DPA-4 | [DeepMD 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-deepmd) | 公开 DPA-3 下载、模型标注、Student 和完整 workflow |
 | MACE | [MACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-mace) | 固定 checkpoint、模型标注、Student 和完整 workflow |
+| TACE | [TACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-tace) | 固定 foundation model、预测字段归一化、Student 和完整 workflow |
 
 每个教程都按相同顺序组织：
 

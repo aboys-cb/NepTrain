@@ -13,6 +13,7 @@ source-tree layout.
 | Active learning with ABACUS | [`workflow-abacus-slurm`](workflow-abacus-slurm/README.en.md) | ABACUS single-point calculations | TorchNEP, GPUMD, ABACUS, Slurm |
 | Distillation from DPA-3/DPA-4 | [`distillation-deepmd`](distillation-deepmd/README.en.md) | DeepMD/DPA teacher | TorchNEP, DeePMD-kit, optionally GPUMD |
 | Distillation from MACE | [`distillation-mace`](distillation-mace/README.en.md) | MACE teacher | TorchNEP, MACE, optionally GPUMD |
+| Distillation from TACE | [`distillation-tace`](distillation-tace/README.en.md) | TACE teacher | TorchNEP, TACE, optionally GPUMD |
 
 Recommended learning order:
 

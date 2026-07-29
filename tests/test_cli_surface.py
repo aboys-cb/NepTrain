@@ -90,6 +90,7 @@ def test_primary_help_only_shows_the_new_product_surface():
     [
         ("mace", "NepTrain.runners.mace"),
         ("deepmd", "NepTrain.runners.deepmd"),
+        ("tace", "NepTrain.runners.tace"),
     ],
 )
 def test_internal_model_worker_dispatches_to_the_selected_adapter(
@@ -113,6 +114,7 @@ def test_internal_model_worker_dispatches_to_the_selected_adapter(
             output="output.xyz",
             device="cpu",
             precision="float64",
+            fidelity_index=2,
         )
     )
 
@@ -126,8 +128,45 @@ def test_internal_model_worker_dispatches_to_the_selected_adapter(
     assert captured["options"]["precision"] == "float64"
     if adapter == "deepmd":
         assert captured["options"]["head"] == "OMol25"
+    elif adapter == "tace":
+        assert captured["options"]["fidelity_index"] == 2
     else:
         assert "head" not in captured["options"]
+
+
+def test_doctor_detects_tace_command_for_model_labeling():
+    config = {
+        "training": {"backend": "gpumd"},
+        "md": {"backend": "gpumd"},
+        "labeling": {
+            "backend": "model",
+            "runner": "neptrain model-worker tace --fidelity-index 0",
+        },
+        "execution": {
+            "stage_targets": {
+                "training": "teacher",
+                "sampling": "teacher",
+                "labeling": "teacher",
+                "analysis": "teacher",
+            },
+            "sampling_route_targets": {},
+        },
+    }
+    target = ExecutionTarget(
+        name="teacher",
+        executor="process",
+        command="neptrain",
+    )
+
+    tools, packages, roles = _doctor_target_requirements(
+        config,
+        "teacher",
+        target,
+    )
+
+    assert "tace-eval" in tools
+    assert packages == []
+    assert "labeling" in roles
 
 
 def test_doctor_extracts_launcher_and_payload_commands():
