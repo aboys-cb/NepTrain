@@ -181,6 +181,23 @@ neptrain workflow extend fe-workflow 5
 NepTrain accepts only `schema_version: 8`. Unknown fields and legacy project
 formats fail explicitly instead of being migrated silently.
 
+Optional Feishu progress notifications can be configured directly in
+`project.yaml`:
+
+```yaml
+notifications:
+  feishu:
+    webhook: https://open.feishu.cn/open-apis/bot/v2/hook/REPLACE
+    secret: REPLACE
+    timeout_seconds: 5
+```
+
+`neptrain doctor --project project.yaml` sends a real connectivity probe.
+Workflow delivery runs on a background thread and is always best effort:
+notification failures never change workflow state, exit status, or the
+scientific ledger. Progress and terminal messages include both the workflow id
+and absolute workflow path so concurrent runs remain distinguishable.
+
 ## Labeling backends
 
 | Backend | Runtime | Main boundary |

@@ -1147,6 +1147,13 @@ class WorkflowIterationAdapter:
                         for attempt in route_plan["attempts"]
                     }
                 ),
+                "scenario_temperatures": sorted(
+                    {
+                        float(attempt["temperature"])
+                        for route_plan in route_plans
+                        for attempt in route_plan["attempts"]
+                    }
+                ),
                 "scenario_targets": sorted(
                     {
                         str(attempt["target_level"])

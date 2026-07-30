@@ -445,6 +445,22 @@ def test_doctor_reads_backends_and_route_targets_from_project(
     with project.open("w", encoding="utf-8") as handle:
         yaml.dump(value, handle)
     monkeypatch.setattr("importlib.util.find_spec", lambda _package: object())
+    value["notifications"] = {
+        "feishu": {
+            "webhook": (
+                "https://open.feishu.cn/open-apis/bot/v2/hook/test-token"
+            ),
+            "secret": "test-secret",
+        }
+    }
+    with project.open("w", encoding="utf-8") as handle:
+        yaml.dump(value, handle)
+    from NepTrain.core.notifications import DeliveryResult
+
+    monkeypatch.setattr(
+        "NepTrain.core.notifications.doctor_probe",
+        lambda *_args, **_kwargs: DeliveryResult(True, "success"),
+    )
 
     run_doctor(
         SimpleNamespace(
@@ -464,6 +480,7 @@ def test_doctor_reads_backends_and_route_targets_from_project(
     assert "CHECK training=gpumd md=gpumd inference=auto" in output
     assert "roles=analysis,labeling,sampling,training" in output
     assert "roles=sampling" in output
+    assert "OK Feishu webhook signature and delivery" in output
     assert "Doctor completed successfully." in output
 
 

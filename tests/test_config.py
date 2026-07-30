@@ -73,7 +73,7 @@ def _project(**overrides):
         },
     }
     for section, replacement in overrides.items():
-        value[section].update(replacement)
+        value.setdefault(section, {}).update(replacement)
     if value["labeling"].get("backend") == "vasp":
         value["labeling"].setdefault("resource_path", "./potpaw")
         value["labeling"].setdefault(
@@ -101,6 +101,55 @@ def test_schema_v8_loads_without_migration(tmp_path):
     assert config["schema_version"] == 8
     assert config["sampling"]["routes"][0]["conditions"]["temperature_path"] == [300]
     assert changes == []
+
+
+def test_feishu_notifications_accept_direct_project_credentials(tmp_path):
+    config, _ = load_config(
+        _write(
+            tmp_path,
+            _project(
+                notifications={
+                    "feishu": {
+                        "webhook": (
+                            "https://open.feishu.cn/open-apis/bot/v2/hook/"
+                            "test-token"
+                        ),
+                        "secret": "test-secret",
+                        "timeout_seconds": 3,
+                    }
+                }
+            ),
+        )
+    )
+
+    assert config["notifications"]["feishu"]["secret"] == "test-secret"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("webhook", ""),
+        ("secret", ""),
+        ("timeout_seconds", 0),
+        ("timeout_seconds", 31),
+    ],
+)
+def test_feishu_notification_config_is_strict(tmp_path, field, value):
+    settings = {
+        "webhook": (
+            "https://open.feishu.cn/open-apis/bot/v2/hook/test-token"
+        ),
+        "secret": "test-secret",
+    }
+    settings[field] = value
+
+    with pytest.raises(ConfigError, match=rf"notifications\.feishu\.{field}"):
+        load_config(
+            _write(
+                tmp_path,
+                _project(notifications={"feishu": settings}),
+            )
+        )
 
 
 def test_sampling_defaults_do_not_need_to_be_repeated_in_project_yaml(tmp_path):

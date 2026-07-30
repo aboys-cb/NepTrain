@@ -213,6 +213,10 @@ class WorkflowWorkspace:
     def controller_log(self) -> Path:
         return self.logs_dir / "controller.log"
 
+    @property
+    def notification_state(self) -> Path:
+        return self.internal_dir / "notifications.json"
+
     def generation_dir(self, generation: int) -> Path:
         return self.generations_dir / f"{generation:04d}"
 

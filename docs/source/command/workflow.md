@@ -87,6 +87,25 @@ sampling:
 `route_id` 和内容指纹会隔离场景成熟度与恢复结果。高级 route 可以显式覆盖
 `production_temperatures`、`pressure` 和整套 `progression`。
 
+需要在飞书群中接收每轮完成和流程终态时，在 `project.yaml` 直接配置自定义
+机器人：
+
+```yaml
+notifications:
+  feishu:
+    webhook: https://open.feishu.cn/open-apis/bot/v2/hook/REPLACE
+    secret: REPLACE
+    timeout_seconds: 5
+```
+
+`neptrain doctor --project project.yaml` 会真实发送一条测试消息，同时验证网络、
+签名和飞书响应。Controller 运行时只把通知事件放入后台线程；网络超时、签名失败、
+飞书拒绝或通知状态文件异常均不会改变 workflow 状态、退出码或科学 ledger。
+每个已接受 generation 报告采样、选样、标注、训练集变化和验证 RMSE；流程完成、
+失败、评估拒绝、停滞或预算耗尽另发终态消息。投递去重和结果保存在
+`.neptrain/notifications.json`，`neptrain workflow status` 会显示其健康状态。
+每条进度和终态消息都会显示 workflow 名称与绝对路径，便于区分并发运行的任务。
+
 默认情况下，全部 route 使用 `execution.stage_targets.sampling`。需要把某条
 route 送到另一台 Slurm 平台时，只写例外映射：
 

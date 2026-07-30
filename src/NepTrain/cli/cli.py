@@ -203,6 +203,16 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
         else:
             completed = sum(job["state"] == "COMPLETED" for job in status.jobs)
             print(f"Executor: {completed}/{len(status.jobs)} stages completed")
+    if status.notifications:
+        notification = status.notifications
+        print(
+            "Notifications: "
+            f"Feishu {notification['state']}, "
+            f"{notification['delivered']} delivered, "
+            f"{notification['failed']} failed"
+        )
+        if notification.get("last_error"):
+            print(f"Notification error: {notification['last_error']}")
     if status.next_action:
         print(f"Next: {status.next_action}")
 
@@ -924,6 +934,26 @@ def run_doctor(args):
                 "lammps",
             )
         print(f"OK real LAMMPS smoke at mpi_ranks={args.mpi_ranks}")
+    if config is not None:
+        feishu = config.get("notifications", {}).get("feishu", {})
+        if feishu:
+            from NepTrain.core.notifications import doctor_probe
+
+            workflow_id = str(
+                config.get("workflow", {}).get("id") or project.stem
+            )
+            result = doctor_probe(
+                feishu,
+                workflow_id=workflow_id,
+                project_path=project,
+            )
+            print(
+                f"{'OK' if result.ok else 'FAIL'} Feishu webhook "
+                "signature and delivery"
+            )
+            if not result.ok:
+                failures.append("Feishu webhook")
+                print(f"  {result.detail}")
     if failures:
         raise SystemExit("Doctor failed: " + ", ".join(failures))
     print("Doctor completed successfully.")

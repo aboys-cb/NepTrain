@@ -38,6 +38,7 @@ dependencies = [
 "argcomplete",
 "ruamel.yaml",
 "matplotlib>=3.8",
+"urllib3>=2,<3",
 "nep-adapters>=1.0,<2"
 ]
 

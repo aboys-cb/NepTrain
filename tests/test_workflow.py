@@ -262,6 +262,48 @@ def test_status_reports_prepared_controller_without_mutation(tmp_path: Path):
     assert preparation.manifest.read_bytes() == before
 
 
+def test_status_reports_notification_health_without_affecting_workflow(
+    tmp_path: Path,
+):
+    config, initial = _inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + """
+notifications:
+  feishu:
+    webhook: https://open.feishu.cn/open-apis/bot/v2/hook/test-token
+    secret: test-secret
+""",
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    workspace.notification_state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "provider": "feishu",
+                "events": {
+                    "generation:1:accepted": {
+                        "state": "failed",
+                        "attempts": 1,
+                        "last_error": "connection timeout",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = workflow_status(preparation.output_dir)
+
+    assert status.state == "prepared"
+    assert status.notifications is not None
+    assert status.notifications["state"] == "degraded"
+    assert status.notifications["failed"] == 1
+    assert status.notifications["last_error"] == "connection timeout"
+
+
 def test_status_uses_controller_task_instead_of_scheduler_chain(tmp_path: Path):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")

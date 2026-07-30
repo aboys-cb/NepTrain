@@ -1795,6 +1795,39 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
             controller.state.pop("reason", None)
             controller._save()
             try:
+                from .notifications import build_workflow_notifier
+
+                notifier = build_workflow_notifier(
+                    controller.config,
+                    workspace,
+                )
+            except Exception as error:
+                notifier = None
+                print(
+                    f"NepTrain notification warning: cannot initialize "
+                    f"notifications: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            def report_progress(tick: ControllerTick) -> None:
+                if notifier is None:
+                    return
+                try:
+                    notifier.observe(
+                        workflow_id=controller.workflow_id,
+                        plans=controller.plans,
+                        controller_state=controller.state,
+                        tick=tick,
+                    )
+                except Exception as error:
+                    print(
+                        f"NepTrain notification warning: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            try:
                 while not stop_event.is_set():
                     try:
                         tick = controller.tick(
@@ -1834,6 +1867,7 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                                 controller.state.get("reason", error)
                             ),
                         )
+                    report_progress(tick)
                     if tick.state in {
                         "complete",
                         "rejected",
@@ -1852,8 +1886,24 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                 controller.state["state"] = "failed"
                 controller.state["reason"] = str(error)
                 controller._save()
+                report_progress(
+                    ControllerTick(
+                        "failed",
+                        detail=str(error),
+                    )
+                )
                 raise
             finally:
+                if notifier is not None:
+                    try:
+                        notifier.close()
+                    except Exception as error:
+                        print(
+                            "NepTrain notification warning: cannot stop "
+                            f"notification thread: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                 try:
                     if (
                         workspace.controller_pid.read_text(

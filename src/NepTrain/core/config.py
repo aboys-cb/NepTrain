@@ -82,6 +82,9 @@ _FIELDS: dict[str, set[str]] = {
         "sampling_route_targets",
         "targets",
     },
+    "notifications": {
+        "feishu",
+    },
 }
 _SAMPLING_FIELDS = {
     "candidate_pool": {
@@ -122,6 +125,11 @@ _TARGET_FIELDS = {
     "directives",
     "labeling_resource_path",
     "environment",
+}
+_FEISHU_NOTIFICATION_FIELDS = {
+    "webhook",
+    "secret",
+    "timeout_seconds",
 }
 
 
@@ -344,6 +352,15 @@ def _reject_unknown(config: Mapping[str, Any]) -> None:
                 + ", ".join(unknown)
                 + "; remove obsolete or misspelled fields"
             )
+    notifications = _mapping(config, "notifications")
+    feishu = _mapping(notifications, "feishu")
+    unknown = sorted(set(feishu) - _FEISHU_NOTIFICATION_FIELDS)
+    if unknown:
+        raise ConfigError(
+            "unknown notifications.feishu fields: "
+            + ", ".join(unknown)
+            + "; remove obsolete or misspelled fields"
+        )
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
@@ -370,6 +387,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
     workflow = _mapping(config, "workflow")
     evaluation = _mapping(config, "evaluation")
     execution = _mapping(config, "execution")
+    notifications = _mapping(config, "notifications")
 
     if training.get("backend") not in {"gpumd", "torchnep"}:
         raise ConfigError("training.backend must be gpumd or torchnep")
@@ -594,6 +612,33 @@ def validate_config(config: Mapping[str, Any]) -> None:
             )
         if any(float(value) <= 0 for value in thresholds.values()):
             raise ConfigError("evaluation.max_rmse values must be positive")
+
+    feishu = _mapping(notifications, "feishu")
+    if feishu:
+        for field in ("webhook", "secret"):
+            value = feishu.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(
+                    f"notifications.feishu.{field} must be a non-empty string"
+                )
+        if not str(feishu["webhook"]).startswith(
+            "https://open.feishu.cn/open-apis/bot/v2/hook/"
+        ):
+            raise ConfigError(
+                "notifications.feishu.webhook must be a Feishu custom-bot "
+                "v2 webhook"
+            )
+        timeout = feishu.get("timeout_seconds", 5)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or not 0.2 <= float(timeout) <= 30
+        ):
+            raise ConfigError(
+                "notifications.feishu.timeout_seconds must be between "
+                "0.2 and 30 seconds"
+            )
 
     try:
         interval = float(execution.get("poll_interval", 30))

@@ -1164,6 +1164,35 @@ def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
     ).controller_pid.exists()
 
 
+def test_notification_failure_never_changes_controller_result(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+
+    class BrokenNotifier:
+        def observe(self, **_kwargs):
+            raise RuntimeError("intentional notification failure")
+
+        def close(self):
+            raise RuntimeError("intentional close failure")
+
+    monkeypatch.setattr(
+        "NepTrain.core.notifications.build_workflow_notifier",
+        lambda *_args, **_kwargs: BrokenNotifier(),
+    )
+    monkeypatch.setattr(
+        PersistentController,
+        "tick",
+        lambda *_args, **_kwargs: ControllerTick("complete"),
+    )
+
+    assert run_controller(preparation.output_dir, poll_interval=0.2) == 0
+    assert "intentional notification failure" in capsys.readouterr().err
+
+
 def test_group_submission_checks_stop_between_parallel_launch_batches(
     tmp_path: Path,
 ):

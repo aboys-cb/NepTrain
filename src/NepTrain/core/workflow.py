@@ -57,6 +57,7 @@ class WorkflowStatus:
     next_action: str | None
     generations: tuple[Mapping[str, Any], ...]
     jobs: tuple[Mapping[str, Any], ...]
+    notifications: Mapping[str, Any] | None
 
 
 _STAGES = (
@@ -1318,6 +1319,62 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         reason = "workflow is prepared and controller has not started"
         next_action = f"neptrain workflow run {workflow_path}"
 
+    notification_summary = None
+    configured_notifications = False
+    try:
+        from .config import load_config
+
+        config, _ = load_config(workspace.project_file)
+        configured_notifications = bool(
+            config.get("notifications", {}).get("feishu")
+        )
+    except Exception:
+        pass
+    if configured_notifications or workspace.notification_state.is_file():
+        notification_summary = {
+            "provider": "feishu",
+            "state": "configured",
+            "delivered": 0,
+            "failed": 0,
+            "last_error": None,
+        }
+        if workspace.notification_state.is_file():
+            try:
+                notification_state = _read_json(
+                    workspace.notification_state,
+                    role="notification state",
+                )
+                events = notification_state.get("events", {})
+                if not isinstance(events, Mapping):
+                    raise ValueError("notification events must be a mapping")
+                delivered = sum(
+                    isinstance(record, Mapping)
+                    and record.get("state") == "delivered"
+                    for record in events.values()
+                )
+                failed_records = [
+                    record
+                    for record in events.values()
+                    if isinstance(record, Mapping)
+                    and record.get("state") == "failed"
+                ]
+                notification_summary.update(
+                    state="degraded" if failed_records else "ok",
+                    delivered=delivered,
+                    failed=len(failed_records),
+                    last_error=(
+                        failed_records[-1].get("last_error")
+                        if failed_records
+                        else None
+                    ),
+                )
+            except Exception as error:
+                notification_summary.update(
+                    state="degraded",
+                    failed=1,
+                    last_error=f"cannot read notification state: {error}",
+                )
+
     return WorkflowStatus(
         workflow_id=preparation.workflow_id,
         state=state,
@@ -1329,6 +1386,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         next_action=next_action,
         generations=generations,
         jobs=tuple(jobs),
+        notifications=notification_summary,
     )
 
 
