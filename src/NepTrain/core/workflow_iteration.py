@@ -295,7 +295,7 @@ def _nep_prediction_evaluation(
         comparisons["mforce"] = ParitySeries(
             reference_mforce,
             predicted_mforce,
-            "eV/spin unit",
+            "eV/μB",
         )
     return PredictionEvaluation(metrics, comparisons)
 

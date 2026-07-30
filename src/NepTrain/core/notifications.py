@@ -259,7 +259,7 @@ def _generation_event(
         f"E={_metric(quality.get('energy_rmse'), scale=1, unit='eV')}，"
         f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}，"
         f"V={_metric(quality.get('virial_rmse'), scale=1, unit='eV')}，"
-        f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/spin unit')}",
+        f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/μB')}",
         f"结论：{outcome}",
     ]
     training_line = (

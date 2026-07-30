@@ -127,6 +127,7 @@ def test_generation_report_contains_scientific_progress():
                     "added_training_count": 9,
                     "energy_rmse": 0.01,
                     "force_rmse": 0.2,
+                    "mforce_rmse": 0.15,
                     "active_model_sha256": "a" * 64,
                 }
             },
@@ -149,6 +150,8 @@ def test_generation_report_contains_scientific_progress():
     assert "1 批失败" in event.text
     assert "部分成功并已接受" in event.text
     assert "F=200 meV/Å" in event.text
+    assert "M=150 meV/μB" in event.text
+    assert "meV/spin unit" not in event.text
     assert "温度：300/500 K" in event.text
     assert "最长时长：400 steps" in event.text
 
