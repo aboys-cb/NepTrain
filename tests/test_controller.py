@@ -59,6 +59,7 @@ from NepTrain.core.scientific_data import (
 from NepTrain.core.workflow_workspace import WorkflowWorkspace
 import NepTrain.core.controller as controller_module
 import NepTrain.core.execution as execution_module
+import NepTrain.core.workflow_iteration as workflow_iteration_module
 
 
 def _write(path: Path, text: str = "fixture\n") -> Path:
@@ -123,6 +124,53 @@ def _plan() -> GenerationPlan:
         seed=7,
         max_selected=2,
     )
+
+
+def test_empty_label_task_omits_dft_resources(tmp_path):
+    initial = _write(tmp_path / "initial.xyz")
+    selected = tmp_path / "selected-input.xyz"
+    selected.touch()
+    missing_incar = tmp_path / "missing-INCAR"
+    missing_resources = tmp_path / "missing-potcar"
+    plan = _plan()
+    task = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="empty-label",
+        generation=1,
+        stage="label",
+        attempt=1,
+        target=ExecutionTarget("analysis", "process"),
+        plan=plan,
+        config={
+            "training": {},
+            "sampling": {},
+            "md": {},
+            "labeling": {
+                "backend": "vasp",
+                "input_path": str(missing_incar),
+                "resource_path": str(missing_resources),
+            },
+            "workflow": {},
+            "execution": {},
+        },
+        initial_training=initial,
+        context=StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation",
+            plan=plan,
+            artifacts={"selected_input": selected},
+            previous_artifacts={},
+        ),
+        stage_input={"empty_selection": True},
+    )
+
+    descriptor = json.loads(task.descriptor.read_text())
+    assert descriptor["identity"]["target"] == "analysis"
+    assert descriptor["stage_input"] == {"empty_selection": True}
+    assert "input_path" not in descriptor["config"]["labeling"]
+    assert "resource_path" not in descriptor["config"]["labeling"]
+
 
 def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypatch):
     initial = _write(tmp_path / "initial.xyz")
@@ -1736,6 +1784,34 @@ def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
     dft_root = preparation.output_dir / "generations" / "0001" / "label"
     assert len(list(dft_root.glob("00000*-Fe"))) == 3
     assert not (dft_root / "calculations").exists()
+
+
+def test_controller_reports_exhausted_sampling_coverage(
+    tmp_path, monkeypatch
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: ImmediateExecutor(target, launches),
+    )
+    monkeypatch.setattr(
+        workflow_iteration_module.WorkflowIterationAdapter,
+        "plan_explore_attempts",
+        lambda _self, _context: (),
+    )
+
+    for _ in range(6):
+        tick = controller.tick()
+        if tick.state == "coverage_exhausted":
+            break
+    else:
+        raise AssertionError("controller did not stop at exhausted coverage")
+
+    assert controller.state["current"] is None
+    assert "independent validation" in controller.state["reason"]
+    assert [stage for stage, _ in launches] == ["train"]
 
 
 def test_label_oom_is_not_retried_and_does_not_stop_sibling_tasks(tmp_path):

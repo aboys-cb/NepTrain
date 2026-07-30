@@ -85,6 +85,18 @@ class Nep3Calculator:
             return self._calculator.get_spin_structures_descriptor(frames)
         return self._calculator.get_structures_descriptor(frames)
 
+    def get_structures_atomic_descriptors(
+        self, structures: Iterable[Atoms]
+    ) -> np.ndarray:
+        frames = self._structures(structures)
+        if not frames:
+            return np.empty((0, self.model_info.descriptor_dim), dtype=np.float64)
+        if self.model_info.supports("spin"):
+            return self._calculator.predict_spin_descriptors(frames)
+        return self._calculator.get_structures_descriptor(
+            frames, mean_descriptor=False
+        )
+
     def calculate(self, structures: Iterable[Atoms] | Atoms, mean_virial: bool = True):
         frames = self._structures(structures)
         if self.model_info.supports("spin"):
@@ -128,3 +140,16 @@ class DescriptorCalculator:
         if self.calculator_type == "nep":
             return self.calculator.get_structures_descriptors(frames)
         return np.asarray([self.calculator.create_single(frame).mean(0) for frame in frames])
+
+    def get_structures_atomic_descriptors(
+        self, structures: Iterable[Atoms]
+    ) -> np.ndarray:
+        frames = list(structures)
+        if not frames:
+            return np.array([])
+        if self.calculator_type == "nep":
+            return self.calculator.get_structures_atomic_descriptors(frames)
+        return np.concatenate(
+            [np.asarray(self.calculator.create_single(frame)) for frame in frames],
+            axis=0,
+        )

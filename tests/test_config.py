@@ -120,6 +120,28 @@ def test_sampling_defaults_do_not_need_to_be_repeated_in_project_yaml(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "reduction", ["global_mean", "elementwise_mean_std"]
+)
+def test_sampling_accepts_descriptor_reduction_modes(tmp_path, reduction):
+    value = _project()
+    value["sampling"]["selection"]["descriptor_reduction"] = reduction
+
+    config, _ = load_config(_write(tmp_path, value))
+
+    assert (
+        config["sampling"]["selection"]["descriptor_reduction"] == reduction
+    )
+
+
+def test_sampling_rejects_unknown_descriptor_reduction(tmp_path):
+    value = _project()
+    value["sampling"]["selection"]["descriptor_reduction"] = "element_average"
+
+    with pytest.raises(ConfigError, match="descriptor_reduction"):
+        load_config(_write(tmp_path, value))
+
+
+@pytest.mark.parametrize(
     "workflow_id",
     ["../escaped", "/absolute", "with space", ".hidden", "", "a" * 65, 7],
 )

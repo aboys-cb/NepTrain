@@ -41,6 +41,7 @@ from NepTrain.core.manual import (
     wait_operation,
 )
 import NepTrain.core.manual as manual_module
+import NepTrain.core.execution as execution_module
 
 
 def _structures(path: Path, count: int = 3) -> Path:
@@ -415,6 +416,56 @@ def test_execution_transport_sends_remote_scripts_via_stdin():
         "source.tar.gz",
         "remote:/remote/work/source.tar.gz",
     ]
+
+
+def test_ssh_control_directory_is_recreated_after_external_cleanup(monkeypatch):
+    monkeypatch.setattr(execution_module, "_SSH_CONTROL_DIRECTORY", None)
+
+    first = Path(execution_module._ssh_control_path("remote"))
+    shutil.rmtree(first.parent)
+    second = Path(execution_module._ssh_control_path("remote"))
+
+    assert second.parent.is_dir()
+    assert second.parent != first.parent
+
+
+def test_execution_transport_retries_a_missing_control_directory(monkeypatch):
+    monkeypatch.setattr(execution_module, "_SSH_CONTROL_DIRECTORY", None)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                args,
+                255,
+                stdout="",
+                stderr=(
+                    "unix_listener: cannot bind to path "
+                    "/tmp/neptrain-ssh-missing/socket.random: "
+                    "No such file or directory"
+                ),
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="ok\n", stderr="")
+
+    transport = ExecutionTransport(
+        ExecutionTarget(
+            "remote",
+            "slurm",
+            host="remote",
+            work_root="/remote/work",
+            partition="cpu",
+        ),
+        runner=fake_run,
+    )
+
+    completed = transport.run_script("true", check=True)
+
+    first_path = next(value for value in calls[0] if value.startswith("ControlPath="))
+    second_path = next(value for value in calls[1] if value.startswith("ControlPath="))
+    assert completed.stdout == "ok\n"
+    assert len(calls) == 2
+    assert first_path != second_path
 
 
 def test_execution_transport_times_out_remote_scheduler_commands():

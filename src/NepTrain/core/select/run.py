@@ -12,6 +12,12 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from ..content_addressing import file_sha256
+from ..descriptor_features import (
+    ELEMENTWISE_MEAN_STD,
+    GLOBAL_MEAN,
+    descriptor_elements,
+    reduce_atomic_descriptors,
+)
 from ..fps import hierarchical_farthest_point_sampling
 from ..nep.calculator import DescriptorCalculator
 from ..scientific_data import STRUCTURE_ID_VERSION, structure_id
@@ -106,6 +112,30 @@ def _descriptor_calculator(args, frames: Sequence[Atoms]) -> tuple[Any, dict[str
     }
 
 
+def _structure_descriptor_rows(
+    calculator: Any,
+    frames: Sequence[Atoms],
+    *,
+    reduction: str,
+    elements: Sequence[str],
+) -> np.ndarray:
+    if reduction == GLOBAL_MEAN:
+        return np.asarray(
+            calculator.get_structures_descriptors(frames),
+            dtype=np.float64,
+        )
+    atomic = np.asarray(
+        calculator.get_structures_atomic_descriptors(frames),
+        dtype=np.float64,
+    )
+    return reduce_atomic_descriptors(
+        frames,
+        atomic,
+        reduction=ELEMENTWISE_MEAN_STD,
+        elements=elements,
+    )
+
+
 def run_select(args) -> dict[str, Any]:
     if args.max_selected <= 0:
         raise SelectionError("--max-selected must be a positive integer")
@@ -160,17 +190,28 @@ def run_select(args) -> dict[str, Any]:
     calculator, descriptor_record = _descriptor_calculator(
         args, [*candidates, *references]
     )
-    candidate_descriptors = np.asarray(
-        calculator.get_structures_descriptors(candidates),
-        dtype=np.float64,
+    elements = descriptor_elements([*candidates, *references])
+    candidate_descriptors = _structure_descriptor_rows(
+        calculator,
+        candidates,
+        reduction=args.descriptor_reduction,
+        elements=elements,
     )
     reference_descriptors = (
-        np.asarray(
-            calculator.get_structures_descriptors(references),
-            dtype=np.float64,
+        _structure_descriptor_rows(
+            calculator,
+            references,
+            reduction=args.descriptor_reduction,
+            elements=elements,
         )
         if references
         else None
+    )
+    descriptor_record.update(
+        {
+            "reduction": args.descriptor_reduction,
+            "elements": list(elements),
+        }
     )
     result = hierarchical_farthest_point_sampling(
         candidates,

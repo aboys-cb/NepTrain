@@ -90,6 +90,7 @@ _SAMPLING_FIELDS = {
         "health",
     },
     "selection": {
+        "descriptor_reduction",
         "max_selected",
         "novelty",
     },
@@ -404,6 +405,14 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ConfigError(str(error)) from error
     if int(selection.get("max_selected", 100)) < 1:
         raise ConfigError("sampling.selection.max_selected must be positive")
+    if selection.get("descriptor_reduction", "global_mean") not in {
+        "global_mean",
+        "elementwise_mean_std",
+    }:
+        raise ConfigError(
+            "sampling.selection.descriptor_reduction must be global_mean "
+            "or elementwise_mean_std"
+        )
     novelty = selection.get("novelty", "auto")
     if novelty != "auto":
         if not isinstance(novelty, Mapping):

@@ -216,6 +216,7 @@ neptrain label candidates.xyz \
 neptrain select md-300.xyz md-600.xyz \
   --base train.xyz \
   --nep nep.txt \
+  --descriptor-reduction elementwise_mean_std \
   --max-selected 64 \
   --min-novelty 0.01 \
   --out selected.xyz \
@@ -224,7 +225,9 @@ neptrain select md-300.xyz md-600.xyz \
 
 手动命令和 workflow 共用按元素集合分组、按来源条件平衡的 FPS 策略。
 `--base` 作为已有训练集 warm start；精确重复结构和描述符重复点不会为填满上限而
-再次入选。提供 `--nep` 时使用 NEP 描述符，否则使用 SOAP。JSON 报告记录结构
+再次入选。`global_mean` 保留原来的全原子平均；推荐多元素体系使用
+`elementwise_mean_std`，分别保留每种元素的描述符均值和标准差，避免不同元素在
+结构平均时相互中和。提供 `--nep` 时使用 NEP 描述符，否则使用 SOAP。JSON 报告记录结构
 身份版本、描述符来源、入选 ID、novelty 和各分组统计。
 
 ### Slurm target
@@ -431,21 +434,40 @@ k 点设置。
 `production_temperatures` 后，其余温度只做便宜的 smoke 探路。所有通过健康检查
 的 dump 帧都会参与全局 FPS；系统只会去除
 训练集已有结构和完全重复结构，不会在描述符计算前按 stride 或数量上限抽帧。
-`max_selected` 是一个采样轮最多送去 Label Adapter 的结构数。系统自动把常规
-积累下限设为它的一半（默认 100 对应 50）；当前场景 frontier 耗尽或物理失败
-抢救时可以提前 flush，不需要用户再维护一组批量阈值。
+`max_selected` 是一个采样轮最多送去 Label Adapter 的结构数，不要求每轮填满。
+每个仍有新颖结构的温压条件先保留一个锚点，剩余名额按全局 novelty 分配，因此
+已经学好的低温不会与新解锁的高温继续等额占用 DFT。
+
+多元素体系可在 workflow 中启用按元素规约的结构描述符：
+
+```yaml
+sampling:
+  selection:
+    descriptor_reduction: elementwise_mean_std
+    max_selected: 100
+    novelty: auto
+```
+
+默认值 `global_mean` 保留旧行为。`elementwise_mean_std` 会在统一元素顺序下拼接
+各元素的描述符均值和标准差；候选结构、完整 `train.xyz`、自动 novelty 阈值和 FPS
+始终使用同一规约。
 
 模型版本之间是硬边界：每轮候选只允许来自该轮激活模型，候选文件和 manifest
 都会记录模型哈希。标签诊断超阈值或 MD 发生物理失败时才更新模型；只有新模型完成
-evaluate 并写入 lineage，下一轮 MD 才会启动。若当前模型已通过新标签诊断，则
-保持该模型继续做长时认证，避免无意义更新反复清零稳定性证据。因此不会把旧模型
-轨迹误当成新模型的采样证据。
+evaluate 并写入 lineage，下一轮 MD 才会启动。模型更新不会清零已经完成的
+smoke、short 或 long 采样证据；只有最终 production 认证重新绑定当前模型。
+因此既不会把旧模型轨迹混入新候选池，也不会让每一代无意义地退回 smoke。
 
 每个 replica 都会得到 NepTrain 派生的确定性 `{{ seed }}`；用户模板可把它同时
 用于 `velocity create` 和 DynSpin thermostat，保证重复运行可复现但 replica
-彼此独立。`novelty: auto` 不伪造误差校准：选择阶段接受所有正新颖度候选，
-完成条件要求当前池没有剩余覆盖缺口。需要显式阈值时，可同时配置
+彼此独立。`novelty: auto` 会以当前完整 `train.xyz` 为参考，只用同元素训练结构
+拟合描述符中心和尺度，再从留一最近邻距离估计保守覆盖阈值。候选结构只使用该尺度
+变换，不参与阈值坐标系的拟合。一个温压条件只有在本档 MD 正常完成且剩余 novelty
+落入该阈值后才晋级；仍有缺口就留在当前时长继续采样。若本轮没有结构超过阈值，
+workflow 会跳过 DFT 和重训，直接推进采样阶梯。需要固定策略时，可同时配置
 `selection_threshold` 和 `completion_threshold`。
+完整阶梯耗尽后，独立验证通过才会报告 `complete`；没有独立验证时会停在
+`coverage_exhausted`，不会把“采样未发现新结构”冒充为“模型精度已经验证”。
 
 `workflow.max_model_generations` 是最大模型代数预算。生产温度、最长时长、replica、轨迹诊断和
 validation 全部通过后会提前完成；预算耗尽或连续无进展会分别报告

@@ -1278,8 +1278,19 @@ class PersistentController:
             )
             attempt_specs = adapter.plan_explore_attempts(context)
             if not attempt_specs:
-                raise ControllerError(
-                    "sampling frontier has no unlocked MD attempts"
+                self.state["state"] = "coverage_exhausted"
+                self.state["reason"] = (
+                    "sampling coverage is exhausted for the active model, "
+                    "but independent validation has not established workflow "
+                    "convergence"
+                )
+                self.state["current"] = None
+                self._save()
+                return ControllerTick(
+                    "coverage_exhausted",
+                    plan.generation,
+                    stage,
+                    detail=self.state["reason"],
                 )
             attempt = self._attempt(plan.generation, stage)
             tasks = []
@@ -1335,6 +1346,7 @@ class PersistentController:
             stage == "label"
             and self.config.get("labeling", {}).get("backend", "vasp")
             in {"vasp", "abacus"}
+            and context.artifacts["selected_input"].stat().st_size > 0
         ):
             frames = ase_read(context.artifacts["selected_input"], index=":")
             if not isinstance(frames, list):
@@ -1405,7 +1417,15 @@ class PersistentController:
             self.state["state"] = "launching"
             self._save()
             return self.tick(should_stop=should_stop)
-        resource = _RESOURCE_FOR_STAGE[stage]
+        empty_label = bool(
+            stage == "label"
+            and context.artifacts["selected_input"].stat().st_size == 0
+        )
+        resource = (
+            "analysis"
+            if empty_label
+            else _RESOURCE_FOR_STAGE[stage]
+        )
         target_name = self.stage_targets[resource]
         target = self.targets[target_name]
         attempt = self._attempt(plan.generation, stage)
@@ -1422,6 +1442,9 @@ class PersistentController:
             initial_training=self.initial_training,
             context=context,
             workflow_instance_id=self.manifest["instance_id"],
+            stage_input={"empty_selection": True}
+            if empty_label
+            else None,
         )
         self.state["current"] = {
             "task_id": task.task_id,
@@ -1817,6 +1840,7 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         "failed",
                         "stalled",
                         "budget_exhausted",
+                        "coverage_exhausted",
                     }:
                         return 0 if tick.state == "complete" else 2
                     stop_event.wait(interval)
@@ -2015,6 +2039,7 @@ def stop_workflow(
             "rejected",
             "stalled",
             "budget_exhausted",
+            "coverage_exhausted",
         }
         if prior_current is None and prior_name in no_op_states:
             result["current_execution"] = {

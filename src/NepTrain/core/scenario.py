@@ -320,8 +320,6 @@ class ScenarioLadder:
         current = str(record["maturity"])
         if current == "untested":
             return "smoke_passed"
-        if record.get("canary_model_id") != model_id:
-            return "smoke_passed"
         if temperature not in self.production_temperatures:
             return None
         if current == "production_ready":
@@ -346,8 +344,12 @@ class ScenarioLadder:
     ) -> int:
         return sum(
             bool(item.get("accepted"))
+            and item.get("novelty_converged", True) is not False
             and item.get("target_level") == target
-            and item.get("model_id") == model_id
+            and (
+                target != "production_ready"
+                or item.get("model_id") == model_id
+            )
             for item in record.get("evidence", [])
         )
 
@@ -554,6 +556,7 @@ class ScenarioLadder:
         model_improved: bool,
         novelty_converged: bool,
         final_model_id: str,
+        novelty_converged_by_attempt: Mapping[str, bool] | None = None,
     ) -> dict[str, Any]:
         """Append attempt evidence and promote only trusted completed replicas."""
 
@@ -579,6 +582,16 @@ class ScenarioLadder:
                 raise ScenarioMaturityError(
                     f"scenario {name} results must match every planned attempt"
                 )
+        if novelty_converged_by_attempt is not None and (
+            set(novelty_converged_by_attempt) != attempt_ids
+            or not all(
+                isinstance(value, bool)
+                for value in novelty_converged_by_attempt.values()
+            )
+        ):
+            raise ScenarioMaturityError(
+                "scenario novelty results must match every planned attempt"
+            )
 
         starting_maturity = {
             attempt.scenario_id: scenarios.get(
@@ -643,6 +656,13 @@ class ScenarioLadder:
                     "diagnostic_accepted": diagnostic_accepted[
                         attempt.attempt_id
                     ],
+                    "novelty_converged": (
+                        True
+                        if novelty_converged_by_attempt is None
+                        else novelty_converged_by_attempt[
+                            attempt.attempt_id
+                        ]
+                    ),
                     "diagnostic": _compact_metrics(
                         attempt_diagnostics.get(attempt.attempt_id, {})
                     ),

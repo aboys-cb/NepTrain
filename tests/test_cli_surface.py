@@ -316,6 +316,7 @@ def test_select_exposes_production_sampling_controls():
     assert "--nep" in completed.stdout
     assert "--max-selected" in completed.stdout
     assert "--min-novelty" in completed.stdout
+    assert "--descriptor-reduction" in completed.stdout
     assert "--report" in completed.stdout
     assert "--pca" not in completed.stdout
     assert "--umap" not in completed.stdout

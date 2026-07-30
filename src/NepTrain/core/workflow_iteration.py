@@ -21,7 +21,16 @@ from .candidate_pool import (
     write_candidate_pool,
 )
 from .content_addressing import file_sha256
-from .fps import hierarchical_farthest_point_sampling
+from .descriptor_features import (
+    ELEMENTWISE_MEAN_STD,
+    GLOBAL_MEAN,
+    descriptor_elements,
+    reduce_atomic_descriptors,
+)
+from .fps import (
+    adaptive_novelty_threshold,
+    hierarchical_farthest_point_sampling,
+)
 from .labeling import LabelRequest, LabelResult, label
 from .iteration import (
     StageContext,
@@ -60,6 +69,7 @@ TrainRunner = Callable[[TrainingRequest, str], TrainingResult]
 MdRunner = Callable[[MdRequest, str], MdResult]
 LabelRunner = Callable[[LabelRequest, str], LabelResult]
 DescriptorRunner = Callable[[Path, Sequence[Atoms]], np.ndarray]
+AtomicDescriptorRunner = Callable[[Path, Sequence[Atoms]], np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -82,6 +92,19 @@ def _nep_descriptors(model: Path, frames: Sequence[Atoms]) -> np.ndarray:
     calculator = DescriptorCalculator("nep", model_file=model)
     try:
         return np.asarray(calculator.get_structures_descriptors(frames), dtype=np.float64)
+    finally:
+        calculator.calculator.close()
+
+
+def _nep_atomic_descriptors(
+    model: Path, frames: Sequence[Atoms]
+) -> np.ndarray:
+    calculator = DescriptorCalculator("nep", model_file=model)
+    try:
+        return np.asarray(
+            calculator.get_structures_atomic_descriptors(frames),
+            dtype=np.float64,
+        )
     finally:
         calculator.calculator.close()
 
@@ -112,6 +135,67 @@ def _batched_descriptors(
     if not chunks:
         raise WorkflowIterationError("descriptor input cannot be empty")
     return np.vstack(chunks)
+
+
+def _batched_elementwise_descriptors(
+    runner: AtomicDescriptorRunner,
+    model: Path,
+    frames: Sequence[Atoms],
+    *,
+    elements: Sequence[str],
+) -> np.ndarray:
+    """Describe and reduce each frame batch without retaining all atomic rows."""
+
+    chunks = []
+    width = None
+    for start in range(0, len(frames), _DESCRIPTOR_BATCH_SIZE):
+        stop = min(start + _DESCRIPTOR_BATCH_SIZE, len(frames))
+        batch = frames[start:stop]
+        values = np.asarray(runner(model, batch), dtype=np.float64)
+        expected_atoms = sum(len(frame) for frame in batch)
+        if values.ndim != 2 or len(values) != expected_atoms:
+            raise WorkflowIterationError(
+                "atomic descriptor backend must return one feature row per atom"
+            )
+        if width is None:
+            width = values.shape[1]
+        elif values.shape[1] != width:
+            raise WorkflowIterationError(
+                "atomic descriptor feature width changed between batches"
+            )
+        chunks.append(
+            reduce_atomic_descriptors(
+                batch,
+                values,
+                reduction=ELEMENTWISE_MEAN_STD,
+                elements=elements,
+            )
+        )
+    if not chunks:
+        raise WorkflowIterationError("descriptor input cannot be empty")
+    return np.vstack(chunks)
+
+
+def _structure_descriptors(
+    runtime: "WorkflowRuntime",
+    model: Path,
+    frames: Sequence[Atoms],
+    *,
+    reduction: str,
+    elements: Sequence[str],
+) -> np.ndarray:
+    if reduction == GLOBAL_MEAN:
+        return _batched_descriptors(runtime.descriptors, model, frames)
+    if reduction == ELEMENTWISE_MEAN_STD:
+        return _batched_elementwise_descriptors(
+            runtime.atomic_descriptors,
+            model,
+            frames,
+            elements=elements,
+        )
+    raise WorkflowIterationError(
+        f"unsupported sampling descriptor reduction: {reduction}"
+    )
 
 
 def _rmse(reference: np.ndarray, prediction: np.ndarray) -> float:
@@ -224,10 +308,11 @@ class WorkflowRuntime:
     md: MdRunner = run_md
     label: LabelRunner = label
     descriptors: DescriptorRunner = _nep_descriptors
+    atomic_descriptors: AtomicDescriptorRunner = _nep_atomic_descriptors
     predict: PredictionRunner = _nep_prediction_evaluation
 
 
-def _read_frames(path: Path) -> list[Atoms]:
+def _read_frames(path: Path, *, allow_empty: bool = False) -> list[Atoms]:
     paths = (
         sorted(
             item
@@ -239,11 +324,21 @@ def _read_frames(path: Path) -> list[Atoms]:
     )
     frames: list[Atoms] = []
     for item in paths:
+        if allow_empty and item.is_file() and item.stat().st_size == 0:
+            continue
         loaded = ase_read(item, index=":", format=None)
         frames.extend(loaded if isinstance(loaded, list) else [loaded])
-    if not frames:
+    if not frames and not allow_empty:
         raise WorkflowIterationError(f"no structures found in {path}")
     return frames
+
+
+def _condition_stratum(stratum: str) -> str:
+    """Drop transient trajectory-window identity from a physical condition."""
+
+    return "|".join(
+        part for part in str(stratum).split("|") if not part.startswith("W=")
+    )
 
 
 class WorkflowIterationAdapter:
@@ -1252,14 +1347,82 @@ class WorkflowIterationAdapter:
             )
         candidates = list(all_candidates)
         training = _read_frames(context.artifacts["training_input"])
+        descriptor_reduction = self.config["sampling"]["selection"].get(
+            "descriptor_reduction", GLOBAL_MEAN
+        )
+        training_elements = descriptor_elements(training)
         known_ids = {structure_id(frame) for frame in training}
         candidates = [
             frame for frame in candidates if structure_id(frame) not in known_ids
         ]
         if not candidates:
-            raise WorkflowIterationError(
-                "all MD candidates already exist in the training set; "
-                "increase MD steps or temperature"
+            selected_path = context.work_dir / "selected-input.xyz"
+            selected_path.touch()
+            result_path = atomic_write_json(
+                context.work_dir / "selection-result.json",
+                {
+                    "selected_indices": [],
+                    "selected_ids": [],
+                    "selected_novelty": [],
+                    "counts_by_stratum": {},
+                    "remaining_novelty_by_stratum": {},
+                    "remaining_novelty_by_condition": {},
+                    "remaining_novelty": 0.0,
+                    "groups": [],
+                    "generation": context.generation,
+                    "sampling_model_sha256": pool_manifest.model_sha256,
+                    "route_fingerprints": dict(
+                        pool_manifest.route_fingerprints
+                    ),
+                    "batch_ready": False,
+                    "batch_kind": "coverage_complete",
+                    "regular_minimum": regular_batch_minimum(
+                        context.plan.max_selected
+                    ),
+                    "novelty_mode": "auto"
+                    if self.config["sampling"]["selection"].get(
+                        "novelty", "auto"
+                    )
+                    == "auto"
+                    else "explicit",
+                    "descriptor_reduction": descriptor_reduction,
+                    "descriptor_elements": list(training_elements),
+                    "resolved_selection_novelty_threshold": 0.0,
+                    "resolved_completion_coverage_threshold": 0.0,
+                },
+            )
+            return StageOutcome(
+                artifacts={
+                    "selected_input": selected_path,
+                    "selection_result": result_path,
+                },
+                metrics={
+                    "candidate_count_before_deduplication": len(
+                        all_candidates
+                    ),
+                    "candidate_count_after_deduplication": 0,
+                    "duplicate_candidate_count": 0,
+                    "selected_count": 0,
+                    "remaining_novelty": 0.0,
+                    "configured_max_selected": context.plan.max_selected,
+                    "regular_batch_minimum": regular_batch_minimum(
+                        context.plan.max_selected
+                    ),
+                    "batch_ready": False,
+                    "batch_kind": "coverage_complete",
+                    "sampling_model_sha256": pool_manifest.model_sha256,
+                    "route_fingerprints": dict(
+                        pool_manifest.route_fingerprints
+                    ),
+                    "failed_md_attempt_count": failed_count,
+                    "selection_novelty_threshold": 0.0,
+                    "completion_coverage_threshold": 0.0,
+                    "descriptor_reduction": descriptor_reduction,
+                    "descriptor_elements": list(training_elements),
+                    "novel_selected_count": 0,
+                    "counts_by_stratum": {},
+                    "fps_groups": [],
+                },
             )
         def preference(frame: Atoms) -> tuple[str, ...]:
             return (
@@ -1303,47 +1466,79 @@ class WorkflowIterationAdapter:
             if "md_window" in frame.info:
                 base = f"W={frame.info['md_window']}|{base}"
             strata.append(base)
+        elements = descriptor_elements([*candidates, *training])
+        candidate_descriptors = _structure_descriptors(
+            self.runtime,
+            context.artifacts["model"],
+            candidates,
+            reduction=descriptor_reduction,
+            elements=elements,
+        )
+        reference_descriptors = _structure_descriptors(
+            self.runtime,
+            context.artifacts["model"],
+            training,
+            reduction=descriptor_reduction,
+            elements=elements,
+        )
+        novelty = self.config["sampling"]["selection"].get(
+            "novelty", "auto"
+        )
+        adaptive = novelty == "auto"
+        selection_threshold = (
+            adaptive_novelty_threshold(
+                candidates,
+                candidate_descriptors,
+                training,
+                reference_descriptors,
+            )
+            if adaptive
+            else context.plan.selection_novelty_threshold
+        )
+        completion_threshold = (
+            selection_threshold
+            if adaptive
+            else context.plan.completion_coverage_threshold
+        )
         result = hierarchical_farthest_point_sampling(
             candidates,
-            _batched_descriptors(
-                self.runtime.descriptors,
-                context.artifacts["model"],
-                candidates,
-            ),
+            candidate_descriptors,
             candidate_ids,
             strata,
             budget=context.plan.max_selected,
-            min_novelty=context.plan.selection_novelty_threshold,
+            min_novelty=selection_threshold,
             reference_structures=training,
-            reference_descriptors=_batched_descriptors(
-                self.runtime.descriptors,
-                context.artifacts["model"],
-                training,
-            ),
+            reference_descriptors=reference_descriptors,
         )
         selected = [candidates[index] for index in result.selected_indices]
-        if not selected:
-            raise WorkflowIterationError(
-                "FPS selected no structures; lower the selection novelty threshold"
-            )
         selected_path = context.work_dir / "selected-input.xyz"
-        ase_write(selected_path, selected, format="extxyz")
+        if selected:
+            ase_write(selected_path, selected, format="extxyz")
+        else:
+            selected_path.touch()
         regular_minimum = regular_batch_minimum(context.plan.max_selected)
         emergency_minimum = min(8, context.plan.max_selected)
         emergency = failed_count > 0
         batch_kind = (
-            "regular"
-            if len(selected) >= regular_minimum
+            "coverage_complete"
+            if not selected
             else (
-                "emergency"
-                if emergency and len(selected) >= emergency_minimum
+                "regular"
+                if len(selected) >= regular_minimum
                 else (
-                    "frontier_flush"
-                    if pool_manifest.frontier_exhausted
+                    "emergency"
+                    if emergency and len(selected) >= emergency_minimum
                     else "novelty_flush"
                 )
             )
         )
+        remaining_by_condition: dict[str, float] = {}
+        for stratum, value in result.remaining_novelty_by_stratum.items():
+            condition = _condition_stratum(stratum)
+            remaining_by_condition[condition] = max(
+                remaining_by_condition.get(condition, 0.0),
+                float(value),
+            )
         result_path = atomic_write_json(
             context.work_dir / "selection-result.json",
             {
@@ -1351,6 +1546,12 @@ class WorkflowIterationAdapter:
                 "selected_ids": list(result.selected_ids),
                 "selected_novelty": list(result.selected_novelty),
                 "counts_by_stratum": dict(result.counts_by_stratum),
+                "remaining_novelty_by_stratum": dict(
+                    result.remaining_novelty_by_stratum
+                ),
+                "remaining_novelty_by_condition": dict(
+                    sorted(remaining_by_condition.items())
+                ),
                 "remaining_novelty": result.remaining_novelty,
                 "groups": [
                     {
@@ -1364,9 +1565,18 @@ class WorkflowIterationAdapter:
                 "route_fingerprints": dict(
                     pool_manifest.route_fingerprints
                 ),
-                "batch_ready": True,
+                "batch_ready": bool(selected),
                 "batch_kind": batch_kind,
                 "regular_minimum": regular_minimum,
+                "novelty_mode": "auto" if adaptive else "explicit",
+                "descriptor_reduction": descriptor_reduction,
+                "descriptor_elements": list(elements),
+                "resolved_selection_novelty_threshold": (
+                    selection_threshold
+                ),
+                "resolved_completion_coverage_threshold": (
+                    completion_threshold
+                ),
             },
         )
         return StageOutcome(
@@ -1379,24 +1589,26 @@ class WorkflowIterationAdapter:
                 "remaining_novelty": result.remaining_novelty,
                 "configured_max_selected": context.plan.max_selected,
                 "regular_batch_minimum": regular_minimum,
-                "batch_ready": True,
+                "batch_ready": bool(selected),
                 "batch_kind": batch_kind,
                 "sampling_model_sha256": pool_manifest.model_sha256,
                 "route_fingerprints": dict(
                     pool_manifest.route_fingerprints
                 ),
                 "failed_md_attempt_count": failed_count,
-                "selection_novelty_threshold": (
-                    context.plan.selection_novelty_threshold
-                ),
-                "completion_coverage_threshold": (
-                    context.plan.completion_coverage_threshold
-                ),
+                "selection_novelty_threshold": selection_threshold,
+                "completion_coverage_threshold": completion_threshold,
+                "novelty_mode": "auto" if adaptive else "explicit",
+                "descriptor_reduction": descriptor_reduction,
+                "descriptor_elements": list(elements),
                 "novel_selected_count": sum(
-                    value > context.plan.selection_novelty_threshold
+                    value > selection_threshold
                     for value in result.selected_novelty
                 ),
                 "counts_by_stratum": dict(result.counts_by_stratum),
+                "remaining_novelty_by_condition": dict(
+                    sorted(remaining_by_condition.items())
+                ),
                 "fps_groups": [
                     {
                         "element_set": list(report.element_set),
@@ -1405,6 +1617,9 @@ class WorkflowIterationAdapter:
                         "initial_quota": report.initial_quota,
                         "selected_count": report.selected_count,
                         "remaining_novelty": report.remaining_novelty,
+                        "remaining_novelty_by_stratum": dict(
+                            report.remaining_novelty_by_stratum
+                        ),
                     }
                     for _, report in sorted(result.groups.items())
                 ],
@@ -1415,6 +1630,34 @@ class WorkflowIterationAdapter:
         options = self.config.get("labeling", {})
         backend = str(options.get("backend", "toy"))
         kpoint_mode = str(options.get("kpoint_mode", "auto"))
+        selected = _read_frames(
+            context.artifacts["selected_input"], allow_empty=True
+        )
+        if not selected:
+            output = context.work_dir / "selected-labels.xyz"
+            output.touch()
+            provenance_path = atomic_write_json(
+                context.work_dir / "label-provenance.json",
+                {
+                    "backend": backend,
+                    "origin": "no_novel_structures",
+                    "input_structure_ids": [],
+                    "labeled_count": 0,
+                    "labels_sha256": file_sha256(output),
+                },
+            )
+            return StageOutcome(
+                artifacts={
+                    "labeled": output,
+                    "label_provenance": provenance_path,
+                },
+                metrics={
+                    "backend": backend,
+                    "origin": "no_novel_structures",
+                    "labeled_count": 0,
+                    "skipped": True,
+                },
+            )
         frame_indices = context.stage_input.get("frame_indices", ())
         flat_single_case = (
             context.flat_output
@@ -1473,10 +1716,7 @@ class WorkflowIterationAdapter:
             ),
             backend,
         )
-        expected_ids = [
-            structure_id(frame)
-            for frame in _read_frames(context.artifacts["selected_input"])
-        ]
+        expected_ids = [structure_id(frame) for frame in selected]
         try:
             validate_labeled_frames(result.frames)
             actual_ids = labeled_input_structure_ids(result.frames)
@@ -1651,7 +1891,25 @@ class WorkflowIterationAdapter:
 
     def _diagnose(self, context: StageContext) -> StageOutcome:
         options = self.config.get("evaluation", {})
-        frames = _read_frames(context.artifacts["labeled"])
+        frames = _read_frames(context.artifacts["labeled"], allow_empty=True)
+        if not frames:
+            signals = {
+                "diagnostic_only": True,
+                "quality_gate_configured": self.evaluation_configured,
+                "diagnostic_accepted": None,
+                "attempt_accepted": {},
+                "attempt_metrics": {},
+                "evaluated_count": 0,
+                "spin_frame_count": 0,
+                "skipped": True,
+                "reason": "no novel structures required labeling",
+            }
+            output = atomic_write_json(
+                context.work_dir / "acquisition-signals.json", signals
+            )
+            return StageOutcome(
+                artifacts={"acquisition_signals": output}, metrics=signals
+            )
         _, spin_count = validate_spin_dataset(frames, require_mforce=True)
         thresholds = dict(options.get("max_rmse", {}))
         raw_metrics = self.runtime.predict(
@@ -1709,10 +1967,12 @@ class WorkflowIterationAdapter:
 
     def _merge(self, context: StageContext) -> StageOutcome:
         original = _read_frames(context.artifacts["training_input"])
-        labeled = _read_frames(context.artifacts["labeled"])
+        labeled = _read_frames(context.artifacts["labeled"], allow_empty=True)
         try:
             original_ids = validate_labeled_frames(original)
-            labeled_ids = validate_labeled_frames(labeled)
+            labeled_ids = (
+                validate_labeled_frames(labeled) if labeled else []
+            )
         except ScientificDataError as error:
             raise WorkflowIterationError(
                 f"training merge input violates the scientific data contract: {error}"
@@ -1772,23 +2032,31 @@ class WorkflowIterationAdapter:
             previous_signals.get("production_ready") is True
             and previous_signals.get("validation_accepted") is False
         )
-        retrain_required = bool(
-            failed_md
-            or not diagnostic.get("diagnostic_accepted", False)
-            or continue_training
-        )
         parent_model_sha256 = file_sha256(context.artifacts["model"])
         training_count = len(_read_frames(training_input))
         previous_training_count = len(
             _read_frames(context.artifacts["training_input"])
         )
         added_count = training_count - previous_training_count
+        retrain_required = bool(
+            added_count > 0
+            and (
+                failed_md
+                or not diagnostic.get("diagnostic_accepted", False)
+                or continue_training
+            )
+        )
         if not retrain_required:
             decision = {
                 "retrained": False,
                 "reason": (
-                    "current model passed new-label diagnostics; "
-                    "continue certification without changing the model"
+                    "no novel structures required labeling; "
+                    "advance coverage without changing the model"
+                    if added_count == 0
+                    else (
+                        "current model passed new-label diagnostics; "
+                        "continue certification without changing the model"
+                    )
                 ),
             }
             lineage = {
@@ -1931,6 +2199,21 @@ class WorkflowIterationAdapter:
             previous_routes = previous.get("routes", {})
 
         route_by_id = {route.route_id: route for route in self.routes}
+        selection = json.loads(
+            context.artifacts["selection_result"].read_text(encoding="utf-8")
+        )
+        completion_threshold = float(
+            selection.get(
+                "resolved_completion_coverage_threshold",
+                context.plan.completion_coverage_threshold,
+            )
+        )
+        remaining_by_condition = {
+            str(key): float(value)
+            for key, value in selection.get(
+                "remaining_novelty_by_condition", {}
+            ).items()
+        }
         histories: dict[str, Any] = {}
         all_ready = True
         total_counts: dict[str, int] = {}
@@ -1958,6 +2241,21 @@ class WorkflowIterationAdapter:
                 ).get(str(attempt["attempt_id"]))
                 for attempt in route_plan["attempts"]
             }
+            novelty_by_attempt = {}
+            for attempt in route_plan["attempts"]:
+                condition = (
+                    f"R={route_id}|"
+                    f"T={float(attempt['temperature']):g}|"
+                    f"P={float(attempt['pressure']):g}"
+                )
+                novelty_by_attempt[str(attempt["attempt_id"])] = (
+                    bool(
+                        remaining_by_condition[condition]
+                        <= completion_threshold
+                    )
+                    if condition in remaining_by_condition
+                    else novelty_converged
+                )
             ladder = self.scenario_ladders[route_id]
             route_history = ladder.record(
                 route_plan["attempts"],
@@ -1970,6 +2268,7 @@ class WorkflowIterationAdapter:
                 validation_accepted=validation_accepted,
                 model_improved=model_improved,
                 novelty_converged=novelty_converged,
+                novelty_converged_by_attempt=novelty_by_attempt,
                 final_model_id=final_model_id,
             )
             ready = ladder.production_ready(
@@ -2020,7 +2319,9 @@ class WorkflowIterationAdapter:
             context.artifacts["model_lineage"].read_text(encoding="utf-8")
         )
         candidate_trained = retraining.get("retrained") is True
-        labeled_frames = _read_frames(context.artifacts["labeled"])
+        labeled_frames = _read_frames(
+            context.artifacts["labeled"], allow_empty=True
+        )
         label_metrics = (
             {
                 name: float(value)
@@ -2067,7 +2368,12 @@ class WorkflowIterationAdapter:
         selection = json.loads(
             context.artifacts["selection_result"].read_text(encoding="utf-8")
         )
-        novelty_threshold = float(context.plan.completion_coverage_threshold)
+        novelty_threshold = float(
+            selection.get(
+                "resolved_completion_coverage_threshold",
+                context.plan.completion_coverage_threshold,
+            )
+        )
         remaining_novelty = float(selection.get("remaining_novelty", 0.0))
         novelty_converged = bool(remaining_novelty <= novelty_threshold)
         history, production_ready = self._record_route_histories(
@@ -2268,7 +2574,9 @@ class WorkflowIterationAdapter:
         candidate_validation_score = _threshold_score(
             candidate_metrics, thresholds
         )
-        labeled_frames = _read_frames(context.artifacts["labeled"])
+        labeled_frames = _read_frames(
+            context.artifacts["labeled"], allow_empty=True
+        )
         candidate_label_metrics: dict[str, float] = {}
         candidate_label_attempt_metrics: dict[
             str, dict[str, float]
@@ -2382,7 +2690,12 @@ class WorkflowIterationAdapter:
         selection = json.loads(
             context.artifacts["selection_result"].read_text(encoding="utf-8")
         )
-        novelty_threshold = float(context.plan.completion_coverage_threshold)
+        novelty_threshold = float(
+            selection.get(
+                "resolved_completion_coverage_threshold",
+                context.plan.completion_coverage_threshold,
+            )
+        )
         remaining_novelty = float(selection.get("remaining_novelty", 0.0))
         novelty_converged = bool(remaining_novelty <= novelty_threshold)
         comparison_validation_score = (

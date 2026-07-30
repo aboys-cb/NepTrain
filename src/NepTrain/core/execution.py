@@ -543,6 +543,10 @@ def build_stage_task(
     inputs = temporary / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     portable_config = json.loads(json.dumps(config))
+    empty_label = bool(
+        stage == "label"
+        and (stage_input or {}).get("empty_selection") is True
+    )
     if stage == "explore" and requested_route_id:
         portable_config["sampling"]["routes"] = [
             route
@@ -553,11 +557,15 @@ def build_stage_task(
             raise ExecutionError(
                 f"explore task refers to unknown route {requested_route_id}"
             )
-    if stage == "label" and target.labeling_resource_path:
+    if (
+        stage == "label"
+        and not empty_label
+        and target.labeling_resource_path
+    ):
         portable_config.setdefault("labeling", {})["resource_path"] = (
             target.labeling_resource_path
         )
-    elif stage == "label":
+    elif stage == "label" and not empty_label:
         resource_path = portable_config.get("labeling", {}).get(
             "resource_path"
         )
@@ -567,6 +575,8 @@ def build_stage_task(
             )
 
     path_fields = set(_STAGE_CONFIG_PATH_FIELDS[stage])
+    if empty_label:
+        path_fields.clear()
     if stage == "train" and generation > 1:
         path_fields.clear()
     evaluation = portable_config.get("evaluation", {})
@@ -587,7 +597,7 @@ def build_stage_task(
         "training.initial_path",
     }
     retained_path_fields = set(path_fields)
-    if stage == "label":
+    if stage == "label" and not empty_label:
         retained_path_fields.add("labeling.resource_path")
     for dotted in sorted(all_path_fields - retained_path_fields):
         _delete_dotted(portable_config, dotted)
@@ -1042,17 +1052,53 @@ _SSH_CONTROL_DIRECTORY: tempfile.TemporaryDirectory | None = None
 _SSH_CONTROL_LOCK = threading.Lock()
 
 
+def _new_ssh_control_directory() -> tempfile.TemporaryDirectory:
+    return tempfile.TemporaryDirectory(
+        prefix="neptrain-ssh-",
+        dir="/tmp",
+    )
+
+
+def _discard_ssh_control_directory() -> None:
+    global _SSH_CONTROL_DIRECTORY
+    with _SSH_CONTROL_LOCK:
+        directory = _SSH_CONTROL_DIRECTORY
+        _SSH_CONTROL_DIRECTORY = None
+    if directory is not None:
+        try:
+            directory.cleanup()
+        except OSError:
+            pass
+
+
 def _ssh_control_path(host: str) -> str:
     global _SSH_CONTROL_DIRECTORY
     with _SSH_CONTROL_LOCK:
-        if _SSH_CONTROL_DIRECTORY is None:
-            _SSH_CONTROL_DIRECTORY = tempfile.TemporaryDirectory(
-                prefix="neptrain-ssh-",
-                dir="/tmp",
-            )
+        if (
+            _SSH_CONTROL_DIRECTORY is None
+            or not Path(_SSH_CONTROL_DIRECTORY.name).is_dir()
+        ):
+            stale = _SSH_CONTROL_DIRECTORY
+            _SSH_CONTROL_DIRECTORY = _new_ssh_control_directory()
+            if stale is not None:
+                try:
+                    stale.cleanup()
+                except OSError:
+                    pass
         directory = _SSH_CONTROL_DIRECTORY.name
     host_id = canonical_sha256({"host": host})[:16]
     return str(Path(directory) / host_id)
+
+
+def _missing_ssh_control_directory(
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    detail = f"{completed.stderr or ''}\n{completed.stdout or ''}"
+    return (
+        completed.returncode != 0
+        and "unix_listener: cannot bind to path" in detail
+        and "No such file or directory" in detail
+    )
 
 
 class ExecutionTransport:
@@ -1089,17 +1135,17 @@ class ExecutionTransport:
     ) -> subprocess.CompletedProcess[str]:
         if not self.remote:
             raise ExecutionError("remote script requires an SSH execution target")
-        command = [
-            "ssh",
-            *self._ssh_options(),
-            str(self.target.host),
-            "bash",
-            "-s",
-            "--",
-            *(str(value) for value in arguments),
-        ]
-        try:
-            completed = self.runner(
+        def invoke() -> subprocess.CompletedProcess[str]:
+            command = [
+                "ssh",
+                *self._ssh_options(),
+                str(self.target.host),
+                "bash",
+                "-s",
+                "--",
+                *(str(value) for value in arguments),
+            ]
+            return self.runner(
                 command,
                 input=script if script.endswith("\n") else script + "\n",
                 capture_output=True,
@@ -1107,6 +1153,12 @@ class ExecutionTransport:
                 check=False,
                 timeout=timeout,
             )
+
+        try:
+            completed = invoke()
+            if _missing_ssh_control_directory(completed):
+                _discard_ssh_control_directory()
+                completed = invoke()
         except subprocess.TimeoutExpired as error:
             raise ExecutionError(
                 f"remote command timed out after {timeout}s on {self.target.name}"
@@ -1163,18 +1215,24 @@ esac
     ) -> subprocess.CompletedProcess[str]:
         if not self.remote:
             raise ExecutionError("remote copy requires an SSH execution target")
-        command = ["scp", *self._ssh_options()]
-        if recursive:
-            command.append("-r")
-        command.extend([str(source), str(destination)])
-        try:
-            completed = self.runner(
+        def invoke() -> subprocess.CompletedProcess[str]:
+            command = ["scp", *self._ssh_options()]
+            if recursive:
+                command.append("-r")
+            command.extend([str(source), str(destination)])
+            return self.runner(
                 command,
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=timeout,
             )
+
+        try:
+            completed = invoke()
+            if _missing_ssh_control_directory(completed):
+                _discard_ssh_control_directory()
+                completed = invoke()
         except subprocess.TimeoutExpired as error:
             raise ExecutionError(
                 f"remote copy timed out after {timeout}s for {self.target.name}"

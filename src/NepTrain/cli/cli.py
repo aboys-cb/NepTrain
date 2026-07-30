@@ -1065,6 +1065,15 @@ def build_select(subparsers):
         help="NEPAdapters descriptor backend, default auto.",
     )
     parser_select.add_argument(
+        "--descriptor-reduction",
+        choices=("global_mean", "elementwise_mean_std"),
+        default="global_mean",
+        help=(
+            "Structure descriptor reduction: historical global_mean or "
+            "element-preserving elementwise_mean_std."
+        ),
+    )
+    parser_select.add_argument(
         "--max-selected",
         "-max",
         type=int,

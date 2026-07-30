@@ -29,6 +29,7 @@ class FPSGroupReport:
     selected_count: int
     selected_ids: tuple[str, ...]
     counts_by_stratum: Mapping[str, int]
+    remaining_novelty_by_stratum: Mapping[str, float]
     remaining_novelty: float
 
 
@@ -41,6 +42,7 @@ class HierarchicalFPSResult:
     selected_novelty: tuple[float, ...]
     groups: Mapping[ElementSet, FPSGroupReport]
     counts_by_stratum: Mapping[str, int]
+    remaining_novelty_by_stratum: Mapping[str, float]
     remaining_novelty: float
 
 
@@ -84,15 +86,18 @@ class _GroupState:
         eligible = self.eligible(min_novelty)
         if not len(eligible):
             return None
-        active_strata = {self.strata[index] for index in eligible}
-        least_used = min(self.counts_by_stratum[name] for name in active_strata)
-        balanced = [
+        # Preserve one anchor from every eligible stratum, then let novelty
+        # alone allocate the remaining budget.  Continually balancing stratum
+        # counts wastes labels on mature conditions once their candidates are
+        # already close to the reference set.
+        uncovered = [
             int(index)
             for index in eligible
-            if self.counts_by_stratum[self.strata[index]] == least_used
+            if self.counts_by_stratum[self.strata[index]] == 0
         ]
+        candidates = uncovered or [int(index) for index in eligible]
         return min(
-            balanced,
+            candidates,
             key=lambda index: (-float(self.distances[index]), self.ids[index]),
         )
 
@@ -113,6 +118,20 @@ class _GroupState:
 
     def remaining_novelty(self) -> float:
         return float(self.distances[self.available].max(initial=0.0))
+
+    def remaining_novelty_by_stratum(self) -> dict[str, float]:
+        return {
+            stratum: float(
+                self.distances[
+                    self.available
+                    & np.asarray(
+                        [value == stratum for value in self.strata],
+                        dtype=bool,
+                    )
+                ].max(initial=0.0)
+            )
+            for stratum in sorted(set(self.strata))
+        }
 
 
 def element_set(structure: Any) -> ElementSet:
@@ -206,9 +225,13 @@ def _normalized_group(
     points: np.ndarray,
     references: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    combined = np.vstack((references, points)) if len(references) else points
-    center = np.median(combined, axis=0)
-    scale = np.std(combined, axis=0)
+    # A warm-started FPS group measures novelty relative to the training set,
+    # so candidates must not influence the coordinate system that defines
+    # training-set resolution. Without references, candidates are the only
+    # available coordinate source for the deterministic first generation.
+    fit = references if len(references) else points
+    center = np.median(fit, axis=0)
+    scale = np.std(fit, axis=0)
     scale[scale < 1.0e-12] = 1.0
     normalized_points = (points - center) / scale
     normalized_references = (references - center) / scale
@@ -251,6 +274,97 @@ def _nearest_distances(
     return result
 
 
+def _leave_one_out_nearest_distances(
+    points: np.ndarray,
+    *,
+    batch_size: int = 512,
+) -> np.ndarray:
+    """Return each point's nearest distinct neighbour with bounded memory."""
+
+    result = np.full(len(points), np.inf, dtype=np.float64)
+    point_norm = np.einsum("ij,ij->i", points, points)
+    for start in range(0, len(points), batch_size):
+        stop = min(start + batch_size, len(points))
+        squared = (
+            point_norm[start:stop, None]
+            + point_norm[None, :]
+            - 2.0 * points[start:stop] @ points.T
+        )
+        rows = np.arange(stop - start)
+        squared[rows, np.arange(start, stop)] = np.inf
+        result[start:stop] = np.sqrt(
+            np.maximum(squared, 0.0).min(axis=1)
+        )
+    return result
+
+
+def adaptive_novelty_threshold(
+    candidate_structures: Sequence[Any],
+    candidate_descriptors: np.ndarray,
+    reference_structures: Sequence[Any],
+    reference_descriptors: np.ndarray,
+    *,
+    quantile: float = 0.1,
+    max_references_per_group: int = 2048,
+) -> float:
+    """Estimate a conservative resolved-distance threshold from known data.
+
+    The threshold is the lower decile of non-zero leave-one-out nearest
+    neighbour distances in the normalized training descriptors.  Candidates
+    closer than that are already inside the resolution represented by the
+    training set.  Exact element sets are calibrated independently before the
+    distances are pooled.
+    """
+
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be between zero and one")
+    if max_references_per_group < 2:
+        raise ValueError("max_references_per_group must be at least two")
+    points = _validate_descriptors(
+        candidate_descriptors,
+        expected_rows=len(candidate_structures),
+        name="candidate_descriptors",
+    )
+    references = _validate_descriptors(
+        reference_descriptors,
+        expected_rows=len(reference_structures),
+        name="reference_descriptors",
+        feature_count=points.shape[1],
+    )
+    candidate_keys = tuple(element_set(value) for value in candidate_structures)
+    reference_keys = tuple(element_set(value) for value in reference_structures)
+    distances: list[float] = []
+    for key in sorted(set(candidate_keys)):
+        group_points = points[
+            [index for index, value in enumerate(candidate_keys) if value == key]
+        ]
+        group_references = references[
+            [index for index, value in enumerate(reference_keys) if value == key]
+        ]
+        if len(group_references) < 2:
+            continue
+        _, normalized_references = _normalized_group(
+            group_points, group_references
+        )
+        if len(normalized_references) > max_references_per_group:
+            indices = np.linspace(
+                0,
+                len(normalized_references) - 1,
+                max_references_per_group,
+                dtype=int,
+            )
+            normalized_references = normalized_references[indices]
+        nearest = _leave_one_out_nearest_distances(normalized_references)
+        distances.extend(
+            float(value)
+            for value in nearest
+            if np.isfinite(value) and value > 1.0e-12
+        )
+    if not distances:
+        return 0.0
+    return float(np.quantile(np.asarray(distances), quantile))
+
+
 def farthest_point_sampling(
     candidate_descriptors: np.ndarray,
     *,
@@ -260,7 +374,7 @@ def farthest_point_sampling(
     candidate_ids: Sequence[str] | None = None,
     strata: Sequence[str] | None = None,
 ) -> FarthestPointResult:
-    """Select one deterministic, balanced FPS group.
+    """Select one deterministic FPS group with one anchor per stratum.
 
     ``min_novelty`` is a strict gate after the deterministic no-reference seed.
     Exact duplicates of a reference or selected candidate are therefore never
@@ -370,7 +484,7 @@ def hierarchical_farthest_point_sampling(
     reference_structures: Sequence[Any] = (),
     reference_descriptors: np.ndarray | None = None,
 ) -> HierarchicalFPSResult:
-    """Select candidates using element groups, soft strata, and conditional FPS.
+    """Select candidates using element groups, stratum anchors, and conditional FPS.
 
     Exact element sets define the outer groups.  Initial group quotas are
     proportional to the square root of candidate group size and guarantee one
@@ -418,7 +532,7 @@ def hierarchical_farthest_point_sampling(
             "reference structures and descriptors must have the same length"
         )
     if not len(candidate_structures):
-        return HierarchicalFPSResult((), (), (), {}, {}, 0.0)
+        return HierarchicalFPSResult((), (), (), {}, {}, {}, 0.0)
 
     candidate_keys = tuple(element_set(value) for value in candidate_structures)
     reference_keys = tuple(element_set(value) for value in reference_structures)
@@ -525,6 +639,9 @@ def hierarchical_farthest_point_sampling(
             selected_count=len(state.selected_local),
             selected_ids=selected_ids,
             counts_by_stratum=dict(sorted(state.counts_by_stratum.items())),
+            remaining_novelty_by_stratum=(
+                state.remaining_novelty_by_stratum()
+            ),
             remaining_novelty=state.remaining_novelty(),
         )
 
@@ -536,6 +653,22 @@ def hierarchical_farthest_point_sampling(
         selected_novelty=tuple(value[2] for value in selections),
         groups=reports,
         counts_by_stratum=dict(sorted(total_counts.items())),
+        remaining_novelty_by_stratum={
+            stratum: max(
+                (
+                    report.remaining_novelty_by_stratum.get(stratum, 0.0)
+                    for report in reports.values()
+                ),
+                default=0.0,
+            )
+            for stratum in sorted(
+                {
+                    stratum
+                    for report in reports.values()
+                    for stratum in report.remaining_novelty_by_stratum
+                }
+            )
+        },
         remaining_novelty=max(
             (report.remaining_novelty for report in reports.values()),
             default=0.0,
@@ -548,6 +681,7 @@ __all__ = [
     "FarthestPointResult",
     "FPSGroupReport",
     "HierarchicalFPSResult",
+    "adaptive_novelty_threshold",
     "element_set",
     "farthest_point_sampling",
     "hierarchical_farthest_point_sampling",

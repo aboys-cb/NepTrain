@@ -23,6 +23,9 @@ class _PositionDescriptor:
             dtype=np.float64,
         )
 
+    def get_structures_atomic_descriptors(self, structures):
+        return self.get_structures_descriptors(structures)
+
 
 def _frame(x: float) -> Atoms:
     return Atoms(
@@ -57,6 +60,7 @@ def test_manual_selection_uses_shared_policy_and_writes_provenance(
         base=str(reference_path),
         nep=None,
         backend="auto",
+        descriptor_reduction="global_mean",
         max_selected=3,
         min_novelty=0.0,
         filter=False,
@@ -86,4 +90,5 @@ def test_manual_selection_uses_shared_policy_and_writes_provenance(
     assert persisted["protocol"] == "neptrain.manual-selection.v1"
     assert persisted["structure_id_version"] == STRUCTURE_ID_VERSION
     assert persisted["descriptor"]["kind"] == "soap"
+    assert persisted["descriptor"]["reduction"] == "global_mean"
     assert persisted["output"] == str(output_path.resolve())

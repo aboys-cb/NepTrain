@@ -5,6 +5,7 @@ import pytest
 from ase import Atoms
 
 from NepTrain.core.fps import (
+    adaptive_novelty_threshold,
     farthest_point_sampling,
     hierarchical_farthest_point_sampling,
 )
@@ -26,7 +27,7 @@ def test_shared_fps_rejects_exact_duplicates_at_zero_threshold():
     assert result.selected_ids == ("novel-a",)
 
 
-def test_shared_fps_balances_strata_and_is_input_order_independent():
+def test_shared_fps_anchors_strata_and_is_input_order_independent():
     points = np.asarray(
         [
             [1.0, 0.0],
@@ -56,10 +57,27 @@ def test_shared_fps_balances_strata_and_is_input_order_independent():
     )
 
     assert first.selected_ids == second.selected_ids
-    assert first.counts_by_stratum == {"A": 2, "B": 2}
+    assert first.counts_by_stratum == {"A": 3, "B": 1}
 
 
-def test_sqrt_quotas_and_soft_strata_balance():
+def test_shared_fps_uses_global_novelty_after_stratum_anchors():
+    points = np.asarray([[10.0], [9.0], [8.0], [1.0], [0.5], [0.25]])
+    ids = ["a10", "a9", "a8", "b1", "b05", "b025"]
+    strata = ["A", "A", "A", "B", "B", "B"]
+
+    result = farthest_point_sampling(
+        points,
+        budget=4,
+        reference_descriptors=np.asarray([[0.0]]),
+        candidate_ids=ids,
+        strata=strata,
+    )
+
+    assert result.selected_ids == ("a10", "b1", "a8", "a9")
+    assert result.counts_by_stratum == {"A": 3, "B": 1}
+
+
+def test_sqrt_quotas_and_stratum_anchors():
     structures = [_atoms("Fe")] * 9 + [_atoms("FeO")] * 4
     descriptors = np.asarray(
         [[float(value), 0.0] for value in range(1, 10)]
@@ -196,3 +214,40 @@ def test_remaining_novelty_and_group_report_include_unselected_candidates():
     assert report.counts_by_stratum == {"hot": 1}
     assert report.remaining_novelty > 0.0
     assert result.remaining_novelty == report.remaining_novelty
+    assert set(result.remaining_novelty_by_stratum) == {"cold", "hot"}
+    assert result.remaining_novelty_by_stratum["cold"] == 0.0
+    assert result.remaining_novelty_by_stratum["hot"] > 0.0
+
+
+def test_adaptive_threshold_uses_training_resolution_not_candidate_scale():
+    references = np.asarray([[0.0], [1.0], [2.0], [3.0], [4.0]])
+    candidates = np.asarray([[4.01], [8.0]])
+    structures = [_atoms("Fe")] * len(candidates)
+    reference_structures = [_atoms("Fe")] * len(references)
+
+    threshold = adaptive_novelty_threshold(
+        structures,
+        candidates,
+        reference_structures,
+        references,
+    )
+    threshold_with_extreme_candidate = adaptive_novelty_threshold(
+        structures,
+        np.asarray([[4.01], [8000.0]]),
+        reference_structures,
+        references,
+    )
+    result = hierarchical_farthest_point_sampling(
+        structures,
+        candidates,
+        ["inside-resolution", "novel"],
+        ["cold", "hot"],
+        budget=2,
+        min_novelty=threshold,
+        reference_structures=reference_structures,
+        reference_descriptors=references,
+    )
+
+    assert threshold > 0.0
+    assert threshold_with_extreme_candidate == pytest.approx(threshold)
+    assert result.selected_ids == ("novel",)

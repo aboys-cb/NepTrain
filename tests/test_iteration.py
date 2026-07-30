@@ -29,6 +29,7 @@ from NepTrain.core.workflow_iteration import (
     WorkflowIterationError,
     WorkflowRuntime,
     _batched_descriptors,
+    _structure_descriptors,
 )
 from NepTrain.core.reporting import ParitySeries
 from NepTrain.core.dft.toy import ToyTeacher
@@ -39,6 +40,7 @@ from NepTrain.core.candidate_pool import (
     validate_candidate_pool,
     write_candidate_pool,
 )
+from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
@@ -55,6 +57,35 @@ def test_descriptor_backend_receives_every_frame_in_bounded_batches(tmp_path):
 
     assert calls == [4096, 5]
     assert values.shape == (4101, 3)
+
+
+def test_elementwise_workflow_descriptors_use_atomic_backend(tmp_path):
+    frames = [
+        Atoms("FeO", positions=[[0, 0, 0], [1, 0, 0]]),
+        Atoms("FeO", positions=[[0, 0, 0], [1, 0, 0]]),
+    ]
+
+    def forbidden_global(*_args):
+        raise AssertionError("global descriptor backend must not be used")
+
+    def atomic(_model, _frames):
+        return np.asarray([[2.0], [-2.0], [3.0], [-3.0]])
+
+    values = _structure_descriptors(
+        WorkflowRuntime(
+            descriptors=forbidden_global,
+            atomic_descriptors=atomic,
+        ),
+        tmp_path / "nep.txt",
+        frames,
+        reduction="elementwise_mean_std",
+        elements=("Fe", "O"),
+    )
+
+    np.testing.assert_allclose(
+        values,
+        [[2.0, 0.0, -2.0, 0.0], [3.0, 0.0, -3.0, 0.0]],
+    )
 
 
 def _sampling(
@@ -157,7 +188,7 @@ def test_candidate_pool_rejects_a_different_sampling_model(tmp_path: Path):
         )
 
 
-def test_stratified_fps_is_input_order_independent_and_balanced():
+def test_stratified_fps_is_input_order_independent_with_stratum_anchors():
     points = np.asarray(
         [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [0.0, 1.0], [0.0, 2.0], [0.0, 3.0]]
     )
@@ -177,7 +208,7 @@ def test_stratified_fps_is_input_order_independent_and_balanced():
     )
 
     assert first.selected_ids == second.selected_ids
-    assert first.counts_by_stratum == {"A": 2, "B": 2}
+    assert first.counts_by_stratum == {"A": 3, "B": 1}
 
 
 def test_zero_min_novelty_rejects_candidates_duplicating_reference():
@@ -208,10 +239,10 @@ def test_two_generation_toy_workflow_is_deterministic_and_resumable(tmp_path: Pa
     assert report.selected_counts == (8, 8)
     assert report.training_counts[1] > report.training_counts[0]
     assert report.coverage_p95[1] < report.coverage_p95[0]
-    assert report.scenario_steps == ((100,), (100,))
+    assert report.scenario_steps == ((100,), (100, 400))
     assert report.maturity_counts == (
         {"smoke_passed": 1},
-        {"smoke_passed": 2},
+        {"smoke_passed": 1, "short_stable": 1},
     )
     assert report.deterministic_selection
     assert report.resume_reused_artifacts
@@ -240,11 +271,16 @@ def test_toy_generations_keep_all_temperature_strata_visible(tmp_path: Path):
         "T=500|P=0",
         "T=700|P=0",
     }
-    assert max(report.strata_counts[2].values()) - min(
-        report.strata_counts[2].values()
-    ) <= 1
-    assert report.scenario_steps[2] == (100,)
-    assert report.maturity_counts[2] == {"smoke_passed": 3}
+    assert all(value >= 1 for value in report.strata_counts[2].values())
+    assert report.strata_counts[2]["T=700|P=0"] > report.strata_counts[2][
+        "T=300|P=0"
+    ]
+    assert report.scenario_steps[2] == (100, 400, 1600)
+    assert report.maturity_counts[2] == {
+        "smoke_passed": 1,
+        "short_stable": 1,
+        "long_stable": 1,
+    }
 
 
 def test_controller_rejects_completed_artifact_drift(tmp_path: Path):
@@ -547,6 +583,10 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
         },
         "workflow": {},
     }
+    config["sampling"]["selection"]["novelty"] = {
+        "selection_threshold": 0.0,
+        "completion_threshold": 0.0,
+    }
     runtime = WorkflowRuntime(
         train=fake_train,
         md=fake_md,
@@ -715,6 +755,10 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
             },
         },
     }
+    config["sampling"]["selection"]["novelty"] = {
+        "selection_threshold": 0.0,
+        "completion_threshold": 0.0,
+    }
     runtime = WorkflowRuntime(
         descriptors=lambda _model, frames: toy_raw_features(frames, "spin")
     )
@@ -792,8 +836,162 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     } == {"failure-route"}
 
 
+def test_no_novel_candidates_skip_label_backend_and_retraining(tmp_path: Path):
+    frame = ToyTeacher("ordinary").label(
+        toy_candidate_frames("ordinary", 41, 1)[0]
+    )
+    initial = tmp_path / "initial.xyz"
+    candidates = tmp_path / "candidates.xyz"
+    model = tmp_path / "nep.txt"
+    manifest = tmp_path / "candidate-pool.json"
+    ase_write(initial, [frame], format="extxyz")
+    candidate = frame.copy()
+    candidate.info.update(
+        route_id="default",
+        route_fingerprint="f" * 64,
+        temperature=300.0,
+        pressure=0.0,
+        source_id="same-structure",
+    )
+    ase_write(candidates, [candidate], format="extxyz")
+    model.write_text("model\n", encoding="utf-8")
+    write_candidate_pool(
+        candidates,
+        manifest,
+        [candidate],
+        generation=1,
+        model_path=model,
+        requested_md_runs=1,
+        available_md_runs=1,
+        scheduled_md_runs=1,
+        failed_md_runs=0,
+    )
+    config_file = tmp_path / "nep.in"
+    config_file.write_text("type 1 Fe\n", encoding="utf-8")
+    config = {
+        "training": {"backend": "torchnep", "config_path": str(config_file)},
+        "md": {"backend": "lammps", "spin": False},
+        "sampling": _sampling(
+            (300.0,), structures=initial, template=config_file
+        ),
+        "labeling": {"backend": "vasp"},
+    }
+
+    def forbidden_label(*_args, **_kwargs):
+        raise AssertionError("label backend must not run for an empty batch")
+
+    def forbidden_train(*_args, **_kwargs):
+        raise AssertionError("training backend must not run without new labels")
+
+    adapter = WorkflowIterationAdapter(
+        config,
+        initial_training=initial,
+        runtime=WorkflowRuntime(
+            label=forbidden_label,
+            train=forbidden_train,
+            descriptors=lambda _model, frames: toy_raw_features(
+                frames, "ordinary"
+            ),
+        ),
+    )
+    plan = GenerationPlan(1, 1, 10)
+    selected = adapter._select(
+        StageContext(
+            1,
+            tmp_path,
+            plan,
+            {
+                "candidates": candidates,
+                "candidate_pool_manifest": manifest,
+                "training_input": initial,
+                "model": model,
+            },
+            {},
+        )
+    )
+    assert selected.metrics["selected_count"] == 0
+    assert selected.metrics["batch_kind"] == "coverage_complete"
+    assert selected.metrics["descriptor_reduction"] == "global_mean"
+    assert selected.metrics["descriptor_elements"] == ["Fe"]
+
+    label_dir = tmp_path / "label"
+    label_dir.mkdir()
+    labeled = adapter._label(
+        StageContext(
+            1,
+            tmp_path,
+            plan,
+            {**selected.artifacts, "model": model},
+            {},
+            stage_dir=label_dir,
+        )
+    )
+    assert labeled.metrics["skipped"] is True
+    assert labeled.artifacts["labeled"].stat().st_size == 0
+
+    diagnose_dir = tmp_path / "diagnose"
+    diagnose_dir.mkdir()
+    diagnosed = adapter._diagnose(
+        StageContext(
+            1,
+            tmp_path,
+            plan,
+            {"labeled": labeled.artifacts["labeled"], "model": model},
+            {},
+            stage_dir=diagnose_dir,
+        )
+    )
+    merge_dir = tmp_path / "merge"
+    merge_dir.mkdir()
+    merged = adapter._merge(
+        StageContext(
+            1,
+            tmp_path,
+            plan,
+            {
+                "training_input": initial,
+                "labeled": labeled.artifacts["labeled"],
+            },
+            {},
+            stage_dir=merge_dir,
+        )
+    )
+    attempts = tmp_path / "md-attempts.json"
+    attempts.write_text(
+        json.dumps({"attempts": [{"completed": True}]}), encoding="utf-8"
+    )
+    retrain_dir = tmp_path / "retrain"
+    retrain_dir.mkdir()
+    retrained = adapter._retrain(
+        StageContext(
+            1,
+            tmp_path,
+            plan,
+            {
+                "training_input": initial,
+                "training_set": merged.artifacts["training_set"],
+                "model": model,
+                "acquisition_signals": diagnosed.artifacts[
+                    "acquisition_signals"
+                ],
+                "md_attempts": attempts,
+                "label_provenance": labeled.artifacts["label_provenance"],
+            },
+            {},
+            stage_dir=retrain_dir,
+        )
+    )
+    assert retrained.metrics["retrained"] is False
+    assert retrained.metrics["model_updated"] is False
+
+
+@pytest.mark.parametrize(
+    "descriptor_reduction",
+    ["global_mean", "elementwise_mean_std"],
+)
 def test_workflow_selection_describes_every_unique_valid_dump_frame(
     tmp_path: Path,
+    descriptor_reduction: str,
 ):
     initial = tmp_path / "initial.xyz"
     candidates_path = tmp_path / "candidates.xyz"
@@ -826,20 +1024,33 @@ def test_workflow_selection_describes_every_unique_valid_dump_frame(
     )
 
     descriptor_counts = []
+    atomic_descriptor_counts = []
 
     def descriptors(_model, frames):
         descriptor_counts.append(len(frames))
         return toy_raw_features(frames, "ordinary")
 
+    def atomic_descriptors(_model, frames):
+        atomic_descriptor_counts.append(len(frames))
+        rows = toy_raw_features(frames, "ordinary")
+        return np.vstack(
+            [
+                np.repeat(row[None, :], len(frame), axis=0)
+                for frame, row in zip(frames, rows, strict=True)
+            ]
+        )
+
+    sampling = _sampling(
+        structures=initial,
+        template=initial,
+        max_selected=4,
+    )
+    sampling["selection"]["descriptor_reduction"] = descriptor_reduction
     adapter = WorkflowIterationAdapter(
         {
             "training": {"backend": "gpumd"},
             "md": {"backend": "lammps", "spin": False},
-            "sampling": _sampling(
-                structures=initial,
-                template=initial,
-                max_selected=4,
-            ),
+            "sampling": sampling,
             "labeling": {"backend": "toy"},
             "evaluation": {
                 "validation_path": str(initial),
@@ -847,7 +1058,10 @@ def test_workflow_selection_describes_every_unique_valid_dump_frame(
             },
         },
         initial_training=initial,
-        runtime=WorkflowRuntime(descriptors=descriptors),
+        runtime=WorkflowRuntime(
+            descriptors=descriptors,
+            atomic_descriptors=atomic_descriptors,
+        ),
     )
     outcome = adapter._select(
         StageContext(
@@ -864,10 +1078,17 @@ def test_workflow_selection_describes_every_unique_valid_dump_frame(
         )
     )
 
-    assert descriptor_counts == [20, 1]
+    if descriptor_reduction == "global_mean":
+        assert descriptor_counts == [20, 1]
+        assert atomic_descriptor_counts == []
+    else:
+        assert descriptor_counts == []
+        assert atomic_descriptor_counts == [20, 1]
     assert outcome.metrics["candidate_count_before_deduplication"] == 20
     assert outcome.metrics["candidate_count_after_deduplication"] == 20
     assert outcome.metrics["selected_count"] == 4
+    assert outcome.metrics["descriptor_reduction"] == descriptor_reduction
+    assert outcome.metrics["descriptor_elements"] == ["Fe"]
 
 
 def test_explore_accumulates_same_model_md_waves_to_the_derived_floor(
@@ -1379,6 +1600,17 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
     diagnostic.write_text(
         json.dumps({"diagnostic_accepted": False}), encoding="utf-8"
     )
+    expanded_training = tmp_path / "expanded-train.xyz"
+    ase_write(
+        expanded_training,
+        [
+            *initial_frames,
+            ToyTeacher("ordinary").label(
+                toy_candidate_frames("ordinary", 33, 1)[0]
+            ),
+        ],
+        format="extxyz",
+    )
     update_dir = tmp_path / "update"
     update_dir.mkdir()
     updated = adapter.run_stage(
@@ -1387,9 +1619,9 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
             generation=2,
             generation_dir=tmp_path,
             plan=GenerationPlan(2, 2, 2),
-            artifacts={
-                "training_input": initial,
-                "training_set": initial,
+                artifacts={
+                    "training_input": initial,
+                    "training_set": expanded_training,
                 "model": model,
                 "acquisition_signals": diagnostic,
                 "md_attempts": attempts,

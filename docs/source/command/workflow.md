@@ -119,20 +119,52 @@ velocity seed；对 `npt_ber` 和
 默认全部温度都会跑到最长时长。显式设置 `production_temperatures` 后，未列入
 其中的中间温度只做低成本 smoke 探路。
 
-场景通过后，Controller 会同时解锁下一个温度和当前生产温度的下一档时长。
-失败场景保留在原位置，采集稳定段和炸前帧，经 FPS、标注和重训后重试，不会
-越过失败温度。`progression.replicas` 控制各时长需要的独立 MD 次数。
+一个温压条件只有在本档 replica 正常结束，并且 FPS 判断该条件的剩余结构已落入
+当前训练集的覆盖尺度后，才会晋级。晋级后，Controller 同时解锁下一个温度和当前
+生产温度的下一档时长；仍有覆盖缺口的条件继续停在本档。模型更新不会把已经完成的
+smoke、short 或 long 证据清零，只有最终 production 认证需要绑定当前模型哈希。
+`progression.replicas` 控制各时长需要的独立 MD 次数。
 
-所有通过健康检查的 dump 帧都会参与全局选择。FPS 先按精确元素集合分组，按
-组大小平方根分配初始名额；组内再按 route、温压条件和轨迹窗口做软平衡，并且
-只用相同元素集合的训练结构 warm-start。未用完的名额会确定性转给仍有新颖候选
-的元素组。当前使用结构级 NEP descriptor，不把它描述成逐原子局域新颖度。
+所有通过健康检查的 dump 帧都会参与全局选择。FPS 先按精确元素集合分组，只用
+相同元素集合的当前 `train.xyz` 做 warm start；每个仍有新颖结构的温压条件先保留
+一个锚点，剩余名额完全按全局 novelty 分配。已经学好的低温条件不会再被等额配满，
+高温或新解锁条件可以取得大部分预算。FPS 使用结构级 NEP descriptor；可选择原有的
+全原子平均，也可选择按元素规约的均值与标准差通道，但都不把它描述成逐原子局域
+新颖度。
 
 NepTrain 只在 FPS 前去除训练集已有结构和同一 route 内的完全重复结构，不按固定
 stride 抽帧，也不使用候选数量上限提前裁剪。
-`sampling.selection.max_selected` 是每个采样轮最多送去 Label Adapter 的结构
-数。常规标注下限由系统自动取其一半，例如上限 100 时优先积累至少 50 个；若当前
-场景 frontier 已经耗尽，或出现物理失败需要抢救，则允许较小批次提前提交。
+`sampling.selection.max_selected` 是每个采样轮最多送去 Label Adapter 的结构数，
+不是必须填满的配额。`novelty: auto` 只用当前 `train.xyz` 中的同元素结构拟合描述符
+中心和逐特征尺度，再从训练集留一最近邻距离估计保守阈值。候选结构只使用该变换，
+不参与尺度拟合；因此极端候选不会反向压低阈值。候选低于训练集已有分辨率时不送
+DFT。若本轮一个结构也选不到，
+workflow 会跳过 Label Adapter 和重训，直接记录覆盖证据并推进下一档采样，而不是
+报错或提交空的 VASP/ABACUS 作业。需要固定策略时，可显式设置
+`selection_threshold` 和 `completion_threshold`。
+
+多元素体系建议明确选择按元素规约：
+
+```yaml
+sampling:
+  selection:
+    descriptor_reduction: elementwise_mean_std
+    max_selected: 100
+    novelty: auto
+```
+
+`descriptor_reduction` 有两个值：
+
+- `global_mean`：默认值，保留原有的全原子描述符平均；
+- `elementwise_mean_std`：按稳定元素顺序拼接每种元素的描述符均值和标准差，
+  避免少数元素或不同元素的变化在总平均中被冲淡。
+
+候选结构、完整 `train.xyz`、自动 novelty 阈值与 FPS 使用同一种规约。切换规约后，
+旧规约下的绝对 novelty 阈值不能直接复用；`novelty: auto` 会重新按当前训练集估计。
+
+当所有温度和时长都已覆盖时，配置了独立验证且指标通过的 workflow 才会进入
+`complete`。没有独立验证的流程会停在 `coverage_exhausted`：它表示当前描述符和
+采样路径已找不到覆盖缺口，不等价于模型已经通过独立精度验证。
 
 这里的“一代”严格绑定一个模型哈希。Controller 会枚举该模型下所有已解锁
 scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交；全部进入终态后
