@@ -228,6 +228,11 @@ class ToyIterationAdapter:
                 "scenario_temperatures": sorted(
                     {attempt.temperature for attempt in attempts}
                 ),
+                "scenario_temperatures_by_route": {
+                    "default": sorted(
+                        {attempt.temperature for attempt in attempts}
+                    )
+                },
                 "scenario_steps": sorted({attempt.steps for attempt in attempts}),
                 "scenario_targets": sorted(
                     {attempt.target_level for attempt in attempts}

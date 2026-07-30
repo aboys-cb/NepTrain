@@ -354,6 +354,32 @@ neptrain workflow stop fe-workflow
 neptrain workflow extend fe-workflow 5
 ```
 
+默认状态页优先显示当前代次、采样温度路径、实际 MD 进度和历代验证精度。例如：
+
+```text
+NepTrain · Fe-spin
+路径：/work/neptrain/Fe-spin
+状态：运行中 | 第 3/6 代 | 采样中
+更新：14:32:08（8 秒前）
+
+采样进度：
+300 K ✓ → 500 K ● 3.2/10 ps（2/4 条轨迹完成）→ 700 K ○
+
+验证集精度：
+代    状态    E/eV          F/meV·Å⁻¹    V/eV          M/meV/μB    验收
+G1    完成    0.0180        210           0.0410        168          通过
+G2    完成    0.0142 ↓21%   176 ↓16%      0.0350 ↓15%  149 ↓11%     通过
+G3    采样中  -             -             -             -            等待
+```
+
+ps 进度来自 MD 已写出的实际 step 和模板中的有效 timestep，不使用墙钟时间估算；
+远端文件暂时不可见时会明确显示“ps 暂不可读”。未配置独立验证集时，状态页不把
+训练误差冒充为泛化精度，而是显示“暂无可比较数据”。
+
+`--jobs` 按“代次 + 阶段 + attempt”压缩同一批任务。即使同时运行 20 个 MD 或
+100 个 DFT 标注任务，也只显示每批的完成、运行、等待和失败计数；逐任务结构仍
+完整保留在 `--json` 输出中。
+
 `workflow status --json` 的 stdout 使用
 `neptrain.workflow-status.v1`；run/resume、stop 和 extend 分别使用稳定的
 `workflow-control.v1`、`workflow-stop.v1` 和 `workflow-extend.v1`。诊断不混入

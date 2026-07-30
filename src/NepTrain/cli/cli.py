@@ -4,10 +4,12 @@
 # @Author  : 兵
 # @email    : 1747193328@qq.com
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import shlex
+import unicodedata
 from NepTrain import __version__
 from NepTrain.core.config import (
     DEFAULT_MAX_CONCURRENT,
@@ -74,147 +76,336 @@ def run_smoke_command(args):
     _print_json(result)
 
 
-def _science_value(value):
+_STATE_LABELS = {
+    "prepared": "待启动",
+    "running": "运行中",
+    "waiting": "等待中",
+    "degraded": "连接异常",
+    "paused": "已暂停",
+    "complete": "已完成",
+    "failed": "失败",
+    "rejected": "验收未通过",
+    "stalled": "已停滞",
+    "budget_exhausted": "代次预算耗尽",
+    "coverage_exhausted": "采样覆盖耗尽",
+    "damaged": "状态损坏",
+}
+_STAGE_LABELS = {
+    "train": "训练",
+    "explore": "采样",
+    "select": "选样",
+    "label": "标注",
+    "diagnose": "诊断",
+    "merge": "合并训练集",
+    "retrain": "重新训练",
+    "evaluate": "评估",
+}
+
+
+def _updated_text(value):
+    if not value:
+        return "暂无时间记录"
+    try:
+        observed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        seconds = max(0, int((now - observed.astimezone(timezone.utc)).total_seconds()))
+        if seconds < 5:
+            age = "刚刚"
+        elif seconds < 60:
+            age = f"{seconds} 秒前"
+        elif seconds < 3600:
+            age = f"{seconds // 60} 分钟前"
+        else:
+            age = f"{seconds // 3600} 小时前"
+        return f"{observed.astimezone().strftime('%H:%M:%S')}（{age}）"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _ps(value):
+    return f"{float(value):.4g}"
+
+
+def _sampling_cell(cell):
+    temperature = f"{float(cell['temperature']):g} K"
+    state = cell["state"]
+    if state == "complete":
+        return f"{temperature} ✓"
+    if state == "pending":
+        return f"{temperature} ○"
+    marker = "●" if state == "active" else "⚠"
+    current = cell.get("current_ps")
+    target = cell.get("target_ps")
+    progress = (
+        f" {_ps(current)}/{_ps(target)} ps"
+        if current is not None and target is not None
+        else "（ps 暂不可读）"
+    )
+    count = (
+        f"（{cell['completed']}/{cell['total']} 条轨迹完成）"
+        if cell.get("total")
+        else ""
+    )
+    return f"{temperature} {marker}{progress}{count}"
+
+
+def _metric_cell(value, previous, *, scale):
     if value is None:
         return "-"
-    if isinstance(value, float):
-        return f"{value:.4g}"
-    return str(value)
+    number = float(value) * scale
+    text = f"{number:.4g}"
+    if previous is None or float(previous) == 0:
+        return text
+    change = (float(value) - float(previous)) / abs(float(previous)) * 100
+    if abs(change) < 0.5:
+        return text
+    arrow = "↓" if change < 0 else "↑"
+    return f"{text} {arrow}{abs(change):.0f}%"
 
 
-def _print_scientific_progress(generations):
-    print("Science:")
-    for generation in generations:
-        number = generation["generation"]
-        state = generation["state"].replace("_", " ")
-        plan = generation["plan"]
-        if generation["state"] == "not_started":
-            print(
-                f"  G{number} {state}: FPS selects up to "
-                f"{plan['max_selected']}; MD conditions come from "
-                "sampling routes"
-            )
-            continue
+def _display_width(value):
+    return sum(
+        2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        for character in str(value)
+    )
 
-        sampling = generation["sampling"]
-        training = generation["training"]
-        flow = []
-        if sampling["candidate_count"] is not None:
-            flow.append(f"MD {sampling['candidate_count']} candidates")
-        if sampling["candidate_count_after_deduplication"] is not None:
-            flow.append(
-                f"{sampling['candidate_count_after_deduplication']} unique eligible"
+
+def _table(rows):
+    widths = [
+        max(_display_width(row[index]) for row in rows)
+        for index in range(len(rows[0]))
+    ]
+    for row in rows:
+        print(
+            "  ".join(
+                str(value) + " " * (widths[index] - _display_width(value))
+                for index, value in enumerate(row)
+            ).rstrip()
+        )
+
+
+def _generation_state(generation, status):
+    state = generation["state"]
+    if state == "accepted":
+        return "完成"
+    if state == "rejected":
+        return "未通过"
+    if state == "not_started":
+        return "未开始"
+    if generation["generation"] == status.generation and status.stage:
+        return f"{_STAGE_LABELS.get(status.stage, status.stage)}中"
+    return "进行中"
+
+
+def _print_precision(status):
+    print()
+    if status.precision_basis != "validation":
+        print("精度变化：暂无可比较数据（未配置独立验证集）")
+        return
+    print("验证集精度：")
+    rows = [
+        (
+            "代",
+            "状态",
+            "E/eV",
+            "F/meV·Å⁻¹",
+            "V/eV",
+            "M/meV/μB",
+            "验收",
+        )
+    ]
+    previous = {
+        "energy_rmse": None,
+        "force_rmse": None,
+        "virial_rmse": None,
+        "mforce_rmse": None,
+    }
+    for generation in status.generations:
+        metrics = generation["quality"]["validation_rmse"]
+        rows.append(
+            (
+                f"G{generation['generation']}",
+                _generation_state(generation, status),
+                _metric_cell(
+                    metrics["energy_rmse"],
+                    previous["energy_rmse"],
+                    scale=1,
+                ),
+                _metric_cell(
+                    metrics["force_rmse"],
+                    previous["force_rmse"],
+                    scale=1000,
+                ),
+                _metric_cell(
+                    metrics["virial_rmse"],
+                    previous["virial_rmse"],
+                    scale=1,
+                ),
+                _metric_cell(
+                    metrics["mforce_rmse"],
+                    previous["mforce_rmse"],
+                    scale=1000,
+                ),
+                (
+                    "通过"
+                    if generation["quality"]["accepted"] is True
+                    else "未通过"
+                    if generation["quality"]["accepted"] is False
+                    else "等待"
+                ),
             )
-        if sampling["selected_count"] is not None:
-            flow.append(f"FPS {sampling['selected_count']}")
-        if sampling["labeled_count"] is not None:
-            flow.append(f"labels {sampling['labeled_count']}")
-        before = training["before_count"]
-        after = training["after_count"]
-        if before is not None or after is not None:
-            training_text = f"training {_science_value(before)}"
-            if after is not None:
-                training_text += f" -> {after}"
-            if training["added_count"] is not None:
-                training_text += f" (+{training['added_count']})"
-            flow.append(training_text)
-        if not flow:
-            completed = ", ".join(generation["completed_stages"]) or "none"
-            flow.append(f"completed stages: {completed}")
-        print(f"  G{number} {state}: " + " -> ".join(flow))
-        windows = sampling["candidate_counts_by_window"]
-        duplicates = sampling["duplicate_candidate_count"]
-        if windows or duplicates is not None:
-            details = [
-                f"{name}={count}" for name, count in sorted(windows.items())
-            ]
-            if duplicates is not None:
-                details.append(f"duplicates={duplicates}")
-            print("    sampling: " + ", ".join(details))
-        batch_kind = sampling.get("batch_kind")
-        batch_floor = sampling.get("regular_batch_minimum")
-        if batch_kind:
-            print(
-                f"    batch: {batch_kind}, regular floor={batch_floor}, "
-                f"active model={str(sampling.get('sampling_model_sha256') or '-')[:12]}"
-            )
-        active_model = training.get("active_model_sha256")
-        if active_model:
-            action = (
-                "updated"
-                if training.get("model_updated")
-                else "reused for certification"
-            )
-            print(f"    model: {str(active_model)[:12]} ({action})")
-        validation = generation["quality"]["validation_rmse"]
-        if any(value is not None for value in validation.values()):
-            print(
-                "    validation RMSE: "
-                f"E={_science_value(validation['energy_rmse'])}, "
-                f"F={_science_value(validation['force_rmse'])}, "
-                f"V={_science_value(validation['virial_rmse'])}, "
-                f"M={_science_value(validation['mforce_rmse'])}"
-            )
-        maturity = generation["scenarios"]["counts_by_maturity"]
-        if maturity:
-            print(
-                "    scenario maturity: "
-                + ", ".join(
-                    f"{name}={count}" for name, count in sorted(maturity.items())
-                )
-            )
+        )
+        for name, value in metrics.items():
+            if value is not None:
+                previous[name] = value
+    _table(rows)
+
+
+def _compact_job_ids(jobs):
+    values = [str(job["job_id"]) for job in jobs if job.get("job_id")]
+    if not values:
+        return "-"
+    unique = list(dict.fromkeys(values))
+    if len(unique) == 1:
+        return unique[0]
+    if all(value.isdigit() for value in unique):
+        numbers = sorted(int(value) for value in unique)
+        if numbers == list(range(numbers[0], numbers[-1] + 1)):
+            return f"{numbers[0]}–{numbers[-1]}"
+    preview = ", ".join(unique[:3])
+    return preview + (f", …（共 {len(unique)} 个）" if len(unique) > 3 else "")
+
+
+def _print_job_batches(jobs):
+    groups = {}
+    for job in jobs:
+        key = (
+            job.get("generation"),
+            job.get("stage") or Path(job["script"]).name,
+            job.get("attempt"),
+        )
+        groups.setdefault(key, []).append(job)
+    print()
+    print("执行批次：")
+    if not groups:
+        print("  暂无执行任务")
+        return
+    state_labels = {
+        "COMPLETED": "完成",
+        "RUNNING": "运行",
+        "PENDING": "等待",
+        "SUBMITTED": "等待",
+        "SUBMITTING": "等待",
+        "LAUNCHING": "等待",
+        "QUEUED": "等待",
+        "NOT_SUBMITTED": "等待",
+        "FAILED": "失败",
+        "CANCELLED": "取消",
+        "CANCELLING": "取消中",
+        "SKIPPED": "跳过",
+        "UNKNOWN": "未知",
+    }
+    for (generation, stage, attempt), batch in groups.items():
+        counts = {}
+        for job in batch:
+            label = state_labels.get(str(job["state"]).upper(), str(job["state"]))
+            counts[label] = counts.get(label, 0) + 1
+        parts = [f"{len(batch)} 个任务"]
+        ordered_labels = (
+            "完成",
+            "运行",
+            "等待",
+            "失败",
+            "取消",
+            "取消中",
+            "跳过",
+            "未知",
+        )
+        for label in ordered_labels:
+            if counts.get(label):
+                parts.append(f"{label} {counts[label]}")
+        known = {"完成", "运行", "等待", "失败", "取消", "取消中", "跳过", "未知"}
+        parts.extend(
+            f"{label} {count}"
+            for label, count in sorted(counts.items())
+            if label not in known
+        )
+        prefix = f"G{generation} " if generation is not None else ""
+        print(
+            f"  {prefix}{_STAGE_LABELS.get(str(stage), stage)} "
+            f"{attempt}：{' | '.join(parts)} | Job {_compact_job_ids(batch)}"
+        )
 
 
 def _print_workflow_status(status, *, show_jobs: bool = True):
-    print(f"Workflow: {status.workflow_id}")
-    print(f"State: {status.state}")
-    print(
-        f"Progress: {status.completed_generations}/{status.total_generations} "
-        "model generations"
+    state = _STATE_LABELS.get(status.state, status.state)
+    generation = status.generation or status.completed_generations
+    stage = _STAGE_LABELS.get(status.stage, status.stage) if status.stage else None
+    location = (
+        f"第 {generation}/{status.total_generations} 代"
+        if generation
+        else f"0/{status.total_generations} 代"
     )
-    if status.generation is not None:
-        print(f"Ledger: generation {status.generation}, stage {status.stage}")
-    else:
-        print("Ledger: complete")
-    print(f"Reason: {status.reason}")
-    _print_scientific_progress(status.generations)
+    if stage:
+        suffix = (
+            "中"
+            if status.state in {"running", "waiting", "degraded"}
+            else ""
+        )
+        location += f" | {stage}{suffix}"
+    print(f"NepTrain · {status.workflow_id}")
+    print(f"路径：{status.project_path}")
+    print(f"状态：{state} | {location}")
+    print(f"更新：{_updated_text(status.updated_at)}")
+    if status.state in {
+        "degraded",
+        "paused",
+        "failed",
+        "rejected",
+        "stalled",
+        "budget_exhausted",
+        "coverage_exhausted",
+        "damaged",
+    }:
+        print(f"原因：{status.reason}")
+
+    if status.sampling_routes:
+        print()
+        print("采样进度：")
+        multiple = len(status.sampling_routes) > 1
+        total_failed = 0
+        for route in status.sampling_routes:
+            prefix = f"{route['route_id']}：" if multiple else ""
+            line = " → ".join(
+                _sampling_cell(cell) for cell in route["temperatures"]
+            )
+            print(f"{prefix}{line}")
+            total_failed += int(route.get("failed", 0))
+        if total_failed:
+            print(f"异常：{total_failed} 条采样轨迹失败，失败证据已保留")
+
+    _print_precision(status)
     if show_jobs:
-        print("Executions:")
-        for job in status.jobs:
-            marker = "*" if job["current"] else "-"
-            attempt = job["attempt"] or "not-submitted"
-            job_id = job["job_id"] or "-"
-            print(
-                f"  {marker} {attempt:13} {job_id:>8} "
-                f"{job['state']:>20}  {Path(job['script']).name}"
-            )
-    else:
-        active = [
-            job
-            for job in status.jobs
-            if job["current"] and job["state"] not in {"NOT_SUBMITTED", "COMPLETED"}
-        ]
-        if active:
-            job = active[-1]
-            print(
-                f"Executor: {job['job_id'] or '-'} {job['state']} "
-                f"({Path(job['script']).name})"
-            )
-        else:
-            completed = sum(job["state"] == "COMPLETED" for job in status.jobs)
-            print(f"Executor: {completed}/{len(status.jobs)} stages completed")
+        _print_job_batches(status.jobs)
     if status.notifications:
         notification = status.notifications
+        notification_state = {
+            "configured": "已配置",
+            "ok": "正常",
+            "degraded": "异常",
+        }.get(notification["state"], notification["state"])
+        print()
         print(
-            "Notifications: "
-            f"Feishu {notification['state']}, "
-            f"{notification['delivered']} delivered, "
-            f"{notification['failed']} failed"
+            "通知：飞书"
+            f"{notification_state} | 成功 {notification['delivered']} | "
+            f"失败 {notification['failed']}"
         )
         if notification.get("last_error"):
-            print(f"Notification error: {notification['last_error']}")
-    if status.next_action:
-        print(f"Next: {status.next_action}")
+            print(f"通知错误：{notification['last_error']}")
+    if status.next_action and status.state not in {"running", "waiting", "degraded"}:
+        print(f"下一步：{status.next_action}")
 
 
 def run_project_command(args):
@@ -1821,7 +2012,11 @@ def build_workflow_commands(subparsers):
     status.set_defaults(func=run_status_command)
     status.add_argument("project")
     status.add_argument("--json", action="store_true")
-    status.add_argument("--jobs", action="store_true")
+    status.add_argument(
+        "--jobs",
+        action="store_true",
+        help="Show execution tasks grouped by generation, stage, and attempt.",
+    )
 
     resume = actions.add_parser(
         "resume", help="Start or restart an existing workflow controller."

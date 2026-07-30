@@ -1744,6 +1744,11 @@ def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
         "default",
         "second",
     }
+    assert {
+        item["route_id"]: (item["temperature"], item["steps"])
+        for item in current["tasks"]
+    } == {"default": (300.0, 2), "second": (500.0, 2)}
+    assert all(item["target_level"] == "smoke_passed" for item in current["tasks"])
     assert all(item["handle"] is not None for item in current["tasks"])
     assert [stage for stage, _ in launches].count("explore") == 2
     controller.tick()

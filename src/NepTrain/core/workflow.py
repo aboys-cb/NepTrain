@@ -48,6 +48,7 @@ class WorkflowResume:
 @dataclass(frozen=True)
 class WorkflowStatus:
     workflow_id: str
+    project_path: str
     state: str
     completed_generations: int
     total_generations: int
@@ -58,6 +59,9 @@ class WorkflowStatus:
     generations: tuple[Mapping[str, Any], ...]
     jobs: tuple[Mapping[str, Any], ...]
     notifications: Mapping[str, Any] | None
+    updated_at: str | None
+    sampling_routes: tuple[Mapping[str, Any], ...]
+    precision_basis: str | None
 
 
 _STAGES = (
@@ -1092,6 +1096,15 @@ def _generation_science(
         "scenarios": {
             "target_maturities": tuple(explore.get("scenario_targets", ())),
             "attempted_steps": tuple(explore.get("scenario_steps", ())),
+            "attempted_temperatures": tuple(
+                explore.get("scenario_temperatures", ())
+            ),
+            "attempted_temperatures_by_route": {
+                str(route_id): tuple(values)
+                for route_id, values in dict(
+                    explore.get("scenario_temperatures_by_route", {})
+                ).items()
+            },
             "counts_by_maturity": dict(
                 evaluate.get("scenario_counts_by_maturity", {})
             ),
@@ -1121,6 +1134,298 @@ def _scientific_progress(
     )
 
 
+def _md_timestep_ps(
+    route: Mapping[str, Any],
+    *,
+    backend: str,
+    base_dir: Path,
+) -> float | None:
+    template_value = route.get("template_path")
+    if not template_value:
+        return 0.001
+    template = Path(str(template_value))
+    if not template.is_absolute():
+        template = base_dir / template
+    try:
+        lines = template.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return None
+    command = "time_step" if backend == "gpumd" else "timestep"
+    commands = [
+        raw.split("#", 1)[0].strip().split()
+        for raw in lines
+    ]
+    if backend == "lammps":
+        units = [
+            parts[1]
+            for parts in commands
+            if len(parts) >= 2 and parts[0] == "units"
+        ]
+        if not units or units[-1] != "metal":
+            return None
+    values = []
+    for parts in commands:
+        if len(parts) < 2 or parts[0] != command:
+            continue
+        try:
+            value = float(parts[1])
+        except ValueError:
+            return None
+        if value <= 0:
+            return None
+        values.append(value)
+    if not values:
+        return 0.001
+    return values[-1] / 1000.0 if backend == "gpumd" else values[-1]
+
+
+def _active_md_output(task: Mapping[str, Any]) -> Path | None:
+    roots = [task.get("bundle")]
+    handle = task.get("handle")
+    if isinstance(handle, Mapping):
+        roots.append(handle.get("remote_bundle"))
+    candidates = []
+    for value in roots:
+        if not value:
+            continue
+        root = Path(str(value)).expanduser()
+        if not root.is_dir():
+            continue
+        candidates.extend(
+            item
+            for item in root.glob(".output-building-*")
+            if item.is_dir()
+        )
+        output = root / "output"
+        if output.is_dir():
+            candidates.append(output)
+    if not candidates:
+        return None
+    try:
+        return max(candidates, key=lambda item: item.stat().st_mtime_ns)
+    except OSError:
+        return candidates[-1]
+
+
+def _tail_text(path: Path, *, maximum_bytes: int = 2_000_000) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - maximum_bytes))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _lammps_last_step(path: Path) -> int | None:
+    dump = _tail_text(path / "dump.lammpstrj")
+    if dump is not None:
+        values = re.findall(r"ITEM:\s+TIMESTEP\s+(\d+)", dump)
+        if values:
+            return int(values[-1])
+    log = _tail_text(path / "log.lammps")
+    if log is None:
+        return None
+    lines = log.splitlines()
+    last_step = None
+    in_thermo = False
+    for raw in lines:
+        parts = raw.split()
+        if parts and parts[0] == "Step":
+            in_thermo = True
+            continue
+        if in_thermo and parts:
+            try:
+                last_step = int(parts[0])
+            except ValueError:
+                if raw.startswith(("Loop time", "ERROR:")):
+                    in_thermo = False
+    return last_step
+
+
+def _gpumd_time_ps(path: Path) -> float | None:
+    text = _tail_text(path / "dump.xyz")
+    if text is None:
+        return None
+    values = re.findall(
+        r"(?:^|\s)Time=([-+0-9.eE]+)(?:\s|$)",
+        text,
+        flags=re.MULTILINE,
+    )
+    if not values:
+        return None
+    try:
+        return float(values[-1]) / 1000.0
+    except ValueError:
+        return None
+
+
+def _sampling_task_state(task: Mapping[str, Any]) -> str:
+    if task.get("collected_bundle"):
+        return "complete"
+    if task.get("terminal_failure"):
+        return "failed"
+    cancellation = task.get("cancellation")
+    if isinstance(cancellation, Mapping) and cancellation:
+        return "failed"
+    if not task.get("handle"):
+        return "waiting"
+    observed = str(task.get("observed_state", "running")).lower()
+    if observed in {"completed", "complete"}:
+        return "complete"
+    if observed in {"failed", "cancelled", "skipped"}:
+        return "failed"
+    return "running"
+
+
+def _sampling_progress(
+    config: Mapping[str, Any],
+    controller: Mapping[str, Any],
+    generations: tuple[Mapping[str, Any], ...],
+    *,
+    base_dir: Path,
+) -> tuple[Mapping[str, Any], ...]:
+    routes = config.get("sampling", {}).get("routes", ())
+    if not isinstance(routes, list):
+        return ()
+    route_ids = [
+        str(route.get("id", "default"))
+        for route in routes
+        if isinstance(route, Mapping)
+    ]
+    backend = str(config.get("md", {}).get("backend", "lammps"))
+    completed_by_route: dict[str, set[float]] = {}
+    for generation in generations:
+        by_route = generation.get("scenarios", {}).get(
+            "attempted_temperatures_by_route", {}
+        )
+        if not isinstance(by_route, Mapping):
+            continue
+        if not by_route and len(route_ids) == 1:
+            by_route = {
+                route_ids[0]: generation.get("scenarios", {}).get(
+                    "attempted_temperatures", ()
+                )
+            }
+        for route_id, values in by_route.items():
+            completed_by_route.setdefault(str(route_id), set()).update(
+                float(value) for value in values
+            )
+    current = controller.get("current")
+    current_tasks = (
+        current.get("tasks", ())
+        if isinstance(current, Mapping)
+        and current.get("stage") == "explore"
+        and isinstance(current.get("tasks"), list)
+        else ()
+    )
+    tasks_by_condition: dict[tuple[str, float], list[dict[str, Any]]] = {}
+    for raw in current_tasks:
+        if not isinstance(raw, Mapping):
+            continue
+        try:
+            route_id = str(raw["route_id"])
+            temperature = float(raw["temperature"])
+            steps = int(raw["steps"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        task = dict(raw)
+        task["state"] = _sampling_task_state(raw)
+        task["steps"] = steps
+        output = _active_md_output(raw)
+        if task["state"] == "complete":
+            task["current_ps"] = "target"
+        elif output is None:
+            task["current_ps"] = None
+        elif backend == "gpumd":
+            task["current_ps"] = _gpumd_time_ps(output)
+        else:
+            task["last_step"] = _lammps_last_step(output)
+            task["current_ps"] = None
+        tasks_by_condition.setdefault((route_id, temperature), []).append(task)
+
+    summaries = []
+    for raw_route in routes:
+        if not isinstance(raw_route, Mapping):
+            continue
+        route_id = str(raw_route.get("id", "default"))
+        raw_path = raw_route.get("conditions", {}).get(
+            "temperature_path", ()
+        )
+        temperatures = [float(value) for value in raw_path]
+        timestep_ps = _md_timestep_ps(
+            raw_route,
+            backend=backend,
+            base_dir=base_dir,
+        )
+        scheduled_indices = [
+            index
+            for index, temperature in enumerate(temperatures)
+            if tasks_by_condition.get((route_id, temperature))
+        ]
+        furthest_scheduled = max(scheduled_indices, default=-1)
+        cells = []
+        for temperature_index, temperature in enumerate(temperatures):
+            tasks = tasks_by_condition.get((route_id, temperature), [])
+            states = [str(task["state"]) for task in tasks]
+            completed = states.count("complete")
+            failed = states.count("failed")
+            if tasks and completed == len(tasks):
+                state = "complete"
+            elif tasks and any(
+                value in {"running", "waiting"} for value in states
+            ):
+                state = "active"
+            elif tasks:
+                state = "failed"
+            elif temperature in completed_by_route.get(route_id, set()):
+                state = "complete"
+            elif temperature_index < furthest_scheduled:
+                state = "complete"
+            else:
+                state = "pending"
+            target_ps_values = [
+                task["steps"] * timestep_ps
+                for task in tasks
+                if timestep_ps is not None
+            ]
+            current_ps_values = []
+            for task in tasks:
+                value = task.get("current_ps")
+                if value == "target" and timestep_ps is not None:
+                    current_ps_values.append(task["steps"] * timestep_ps)
+                elif isinstance(value, int | float):
+                    current_ps_values.append(float(value))
+                elif task.get("last_step") is not None and timestep_ps is not None:
+                    current_ps_values.append(
+                        int(task["last_step"]) * timestep_ps
+                    )
+            cells.append(
+                {
+                    "temperature": temperature,
+                    "state": state,
+                    "completed": completed,
+                    "failed": failed,
+                    "total": len(tasks),
+                    "current_ps": max(current_ps_values, default=None),
+                    "target_ps": max(target_ps_values, default=None),
+                }
+            )
+        summaries.append(
+            {
+                "route_id": route_id,
+                "temperatures": tuple(cells),
+                "failed": sum(
+                    cell["failed"] for cell in cells
+                ),
+            }
+        )
+    return tuple(summaries)
+
+
 def workflow_status(output_dir: str | Path) -> WorkflowStatus:
     """Return the controller ledger and execution summary for one workflow."""
 
@@ -1148,6 +1453,13 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         raise WorkflowError(
             f"controller state is malformed: {workspace.controller_file}"
         )
+    config: Mapping[str, Any] = {}
+    try:
+        from .config import load_config
+
+        config, _ = load_config(workspace.project_file)
+    except Exception:
+        pass
     if ledger is None:
         generation_evidence = any(
             item.is_file() or item.is_symlink()
@@ -1189,6 +1501,8 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             handle = task_record.get("handle") or {}
             jobs.append(
                 {
+                    "generation": item.get("generation"),
+                    "stage": item.get("stage"),
                     "attempt": f"attempt-{item.get('attempt', 1)}",
                     "script": (
                         f"{task_record.get('target', '-')}/"
@@ -1236,6 +1550,8 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                 ).upper()
             jobs.append(
                 {
+                    "generation": current.get("generation"),
+                    "stage": current.get("stage"),
                     "attempt": f"attempt-{current.get('attempt', 1)}",
                     "script": (
                         f"{task_record.get('target', '-')}/"
@@ -1320,16 +1636,9 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         next_action = f"neptrain workflow run {workflow_path}"
 
     notification_summary = None
-    configured_notifications = False
-    try:
-        from .config import load_config
-
-        config, _ = load_config(workspace.project_file)
-        configured_notifications = bool(
-            config.get("notifications", {}).get("feishu")
-        )
-    except Exception:
-        pass
+    configured_notifications = bool(
+        config.get("notifications", {}).get("feishu")
+    )
     if configured_notifications or workspace.notification_state.is_file():
         notification_summary = {
             "provider": "feishu",
@@ -1377,6 +1686,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
 
     return WorkflowStatus(
         workflow_id=preparation.workflow_id,
+        project_path=str(preparation.output_dir),
         state=state,
         completed_generations=progress.completed_generations,
         total_generations=len(preparation.plans),
@@ -1387,6 +1697,25 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         generations=generations,
         jobs=tuple(jobs),
         notifications=notification_summary,
+        updated_at=(
+            str(
+                controller.get("heartbeat_at")
+                or controller.get("started_at")
+            )
+            if controller.get("heartbeat_at") or controller.get("started_at")
+            else None
+        ),
+        sampling_routes=_sampling_progress(
+            config,
+            controller,
+            generations,
+            base_dir=workspace.root,
+        ),
+        precision_basis=(
+            "validation"
+            if config.get("evaluation", {}).get("validation_path")
+            else None
+        ),
     )
 
 

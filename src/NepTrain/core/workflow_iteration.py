@@ -709,6 +709,10 @@ class WorkflowIterationAdapter:
                     "route_id": route.route_id,
                     "route_fingerprint": route.fingerprint,
                     "attempt_id": attempt.attempt_id,
+                    "temperature": attempt.temperature,
+                    "steps": attempt.steps,
+                    "target_level": attempt.target_level,
+                    "replica": attempt.replica,
                 }
                 for attempt in attempts
             )
@@ -1154,6 +1158,15 @@ class WorkflowIterationAdapter:
                         for attempt in route_plan["attempts"]
                     }
                 ),
+                "scenario_temperatures_by_route": {
+                    str(route_plan["route_id"]): sorted(
+                        {
+                            float(attempt["temperature"])
+                            for attempt in route_plan["attempts"]
+                        }
+                    )
+                    for route_plan in route_plans
+                },
                 "scenario_targets": sorted(
                     {
                         str(attempt["target_level"])
@@ -1327,6 +1340,36 @@ class WorkflowIterationAdapter:
                 "failed_source_count": failed_md_runs,
                 "routes": route_metrics,
                 "md_wave_task_count": len(outcomes),
+                "scenario_steps": sorted(
+                    {
+                        int(attempt["steps"])
+                        for route_plan in route_plans
+                        for attempt in route_plan["attempts"]
+                    }
+                ),
+                "scenario_temperatures": sorted(
+                    {
+                        float(attempt["temperature"])
+                        for route_plan in route_plans
+                        for attempt in route_plan["attempts"]
+                    }
+                ),
+                "scenario_temperatures_by_route": {
+                    str(route_plan["route_id"]): sorted(
+                        {
+                            float(attempt["temperature"])
+                            for attempt in route_plan["attempts"]
+                        }
+                    )
+                    for route_plan in route_plans
+                },
+                "scenario_targets": sorted(
+                    {
+                        str(attempt["target_level"])
+                        for route_plan in route_plans
+                        for attempt in route_plan["attempts"]
+                    }
+                ),
             },
         )
 

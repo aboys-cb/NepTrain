@@ -178,6 +178,11 @@ neptrain workflow stop fe-workflow
 neptrain workflow extend fe-workflow 5
 ```
 
+Human-readable workflow status focuses on the active generation, a compact
+temperature path with observable MD progress in ps, and a per-generation RMSE
+table. `--jobs` groups large MD and labeling batches by generation, stage, and
+attempt; `--json` retains every individual execution record.
+
 NepTrain accepts only `schema_version: 8`. Unknown fields and legacy project
 formats fail explicitly instead of being migrated silently.
 

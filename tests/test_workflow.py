@@ -12,6 +12,8 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import write as ase_write
 
 from NepTrain.cli.cli import (
+    _print_job_batches,
+    _print_precision,
     run_project_command,
     run_resume_command,
     run_status_command,
@@ -60,7 +62,10 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
         Atoms("Fe", positions=[[0.0, 0.0, 0.0]]),
         format="extxyz",
     )
-    _write(tmp_path / "lammps.in", "run {{ steps }}\n")
+    _write(
+        tmp_path / "lammps.in",
+        "units metal\ntimestep 0.001\nrun {{ steps }}\n",
+    )
     _write_labeled(tmp_path / "validation.xyz")
     _write(tmp_path / "gpu-env.sh", "module load cuda\n")
     _write(tmp_path / "cpu-env.sh", "module load lammps\n")
@@ -347,10 +352,163 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
         SimpleNamespace(project=str(preparation.output_dir), json=False, jobs=False)
     )
     output = capsys.readouterr().out
-    assert "State: prepared" in output
-    assert "Ledger: generation 1, stage train" in output
-    assert "G1 not started: FPS selects up to 100" in output
-    assert "Executor: 0/0 stages completed" in output
+    assert "NepTrain · controller-smoke" in output
+    assert f"路径：{preparation.output_dir}" in output
+    assert "状态：待启动 | 第 1/3 代 | 训练" in output
+    assert "300 K ○ → 500 K ○" in output
+    assert "验证集精度：" in output
+    assert "G1" in output
+    assert "未开始" in output
+    assert "执行批次：" not in output
+
+
+def test_status_reports_live_md_temperature_and_real_ps(tmp_path: Path, capsys):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    bundle = workspace.tasks_dir / "live-md"
+    output = bundle / ".output-building-123"
+    _write(
+        output / "log.lammps",
+        """
+Step Temp PotEng
+0 300 -1
+3200 500 -1
+""",
+    )
+    workspace.controller_file.write_text(
+        json.dumps(
+            {
+                "protocol": "neptrain.controller.v1",
+                "workflow_id": preparation.workflow_id,
+                "state": "running",
+                "heartbeat_at": "2026-07-30T06:00:00+00:00",
+                "history": [],
+                "current": {
+                    "kind": "task_group",
+                    "generation": 1,
+                    "stage": "explore",
+                    "attempt": 1,
+                    "tasks": [
+                        {
+                            "route_id": "default",
+                            "temperature": 500,
+                            "steps": 10_000,
+                            "bundle": str(bundle),
+                            "target": "cpu",
+                            "handle": {"execution_id": "42"},
+                            "observed_state": "running",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = workflow_status(preparation.output_dir)
+
+    cells = status.sampling_routes[0]["temperatures"]
+    assert cells[0]["state"] == "complete"
+    assert cells[1]["state"] == "active"
+    assert cells[1]["current_ps"] == pytest.approx(3.2)
+    assert cells[1]["target_ps"] == pytest.approx(10.0)
+    run_status_command(
+        SimpleNamespace(project=str(preparation.output_dir), json=False, jobs=False)
+    )
+    output_text = capsys.readouterr().out
+    assert "300 K ✓ → 500 K ● 3.2/10 ps" in output_text
+    run_status_command(
+        SimpleNamespace(project=str(preparation.output_dir), json=True, jobs=False)
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["protocol"] == "neptrain.workflow-status.v1"
+    assert payload["sampling_routes"][0]["temperatures"][1][
+        "current_ps"
+    ] == pytest.approx(3.2)
+
+
+def test_status_precision_table_shows_generation_deltas(capsys):
+    generations = []
+    for generation, force in ((1, 0.2), (2, 0.16)):
+        generations.append(
+            {
+                "generation": generation,
+                "state": "accepted",
+                "quality": {
+                    "accepted": True,
+                    "validation_rmse": {
+                        "energy_rmse": 0.02,
+                        "force_rmse": force,
+                        "virial_rmse": 0.04,
+                        "mforce_rmse": 0.15,
+                    },
+                },
+            }
+        )
+    status = SimpleNamespace(
+        precision_basis="validation",
+        generations=tuple(generations),
+        generation=2,
+        stage=None,
+    )
+
+    _print_precision(status)
+
+    output = capsys.readouterr().out
+    assert "验证集精度：" in output
+    assert "F/meV·Å⁻¹" in output
+    assert "M/meV/μB" in output
+    assert "160 ↓20%" in output
+
+
+def test_status_does_not_present_training_error_as_validation(capsys):
+    status = SimpleNamespace(
+        precision_basis=None,
+        generations=(),
+        generation=1,
+        stage="train",
+    )
+
+    _print_precision(status)
+
+    assert (
+        "精度变化：暂无可比较数据（未配置独立验证集）"
+        in capsys.readouterr().out
+    )
+
+
+def test_jobs_are_compacted_by_generation_stage_and_attempt(capsys):
+    jobs = [
+        {
+            "generation": 3,
+            "stage": "explore",
+            "attempt": "attempt-1",
+            "job_id": str(1000 + index),
+            "state": "COMPLETED" if index < 12 else "RUNNING",
+            "script": "cpu/explore",
+        }
+        for index in range(20)
+    ]
+    jobs.extend(
+        {
+            "generation": 3,
+            "stage": "label",
+            "attempt": "attempt-1",
+            "job_id": str(2000 + index),
+            "state": "COMPLETED" if index < 80 else "PENDING",
+            "script": "dft/label",
+        }
+        for index in range(100)
+    )
+
+    _print_job_batches(jobs)
+
+    output = capsys.readouterr().out
+    assert "G3 采样 attempt-1：20 个任务 | 完成 12 | 运行 8" in output
+    assert "Job 1000–1019" in output
+    assert "G3 标注 attempt-1：100 个任务 | 完成 80 | 等待 20" in output
+    assert len(output.splitlines()) == 4
 
 
 def test_generation_status_reports_activation_result_not_retrain_candidate():
