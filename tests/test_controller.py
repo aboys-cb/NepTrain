@@ -153,6 +153,12 @@ def test_empty_label_task_omits_dft_resources(tmp_path):
             },
             "workflow": {},
             "execution": {},
+            "notifications": {
+                "feishu": {
+                    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+                    "secret": "must-not-leave-controller",
+                }
+            },
         },
         initial_training=initial,
         context=StageContext(
@@ -170,6 +176,8 @@ def test_empty_label_task_omits_dft_resources(tmp_path):
     assert descriptor["stage_input"] == {"empty_selection": True}
     assert "input_path" not in descriptor["config"]["labeling"]
     assert "resource_path" not in descriptor["config"]["labeling"]
+    assert "notifications" not in descriptor["config"]
+    assert "must-not-leave-controller" not in task.descriptor.read_text()
 
 
 def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypatch):

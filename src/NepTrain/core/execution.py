@@ -543,6 +543,9 @@ def build_stage_task(
     inputs = temporary / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     portable_config = json.loads(json.dumps(config))
+    # Notifications belong exclusively to the persistent controller.  Never
+    # copy webhook credentials into portable worker bundles or remote hosts.
+    portable_config.pop("notifications", None)
     empty_label = bool(
         stage == "label"
         and (stage_input or {}).get("empty_selection") is True
