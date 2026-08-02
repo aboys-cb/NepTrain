@@ -609,11 +609,15 @@ def test_completed_workflow_extends_plans(tmp_path: Path):
     assert "script_start_index" not in manifest["extensions"][-1]
 
 
-def test_extension_requires_completed_accepted_prefix(tmp_path: Path):
+def test_extension_accepts_an_incomplete_valid_prefix(tmp_path: Path):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
-    with pytest.raises(WorkflowError, match="only be extended"):
-        extend_workflow(preparation, 4)
+    original = [path.read_bytes() for path in preparation.plans]
+
+    extended = extend_workflow(preparation, 4)
+
+    assert len(extended.plans) == 4
+    assert [path.read_bytes() for path in extended.plans[:3]] == original
 
 
 def test_workflow_rejects_prepared_input_drift(tmp_path: Path):

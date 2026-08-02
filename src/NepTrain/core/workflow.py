@@ -704,7 +704,7 @@ def extend_workflow(
     preparation: WorkflowPreparation | str | Path,
     total_generations: int,
 ) -> WorkflowPreparation:
-    """Append immutable generations to a completed, accepted workflow."""
+    """Append immutable generations to a valid workflow generation prefix."""
 
     from .config import load_config, save_config
 
@@ -712,10 +712,10 @@ def extend_workflow(
     with _workflow_lock(preparation.output_dir):
         manifest = _validated_manifest(preparation)
         progress = _workflow_progress(preparation, manifest)
-        if progress.state != "complete":
+        if progress.state not in {"prepared", "complete", "incomplete"}:
             raise WorkflowError(
-                "workflow can only be extended after all prepared generations "
-                "completed and passed evaluation"
+                "workflow can only be extended from a valid prepared, "
+                "complete, or incomplete generation prefix"
             )
         current_total = len(preparation.plans)
         if total_generations <= current_total:
