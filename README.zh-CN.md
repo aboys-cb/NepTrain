@@ -462,9 +462,10 @@ smoke、short 或 long 采样证据；只有最终 production 认证重新绑定
 用于 `velocity create` 和 DynSpin thermostat，保证重复运行可复现但 replica
 彼此独立。`novelty: auto` 会以当前完整 `train.xyz` 为参考，只用同元素训练结构
 拟合描述符中心和尺度，再从留一最近邻距离估计保守覆盖阈值。候选结构只使用该尺度
-变换，不参与阈值坐标系的拟合。一个温压条件只有在本档 MD 正常完成且剩余 novelty
-落入该阈值后才晋级；仍有缺口就留在当前时长继续采样。若本轮没有结构超过阈值，
-workflow 会跳过 DFT 和重训，直接推进采样阶梯。需要固定策略时，可同时配置
+变换，不参与阈值坐标系的拟合。一个温压条件在本档 MD 正常完成并通过健康与诊断
+检查后晋级；剩余 novelty 是否落入阈值只决定结构选择、DFT 标注和重训，不再阻止
+健康轨迹进入下一档时长。若本轮没有结构超过阈值，workflow 会跳过 DFT 和重训，
+直接推进采样阶梯。需要固定策略时，可同时配置
 `selection_threshold` 和 `completion_threshold`。
 完整阶梯耗尽后，独立验证通过才会报告 `complete`；没有独立验证时会停在
 `coverage_exhausted`，不会把“采样未发现新结构”冒充为“模型精度已经验证”。

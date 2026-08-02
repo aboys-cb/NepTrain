@@ -268,7 +268,73 @@ class ScenarioLadder:
                 raise ScenarioMaturityError("scenario maturity level is invalid")
             if not isinstance(record.get("evidence", []), list):
                 raise ScenarioMaturityError("scenario evidence must be a list")
+        self._reconcile_maturity(copied)
         return copied
+
+    def _reconcile_maturity(self, state: dict[str, Any]) -> None:
+        """Recognise trusted MD evidence written by older workflow versions.
+
+        Descriptor coverage determines which structures need labels; it does
+        not invalidate a healthy trajectory.  Older histories coupled those
+        decisions and can therefore contain trusted evidence while leaving a
+        scenario at a lower maturity.  Reconcile that derived state on read so
+        interrupted workflows resume from their actual duration frontier.
+        """
+
+        for record in state["scenarios"].values():
+            levels = (
+                _TARGET_LEVELS
+                if float(record["temperature"])
+                in self.production_temperatures
+                else ("smoke_passed",)
+            )
+            for target in levels:
+                if target == "production_ready":
+                    accepted_by_model: dict[str, int] = {}
+                    verified_model_id = None
+                    for evidence in record.get("evidence", []):
+                        if (
+                            evidence.get("accepted") is True
+                            and evidence.get("target_level") == target
+                            and evidence.get("model_id")
+                        ):
+                            model_id = str(evidence["model_id"])
+                            accepted_by_model[model_id] = (
+                                accepted_by_model.get(model_id, 0) + 1
+                            )
+                            if accepted_by_model[model_id] >= self.replicas[target]:
+                                verified_model_id = model_id
+                    accepted = verified_model_id is not None
+                else:
+                    accepted = self._accepted_replicas(
+                        record,
+                        target,
+                        model_id="",
+                    ) >= self.replicas[target]
+                if not accepted:
+                    break
+                if (
+                    MATURITY_LEVELS.index(target)
+                    > MATURITY_LEVELS.index(str(record["maturity"]))
+                ):
+                    record["maturity"] = target
+                    if target == "production_ready":
+                        record["verified_model_id"] = verified_model_id
+                        record["canary_model_id"] = verified_model_id
+
+        final_model_id = state.get("last_model_id")
+        counts = Counter(
+            (
+                "long_stable"
+                if record["maturity"] == "production_ready"
+                and record.get("verified_model_id") != final_model_id
+                else record["maturity"]
+            )
+            for record in state["scenarios"].values()
+        )
+        state["counts_by_maturity"] = {
+            level: counts[level] for level in MATURITY_LEVELS if counts[level]
+        }
 
     def _record(
         self,
@@ -344,7 +410,6 @@ class ScenarioLadder:
     ) -> int:
         return sum(
             bool(item.get("accepted"))
-            and item.get("novelty_converged", True) is not False
             and item.get("target_level") == target
             and (
                 target != "production_ready"

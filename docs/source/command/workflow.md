@@ -138,11 +138,12 @@ velocity seed；对 `npt_ber` 和
 默认全部温度都会跑到最长时长。显式设置 `production_temperatures` 后，未列入
 其中的中间温度只做低成本 smoke 探路。
 
-一个温压条件只有在本档 replica 正常结束，并且 FPS 判断该条件的剩余结构已落入
-当前训练集的覆盖尺度后，才会晋级。晋级后，Controller 同时解锁下一个温度和当前
-生产温度的下一档时长；仍有覆盖缺口的条件继续停在本档。模型更新不会把已经完成的
-smoke、short 或 long 证据清零，只有最终 production 认证需要绑定当前模型哈希。
-`progression.replicas` 控制各时长需要的独立 MD 次数。
+一个温压条件在本档 replica 正常结束并通过轨迹健康与诊断检查后晋级。FPS 覆盖度
+独立决定哪些结构需要标注：发现新颖结构会触发标注和重训，但不会迫使健康轨迹反复
+停留在同一时长。晋级后，Controller 同时解锁下一个温度和当前生产温度的下一档
+时长。模型更新不会把已经完成的 smoke、short 或 long 证据清零，只有最终
+production 认证需要绑定当前模型哈希。`progression.replicas` 控制各时长需要的
+独立 MD 次数。
 
 所有通过健康检查的 dump 帧都会参与全局选择。FPS 先按精确元素集合分组，只用
 相同元素集合的当前 `train.xyz` 做 warm start；每个仍有新颖结构的温压条件先保留
