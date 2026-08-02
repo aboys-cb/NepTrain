@@ -398,7 +398,8 @@ workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 
 - `prepared`：只有不可变输入快照，下一步是 `workflow run`。
 - `running`：Controller lock 存在且当前任务可观察。
 - `degraded`：临时 SSH/scheduler 查询失败，Controller 保留原 handle 并重试；
-  连续 3 次失败后进入 `failed`，保留 current intent 供 `resume`。
+  连接恢复后自动继续，不会把传输故障冒充为计算失败。只有 scheduler 明确返回
+  失败、取消或确认任务丢失时，才进入 `failed`。
 - `paused`：Controller 已停止或 PID/lock 不在，但远端工作和 current intent 保留。
 - `failed` / `rejected`：执行失败或科学验收失败，可按记录创建新 attempt 恢复。
 - `damaged`：已提交 artifact、ledger 或 publication 不满足 hash/身份契约。

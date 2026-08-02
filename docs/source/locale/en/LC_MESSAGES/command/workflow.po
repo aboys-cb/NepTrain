@@ -809,11 +809,14 @@ msgstr ""
 #: ../../source/command/workflow.md:354 ceb930f1caaa40c8a61fd56eb289d5a0
 msgid ""
 "`degraded`：临时 SSH/scheduler 查询失败，Controller 保留原 handle 并重试； 连"
-"续 3 次失败后进入 `failed`，保留 current intent 供 `resume`。"
+"接恢复后自动继续，不会把传输故障冒充为计算失败。只有 scheduler 明确返回失败、"
+"取消或确认任务丢失时，才进入 `failed`。"
 msgstr ""
 "`degraded`: a temporary SSH or scheduler query failed; the Controller "
-"retains the original handle and retries. After three consecutive failures it "
-"enters `failed`, preserving the current intent for `resume`."
+"retains the original handle and retries. It resumes automatically after the "
+"connection recovers and does not present a transport outage as a compute "
+"failure. It enters `failed` only after the scheduler explicitly reports a "
+"failure or cancellation, or confirms that the task was lost."
 
 #: ../../source/command/workflow.md:356 6eec7308ecef4c528a3e995450d9a24f
 msgid ""

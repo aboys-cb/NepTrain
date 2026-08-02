@@ -58,7 +58,6 @@ _RESOURCE_FOR_STAGE = {
     "evaluate": "analysis",
 }
 _EXECUTION_UNKNOWN_GRACE_SECONDS = 300.0
-_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3
 _MAX_PARALLEL_OBSERVATIONS = 4
 _MAX_PARALLEL_LAUNCHES = 4
 
@@ -1853,23 +1852,16 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         )
                         controller.state["transport_failures"] = failures
                         controller.state["last_transport_error"] = str(error)
-                        if failures >= _MAX_CONSECUTIVE_TRANSPORT_FAILURES:
-                            controller.state["state"] = "failed"
-                            controller.state[
-                                "preserve_current_on_retry"
-                            ] = True
-                            controller.state["reason"] = (
-                                "execution transport failed "
-                                f"{failures} consecutive times: {error}"
-                            )
-                        else:
-                            controller.state["state"] = "degraded"
+                        # A scheduler/SSH timeout says nothing about the
+                        # scientific task's state. Keep the immutable handle
+                        # and continue observing it until transport recovers
+                        # or the scheduler reports a real terminal result.
+                        controller.state["state"] = "degraded"
+                        controller.state.pop("reason", None)
                         controller._save()
                         tick = ControllerTick(
-                            str(controller.state["state"]),
-                            detail=str(
-                                controller.state.get("reason", error)
-                            ),
+                            "degraded",
+                            detail=str(error),
                         )
                     report_progress(tick)
                     if tick.state in {

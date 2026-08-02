@@ -3652,12 +3652,14 @@ def test_controller_turns_persistently_unknown_execution_into_retryable_failure(
     assert controller.state["current"] is None
 
 
-def test_controller_escalates_repeated_transport_errors(tmp_path, monkeypatch):
+def test_controller_recovers_after_repeated_transport_errors(tmp_path, monkeypatch):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     task_id = "preserved-task"
 
-    def fail_transport(controller, *, should_stop=None):
+    transport_calls = []
+
+    def intermittent_transport(controller, *, should_stop=None):
         assert should_stop is not None
         if controller.state.get("current") is None:
             controller.state["current"] = {
@@ -3683,35 +3685,28 @@ def test_controller_escalates_repeated_transport_errors(tmp_path, monkeypatch):
             }
             controller._save()
             return ControllerTick("running")
-        raise ExecutionError("SSH transport is unavailable")
+        transport_calls.append(controller.state.get("state"))
+        if len(transport_calls) <= 3:
+            raise ExecutionError("SSH transport is unavailable")
+        controller.state["state"] = "complete"
+        controller._save()
+        return ControllerTick("complete")
 
-    monkeypatch.setattr(PersistentController, "tick", fail_transport)
+    monkeypatch.setattr(PersistentController, "tick", intermittent_transport)
 
     assert (
         run_controller(preparation.output_dir, poll_interval=0.2)
-        == 2
+        == 0
     )
     state = json.loads(
         (preparation.output_dir / ".neptrain/controller.json").read_text()
     )
-    assert state["state"] == "failed"
-    assert state["transport_failures"] == 3
-    assert state["reason"] == (
-        "execution transport failed 3 consecutive times: "
-        "SSH transport is unavailable"
-    )
+    assert state["state"] == "complete"
+    assert state["transport_failures"] == 0
+    assert "last_transport_error" not in state
     assert state["current"]["task_id"] == task_id
-    assert state["preserve_current_on_retry"] is True
-
-    monkeypatch.undo()
-    controller = PersistentController(preparation.output_dir)
-    controller.retry()
-    assert controller.state["state"] == "launching"
-    assert controller.state["current"]["task_id"] == task_id
-    assert (
-        controller.state["current"]["handle"]["execution_id"]
-        == "701234"
-    )
+    assert transport_calls == ["running", "degraded", "degraded", "degraded"]
+    assert state["current"]["handle"]["execution_id"] == "701234"
 
 
 def test_detached_controller_completes_a_real_multi_process_workflow(tmp_path):
