@@ -14,6 +14,6 @@ fix integrator all dynspin/glsd/npt{{ fix_suffix }} temp {{ temperature }} {{ te
 
 thermo 100
 thermo_style custom step temp pe ke etotal press
-dump trajectory all custom 100 {{ trajectory_file }} id type x y z c_spin[1] c_spin[2] c_spin[3] c_spin[4] c_spin[5] c_spin[6] c_spin[7]
+dump trajectory all custom {{ dump_interval }} {{ trajectory_file }} id type x y z c_spin[1] c_spin[2] c_spin[3] c_spin[4] c_spin[5] c_spin[6] c_spin[7]
 dump_modify trajectory sort id format float %.17g
 run {{ steps }}

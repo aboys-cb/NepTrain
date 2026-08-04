@@ -10,6 +10,7 @@ from ase.io import write as ase_write
 
 from NepTrain.core.gpumd.io import GpumdInputError, RunInput
 from NepTrain.core.md import MdRequest, run_md
+from NepTrain.core.md.dump import adaptive_dump_interval
 
 
 def _atoms() -> Atoms:
@@ -41,6 +42,14 @@ def _write_dump(directory: Path, frames: list[Atoms], times: list[float]) -> Non
     for frame, time_fs in zip(frames, times):
         frame.info["Time"] = time_fs
     ase_write(directory / "dump.xyz", frames, format="extxyz")
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected"),
+    [(25, 1), (5_000, 50), (20_000, 200), (100_000, 1000), (500_000, 1000)],
+)
+def test_adaptive_dump_interval(steps, expected):
+    assert adaptive_dump_interval(steps) == expected
 
 
 def test_default_gpumd_nvt_input_uses_temperature_steps_and_seed(

@@ -82,7 +82,31 @@ def test_custom_template_receives_route_variables_without_ensemble_inference(
         "replica": 3,
         "route_id": "route_b",
         "route_fingerprint": "f" * 64,
+        "dump_interval": 1,
     }
+
+
+def test_default_lammps_dump_interval_grows_with_trajectory_length():
+    template = files("NepTrain.core.md").joinpath("templates/nvt.in").read_text()
+
+    rendered = render_template(
+        template,
+        {
+            "atom_style": "atomic",
+            "structure_file": "structure.data",
+            "pair_style": "nep/cpu",
+            "model_file": "nep.txt",
+            "elements": "Fe",
+            "temperature": 600,
+            "seed": 7,
+            "fix_suffix": "",
+            "trajectory_file": "dump.lammpstrj",
+            "steps": 500_000,
+            "dump_interval": 1000,
+        },
+    )
+
+    assert "dump trajectory all custom 1000 dump.lammpstrj" in rendered
 
 
 def test_read_spin_dump_reconstructs_full_vector(tmp_path: Path):

@@ -31,6 +31,8 @@ neptrain doctor --project project.yaml
 - `sampling.routes`：每条采样路径显式绑定结构、模板和温度路径。
 - `sampling.candidate_pool` / `sampling.selection`：可选的高级覆盖项。
 - LAMMPS 模板：物理过程、`timestep`、阻尼、spin 积分参数和 dump 频率。
+  内置模板使用 `{{ dump_interval }}`：短轨迹约保留 100 帧，长轨迹最多每
+  1000 步输出一帧。自定义模板可以复用该变量，也可以显式固定间隔。
 - `execution.targets.*.setup_script`：module、Python 环境和 LAMMPS plugin。
 
 `workflow init` 默认只生成当前选择的 `lammps.in` 和标注后端输入，不再生成四套
@@ -105,6 +107,25 @@ notifications:
 失败、评估拒绝、停滞或预算耗尽另发终态消息。投递去重和结果保存在
 `.neptrain/notifications.json`，`neptrain workflow status` 会显示其健康状态。
 每条进度和终态消息都会显示 workflow 名称与绝对路径，便于区分并发运行的任务。
+
+Slurm 分析任务需要随候选池增长保留内存余量时，可以给独立 analysis target
+配置有上限的内存阶梯：
+
+```yaml
+execution:
+  stage_targets:
+    analysis: analysis-cpu
+  targets:
+    analysis-cpu:
+      executor: slurm
+      partition: cpu
+      cpus_per_task: 1
+      memory_ladder: [4G, 8G, 16G]
+```
+
+第一次提交使用 4G。只有 `select` 因 Slurm OOM 失败时，Controller 才会自动创建
+可追踪的新 attempt，并依次使用 8G、16G；达到最后一级仍失败时流程正常进入
+`failed`，不会无限重试。不要同时在 `directives` 中再写 `--mem`。
 
 默认情况下，全部 route 使用 `execution.stage_targets.sampling`。需要把某条
 route 送到另一台 Slurm 平台时，只写例外映射：

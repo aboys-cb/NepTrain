@@ -123,6 +123,7 @@ _TARGET_FIELDS = {
     "cpus_per_task",
     "gpus_per_node",
     "directives",
+    "memory_ladder",
     "labeling_resource_path",
     "environment",
 }

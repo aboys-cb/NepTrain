@@ -2820,6 +2820,33 @@ def test_slurm_executor_is_idempotent_without_afterok(tmp_path):
     assert executor.inspect(first).state == "completed"
 
 
+def test_slurm_executor_selects_memory_tier_from_task_attempt(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    (bundle / "task.json").write_text(
+        json.dumps(
+            {
+                "identity": {"attempt": 7},
+                "stage_input": {"memory_tier": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    task = StageTask("abc", "demo", 1, "select", "analysis", bundle)
+    executor = SlurmExecutor(
+        ExecutionTarget(
+            "analysis",
+            "slurm",
+            partition="cpu",
+            memory_ladder=("4G", "8G", "16G"),
+        )
+    )
+
+    script = executor._write_submission_script(task, str(bundle)).read_text()
+
+    assert "#SBATCH --mem=8G" in script
+
+
 def test_remote_slurm_executor_submits_a_group_through_one_remote_script(
     tmp_path,
 ):
@@ -3607,6 +3634,66 @@ def test_controller_retry_creates_a_new_traceable_attempt(tmp_path):
     assert state["history"][0]["failure"] == "intentional failure"
 
 
+def test_selection_oom_automatically_advances_memory_ladder(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    text = config.read_text(encoding="utf-8").replace(
+        "    cpu: {executor: process}\n",
+        (
+            "    cpu:\n"
+            "      executor: slurm\n"
+            "      partition: cpu\n"
+            "      memory_ladder: [4G, 8G, 16G]\n"
+        ),
+    )
+    config.write_text(text, encoding="utf-8")
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    launches = []
+
+    class SelectOomOnceExecutor(ImmediateExecutor):
+        def launch(self, task):
+            handle = super().launch(task)
+            descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+            if task.stage == "select" and descriptor["identity"]["attempt"] == 1:
+                return ExecutionHandle(
+                    task.task_id,
+                    task.target,
+                    "slurm",
+                    "oom-select",
+                    str(task.bundle),
+                )
+            return handle
+
+        def inspect(self, handle):
+            if handle.execution_id == "oom-select":
+                return ExecutionStatus(
+                    "failed",
+                    "Slurm OUT_OF_MEMORY exit=0:125",
+                    "out_of_memory",
+                )
+            return super().inspect(handle)
+
+    controller = PersistentController(
+        preparation.output_dir,
+        executor_factory=lambda target: SelectOomOnceExecutor(target, launches),
+    )
+
+    for _ in range(50):
+        tick = controller.tick()
+        if tick.state == "complete":
+            break
+    else:
+        raise AssertionError("controller did not recover from selection OOM")
+
+    select_history = [
+        item for item in controller.state["history"] if item["stage"] == "select"
+    ]
+    assert [item["attempt"] for item in select_history] == [1, 2]
+    assert select_history[0]["failure_kind"] == "out_of_memory"
+    assert select_history[0]["automatic_retry"] == "oom_memory_ladder"
+    assert select_history[0]["memory_tier"] == 0
+    assert select_history[1]["memory_tier"] == 1
+
+
 def test_controller_turns_persistently_unknown_execution_into_retryable_failure(
     tmp_path,
     monkeypatch,
@@ -3943,3 +4030,36 @@ for name in names:
     train_history = [item for item in state["history"] if item["stage"] == "train"]
     assert len(train_history) == 1
     assert train_history[0]["attempt"] == 1
+
+
+def test_start_controller_accepts_first_tick_state(tmp_path, monkeypatch):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    calls = 0
+
+    def fake_running(_project):
+        nonlocal calls
+        calls += 1
+        return calls > 1
+
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise AssertionError("a ready controller must not be terminated")
+
+    def fake_popen(*_args, **_kwargs):
+        workspace.controller_pid.write_text("4321\n", encoding="utf-8")
+        workspace.controller_file.write_text(
+            json.dumps({"pid": 4321, "state": "launching"}), encoding="utf-8"
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr(controller_module, "controller_running", fake_running)
+    monkeypatch.setattr(controller_module.subprocess, "Popen", fake_popen)
+
+    assert start_controller(preparation.output_dir) == 4321

@@ -13,6 +13,8 @@ import subprocess
 from ase import Atoms
 from ase.io import write as ase_write
 
+from ..md.dump import adaptive_dump_interval
+
 
 class GpumdInputError(ValueError):
     """Raised when a GPUMD template cannot be adapted safely."""
@@ -179,7 +181,7 @@ class RunInput:
 
     @staticmethod
     def _default_dump_interval(steps: int) -> int:
-        return max(1, min(1000, steps // 100))
+        return adaptive_dump_interval(steps)
 
     @staticmethod
     def _set_pressure(values: list[object], pressure: float) -> None:

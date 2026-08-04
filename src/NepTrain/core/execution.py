@@ -251,6 +251,20 @@ def _safe_name(value: str, fallback: str = "task") -> str:
     return cleaned or fallback
 
 
+def _slurm_memory_mebibytes(value: str, *, name: str) -> int:
+    match = re.fullmatch(r"([1-9][0-9]*)([MGT]?)", value.upper())
+    if match is None:
+        raise ExecutionError(
+            f"execution target {name}.memory_ladder values must be positive "
+            "Slurm memory sizes such as 4G"
+        )
+    amount = int(match.group(1))
+    scale = {"": 1, "M": 1, "G": 1024, "T": 1024**2}[
+        match.group(2)
+    ]
+    return amount * scale
+
+
 def _task_directory_name(
     *,
     generation: int,
@@ -291,6 +305,7 @@ class ExecutionTarget:
     cpus_per_task: int | None = None
     gpus_per_node: int | None = None
     directives: tuple[str, ...] = ()
+    memory_ladder: tuple[str, ...] = ()
     labeling_resource_path: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
@@ -394,6 +409,35 @@ class ExecutionTarget:
             raise ExecutionError(
                 f"execution target {name} directives must be single-line Slurm --options"
             )
+        memory_ladder = tuple(
+            str(item) for item in value.get("memory_ladder", [])
+        )
+        if memory_ladder:
+            if executor != "slurm":
+                raise ExecutionError(
+                    f"execution target {name}.memory_ladder requires Slurm"
+                )
+            if any(
+                item.removeprefix("#SBATCH ").startswith("--mem")
+                for item in directives
+            ):
+                raise ExecutionError(
+                    f"execution target {name}.memory_ladder cannot be combined "
+                    "with a --mem directive"
+                )
+            memory_values = [
+                _slurm_memory_mebibytes(item, name=name)
+                for item in memory_ladder
+            ]
+            if any(
+                current <= previous
+                for previous, current in zip(
+                    memory_values, memory_values[1:], strict=False
+                )
+            ):
+                raise ExecutionError(
+                    f"execution target {name}.memory_ladder must be strictly increasing"
+                )
         return cls(
             name=name,
             executor=executor,
@@ -409,6 +453,7 @@ class ExecutionTarget:
             cpus_per_task=int(cpus) if cpus is not None else None,
             gpus_per_node=int(gpus) if gpus is not None else None,
             directives=directives,
+            memory_ladder=memory_ladder,
             labeling_resource_path=(
                 str(labeling_resource_path)
                 if labeling_resource_path is not None
@@ -2413,6 +2458,21 @@ class SlurmExecutor:
     def _job_name(task_id: str) -> str:
         return f"nt-{task_id}"
 
+    def _task_directives(self, task: StageTask) -> tuple[str, ...]:
+        if not self.target.memory_ladder:
+            return self.target.directives
+        try:
+            descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+            memory_tier = int(descriptor.get("stage_input", {}).get("memory_tier", 0))
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ExecutionError(
+                f"cannot determine memory tier for task {task.task_id}"
+            ) from error
+        tier = self.target.memory_ladder[
+            min(max(memory_tier, 0), len(self.target.memory_ladder) - 1)
+        ]
+        return (*self.target.directives, f"--mem={tier}")
+
     def _worker_status(self, bundle: str) -> ExecutionStatus | None:
         if self.target.host is None:
             path = Path(bundle) / "execution.json"
@@ -2488,7 +2548,7 @@ cat "$bundle/execution.json"
                     qos=self.target.qos,
                     cpus_per_task=self.target.cpus_per_task,
                     gpus_per_node=self.target.gpus_per_node,
-                    directives=self.target.directives,
+                    directives=self._task_directives(task),
                     environment=self.target.environment,
                     setup_line=setup,
                 )

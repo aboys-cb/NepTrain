@@ -103,6 +103,50 @@ def test_schema_v8_loads_without_migration(tmp_path):
     assert changes == []
 
 
+def test_slurm_memory_ladder_is_validated(tmp_path):
+    value = _project()
+    value["execution"]["targets"]["analysis"] = {
+        "executor": "slurm",
+        "partition": "cpu",
+        "memory_ladder": ["4G", "8G", "16G"],
+    }
+    value["execution"]["stage_targets"]["analysis"] = "analysis"
+
+    config, _ = load_config(_write(tmp_path, value))
+
+    assert config["execution"]["targets"]["analysis"]["memory_ladder"] == [
+        "4G",
+        "8G",
+        "16G",
+    ]
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"executor": "process", "memory_ladder": ["4G", "8G"]},
+        {
+            "executor": "slurm",
+            "partition": "cpu",
+            "memory_ladder": ["8G", "4G"],
+        },
+        {
+            "executor": "slurm",
+            "partition": "cpu",
+            "directives": ["--mem=4G"],
+            "memory_ladder": ["4G", "8G"],
+        },
+    ],
+)
+def test_invalid_slurm_memory_ladder_is_rejected(tmp_path, target):
+    value = _project()
+    value["execution"]["targets"]["analysis"] = target
+    value["execution"]["stage_targets"]["analysis"] = "analysis"
+
+    with pytest.raises(ConfigError, match="memory_ladder"):
+        load_config(_write(tmp_path, value))
+
+
 def test_feishu_notifications_accept_direct_project_credentials(tmp_path):
     config, _ = load_config(
         _write(

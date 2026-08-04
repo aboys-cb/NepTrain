@@ -186,6 +186,11 @@ attempt; `--json` retains every individual execution record.
 NepTrain accepts only `schema_version: 8`. Unknown fields and legacy project
 formats fail explicitly instead of being migrated silently.
 
+Built-in LAMMPS and GPUMD sampling adapts trajectory dump spacing to the run
+length. Custom LAMMPS templates can use `{{ dump_interval }}`. Slurm analysis
+targets can also declare `memory_ladder: [4G, 8G, 16G]`; selection OOM advances
+to the next tier with a bounded, traceable retry.
+
 Optional Feishu progress notifications can be configured directly in
 `project.yaml`:
 

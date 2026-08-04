@@ -360,6 +360,51 @@ class PersistentController:
             outcome=outcome,
         )
 
+    def _retry_selection_with_more_memory(
+        self,
+        current: dict[str, Any],
+        target: ExecutionTarget,
+    ) -> None:
+        generation = int(current["generation"])
+        plan = next(item for item in self.plans if item.generation == generation)
+        _, context = self.generation_controller.stage_context(plan, "select")
+        new_attempt = int(current.get("attempt", 1)) + 1
+        memory_tier = int(current.get("memory_tier", 0)) + 1
+        archived = dict(current)
+        archived["failed_at"] = _now()
+        archived["automatic_retry"] = "oom_memory_ladder"
+        self.state.setdefault("history", []).append(archived)
+        task = build_stage_task(
+            self.workspace.tasks_dir,
+            workflow_root=self.workspace.root,
+            workflow_id=self.workflow_id,
+            workflow_instance_id=self.manifest["instance_id"],
+            generation=generation,
+            stage="select",
+            attempt=new_attempt,
+            target=target,
+            plan=plan,
+            config=self.config,
+            initial_training=self.initial_training,
+            context=context,
+            stage_input={"memory_tier": memory_tier},
+        )
+        self.state["current"] = {
+            "task_id": task.task_id,
+            "generation": generation,
+            "stage": "select",
+            "resource": str(current["resource"]),
+            "target": target.name,
+            "attempt": new_attempt,
+            "memory_tier": memory_tier,
+            "bundle": str(task.bundle),
+            "handle": None,
+            "created_at": _now(),
+        }
+        self.state["state"] = "launching"
+        self.state.pop("reason", None)
+        self._save()
+
     def _install_outcome(
         self,
         *,
@@ -1204,8 +1249,26 @@ class PersistentController:
                     status.detail,
                 )
             if status.state in {"failed", "cancelled"}:
+                failure_kind = status.failure_kind or (
+                    "cancelled" if status.state == "cancelled" else "unknown"
+                )
+                current["failure_kind"] = failure_kind
+                current["failure"] = status.detail or "stage execution failed"
+                if (
+                    str(current["stage"]) == "select"
+                    and failure_kind == "out_of_memory"
+                    and int(current.get("memory_tier", 0)) + 1
+                    < len(target.memory_ladder)
+                ):
+                    self.state["reason"] = (
+                        f"selection exceeded memory tier "
+                        f"{target.memory_ladder[int(current.get('memory_tier', 0))]}; "
+                        "retrying with the next configured tier"
+                    )
+                    self._retry_selection_with_more_memory(current, target)
+                    return self.tick(should_stop=should_stop)
                 self.state["state"] = "failed"
-                self.state["reason"] = status.detail or "stage execution failed"
+                self.state["reason"] = current["failure"]
                 self._save()
                 return ControllerTick(
                     "failed",
@@ -1432,6 +1495,17 @@ class PersistentController:
         target_name = self.stage_targets[resource]
         target = self.targets[target_name]
         attempt = self._attempt(plan.generation, stage)
+        memory_tier = 0
+        if stage == "select" and target.memory_ladder:
+            memory_tier = max(
+                (
+                    int(item.get("memory_tier", 0))
+                    for item in self.state.get("history", [])
+                    if int(item.get("generation", -1)) == plan.generation
+                    and item.get("stage") == "select"
+                ),
+                default=0,
+            )
         task = build_stage_task(
             self.workspace.tasks_dir,
             workflow_root=self.workspace.root,
@@ -1445,9 +1519,11 @@ class PersistentController:
             initial_training=self.initial_training,
             context=context,
             workflow_instance_id=self.manifest["instance_id"],
-            stage_input={"empty_selection": True}
-            if empty_label
-            else None,
+            stage_input=(
+                {"empty_selection": True}
+                if empty_label
+                else ({"memory_tier": memory_tier} if stage == "select" and target.memory_ladder else None)
+            ),
         )
         self.state["current"] = {
             "task_id": task.task_id,
@@ -1456,6 +1532,11 @@ class PersistentController:
             "resource": resource,
             "target": target_name,
             "attempt": attempt,
+            **(
+                {"memory_tier": memory_tier}
+                if stage == "select" and target.memory_ladder
+                else {}
+            ),
             "bundle": str(task.bundle),
             "handle": None,
             "created_at": _now(),
@@ -1960,10 +2041,23 @@ def start_controller(
                 state = _read_json(workspace.controller_file)
             except ControllerError:
                 state = {}
+            # The controller can finish its first tick before the parent gets
+            # scheduled again.  In that case a live, lock-owning controller is
+            # already ``launching`` or ``waiting`` rather than ``running``.
+            # Matching the recorded pid is the durable readiness signal; an
+            # already-terminal state still belongs on the startup error path.
             if (
                 int(state.get("pid", -1)) == process.pid
-                and state.get("state") == "running"
-                and "reason" not in state
+                and state.get("state")
+                not in {
+                    "failed",
+                    "stalled",
+                    "rejected",
+                    "budget_exhausted",
+                    "coverage_exhausted",
+                    "complete",
+                    "stopped",
+                }
             ):
                 return process.pid
         if process.poll() is not None:

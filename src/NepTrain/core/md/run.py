@@ -13,6 +13,7 @@ from ase.io import iread as ase_iread
 from ase.io import write as ase_write
 
 from ..persistence import atomic_write_json
+from .dump import adaptive_dump_interval
 from .lammps import LammpsError, run_lammps
 from .health import (
     TrajectoryHealthError,
@@ -285,6 +286,7 @@ def run_md(request: MdRequest, backend: str) -> MdResult:
         "replica": request.replica,
         "route_id": request.route_id,
         "route_fingerprint": request.route_fingerprint,
+        "dump_interval": adaptive_dump_interval(request.steps),
     }
     try:
         result = run_lammps(
