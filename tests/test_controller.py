@@ -823,6 +823,60 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
     }
 
 
+def test_adaptive_followup_train_bundle_keeps_training_config(tmp_path):
+    initial = _write(tmp_path / "initial.xyz")
+    training_config = _write(tmp_path / "nep.in")
+    previous_training = _write(tmp_path / "previous-train.xyz")
+    previous_model = _write(tmp_path / "previous-nep.txt")
+    plan = GenerationPlan(2, 8, 2)
+    task = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="adaptive-train",
+        generation=2,
+        stage="train",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=plan,
+        config={
+            "training": {"config_path": str(training_config)},
+            "sampling": {},
+            "md": {"spin": False},
+            "labeling": {},
+            "workflow": {},
+            "execution": {},
+        },
+        initial_training=initial,
+        context=StageContext(
+            generation=2,
+            generation_dir=tmp_path / "generation-2",
+            plan=plan,
+            artifacts={},
+            previous_artifacts={
+                "training_set": previous_training,
+                "activated_model": previous_model,
+            },
+            generation_kind="finalization",
+            stage_sequence=("train", "evaluate"),
+            stage_input={
+                "generation_kind": "finalization",
+                "generation_protocol": "adaptive_v2",
+            },
+        ),
+    )
+
+    descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+
+    assert descriptor["stage_input"]["generation_kind"] == "finalization"
+    assert descriptor["config"]["training"]["config_path"].startswith(
+        "input/config/training/config_path"
+    )
+    assert set(descriptor["previous_artifacts"]) == {
+        "training_set",
+        "activated_model",
+    }
+
+
 def test_stage_result_rejects_paths_outside_the_bundle(tmp_path):
     outside = _write(tmp_path / "outside.dat")
     model = _write(tmp_path / "model.dat")
@@ -1117,6 +1171,91 @@ execution:
     return config, initial
 
 
+def test_controller_uses_reserved_plan_only_after_acquisition_requests_finalization(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  max_model_generations: 1\n",
+            (
+                "  max_model_generations: 1\n"
+                "  convergence:\n"
+                "    acquisition_min_r2:\n"
+                "      energy_r2: 0.95\n"
+                "      force_r2: 0.95\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    plan = GenerationPlan(**json.loads(preparation.plans[0].read_text()))
+    record = {
+        "plan_sha256": plan.sha256,
+        "kind": "acquisition",
+        "stage_sequence": [
+            "train",
+            "evaluate",
+            "explore",
+            "select",
+            "label",
+            "diagnose",
+            "merge",
+        ],
+        "stages": {
+            "merge": {
+                "artifacts": {},
+                "metrics": {
+                    "accepted": True,
+                    "generation_disposition": "continue",
+                    "workflow_converged": False,
+                },
+            }
+        },
+        "accepted": True,
+        "complete": True,
+    }
+    workspace.ledger.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workflow_id": preparation.workflow_id,
+                "generations": {"1": record},
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = PersistentController(preparation.output_dir)
+
+    assert controller._next() is None
+    assert controller.state["state"] == "budget_exhausted"
+
+    record["stages"]["merge"]["metrics"][
+        "generation_disposition"
+    ] = "finalize"
+    workspace.ledger.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workflow_id": preparation.workflow_id,
+                "generations": {"1": record},
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller.state["state"] = "idle"
+    controller.generation_controller.stage_context = (
+        lambda _plan: ("train", "finalization-context")
+    )
+
+    next_work = controller._next()
+
+    assert next_work is not None
+    assert next_work[0].generation == 2
+    assert next_work[1:] == ("train", "finalization-context")
+
+
 def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
     tmp_path: Path, monkeypatch
 ):
@@ -1297,6 +1436,7 @@ def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     launches = []
     bulk_launches = []
+    bulk_inspections = []
     bulk_collections = []
 
     class BulkImmediateExecutor(ImmediateExecutor):
@@ -1311,6 +1451,12 @@ def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
                 [Path(handle.local_bundle).name for handle in handles]
             )
             return tuple(self.collect(handle) for handle in handles)
+
+        def inspect_many(self, handles):
+            bulk_inspections.append(
+                [Path(handle.local_bundle).name for handle in handles]
+            )
+            return tuple(self.inspect(handle) for handle in handles)
 
     controller = PersistentController(
         preparation.output_dir,
@@ -1332,6 +1478,11 @@ def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
         if batch and batch[0][0] == "label"
     )
     assert len(label_launch) == 3
+    assert any(
+        len(batch) == 3
+        and all(name.startswith("g0001-label-") for name in batch)
+        for batch in bulk_inspections
+    ), bulk_inspections
     assert any(
         len(batch) == 3
         and all(name.startswith("g0001-label-") for name in batch)
@@ -2911,6 +3062,135 @@ def test_remote_slurm_executor_submits_a_group_through_one_remote_script(
     )
 
 
+def test_remote_slurm_executor_inspects_a_group_through_one_remote_script(
+    tmp_path,
+):
+    executor = SlurmExecutor(
+        ExecutionTarget(
+            "slurm",
+            "slurm",
+            host="remote",
+            work_root="/remote/work",
+            partition="cpu",
+        )
+    )
+    handles = tuple(
+        ExecutionHandle(
+            f"task-{index}",
+            "slurm",
+            "slurm",
+            str(101 + index),
+            str(tmp_path / f"task-{index}"),
+            remote_bundle=f"/remote/work/demo/jobs/task-{index}",
+        )
+        for index in range(3)
+    )
+    calls = []
+
+    def fake_run_script(script, *arguments, **_kwargs):
+        calls.append((script, arguments))
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            (
+                "W\t0\tNONE\n"
+                "W\t1\tCOMPLETED\n"
+                "W\t2\tFAILED\n"
+                "Q\t101\tPENDING\n"
+                "A\t103\tOUT_OF_MEMORY\t0:9\n"
+            ),
+            "",
+        )
+
+    executor.transport.run_script = fake_run_script
+
+    statuses = executor.inspect_many(handles)
+
+    assert len(calls) == 1
+    assert calls[0][1] == (
+        "/remote/work/demo/jobs/task-0",
+        "101",
+        "/remote/work/demo/jobs/task-1",
+        "102",
+        "/remote/work/demo/jobs/task-2",
+        "103",
+    )
+    assert [status.state for status in statuses] == [
+        "running",
+        "completed",
+        "failed",
+    ]
+    assert statuses[2].failure_kind == "out_of_memory"
+
+
+def test_remote_slurm_executor_cancels_a_group_with_batched_scheduler_calls(
+    tmp_path,
+):
+    executor = SlurmExecutor(
+        ExecutionTarget(
+            "slurm",
+            "slurm",
+            host="remote",
+            work_root="/remote/work",
+            partition="cpu",
+        )
+    )
+    handles = tuple(
+        ExecutionHandle(
+            f"task-{index}",
+            "slurm",
+            "slurm",
+            str(101 + index),
+            str(tmp_path / f"task-{index}"),
+            remote_bundle=f"/remote/work/demo/jobs/task-{index}",
+        )
+        for index in range(3)
+    )
+    calls = []
+
+    def fake_run_script(script, *arguments, **_kwargs):
+        calls.append((script, arguments))
+        if "scancel" in script:
+            assert arguments == ("101", "103")
+            return subprocess.CompletedProcess(["ssh"], 0, "", "")
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                ["ssh"],
+                0,
+                (
+                    "W\t0\tNONE\n"
+                    "W\t1\tCOMPLETED\n"
+                    "W\t2\tNONE\n"
+                    "Q\t101\tRUNNING\n"
+                    "Q\t103\tPENDING\n"
+                ),
+                "",
+            )
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            (
+                "W\t0\tNONE\n"
+                "W\t1\tNONE\n"
+                "A\t101\tCANCELLED\t0:0\n"
+                "A\t103\tCANCELLED\t0:0\n"
+            ),
+            "",
+        )
+
+    executor.transport.run_script = fake_run_script
+
+    statuses = executor.cancel_many(handles)
+
+    assert len(calls) == 3
+    assert sum("scancel" in script for script, _ in calls) == 1
+    assert [status.state for status in statuses] == [
+        "cancelled",
+        "completed",
+        "cancelled",
+    ]
+
+
 def test_slurm_executor_does_not_claim_historical_same_name_job(tmp_path):
     bundle = tmp_path / "task"
     bundle.mkdir()
@@ -3252,6 +3532,81 @@ class CancellableExecutor:
     def cancel(self, handle):
         self.cancellations.append((handle.target, handle.execution_id))
         return ExecutionStatus("cancelled", "test cancellation accepted")
+
+
+def test_group_stop_uses_one_batch_cancellation_per_target(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    tasks = []
+    for index in range(3):
+        task_id = f"task-{index}"
+        target_name = "cpu" if index == 1 else "label"
+        bundle = preparation.output_dir / ".neptrain/jobs" / task_id
+        tasks.append(
+            {
+                "task_id": task_id,
+                "target": target_name,
+                "bundle": str(bundle),
+                "handle": {
+                    "task_id": task_id,
+                    "target": target_name,
+                    "executor": "slurm",
+                    "execution_id": str(101 + index),
+                    "local_bundle": str(bundle),
+                },
+            }
+        )
+    controller.state["state"] = "stopped"
+    controller.state["current"] = {
+        "kind": "task_group",
+        "generation": 1,
+        "stage": "label",
+        "resource": "labeling",
+        "attempt": 1,
+        "tasks": tasks,
+    }
+    controller._save()
+    batches = []
+
+    class BatchCancellableExecutor:
+        def __init__(self, target_name):
+            self.target_name = target_name
+
+        def cancel_many(self, handles):
+            batches.append(
+                (
+                    self.target_name,
+                    [handle.execution_id for handle in handles],
+                )
+            )
+            return tuple(
+                ExecutionStatus("cancelled", "batch cancellation accepted")
+                for _ in handles
+            )
+
+        def cancel(self, _handle):
+            raise AssertionError("single-task cancellation should not run")
+
+    result = stop_workflow(
+        preparation.output_dir,
+        executor_factory=lambda target: BatchCancellableExecutor(target.name),
+    )
+
+    assert batches == [
+        ("label", ["101", "103"]),
+        ("cpu", ["102"]),
+    ]
+    assert [
+        item["action"]
+        for item in result["current_execution"]["tasks"]
+    ] == ["cancelled", "cancelled", "cancelled"]
+    state = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert [
+        item["observed_state"] for item in state["current"]["tasks"]
+    ] == ["cancelled", "cancelled", "cancelled"]
 
 
 def test_stop_prepared_workflow_is_an_idempotent_no_op(tmp_path):

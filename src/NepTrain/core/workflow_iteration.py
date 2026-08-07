@@ -86,6 +86,7 @@ PredictionRunner = Callable[
 ]
 _DESCRIPTOR_BATCH_SIZE = 4096
 _CANDIDATE_VALIDATION_REGRESSION_FACTOR = 1.02
+_PREDICTION_METRIC_BASIS = "per_atom_v1"
 
 
 def _nep_descriptors(model: Path, frames: Sequence[Atoms]) -> np.ndarray:
@@ -208,6 +209,64 @@ def _rmse(reference: np.ndarray, prediction: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(prediction - reference))))
 
 
+def _r2(reference: np.ndarray, prediction: np.ndarray) -> float:
+    """Return a deterministic R2, including constant-reference slices."""
+
+    reference = np.asarray(reference, dtype=np.float64).reshape(-1)
+    prediction = np.asarray(prediction, dtype=np.float64).reshape(-1)
+    if reference.shape != prediction.shape or not len(reference):
+        raise WorkflowIterationError("R2 requires non-empty paired values")
+    residual = float(np.sum(np.square(prediction - reference)))
+    total = float(np.sum(np.square(reference - np.mean(reference))))
+    if total <= np.finfo(np.float64).eps * max(1, len(reference)):
+        return 1.0 if residual <= np.finfo(np.float64).eps else 0.0
+    return float(1.0 - residual / total)
+
+
+def _comparison_quality(series: ParitySeries) -> dict[str, float]:
+    reference = np.asarray(series.reference, dtype=np.float64).reshape(-1)
+    prediction = np.asarray(series.predicted, dtype=np.float64).reshape(-1)
+    scale = float(np.std(reference))
+    tolerance = max(3.0 * scale, np.finfo(np.float64).eps)
+    return {
+        "r2": _r2(reference, prediction),
+        "outlier_fraction": float(
+            np.mean(np.abs(prediction - reference) > tolerance)
+        ),
+    }
+
+
+def _evaluation_quality(
+    evaluation: PredictionEvaluation,
+    frames: Sequence[Atoms],
+) -> dict[str, Any]:
+    quality: dict[str, Any] = {
+        "r2": {},
+        "outlier_fraction": {},
+        "element_force_r2": {},
+    }
+    for name, series in evaluation.comparisons.items():
+        values = _comparison_quality(series)
+        quality["r2"][f"{name}_r2"] = values["r2"]
+        quality["outlier_fraction"][name] = values["outlier_fraction"]
+    force = evaluation.comparisons.get("force")
+    if force is not None:
+        symbols = np.asarray(
+            [symbol for frame in frames for symbol in frame.get_chemical_symbols()]
+        )
+        component_symbols = np.repeat(symbols, 3)
+        if len(component_symbols) != len(force.reference):
+            raise WorkflowIterationError(
+                "force parity values do not match the labeled atom count"
+            )
+        for symbol in sorted(set(symbols)):
+            mask = component_symbols == symbol
+            quality["element_force_r2"][symbol] = _r2(
+                force.reference[mask], force.predicted[mask]
+            )
+    return quality
+
+
 def _within_thresholds(
     metrics: Mapping[str, float], thresholds: Mapping[str, Any]
 ) -> bool:
@@ -237,6 +296,94 @@ def _threshold_score(
     )
 
 
+def _acquisition_convergence_status(
+    diagnostic: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    previous_signals: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Judge convergence from errors made before the new labels are trained."""
+
+    if not policy:
+        return {
+            "acquisition_convergence_configured": False,
+            "acquisition_converged": False,
+            "acquisition_convergence_streak": 0,
+        }
+    thresholds = dict(policy.get("acquisition_max_rmse", {}))
+    r2_thresholds = dict(policy.get("acquisition_min_r2", {}))
+    metrics = {name: diagnostic.get(f"current_model_{name}") for name in thresholds}
+    r2_metrics = {name: diagnostic.get(f"current_model_{name}") for name in r2_thresholds}
+
+    def metrics_accepted(values: Mapping[str, Any]) -> bool:
+        return all(values.get(name) is not None for name in thresholds) and (
+            _within_thresholds(values, thresholds)
+        )
+
+    aggregate_rmse_accepted = metrics_accepted(metrics) if thresholds else True
+    aggregate_r2_accepted = all(
+        r2_metrics.get(name) is not None
+        and np.isfinite(float(r2_metrics[name]))
+        and float(r2_metrics[name]) >= float(limit)
+        for name, limit in r2_thresholds.items()
+    )
+    attempt_metrics = diagnostic.get("attempt_metrics", {})
+    attempts_accepted = all(
+        metrics_accepted(values)
+        for values in attempt_metrics.values()
+    ) if thresholds else True
+    group_min = policy.get("group_min_force_r2")
+    element_r2 = dict(diagnostic.get("element_force_r2", {}))
+    condition_r2 = dict(diagnostic.get("condition_force_r2", {}))
+    groups_accepted = bool(
+        group_min is None
+        or (
+            element_r2
+            and condition_r2
+            and all(float(value) >= float(group_min) for value in element_r2.values())
+            and all(float(value) >= float(group_min) for value in condition_r2.values())
+        )
+    )
+    max_outliers = policy.get("max_outlier_fraction")
+    outliers = dict(diagnostic.get("outlier_fraction", {}))
+    outliers_accepted = bool(
+        max_outliers is None
+        or (
+            outliers
+            and all(float(value) <= float(max_outliers) for value in outliers.values())
+        )
+    )
+    min_selected = int(policy.get("min_selected", 0))
+    enough_evidence = int(diagnostic.get("evaluated_count", 0)) >= min_selected
+    acquisition_accepted = bool(
+        aggregate_rmse_accepted
+        and aggregate_r2_accepted
+        and attempts_accepted
+        and groups_accepted
+        and outliers_accepted
+        and enough_evidence
+    )
+    previous_streak = int(
+        previous_signals.get("acquisition_convergence_streak", 0)
+    )
+    streak = previous_streak + 1 if acquisition_accepted else 0
+    required = int(policy.get("consecutive_generations", 1))
+    return {
+        "acquisition_convergence_configured": True,
+        "acquisition_metrics": metrics,
+        "acquisition_r2": r2_metrics,
+        "acquisition_max_rmse": thresholds,
+        "acquisition_min_r2": r2_thresholds,
+        "acquisition_groups_accepted": groups_accepted,
+        "acquisition_outliers_accepted": outliers_accepted,
+        "acquisition_evidence_count": int(diagnostic.get("evaluated_count", 0)),
+        "acquisition_min_selected": min_selected,
+        "acquisition_accepted": acquisition_accepted,
+        "acquisition_convergence_streak": streak,
+        "acquisition_convergence_required": required,
+        "acquisition_converged": streak >= required,
+    }
+
+
 def _nep_prediction_evaluation(
     model: Path, frames: Sequence[Atoms], backend: str
 ) -> PredictionEvaluation:
@@ -245,20 +392,28 @@ def _nep_prediction_evaluation(
     spin = "spin" in frames[0].arrays
     with Nep3Calculator(model, backend=backend) as calculator:
         if spin:
-            energy, forces, virials, mforces = calculator.calculate_spin(frames)
+            energy, forces, virials, mforces = calculator.calculate_spin(
+                frames, mean_virial=True
+            )
         else:
-            energy, forces, virials = calculator.calculate(frames)
+            energy, forces, virials = calculator.calculate(
+                frames, mean_virial=True
+            )
             mforces = None
+    atom_counts = np.asarray([len(frame) for frame in frames], dtype=float)
     reference_energy = np.asarray(
         [frame.get_potential_energy() for frame in frames]
-    )
-    predicted_energy = np.asarray(energy)
+    ) / atom_counts
+    predicted_energy = np.asarray(energy).reshape(-1) / atom_counts
     reference_force = np.concatenate(
         [reference_forces(frame) for frame in frames]
     )
     predicted_force = np.concatenate(forces)
     reference_virial = np.asarray(
         [frame.info["virial"] for frame in frames]
+    )
+    reference_virial = reference_virial / atom_counts.reshape(
+        (-1,) + (1,) * (reference_virial.ndim - 1)
     )
     predicted_virial = np.asarray(virials)
     metrics = {
@@ -270,7 +425,7 @@ def _nep_prediction_evaluation(
         "energy": ParitySeries(
             reference_energy,
             predicted_energy,
-            "eV",
+            "eV/atom",
         ),
         "force": ParitySeries(
             reference_force,
@@ -280,7 +435,7 @@ def _nep_prediction_evaluation(
         "virial": ParitySeries(
             reference_virial,
             predicted_virial,
-            "eV",
+            "eV/atom",
         ),
     }
     if spin:
@@ -357,14 +512,14 @@ class WorkflowIterationAdapter:
         base_dir: str | Path = ".",
         runtime: WorkflowRuntime | None = None,
         active_stage: str | None = None,
+        active_generation_kind: str = "legacy",
     ):
         self.config = dict(config)
         self.base_dir = Path(base_dir).expanduser().resolve()
         self.runtime = runtime or WorkflowRuntime()
-        requires_routes = active_stage is None or active_stage in {
-            "explore",
-            "evaluate",
-        }
+        requires_routes = active_stage is None or active_stage == "explore" or (
+            active_stage == "evaluate" and active_generation_kind == "legacy"
+        )
         if requires_routes:
             try:
                 self.routes = load_sampling_routes(
@@ -440,7 +595,13 @@ class WorkflowIterationAdapter:
         requires_training_config = (
             active_stage is None
             or active_stage == "retrain"
-            or (active_stage == "train" and initial_training is not None)
+            or (
+                active_stage == "train"
+                and (
+                    initial_training is not None
+                    or active_generation_kind in {"acquisition", "finalization"}
+                )
+            )
         )
         if (
             requires_training_config
@@ -481,10 +642,23 @@ class WorkflowIterationAdapter:
         return tuple(values)
 
     def run_stage(self, stage: str, context: StageContext) -> StageOutcome:
+        if context.generation_kind in {"acquisition", "finalization"}:
+            method = getattr(self, f"_{context.generation_kind}_{stage}", None)
+            if method is None:
+                raise WorkflowIterationError(
+                    f"stage {stage} is not valid for a {context.generation_kind} generation"
+                )
+            return method(context)
         method = getattr(self, f"_{stage}", None)
         if method is None:
             raise WorkflowIterationError(f"unsupported workflow stage: {stage}")
-        return method(context)
+        outcome = method(context)
+        if (
+            stage == "evaluate"
+            and context.stage_input.get("generation_protocol") == "adaptive_v2"
+        ):
+            return self._defer_legacy_convergence(context, outcome)
+        return outcome
 
     def _execute_training(
         self,
@@ -569,6 +743,274 @@ class WorkflowIterationAdapter:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(output), encoding="utf-8")
         return path
+
+    def _adaptive_train(self, context: StageContext) -> StageOutcome:
+        """Train exactly one model on the dataset entering this generation."""
+
+        if context.generation == 1:
+            if self.initial_training is None:
+                raise WorkflowIterationError(
+                    "the first adaptive generation requires an initial training set"
+                )
+            training_input = self.initial_training
+            warm_start = None
+            parent_model_sha256 = None
+        else:
+            training_input = context.previous_artifacts.get("training_set")
+            if training_input is None:
+                raise WorkflowIterationError(
+                    "the previous generation did not publish a merged training set"
+                )
+            parent_model = context.previous_artifacts.get("activated_model")
+            parent_model_sha256 = (
+                file_sha256(parent_model) if parent_model is not None else None
+            )
+            warm_start = context.previous_artifacts.get("activated_checkpoint")
+        result, frame_count, _ = self._execute_training(
+            context,
+            training_input=training_input,
+            role="training",
+            warm_start=warm_start,
+        )
+        candidate_sha256 = file_sha256(result.best_model)
+        lineage = {
+            "version": 2,
+            "generation": context.generation,
+            "generation_kind": context.generation_kind,
+            "parent_model_sha256": parent_model_sha256,
+            "candidate_model_sha256": candidate_sha256,
+            "training_dataset_sha256": file_sha256(training_input),
+            "training_count": frame_count,
+            "trained_on_generation_input": True,
+        }
+        artifacts: dict[str, Path] = {
+            "training_input": training_input,
+            "model_training_set": training_input,
+            "candidate_model": result.best_model,
+            "model_lineage": atomic_write_json(
+                context.work_dir / "model-lineage.json", lineage
+            ),
+        }
+        if context.generation > 1 and parent_model is not None:
+            artifacts["parent_model"] = parent_model
+        if result.final_model is not None:
+            artifacts["candidate_final_model"] = result.final_model
+        if result.checkpoint is not None:
+            artifacts["candidate_checkpoint"] = result.checkpoint
+        artifacts.update(
+            {
+                f"training_output_{name.replace('.', '_')}": path
+                for name, path in result.outputs.items()
+            }
+        )
+        return StageOutcome(
+            artifacts=artifacts,
+            metrics={
+                "backend": result.backend,
+                "training_count": frame_count,
+                "training_dataset_sha256": file_sha256(training_input),
+                "parent_model_sha256": parent_model_sha256,
+                "candidate_model_sha256": candidate_sha256,
+                "generation_kind": context.generation_kind,
+            },
+        )
+
+    def _adaptive_evaluate(self, context: StageContext) -> StageOutcome:
+        """Qualify the generation model before it can drive acquisition."""
+
+        candidate = context.artifacts["candidate_model"]
+        candidate_sha256 = file_sha256(candidate)
+        training_input = context.artifacts["model_training_set"]
+        lineage = json.loads(
+            context.artifacts["model_lineage"].read_text(encoding="utf-8")
+        )
+        if (
+            lineage.get("candidate_model_sha256") != candidate_sha256
+            or lineage.get("training_dataset_sha256")
+            != file_sha256(training_input)
+        ):
+            raise WorkflowIterationError(
+                "adaptive evaluate received inconsistent model lineage"
+            )
+
+        options = self.config.get("evaluation", {})
+        thresholds = dict(options.get("max_rmse", {}))
+        evaluation: PredictionEvaluation | None = None
+        metrics: dict[str, float] = {}
+        validation_accepted: bool | None = None
+        parent_metrics: dict[str, float] | None = None
+        candidate_score: float | None = None
+        parent_score: float | None = None
+        candidate_limit: float | None = None
+        evaluated_count = 0
+        spin_count = 0
+        if self.evaluation_configured:
+            assert self.validation is not None
+            frames = _read_frames(self.validation)
+            _, spin_count = validate_spin_dataset(frames, require_mforce=True)
+            training_ids = {
+                structure_id(frame) for frame in _read_frames(training_input)
+            }
+            overlap = sum(structure_id(frame) in training_ids for frame in frames)
+            if overlap:
+                raise WorkflowIterationError(
+                    f"validation dataset overlaps the model training set by {overlap} frames"
+                )
+            evaluation = self.runtime.predict(
+                candidate,
+                frames,
+                str(options.get("inference_backend", "auto")),
+            )
+            metrics = {name: float(value) for name, value in evaluation.metrics.items()}
+            evaluated_count = len(frames)
+            validation_accepted = _within_thresholds(metrics, thresholds)
+            candidate_score = _threshold_score(metrics, thresholds)
+            parent = context.artifacts.get("parent_model")
+            if parent is not None:
+                parent_evaluation = self.runtime.predict(
+                    parent,
+                    frames,
+                    str(options.get("inference_backend", "auto")),
+                )
+                parent_metrics = {
+                    name: float(value)
+                    for name, value in parent_evaluation.metrics.items()
+                }
+                parent_score = _threshold_score(parent_metrics, thresholds)
+                parent_accepted = _within_thresholds(parent_metrics, thresholds)
+                candidate_limit = (
+                    1.0
+                    if parent_accepted
+                    else parent_score * _CANDIDATE_VALIDATION_REGRESSION_FACTOR
+                )
+                if candidate_score > candidate_limit:
+                    raise WorkflowIterationError(
+                        "trained candidate regressed on the independent validation set"
+                    )
+        finite = bool(candidate.is_file() and candidate.stat().st_size > 0) and all(
+            np.isfinite(float(value)) for value in metrics.values()
+        )
+        if not finite:
+            raise WorkflowIterationError(
+                "trained candidate is empty or produced non-finite evaluation metrics"
+            )
+        accepted = bool(
+            finite
+            and (
+                context.generation_kind != "finalization"
+                or validation_accepted is not False
+            )
+        )
+        active_lineage = {
+            **lineage,
+            "active_model_sha256": candidate_sha256,
+            "candidate_activation_accepted": True,
+            "activation_basis": (
+                "finite independent validation metrics"
+                if self.evaluation_configured
+                else "successful training and non-empty model artifact"
+            ),
+            "validation_accepted": validation_accepted,
+        }
+        evaluation_record = {
+            "version": 1,
+            "generation": context.generation,
+            "generation_kind": context.generation_kind,
+            "model_sha256": candidate_sha256,
+            "training_dataset_sha256": file_sha256(training_input),
+            "metrics": metrics,
+            "model_improved": bool(
+                lineage.get("parent_model_sha256") != candidate_sha256
+            ),
+            "validation_accepted": validation_accepted,
+            "parent_validation_metrics": parent_metrics,
+            "candidate_validation_score": candidate_score,
+            "parent_validation_score": parent_score,
+            "candidate_validation_limit": candidate_limit,
+            "evaluated_count": evaluated_count,
+        }
+        artifacts: dict[str, Path] = {
+            "model": candidate,
+            "activated_model": candidate,
+            "active_model_lineage": atomic_write_json(
+                context.work_dir / "active-model-lineage.json", active_lineage
+            ),
+            "model_evaluation": atomic_write_json(
+                context.work_dir / "model-evaluation.json", evaluation_record
+            ),
+        }
+        if "candidate_checkpoint" in context.artifacts:
+            artifacts["activated_checkpoint"] = context.artifacts[
+                "candidate_checkpoint"
+            ]
+        signals = {
+            **metrics,
+            "prediction_metric_basis": _PREDICTION_METRIC_BASIS,
+            "accepted": accepted,
+            "generation_kind": context.generation_kind,
+            "evaluation_configured": self.evaluation_configured,
+            "validation_accepted": validation_accepted,
+            "evaluated_count": evaluated_count,
+            "spin_frame_count": spin_count,
+            "active_model_sha256": candidate_sha256,
+            "model_training_set_sha256": file_sha256(training_input),
+            "workflow_converged": context.generation_kind == "finalization" and accepted,
+            "generation_disposition": (
+                "finalize" if context.generation_kind == "finalization" else None
+            ),
+            "finalization_pending": False,
+        }
+        if context.generation_kind == "finalization":
+            artifacts["training_set"] = training_input
+            artifacts["signals"] = atomic_write_json(
+                context.work_dir / "signals.json", signals
+            )
+        report = build_evaluation_report(
+            context.work_dir,
+            metrics=metrics,
+            thresholds=thresholds,
+        )
+        artifacts["evaluation_report"] = report.report
+        if report.chart is not None:
+            artifacts["evaluation_chart"] = report.chart
+        if evaluation is not None and evaluation.comparisons:
+            parity = build_parity_report(
+                context.work_dir,
+                series=evaluation.comparisons,
+                source={
+                    "validation_name": self.validation.name if self.validation else None,
+                    "candidate_model_sha256": candidate_sha256,
+                    "evaluated_count": evaluated_count,
+                },
+            )
+            artifacts["evaluation_parity_report"] = parity.report
+            if parity.chart is not None:
+                artifacts["evaluation_parity"] = parity.chart
+        return StageOutcome(artifacts=artifacts, metrics=signals)
+
+    def _acquisition_train(self, context: StageContext) -> StageOutcome:
+        return self._adaptive_train(context)
+
+    def _finalization_train(self, context: StageContext) -> StageOutcome:
+        return self._adaptive_train(context)
+
+    def _acquisition_evaluate(self, context: StageContext) -> StageOutcome:
+        return self._adaptive_evaluate(context)
+
+    def _finalization_evaluate(self, context: StageContext) -> StageOutcome:
+        return self._adaptive_evaluate(context)
+
+    def _acquisition_explore(self, context: StageContext) -> StageOutcome:
+        return self._explore(context)
+
+    def _acquisition_select(self, context: StageContext) -> StageOutcome:
+        return self._select(context)
+
+    def _acquisition_label(self, context: StageContext) -> StageOutcome:
+        return self._label(context)
+
+    def _acquisition_diagnose(self, context: StageContext) -> StageOutcome:
+        return self._diagnose(context)
 
     def _train(self, context: StageContext) -> StageOutcome:
         if context.generation > 1:
@@ -1941,11 +2383,19 @@ class WorkflowIterationAdapter:
 
     def _diagnose(self, context: StageContext) -> StageOutcome:
         options = self.config.get("evaluation", {})
+        convergence_policy = self.config.get("workflow", {}).get(
+            "convergence", {}
+        )
+        thresholds = dict(
+            convergence_policy.get("acquisition_max_rmse", {})
+            or options.get("max_rmse", {})
+        )
+        quality_gate_configured = bool(thresholds)
         frames = _read_frames(context.artifacts["labeled"], allow_empty=True)
         if not frames:
             signals = {
                 "diagnostic_only": True,
-                "quality_gate_configured": self.evaluation_configured,
+                "quality_gate_configured": quality_gate_configured,
                 "diagnostic_accepted": None,
                 "attempt_accepted": {},
                 "attempt_metrics": {},
@@ -1961,16 +2411,28 @@ class WorkflowIterationAdapter:
                 artifacts={"acquisition_signals": output}, metrics=signals
             )
         _, spin_count = validate_spin_dataset(frames, require_mforce=True)
-        thresholds = dict(options.get("max_rmse", {}))
-        raw_metrics = self.runtime.predict(
+        evaluation = self.runtime.predict(
             context.artifacts["model"],
             frames,
             str(options.get("inference_backend", "auto")),
-        ).metrics
+        )
+        raw_metrics = evaluation.metrics
         metrics = {
             f"current_model_{name}": float(value)
             for name, value in raw_metrics.items()
         }
+        r2_policy = dict(convergence_policy.get("acquisition_min_r2", {}))
+        quality = (
+            _evaluation_quality(evaluation, frames)
+            if r2_policy
+            else {"r2": {}, "outlier_fraction": {}, "element_force_r2": {}}
+        )
+        metrics.update(
+            {
+                f"current_model_{name}": float(value)
+                for name, value in quality["r2"].items()
+            }
+        )
         grouped: dict[str, list[Atoms]] = {}
         for frame in frames:
             attempt_id = frame.info.get("scenario_attempt_id")
@@ -1990,21 +2452,46 @@ class WorkflowIterationAdapter:
             attempt_metrics[attempt_id] = values
             attempt_accepted[attempt_id] = (
                 _within_thresholds(values, thresholds)
-                if self.evaluation_configured
+                if quality_gate_configured
                 else None
             )
+        condition_force_r2: dict[str, float] = {}
+        if r2_policy:
+            condition_groups: dict[str, list[Atoms]] = {}
+            for frame in frames:
+                condition = (
+                    f"R={frame.info.get('route_id', 'unknown')}|"
+                    f"T={float(frame.info.get('temperature', 0.0)):g}|"
+                    f"P={float(frame.info.get('pressure', 0.0)):g}"
+                )
+                condition_groups.setdefault(condition, []).append(frame)
+            for condition, condition_frames in sorted(condition_groups.items()):
+                condition_evaluation = self.runtime.predict(
+                    context.artifacts["model"],
+                    condition_frames,
+                    str(options.get("inference_backend", "auto")),
+                )
+                force = condition_evaluation.comparisons.get("force")
+                if force is not None:
+                    condition_force_r2[condition] = _r2(
+                        force.reference, force.predicted
+                    )
         diagnostic_accepted = (
             _within_thresholds(raw_metrics, thresholds)
-            if self.evaluation_configured
+            if quality_gate_configured
             else None
         )
         signals = {
             **metrics,
+            "prediction_metric_basis": _PREDICTION_METRIC_BASIS,
             "diagnostic_only": True,
-            "quality_gate_configured": self.evaluation_configured,
+            "quality_gate_configured": quality_gate_configured,
             "diagnostic_accepted": diagnostic_accepted,
             "attempt_accepted": attempt_accepted,
             "attempt_metrics": attempt_metrics,
+            "element_force_r2": quality["element_force_r2"],
+            "condition_force_r2": condition_force_r2,
+            "outlier_fraction": quality["outlier_fraction"],
             "evaluated_count": len(frames),
             "spin_frame_count": spin_count,
         }
@@ -2059,6 +2546,141 @@ class WorkflowIterationAdapter:
                 "duplicate_labeled_count": 0,
             },
         )
+
+    def _acquisition_merge(self, context: StageContext) -> StageOutcome:
+        """Commit labels and decide only what kind of generation comes next."""
+
+        merged = self._merge(context)
+        diagnostic = json.loads(
+            context.artifacts["acquisition_signals"].read_text(encoding="utf-8")
+        )
+        evaluation = json.loads(
+            context.artifacts["model_evaluation"].read_text(encoding="utf-8")
+        )
+        selection = json.loads(
+            context.artifacts["selection_result"].read_text(encoding="utf-8")
+        )
+        novelty_threshold = float(
+            selection.get(
+                "resolved_completion_coverage_threshold",
+                context.plan.completion_coverage_threshold,
+            )
+        )
+        remaining_novelty = float(selection.get("remaining_novelty", 0.0))
+        novelty_converged = bool(remaining_novelty <= novelty_threshold)
+        previous_signals = (
+            json.loads(
+                context.previous_artifacts["signals"].read_text(encoding="utf-8")
+            )
+            if "signals" in context.previous_artifacts
+            else {}
+        )
+        convergence = _acquisition_convergence_status(
+            diagnostic,
+            self.config.get("workflow", {}).get("convergence", {}),
+            previous_signals,
+        )
+        convergence_evidence = (
+            convergence["acquisition_converged"]
+            if convergence["acquisition_convergence_configured"]
+            else novelty_converged
+        )
+        validation_accepted = evaluation.get("validation_accepted")
+        history, production_ready = self._record_route_histories(
+            context,
+            diagnostic=diagnostic,
+            validation_metrics=evaluation.get("metrics") or None,
+            evidence_validation=evaluation.get("metrics") or None,
+            validation_accepted=validation_accepted,
+            model_improved=bool(evaluation.get("model_improved", True)),
+            novelty_converged=novelty_converged,
+            final_model_id=file_sha256(context.artifacts["model"]),
+        )
+        sampling_complete = bool(production_ready and convergence_evidence)
+        disposition = "finalize" if sampling_complete else "continue"
+        history.update(convergence)
+        history.update(
+            {
+                "workflow_converged": False,
+                "finalization_pending": sampling_complete,
+                "generation_disposition": disposition,
+            }
+        )
+        signals = {
+            **diagnostic,
+            **convergence,
+            "accepted": True,
+            "generation_kind": "acquisition",
+            "generation_disposition": disposition,
+            "finalization_pending": sampling_complete,
+            "workflow_converged": False,
+            "workflow_stalled": False,
+            "production_ready": production_ready,
+            "model_validation_accepted": validation_accepted,
+            "remaining_novelty": remaining_novelty,
+            "novelty_threshold": novelty_threshold,
+            "novelty_converged": novelty_converged,
+            "scenario_counts_by_maturity": history["counts_by_maturity"],
+            "active_model_sha256": file_sha256(context.artifacts["model"]),
+            "merged_training_set_sha256": file_sha256(
+                merged.artifacts["training_set"]
+            ),
+        }
+        artifacts = dict(merged.artifacts)
+        artifacts["scenario_maturity"] = atomic_write_json(
+            context.work_dir / "scenario-maturity.json", history
+        )
+        artifacts["signals"] = atomic_write_json(
+            context.work_dir / "signals.json", signals
+        )
+        return StageOutcome(
+            artifacts=artifacts,
+            metrics={
+                **merged.metrics,
+                **convergence,
+                "accepted": True,
+                "generation_kind": "acquisition",
+                "generation_disposition": disposition,
+                "finalization_pending": sampling_complete,
+                "workflow_converged": False,
+                "production_ready": production_ready,
+            },
+        )
+
+    @staticmethod
+    def _defer_legacy_convergence(
+        context: StageContext,
+        outcome: StageOutcome,
+    ) -> StageOutcome:
+        """Turn a migrated legacy stop into an explicit finalization request."""
+
+        metrics = dict(outcome.metrics)
+        sampling_complete = metrics.get("workflow_converged") is True
+        metrics.update(
+            {
+                "workflow_converged": False,
+                "generation_disposition": (
+                    "finalize" if sampling_complete else "continue"
+                ),
+                "finalization_pending": sampling_complete,
+            }
+        )
+        for name in ("signals", "scenario_maturity"):
+            path = outcome.artifacts.get(name)
+            if path is None:
+                continue
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record.update(
+                {
+                    "workflow_converged": False,
+                    "generation_disposition": metrics[
+                        "generation_disposition"
+                    ],
+                    "finalization_pending": sampling_complete,
+                }
+            )
+            atomic_write_json(path, record)
+        return StageOutcome(artifacts=outcome.artifacts, metrics=metrics)
 
     def _retrain(self, context: StageContext) -> StageOutcome:
         training_input = context.artifacts["training_set"]
@@ -2426,6 +3048,20 @@ class WorkflowIterationAdapter:
         )
         remaining_novelty = float(selection.get("remaining_novelty", 0.0))
         novelty_converged = bool(remaining_novelty <= novelty_threshold)
+        previous_signals = (
+            json.loads(
+                context.previous_artifacts["signals"].read_text(
+                    encoding="utf-8"
+                )
+            )
+            if "signals" in context.previous_artifacts
+            else {}
+        )
+        convergence = _acquisition_convergence_status(
+            diagnostic,
+            self.config.get("workflow", {}).get("convergence", {}),
+            previous_signals,
+        )
         history, production_ready = self._record_route_histories(
             context,
             diagnostic=diagnostic,
@@ -2436,7 +3072,11 @@ class WorkflowIterationAdapter:
             novelty_converged=novelty_converged,
             final_model_id=active_model_sha256,
         )
-        history["workflow_converged"] = False
+        workflow_converged = bool(
+            production_ready and convergence["acquisition_converged"]
+        )
+        history.update(convergence)
+        history["workflow_converged"] = workflow_converged
         history["workflow_stalled"] = False
         maturity_path = atomic_write_json(
             context.work_dir / "scenario-maturity.json", history
@@ -2460,6 +3100,10 @@ class WorkflowIterationAdapter:
             "training_count": lineage.get("training_count"),
         }
         signals = {
+            **convergence,
+            "prediction_metric_basis": diagnostic.get(
+                "prediction_metric_basis"
+            ),
             "accepted": True,
             "evaluation_configured": False,
             "validation_accepted": None,
@@ -2495,7 +3139,7 @@ class WorkflowIterationAdapter:
                 for route in self.routes
             ],
             "production_ready": production_ready,
-            "workflow_converged": False,
+            "workflow_converged": workflow_converged,
             "workflow_stalled": False,
             "no_progress_rounds": int(
                 history.get("no_progress_rounds", 0)
@@ -2759,6 +3403,7 @@ class WorkflowIterationAdapter:
         )
         signals = {
             **metrics,
+            "prediction_metric_basis": _PREDICTION_METRIC_BASIS,
             "accepted": accepted,
             "evaluation_configured": True,
             "validation_accepted": validation_accepted,
@@ -2852,13 +3497,24 @@ class WorkflowIterationAdapter:
             novelty_converged=novelty_converged,
             final_model_id=final_model_id,
         )
+        convergence = _acquisition_convergence_status(
+            diagnostic,
+            self.config.get("workflow", {}).get("convergence", {}),
+            previous_signals,
+        )
+        convergence_evidence = (
+            convergence["acquisition_converged"]
+            if convergence["acquisition_convergence_configured"]
+            else novelty_converged
+        )
         workflow_converged = bool(
-            validation_accepted and production_ready and novelty_converged
+            validation_accepted and production_ready and convergence_evidence
         )
         workflow_stalled = bool(
             not workflow_converged
             and int(history.get("no_progress_rounds", 0)) >= 2
         )
+        history.update(convergence)
         history["workflow_converged"] = workflow_converged
         history["workflow_stalled"] = workflow_stalled
         maturity_path = atomic_write_json(
@@ -2866,6 +3522,7 @@ class WorkflowIterationAdapter:
         )
         artifacts["scenario_maturity"] = maturity_path
         signals.update(
+            **convergence,
             scenario_counts_by_maturity=history["counts_by_maturity"],
             sampling_routes=[
                 {

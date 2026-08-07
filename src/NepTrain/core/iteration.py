@@ -13,18 +13,16 @@ import numpy as np
 
 from .content_addressing import canonical_sha256, file_sha256
 from .fps import farthest_point_sampling
+from .generation_policy import (
+    LEGACY_GENERATION_PROTOCOL,
+    LEGACY_STAGES,
+    generation_stage_sequence,
+    resolve_generation_kind,
+    stage_sequence_for_kind,
+)
 from .persistence import atomic_write_json
 
-STAGES = (
-    "train",
-    "explore",
-    "select",
-    "label",
-    "diagnose",
-    "merge",
-    "retrain",
-    "evaluate",
-)
+STAGES = LEGACY_STAGES
 
 
 class IterationError(RuntimeError):
@@ -134,6 +132,8 @@ class StageContext:
     stage_dir: Path | None = None
     stage_input: Mapping[str, Any] = field(default_factory=dict)
     flat_output: bool = False
+    generation_kind: str = "legacy"
+    stage_sequence: tuple[str, ...] = LEGACY_STAGES
 
     @property
     def work_dir(self) -> Path:
@@ -170,9 +170,15 @@ class StageSummary:
 
 
 class GenerationController:
-    """Execute the fixed generation sequence with an atomic, hash-checked ledger."""
+    """Execute ledger-resolved generation sequences atomically."""
 
-    def __init__(self, root: str | Path, workflow_id: str):
+    def __init__(
+        self,
+        root: str | Path,
+        workflow_id: str,
+        *,
+        generation_protocol: str = LEGACY_GENERATION_PROTOCOL,
+    ):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.workspace = None
@@ -192,6 +198,7 @@ class GenerationController:
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.workflow_id = workflow_id
+        self.generation_protocol = generation_protocol
         with self._lock():
             self._ledger = self._load()
 
@@ -246,15 +253,37 @@ class GenerationController:
             )
 
         previous_artifacts: dict[str, Path] = {}
+        previous = None
         if plan.generation > 1:
             previous = self._ledger["generations"].get(str(plan.generation - 1))
             if not previous or not previous.get("complete") or not previous.get("accepted"):
                 raise IterationError("previous generation is not complete and accepted")
-            for stage in STAGES:
+            for stage in generation_stage_sequence(previous):
                 previous_stage = previous["stages"].get(stage)
                 if previous_stage is None:
                     raise IterationError("previous generation has an incomplete stage ledger")
                 previous_artifacts.update(self._restore_artifacts(previous_stage))
+
+        if "stage_sequence" not in generation_record:
+            if generation_record.get("stages"):
+                kind = "legacy"
+            else:
+                try:
+                    kind = resolve_generation_kind(
+                        self.generation_protocol,
+                        previous,
+                    )
+                except ValueError as error:
+                    raise IterationError(str(error)) from error
+            generation_record["kind"] = kind
+            generation_record["stage_sequence"] = list(
+                stage_sequence_for_kind(kind)
+            )
+            self._write(self._ledger)
+        try:
+            sequence = generation_stage_sequence(generation_record)
+        except ValueError as error:
+            raise IterationError(str(error)) from error
 
         generation_dir = (
             self.workspace.generation_dir(plan.generation)
@@ -264,7 +293,7 @@ class GenerationController:
         artifacts: dict[str, Path] = {}
         metrics: dict[str, Mapping[str, Any]] = {}
         missing_seen = False
-        for stage in STAGES:
+        for stage in sequence:
             stage_record = generation_record["stages"].get(stage)
             if stage_record is None:
                 missing_seen = True
@@ -281,14 +310,17 @@ class GenerationController:
 
     def _next_stage(self, plan: GenerationPlan) -> str | None:
         generation_record, _, _, metrics, _ = self._generation_state(plan)
+        sequence = generation_stage_sequence(generation_record)
         completed = len(metrics)
-        if completed < len(STAGES):
+        if completed < len(sequence):
             if generation_record.get("complete"):
                 raise IterationError("generation is marked complete before all stages finished")
-            return STAGES[completed]
-        accepted = metrics["evaluate"].get("accepted")
+            return sequence[completed]
+        accepted = metrics[sequence[-1]].get("accepted")
         if not isinstance(accepted, bool):
-            raise IterationError("evaluate stage must report an accepted boolean")
+            raise IterationError(
+                f"{sequence[-1]} stage must report an accepted boolean"
+            )
         changed = False
         if generation_record.get("complete"):
             if generation_record.get("accepted") is not accepted:
@@ -356,7 +388,7 @@ class GenerationController:
                     f"generation {plan.generation} expects stage {expected}, not {requested}"
                 )
             (
-                _,
+                generation_record,
                 generation_dir,
                 artifacts,
                 _,
@@ -375,6 +407,12 @@ class GenerationController:
                     else generation_dir
                 ),
                 flat_output=self.workspace is not None,
+                generation_kind=str(generation_record["kind"]),
+                stage_sequence=tuple(generation_stage_sequence(generation_record)),
+                stage_input={
+                    "generation_kind": str(generation_record["kind"]),
+                    "generation_protocol": self.generation_protocol,
+                },
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
             return requested, context
@@ -414,13 +452,14 @@ class GenerationController:
             "metrics": dict(outcome.metrics),
         }
         generation_record["stages"][stage] = stage_record
-        complete = stage == STAGES[-1]
+        sequence = generation_stage_sequence(generation_record)
+        complete = stage == sequence[-1]
         accepted = None
         if complete:
             accepted = stage_record["metrics"].get("accepted")
             if not isinstance(accepted, bool):
                 raise IterationError(
-                    "evaluate stage must report an accepted boolean"
+                    f"{stage} stage must report an accepted boolean"
                 )
             generation_record["accepted"] = accepted
             generation_record["complete"] = True
@@ -514,6 +553,12 @@ class GenerationController:
                     else generation_dir
                 ),
                 flat_output=self.workspace is not None,
+                generation_kind=str(generation_record["kind"]),
+                stage_sequence=tuple(generation_stage_sequence(generation_record)),
+                stage_input={
+                    "generation_kind": str(generation_record["kind"]),
+                    "generation_protocol": self.generation_protocol,
+                },
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
             outcome = adapter.run_stage(requested, context)
@@ -523,25 +568,27 @@ class GenerationController:
             return self._commit_outcome(plan, requested, outcome)
 
     def reopen_rejected(
-        self, plan: GenerationPlan, *, from_stage: str = "retrain"
+        self, plan: GenerationPlan, *, from_stage: str | None = None
     ) -> None:
         """Reopen a rejected generation without discarding its failed attempt."""
-
-        if from_stage not in STAGES:
-            raise IterationError(f"unknown recovery stage: {from_stage}")
         with self._lock():
             self._ledger = self._load()
             generation_record, _, _, _, _ = self._generation_state(plan)
+            sequence = generation_stage_sequence(generation_record)
+            if from_stage is None:
+                from_stage = "retrain" if "retrain" in sequence else "train"
+            if from_stage not in sequence:
+                raise IterationError(f"unknown recovery stage: {from_stage}")
             if not generation_record.get("complete") or generation_record.get(
                 "accepted"
             ) is not False:
                 raise IterationError(
                     f"generation {plan.generation} is not complete and rejected"
                 )
-            start = STAGES.index(from_stage)
+            start = sequence.index(from_stage)
             archived = {
                 stage: generation_record["stages"].pop(stage)
-                for stage in STAGES[start:]
+                for stage in sequence[start:]
             }
             recoveries = generation_record.setdefault("recovery_attempts", [])
             recoveries.append(

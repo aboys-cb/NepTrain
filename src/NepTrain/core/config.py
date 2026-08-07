@@ -75,6 +75,7 @@ _FIELDS: dict[str, set[str]] = {
         "id",
         "max_model_generations",
         "seed",
+        "convergence",
     },
     "execution": {
         "poll_interval",
@@ -131,6 +132,26 @@ _FEISHU_NOTIFICATION_FIELDS = {
     "webhook",
     "secret",
     "timeout_seconds",
+}
+_WORKFLOW_CONVERGENCE_FIELDS = {
+    "acquisition_max_rmse",
+    "acquisition_min_r2",
+    "group_min_force_r2",
+    "max_outlier_fraction",
+    "min_selected",
+    "consecutive_generations",
+}
+_RMSE_FIELDS = {
+    "energy_rmse",
+    "force_rmse",
+    "virial_rmse",
+    "mforce_rmse",
+}
+_R2_FIELDS = {
+    "energy_r2",
+    "force_r2",
+    "virial_r2",
+    "mforce_r2",
 }
 
 
@@ -597,6 +618,118 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError("workflow.max_model_generations must be positive")
         if int(workflow.get("seed", 20260721)) < 0:
             raise ConfigError("workflow.seed must be non-negative")
+        convergence = _mapping(workflow, "convergence")
+        unknown_convergence = sorted(
+            set(convergence) - _WORKFLOW_CONVERGENCE_FIELDS
+        )
+        if unknown_convergence:
+            raise ConfigError(
+                "workflow.convergence has unknown fields: "
+                + ", ".join(unknown_convergence)
+            )
+        if convergence:
+            thresholds = _mapping(convergence, "acquisition_max_rmse")
+            unknown_thresholds = sorted(set(thresholds) - _RMSE_FIELDS)
+            if unknown_thresholds:
+                raise ConfigError(
+                    "workflow.convergence.acquisition_max_rmse has unknown "
+                    "metrics: " + ", ".join(unknown_thresholds)
+                )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+                for value in thresholds.values()
+            ):
+                raise ConfigError(
+                    "workflow.convergence.acquisition_max_rmse values must "
+                    "be finite and positive"
+                )
+            if thresholds:
+                required_rmse = {"energy_rmse", "force_rmse"}
+                if md.get("spin", False):
+                    required_rmse.add("mforce_rmse")
+                missing = sorted(required_rmse - set(thresholds))
+                if missing:
+                    raise ConfigError(
+                        "workflow.convergence.acquisition_max_rmse is missing "
+                        + ", ".join(missing)
+                    )
+            r2_thresholds = _mapping(convergence, "acquisition_min_r2")
+            unknown_r2 = sorted(set(r2_thresholds) - _R2_FIELDS)
+            if unknown_r2:
+                raise ConfigError(
+                    "workflow.convergence.acquisition_min_r2 has unknown "
+                    "metrics: " + ", ".join(unknown_r2)
+                )
+            if not thresholds and not r2_thresholds:
+                raise ConfigError(
+                    "workflow.convergence requires acquisition_min_r2 or "
+                    "acquisition_max_rmse"
+                )
+            required_r2 = {"energy_r2", "force_r2"}
+            if md.get("spin", False):
+                required_r2.add("mforce_r2")
+            if r2_thresholds:
+                missing = sorted(required_r2 - set(r2_thresholds))
+                if missing:
+                    raise ConfigError(
+                        "workflow.convergence.acquisition_min_r2 is missing "
+                        + ", ".join(missing)
+                    )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+                for value in r2_thresholds.values()
+            ):
+                raise ConfigError(
+                    "workflow.convergence.acquisition_min_r2 values must "
+                    "be finite and between 0 and 1"
+                )
+            group_min = convergence.get("group_min_force_r2")
+            if group_min is not None and (
+                isinstance(group_min, bool)
+                or not isinstance(group_min, (int, float))
+                or not math.isfinite(float(group_min))
+                or not 0.0 <= float(group_min) <= 1.0
+            ):
+                raise ConfigError(
+                    "workflow.convergence.group_min_force_r2 must be finite "
+                    "and between 0 and 1"
+                )
+            max_outliers = convergence.get("max_outlier_fraction")
+            if max_outliers is not None and (
+                isinstance(max_outliers, bool)
+                or not isinstance(max_outliers, (int, float))
+                or not math.isfinite(float(max_outliers))
+                or not 0.0 <= float(max_outliers) <= 1.0
+            ):
+                raise ConfigError(
+                    "workflow.convergence.max_outlier_fraction must be finite "
+                    "and between 0 and 1"
+                )
+            min_selected = convergence.get("min_selected", 1)
+            if (
+                isinstance(min_selected, bool)
+                or not isinstance(min_selected, int)
+                or min_selected < 1
+            ):
+                raise ConfigError(
+                    "workflow.convergence.min_selected must be a positive integer"
+                )
+            consecutive = convergence.get("consecutive_generations", 1)
+            if (
+                isinstance(consecutive, bool)
+                or not isinstance(consecutive, int)
+                or consecutive < 1
+            ):
+                raise ConfigError(
+                    "workflow.convergence.consecutive_generations must be "
+                    "a positive integer"
+                )
     if evaluation:
         if not evaluation.get("validation_path"):
             raise ConfigError(

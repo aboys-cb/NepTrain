@@ -228,9 +228,16 @@ def _generation_event(
 ) -> NotificationEvent:
     science = _generation_science(_plan_mapping(plan), record)
     generation = int(science["generation"])
+    generation_kind = science.get("kind")
     sampling = science["sampling"]
     training = science["training"]
-    quality = science["quality"]["validation_rmse"]
+    validation_quality = science["quality"]["validation_rmse"]
+    acquisition_quality = science["quality"]["acquisition_rmse"]
+    has_validation = any(
+        value is not None for value in validation_quality.values()
+    )
+    quality = validation_quality if has_validation else acquisition_quality
+    quality_label = "验证 RMSE" if has_validation else "新增 DFT 预测 RMSE（训练前）"
     stages = record.get("stages", {})
     label_metrics = (
         stages.get("label", {}).get("metrics", {})
@@ -242,6 +249,28 @@ def _generation_event(
     partial = failed_labels > 0 or failed_sources > 0
     icon = "⚠️" if partial else "✅"
     outcome = "部分成功并已接受" if partial else "本轮已接受"
+    if generation_kind == "finalization":
+        lines = [
+            f"🎯 [NepTrain] G{generation}/{total_generations} 最终训练完成",
+            *_workflow_identity(workflow_id, workflow_path),
+            (
+                "最终训练集："
+                f"{_number(training.get('after_count'))} 个结构"
+            ),
+            f"{quality_label}："
+            f"E={_metric(quality.get('energy_rmse'), scale=1000, unit='meV/atom')}，"
+            f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}，"
+            f"V={_metric(quality.get('virial_rmse'), scale=1000, unit='meV/atom')}，"
+            f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/μB')}",
+            "结论：最终模型已验收；本代未运行 MD、FPS 或 DFT",
+        ]
+        model = training.get("active_model_sha256")
+        if model:
+            lines.insert(-1, f"模型：{str(model)[:12]}")
+        return NotificationEvent(
+            f"generation:{generation}:accepted",
+            "\n".join(lines),
+        )
     lines = [
         f"{icon} [NepTrain] G{generation}/{total_generations} 完成",
         *_workflow_identity(workflow_id, workflow_path),
@@ -255,10 +284,10 @@ def _generation_event(
             f"标注：{_number(sampling.get('labeled_count'))} 成功"
             + (f"，{failed_labels} 批失败" if failed_labels else "")
         ),
-        "验证 RMSE："
-        f"E={_metric(quality.get('energy_rmse'), scale=1, unit='eV')}，"
+        f"{quality_label}："
+        f"E={_metric(quality.get('energy_rmse'), scale=1000, unit='meV/atom')}，"
         f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}，"
-        f"V={_metric(quality.get('virial_rmse'), scale=1, unit='eV')}，"
+        f"V={_metric(quality.get('virial_rmse'), scale=1000, unit='meV/atom')}，"
         f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/μB')}",
         f"结论：{outcome}",
     ]

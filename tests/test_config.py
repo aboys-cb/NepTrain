@@ -103,6 +103,102 @@ def test_schema_v8_loads_without_migration(tmp_path):
     assert changes == []
 
 
+def test_acquisition_convergence_policy_is_validated(tmp_path):
+    value = _project(
+        workflow={
+            "convergence": {
+                "acquisition_max_rmse": {
+                    "energy_rmse": 0.003,
+                    "force_rmse": 0.1,
+                    "virial_rmse": 0.03,
+                },
+                "consecutive_generations": 2,
+            }
+        }
+    )
+
+    config, _ = load_config(_write(tmp_path, value))
+
+    assert config["workflow"]["convergence"][
+        "acquisition_max_rmse"
+    ]["energy_rmse"] == pytest.approx(0.003)
+
+
+def test_r2_acquisition_convergence_policy_is_validated(tmp_path):
+    value = _project(
+        workflow={
+            "convergence": {
+                "acquisition_min_r2": {
+                    "energy_r2": 0.95,
+                    "force_r2": 0.95,
+                },
+                "group_min_force_r2": 0.90,
+                "max_outlier_fraction": 0.05,
+                "min_selected": 50,
+                "consecutive_generations": 1,
+            }
+        }
+    )
+
+    config, _ = load_config(_write(tmp_path, value))
+
+    convergence = config["workflow"]["convergence"]
+    assert convergence["acquisition_min_r2"]["force_r2"] == pytest.approx(0.95)
+    assert convergence["min_selected"] == 50
+
+
+@pytest.mark.parametrize(
+    ("convergence", "message"),
+    [
+        (
+            {"acquisition_max_rmse": {"energy_rmse": 0.003}},
+            "force_rmse",
+        ),
+        (
+            {
+                "acquisition_max_rmse": {
+                    "energy_rmse": 0.003,
+                    "force_rmse": 0.1,
+                },
+                "consecutive_generations": 0,
+            },
+            "positive integer",
+        ),
+        (
+            {"acquisition_min_r2": {"energy_r2": 0.95}},
+            "force_r2",
+        ),
+        (
+            {
+                "acquisition_min_r2": {
+                    "energy_r2": 0.95,
+                    "force_r2": 0.95,
+                },
+                "group_min_force_r2": 1.1,
+            },
+            "between 0 and 1",
+        ),
+        (
+            {
+                "acquisition_min_r2": {
+                    "energy_r2": 0.95,
+                    "force_r2": 0.95,
+                },
+                "min_selected": 0,
+            },
+            "positive integer",
+        ),
+    ],
+)
+def test_invalid_acquisition_convergence_policy_is_rejected(
+    tmp_path, convergence, message
+):
+    with pytest.raises(ConfigError, match=message):
+        load_config(
+            _write(tmp_path, _project(workflow={"convergence": convergence}))
+        )
+
+
 def test_slurm_memory_ladder_is_validated(tmp_path):
     value = _project()
     value["execution"]["targets"]["analysis"] = {

@@ -26,6 +26,7 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from .content_addressing import canonical_sha256, file_sha256
+from .generation_policy import stage_sequence_for_kind
 from .iteration import GenerationPlan, StageContext, StageOutcome
 from .persistence import atomic_write_json
 from .sampling_route import load_sampling_routes
@@ -33,9 +34,11 @@ from .slurm import (
     ACTIVE_STATES as _ACTIVE,
     FAILURE_STATES as _TERMINAL_FAILURE,
     SUCCESS_STATES as _TERMINAL_SUCCESS,
+    SlurmQuery,
     SlurmScript,
     SlurmSubmissionError,
     SlurmSubmissionThrottled,
+    aggregate_states,
     parse_submission_job_id,
     query_job,
     render_script,
@@ -128,8 +131,21 @@ _STAGE_ARTIFACTS = {
         "acquisition_signals",
         "selection_result",
         "md_attempts",
+        "candidate_model",
+        "candidate_checkpoint",
+        "model_training_set",
+        "parent_model",
     ),
 }
+_STAGE_ARTIFACTS["merge"] = (
+    *_STAGE_ARTIFACTS["merge"],
+    "model",
+    "model_evaluation",
+    "acquisition_signals",
+    "selection_result",
+    "scenario_plan",
+    "md_attempts",
+)
 _STAGE_PREVIOUS_ARTIFACTS = {
     "train": (
         "training_set",
@@ -149,13 +165,17 @@ _PORTABLE_ARTIFACT_STEMS = {
     "model": "nep",
     "activated_model": "nep",
     "retrained_model": "candidate-nep",
+    "candidate_model": "candidate-nep",
+    "parent_model": "parent-nep",
     "training_input": "base-train",
+    "model_training_set": "model-train",
     "training_set": "train",
     "selected_input": "selected",
     "labeled": "labels",
     "checkpoint": "checkpoint",
     "activated_checkpoint": "checkpoint",
     "retrained_checkpoint": "candidate-checkpoint",
+    "candidate_checkpoint": "candidate-checkpoint",
 }
 _STAGE_DIRECTORY_LABELS = {
     "train": "train",
@@ -549,7 +569,19 @@ def build_stage_task(
     if stage not in _STAGE_CONFIG_PATH_FIELDS:
         raise ExecutionError(f"unsupported stage task: {stage}")
 
-    requested_route_id = str((stage_input or {}).get("route_id", ""))
+    resolved_stage_input = {
+        **dict(context.stage_input),
+        **dict(stage_input or {}),
+    }
+
+    requested_route_id = str(resolved_stage_input.get("route_id", ""))
+    needs_routes = bool(
+        stage == "explore"
+        or (
+            stage == "evaluate"
+            and resolved_stage_input.get("generation_kind", "legacy") == "legacy"
+        )
+    )
     route_identities = (
         [
             {
@@ -562,7 +594,7 @@ def build_stage_task(
             )
             if not requested_route_id or route.route_id == requested_route_id
         ]
-        if stage in {"explore", "evaluate"}
+        if needs_routes
         and config.get("sampling", {}).get("routes")
         else []
     )
@@ -575,7 +607,7 @@ def build_stage_task(
         "plan_sha256": plan.sha256,
         "target": target.name,
         "sampling_routes": route_identities,
-        "stage_input": dict(stage_input or {}),
+        "stage_input": resolved_stage_input,
     }
     tasks_dir.mkdir(parents=True, exist_ok=True)
     temporary = Path(
@@ -593,7 +625,7 @@ def build_stage_task(
     portable_config.pop("notifications", None)
     empty_label = bool(
         stage == "label"
-        and (stage_input or {}).get("empty_selection") is True
+        and resolved_stage_input.get("empty_selection") is True
     )
     if stage == "explore" and requested_route_id:
         portable_config["sampling"]["routes"] = [
@@ -625,7 +657,11 @@ def build_stage_task(
     path_fields = set(_STAGE_CONFIG_PATH_FIELDS[stage])
     if empty_label:
         path_fields.clear()
-    if stage == "train" and generation > 1:
+    if (
+        stage == "train"
+        and generation > 1
+        and resolved_stage_input.get("generation_kind", "legacy") == "legacy"
+    ):
         path_fields.clear()
     evaluation = portable_config.get("evaluation", {})
     if stage == "evaluate":
@@ -649,7 +685,7 @@ def build_stage_task(
         retained_path_fields.add("labeling.resource_path")
     for dotted in sorted(all_path_fields - retained_path_fields):
         _delete_dotted(portable_config, dotted)
-    if stage not in {"explore", "evaluate"}:
+    if not needs_routes:
         portable_config.get("sampling", {}).pop("routes", None)
     for dotted in sorted(path_fields):
         value = _get_dotted(portable_config, dotted)
@@ -674,7 +710,7 @@ def build_stage_task(
 
     routes = (
         portable_config.get("sampling", {}).get("routes", [])
-        if stage in {"explore", "evaluate"}
+        if needs_routes
         else []
     )
     for route_index, route in enumerate(routes):
@@ -735,7 +771,7 @@ def build_stage_task(
                 )
             artifact_destinations[destination] = name
             if stage == "label" and name == "selected_input":
-                raw_indices = (stage_input or {}).get("frame_indices")
+                raw_indices = resolved_stage_input.get("frame_indices")
                 if raw_indices is None:
                     _copy_input(source, destination)
                 else:
@@ -785,7 +821,7 @@ def build_stage_task(
         },
         "initial_training": initial_value,
         "plan": asdict(plan),
-        "stage_input": dict(stage_input or {}),
+        "stage_input": resolved_stage_input,
         "artifacts": copy_artifacts(
             context.artifacts, _STAGE_ARTIFACTS[stage]
         ),
@@ -814,7 +850,7 @@ def build_stage_task(
         stage=stage,
         attempt=attempt,
         task_id=task_id,
-        stage_input=dict(stage_input or {}),
+        stage_input=resolved_stage_input,
     )
     bundle = tasks_dir / directory_name
     atomic_write_json(temporary / "task.json", descriptor)
@@ -951,11 +987,16 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                 shutil.rmtree(work_dir)
             work_dir.mkdir()
             initial_value = descriptor.get("initial_training")
+            worker_stage_input = dict(descriptor.get("stage_input", {}))
+            generation_kind = str(
+                worker_stage_input.get("generation_kind", "legacy")
+            )
             adapter = WorkflowIterationAdapter(
                 config,
                 initial_training=resolve(initial_value) if initial_value else None,
                 base_dir=bundle,
                 active_stage=str(descriptor["identity"]["stage"]),
+                active_generation_kind=generation_kind,
             )
             outcome = adapter.run_stage(
                 descriptor["identity"]["stage"],
@@ -966,8 +1007,10 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     artifacts=artifacts,
                     previous_artifacts=previous,
                     stage_dir=work_dir,
-                    stage_input=dict(descriptor.get("stage_input", {})),
+                    stage_input=worker_stage_input,
                     flat_output=True,
+                    generation_kind=generation_kind,
+                    stage_sequence=stage_sequence_for_kind(generation_kind),
                 ),
             )
             result_artifacts = {}
@@ -2786,18 +2829,13 @@ done
                 )
         return tuple(results)
 
-    def inspect(self, handle: ExecutionHandle) -> ExecutionStatus:
-        bundle = handle.remote_bundle or handle.local_bundle
-        worker_status = self._worker_status(bundle)
+    @staticmethod
+    def _execution_status(
+        worker_status: ExecutionStatus | None,
+        observation: SlurmQuery,
+    ) -> ExecutionStatus:
         if worker_status is not None and worker_status.state == "completed":
             return worker_status
-        observation = query_job(
-            lambda command: self.transport.run(
-                [bundle, *command] if self.target.host else command,
-                cwd=Path(bundle) if not self.target.host else None,
-            ),
-            handle.execution_id,
-        )
         if observation.state is None:
             return worker_status or ExecutionStatus(
                 "unknown",
@@ -2828,6 +2866,145 @@ done
                 "out_of_memory" if state == "OUT_OF_MEMORY" else None,
             )
         return ExecutionStatus("running", state)
+
+    def inspect(self, handle: ExecutionHandle) -> ExecutionStatus:
+        bundle = handle.remote_bundle or handle.local_bundle
+        worker_status = self._worker_status(bundle)
+        observation = query_job(
+            lambda command: self.transport.run(
+                [bundle, *command] if self.target.host else command,
+                cwd=Path(bundle) if not self.target.host else None,
+            ),
+            handle.execution_id,
+        )
+        return self._execution_status(worker_status, observation)
+
+    def inspect_many(
+        self,
+        handles: Sequence[ExecutionHandle],
+    ) -> tuple[ExecutionStatus, ...]:
+        """Inspect one remote Slurm task group through a single SSH command."""
+
+        if not handles:
+            return ()
+        if self.target.host is None:
+            return tuple(self.inspect(handle) for handle in handles)
+
+        arguments: list[str] = []
+        for handle in handles:
+            arguments.extend(
+                [
+                    handle.remote_bundle or handle.local_bundle,
+                    handle.execution_id,
+                ]
+            )
+        completed = self.transport.run_script(
+            """set -uo pipefail
+bundles=()
+job_ids=()
+while [ "$#" -gt 0 ]; do
+  bundles+=("$1")
+  job_ids+=("$2")
+  shift 2
+done
+numeric=()
+for job_id in "${job_ids[@]}"; do
+  if [[ "$job_id" =~ ^[0-9]+$ ]]; then
+    numeric+=("$job_id")
+  fi
+done
+for index in "${!bundles[@]}"; do
+  bundle=${bundles[$index]}
+  state=NONE
+  if [ -f "$bundle/execution.json" ]; then
+    if grep -Eq '"state"[[:space:]]*:[[:space:]]*"COMPLETED"' "$bundle/execution.json"; then
+      state=COMPLETED
+    elif grep -Eq '"state"[[:space:]]*:[[:space:]]*"FAILED"' "$bundle/execution.json"; then
+      state=FAILED
+    elif grep -Eq '"state"[[:space:]]*:[[:space:]]*"RUNNING"' "$bundle/execution.json"; then
+      state=RUNNING
+    fi
+  fi
+  printf 'W\t%s\t%s\n' "$index" "$state"
+done
+if [ "${#numeric[@]}" -eq 0 ]; then
+  exit 0
+fi
+csv=$(IFS=,; printf '%s' "${numeric[*]}")
+while IFS='|' read -r job_id state; do
+  [ -n "$job_id" ] && printf 'Q\t%s\t%s\n' "$job_id" "$state"
+done < <(squeue --noheader --jobs "$csv" --format '%A|%T' 2>/dev/null || true)
+while IFS='|' read -r job_id state exit_code _rest; do
+  [ -n "$job_id" ] && printf 'A\t%s\t%s\t%s\n' "$job_id" "$state" "$exit_code"
+done < <(sacct --noheader -X --parsable2 --jobs "$csv" --format 'JobIDRaw,State,ExitCode' 2>/dev/null || true)
+""",
+            *arguments,
+        )
+        if completed.returncode != 0:
+            raise ExecutionError(
+                (
+                    completed.stderr
+                    or completed.stdout
+                    or "remote batch Slurm inspection failed"
+                ).strip()
+            )
+
+        worker_states: dict[int, str] = {}
+        queue_states: dict[str, list[str]] = {}
+        account_states: dict[str, list[str]] = {}
+        account_exits: dict[str, list[str]] = {}
+        try:
+            for line in completed.stdout.splitlines():
+                columns = line.split("\t")
+                if len(columns) == 3 and columns[0] == "W":
+                    worker_states[int(columns[1])] = columns[2]
+                elif len(columns) == 3 and columns[0] == "Q":
+                    queue_states.setdefault(columns[1], []).append(columns[2])
+                elif len(columns) >= 4 and columns[0] == "A":
+                    account_states.setdefault(columns[1], []).append(columns[2])
+                    account_exits.setdefault(columns[1], []).append(columns[3])
+        except (ValueError, IndexError) as error:
+            raise ExecutionError(
+                "remote batch Slurm inspection returned invalid output"
+            ) from error
+
+        results = []
+        for index, handle in enumerate(handles):
+            worker_state = worker_states.get(index, "NONE")
+            worker_status = (
+                ExecutionStatus("completed", "worker result complete")
+                if worker_state == "COMPLETED"
+                else (
+                    ExecutionStatus("failed", "worker failed")
+                    if worker_state == "FAILED"
+                    else (
+                        ExecutionStatus("running", "worker running")
+                        if worker_state == "RUNNING"
+                        else None
+                    )
+                )
+            )
+            job_id = handle.execution_id
+            queue_state = aggregate_states(queue_states.get(job_id, ()))
+            if queue_state is not None:
+                observation = SlurmQuery(queue_state, source="squeue")
+            else:
+                account_state = aggregate_states(
+                    account_states.get(job_id, ())
+                )
+                exits = account_exits.get(job_id, ())
+                exit_code = next(
+                    (value for value in exits if not value.startswith("0:0")),
+                    exits[0] if exits else "",
+                )
+                observation = SlurmQuery(
+                    account_state,
+                    exit_code,
+                    "sacct",
+                    None if account_state is not None else "Slurm has no accounting record yet",
+                )
+            results.append(self._execution_status(worker_status, observation))
+        return tuple(results)
 
     def collect(self, handle: ExecutionHandle) -> Path:
         return self.transport.collect(handle)
@@ -2919,21 +3096,116 @@ done
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             refreshed = self.inspect(handle)
-            if refreshed.state == "completed":
-                return refreshed
-            if refreshed.state == "failed":
-                if "CANCELLED" in refreshed.detail.upper():
-                    return ExecutionStatus(
-                        "cancelled",
-                        f"Slurm job {handle.execution_id} is cancelled",
-                    )
-                return refreshed
+            resolved = self._resolved_cancellation(handle, refreshed)
+            if resolved is not None:
+                return resolved
             time.sleep(0.2)
         return ExecutionStatus(
             "cancelling",
             f"Slurm accepted cancellation for job {handle.execution_id}; "
             "terminal state is not confirmed yet",
         )
+
+    @staticmethod
+    def _resolved_cancellation(
+        handle: ExecutionHandle,
+        status: ExecutionStatus,
+    ) -> ExecutionStatus | None:
+        if status.state == "completed":
+            return status
+        if status.state != "failed":
+            return None
+        if "CANCELLED" in status.detail.upper():
+            return ExecutionStatus(
+                "cancelled",
+                f"Slurm job {handle.execution_id} is cancelled",
+            )
+        return status
+
+    def cancel_many(
+        self,
+        handles: Sequence[ExecutionHandle],
+    ) -> tuple[ExecutionStatus, ...]:
+        """Cancel one remote Slurm task group with batched scheduler calls."""
+
+        if not handles:
+            return ()
+        if self.target.host is None:
+            return tuple(self.cancel(handle) for handle in handles)
+
+        initial = self.inspect_many(handles)
+        if len(initial) != len(handles):
+            raise ExecutionError(
+                "batch Slurm inspection returned the wrong number of results"
+            )
+        active_indices = [
+            index for index, status in enumerate(initial) if not status.terminal
+        ]
+        if not active_indices:
+            return initial
+        active_handles = tuple(handles[index] for index in active_indices)
+        invalid = [
+            handle.execution_id
+            for handle in active_handles
+            if not handle.execution_id.isdigit()
+        ]
+        if invalid:
+            raise ExecutionError(
+                "Slurm task group has invalid job ids: " + ", ".join(invalid)
+            )
+
+        completed = self.transport.run_script(
+            """set -uo pipefail
+job_ids=("$@")
+scancel "${job_ids[@]}"
+cancel_status=$?
+if [ "$cancel_status" -ne 0 ]; then
+  exit "$cancel_status"
+fi
+csv=$(IFS=,; printf '%s' "${job_ids[*]}")
+deadline=$((SECONDS + 5))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  active=$(squeue --noheader --jobs "$csv" --format '%A' 2>/dev/null || true)
+  [ -z "$active" ] && exit 0
+  sleep 0.2
+done
+exit 0
+""",
+            *(handle.execution_id for handle in active_handles),
+        )
+        refreshed = self.inspect_many(active_handles)
+        if len(refreshed) != len(active_handles):
+            raise ExecutionError(
+                "batch Slurm cancellation returned the wrong number of results"
+            )
+
+        results = list(initial)
+        unresolved = []
+        for index, handle, status in zip(
+            active_indices,
+            active_handles,
+            refreshed,
+            strict=True,
+        ):
+            resolved = self._resolved_cancellation(handle, status)
+            if resolved is None:
+                unresolved.append(handle.execution_id)
+                resolved = ExecutionStatus(
+                    "cancelling",
+                    f"Slurm accepted cancellation for job {handle.execution_id}; "
+                    "terminal state is not confirmed yet",
+                )
+            results[index] = resolved
+        if completed.returncode != 0 and unresolved:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise ExecutionError(
+                detail
+                or (
+                    "Slurm task-group cancellation failed for jobs "
+                    + ", ".join(unresolved)
+                )
+            )
+        return tuple(results)
 
 
 def executor_for(

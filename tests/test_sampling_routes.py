@@ -394,6 +394,16 @@ def test_workflow_generation_runs_without_evaluation(tmp_path: Path):
                 maximum=2,
             ),
             "labeling": {"backend": "toy"},
+            "workflow": {
+                "convergence": {
+                    "acquisition_max_rmse": {
+                        "energy_rmse": 1.0,
+                        "force_rmse": 1.0,
+                        "virial_rmse": 1.0,
+                    },
+                    "consecutive_generations": 1,
+                }
+            },
         },
         initial_training=initial,
         runtime=WorkflowRuntime(
@@ -417,5 +427,8 @@ def test_workflow_generation_runs_without_evaluation(tmp_path: Path):
     assert signals["evaluation_configured"] is False
     assert signals["validation_accepted"] is None
     assert signals["workflow_converged"] is False
+    assert signals["acquisition_accepted"] is True
+    assert signals["acquisition_converged"] is True
+    assert signals["production_ready"] is False
     assert "validation_path" not in signals
     assert signals["candidate_validation_metrics"] is None

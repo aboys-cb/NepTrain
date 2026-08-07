@@ -29,8 +29,12 @@ from NepTrain.core.workflow_iteration import (
     WorkflowIterationError,
     WorkflowRuntime,
     _batched_descriptors,
+    _acquisition_convergence_status,
+    _nep_prediction_evaluation,
+    _evaluation_quality,
     _structure_descriptors,
 )
+from NepTrain.core.generation_policy import ADAPTIVE_GENERATION_PROTOCOL
 from NepTrain.core.reporting import ParitySeries
 from NepTrain.core.dft.toy import ToyTeacher
 from NepTrain.core.labeling import LabelResult
@@ -43,6 +47,523 @@ from NepTrain.core.candidate_pool import (
 from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
+from ase.calculators.singlepoint import SinglePointCalculator
+
+
+def test_prediction_evaluation_uses_per_atom_energy_and_virial(
+    tmp_path, monkeypatch
+):
+    frame = Atoms("Fe2", positions=[[0, 0, 0], [2, 0, 0]])
+    frame.calc = SinglePointCalculator(
+        frame,
+        energy=20.0,
+        forces=np.zeros((2, 3)),
+    )
+    frame.info["virial"] = np.full(6, 8.0)
+
+    class FakeCalculator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def calculate(self, _frames, *, mean_virial):
+            assert mean_virial is True
+            return (
+                np.asarray([22.0]),
+                [np.zeros((2, 3))],
+                np.full((1, 6), 5.0),
+            )
+
+    monkeypatch.setattr(
+        "NepTrain.core.workflow_iteration.Nep3Calculator",
+        FakeCalculator,
+    )
+
+    result = _nep_prediction_evaluation(
+        tmp_path / "nep.txt", [frame], "cpu"
+    )
+
+    assert result.metrics["energy_rmse"] == pytest.approx(1.0)
+    assert result.metrics["virial_rmse"] == pytest.approx(1.0)
+    assert result.comparisons["energy"].unit == "eV/atom"
+    assert result.comparisons["virial"].unit == "eV/atom"
+    np.testing.assert_allclose(result.comparisons["energy"].reference, [10.0])
+    np.testing.assert_allclose(result.comparisons["virial"].reference, 4.0)
+
+
+def test_acquisition_convergence_requires_every_attempt_and_a_streak():
+    policy = {
+        "acquisition_max_rmse": {
+            "energy_rmse": 0.003,
+            "force_rmse": 0.10,
+            "virial_rmse": 0.03,
+        },
+        "consecutive_generations": 2,
+    }
+    diagnostic = {
+        "current_model_energy_rmse": 0.002,
+        "current_model_force_rmse": 0.08,
+        "current_model_virial_rmse": 0.02,
+        "attempt_metrics": {
+            "hot": {
+                "energy_rmse": 0.0025,
+                "force_rmse": 0.09,
+                "virial_rmse": 0.025,
+            }
+        },
+    }
+
+    converged = _acquisition_convergence_status(
+        diagnostic, policy, {"acquisition_convergence_streak": 1}
+    )
+    assert converged["acquisition_accepted"] is True
+    assert converged["acquisition_convergence_streak"] == 2
+    assert converged["acquisition_converged"] is True
+
+    diagnostic["attempt_metrics"]["hot"]["force_rmse"] = 0.11
+    rejected = _acquisition_convergence_status(diagnostic, policy, converged)
+    assert rejected["acquisition_accepted"] is False
+    assert rejected["acquisition_convergence_streak"] == 0
+    assert rejected["acquisition_converged"] is False
+
+
+def test_r2_convergence_requires_aggregate_groups_outliers_and_enough_labels():
+    policy = {
+        "acquisition_min_r2": {
+            "energy_r2": 0.95,
+            "force_r2": 0.95,
+        },
+        "group_min_force_r2": 0.90,
+        "max_outlier_fraction": 0.05,
+        "min_selected": 50,
+        "consecutive_generations": 1,
+    }
+    diagnostic = {
+        "current_model_energy_r2": 0.98,
+        "current_model_force_r2": 0.97,
+        "element_force_r2": {"Ce": 0.94, "Fe": 0.96},
+        "condition_force_r2": {"R=main|T=600|P=0": 0.93},
+        "outlier_fraction": {"energy": 0.01, "force": 0.03},
+        "evaluated_count": 100,
+    }
+
+    result = _acquisition_convergence_status(diagnostic, policy, {})
+    assert result["acquisition_accepted"] is True
+    assert result["acquisition_converged"] is True
+
+    diagnostic["condition_force_r2"]["R=main|T=600|P=0"] = 0.89
+    rejected = _acquisition_convergence_status(diagnostic, policy, {})
+    assert rejected["acquisition_groups_accepted"] is False
+    assert rejected["acquisition_converged"] is False
+
+
+def test_evaluation_quality_keeps_element_force_information():
+    frames = [
+        Atoms("CeFe", positions=[[0, 0, 0], [2, 0, 0]]),
+        Atoms("Fe2", positions=[[0, 0, 0], [2, 0, 0]]),
+    ]
+    reference = np.arange(12, dtype=float)
+    evaluation = PredictionEvaluation(
+        {"force_rmse": 0.1},
+        {
+            "force": ParitySeries(
+                reference,
+                reference + 0.01,
+                "eV/A",
+            )
+        },
+    )
+
+    quality = _evaluation_quality(evaluation, frames)
+
+    assert set(quality["element_force_r2"]) == {"Ce", "Fe"}
+    assert quality["r2"]["force_r2"] > 0.99
+    assert quality["outlier_fraction"]["force"] == 0.0
+
+
+def test_adaptive_generation_finalizes_in_a_train_evaluate_only_generation(
+    tmp_path,
+):
+    calls = []
+
+    class AdaptiveAdapter:
+        def run_stage(self, stage, context):
+            calls.append((context.generation, context.generation_kind, stage))
+            path = context.work_dir / f"{stage}-{context.generation}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+            metrics = {}
+            if context.generation_kind == "acquisition" and stage == "merge":
+                metrics = {
+                    "accepted": True,
+                    "generation_disposition": "finalize",
+                    "workflow_converged": False,
+                }
+            if context.generation_kind == "finalization" and stage == "evaluate":
+                metrics = {
+                    "accepted": True,
+                    "generation_disposition": "finalize",
+                    "workflow_converged": True,
+                }
+            return StageOutcome(
+                {f"g{context.generation}_{stage}": path}, metrics
+            )
+
+    controller = GenerationController(
+        tmp_path / "adaptive",
+        "adaptive",
+        generation_protocol=ADAPTIVE_GENERATION_PROTOCOL,
+    )
+    adapter = AdaptiveAdapter()
+    first = controller.run_generation(GenerationPlan(1, 1, 2), adapter)
+    second = controller.run_generation(GenerationPlan(2, 2, 2), adapter)
+
+    assert first.accepted is True
+    assert second.accepted is True
+    assert calls == [
+        (1, "acquisition", "train"),
+        (1, "acquisition", "evaluate"),
+        (1, "acquisition", "explore"),
+        (1, "acquisition", "select"),
+        (1, "acquisition", "label"),
+        (1, "acquisition", "diagnose"),
+        (1, "acquisition", "merge"),
+        (2, "finalization", "train"),
+        (2, "finalization", "evaluate"),
+    ]
+
+
+def test_rejected_finalization_reopens_from_train(tmp_path):
+    class Adapter:
+        def __init__(self):
+            self.accept_final = False
+
+        def run_stage(self, stage, context):
+            path = context.work_dir / f"{stage}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(stage + "\n", encoding="utf-8")
+            metrics = {}
+            if context.generation_kind == "acquisition" and stage == "merge":
+                metrics = {
+                    "accepted": True,
+                    "generation_disposition": "finalize",
+                }
+            elif context.generation_kind == "finalization" and stage == "evaluate":
+                metrics = {"accepted": self.accept_final}
+            return StageOutcome(
+                {f"g{context.generation}_{stage}": path}, metrics
+            )
+
+    adapter = Adapter()
+    controller = GenerationController(
+        tmp_path / "recover-final",
+        "recover-final",
+        generation_protocol=ADAPTIVE_GENERATION_PROTOCOL,
+    )
+    controller.run_generation(GenerationPlan(1, 1, 2), adapter)
+    plan = GenerationPlan(2, 2, 2)
+    rejected = controller.run_generation(plan, adapter)
+    assert rejected.accepted is False
+
+    controller.reopen_rejected(plan)
+
+    assert controller.next_stage(plan) == "train"
+
+
+def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
+    tmp_path,
+):
+    teacher = ToyTeacher("ordinary")
+    initial = tmp_path / "initial.xyz"
+    structures = tmp_path / "structures.xyz"
+    training_config = tmp_path / "nep.in"
+    ase_write(
+        initial,
+        [teacher.label(toy_candidate_frames("ordinary", 71, 1)[0])],
+        format="extxyz",
+    )
+    ase_write(
+        structures,
+        toy_candidate_frames("ordinary", 72, 1),
+        format="extxyz",
+    )
+    training_config.write_text("type 1 Fe\n", encoding="utf-8")
+
+    def fake_train(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model = request.output_dir / "nep.txt"
+        model.write_text("trained\n", encoding="utf-8")
+        return TrainingResult(backend, model, None, None)
+
+    def fake_md(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        frames = [request.atoms.copy(), request.atoms.copy()]
+        for index, frame in enumerate(frames, start=1):
+            frame.positions[0, 0] += index * 0.01
+            frame.info["lammps_step"] = index * 10
+        ase_write(request.output_file, frames, format="extxyz")
+        return MdResult(
+            backend,
+            request.output_file,
+            request.output_dir,
+            "cpu",
+            completed=True,
+            last_step=20,
+        )
+
+    def perfect_predict(_model, frames, _backend):
+        energy = np.asarray(
+            [frame.get_potential_energy() / len(frame) for frame in frames]
+        )
+        force = np.concatenate([frame.get_forces() for frame in frames])
+        virial = np.asarray(
+            [frame.info["virial"] / len(frame) for frame in frames]
+        )
+        return PredictionEvaluation(
+            {"energy_rmse": 0.0, "force_rmse": 0.0, "virial_rmse": 0.0},
+            {
+                "energy": ParitySeries(energy, energy, "eV/atom"),
+                "force": ParitySeries(force, force, "eV/A"),
+                "virial": ParitySeries(virial, virial, "eV/atom"),
+            },
+        )
+
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {
+                "backend": "gpumd",
+                "config_path": str(training_config),
+            },
+            "md": {"backend": "lammps", "spin": False},
+            "sampling": _sampling(
+                structures=structures,
+                template=training_config,
+                max_selected=2,
+            ),
+            "labeling": {"backend": "toy"},
+            "workflow": {
+                "convergence": {
+                    "acquisition_min_r2": {
+                        "energy_r2": 0.95,
+                        "force_r2": 0.95,
+                    },
+                    "group_min_force_r2": 0.90,
+                    "max_outlier_fraction": 0.05,
+                    "min_selected": 1,
+                    "consecutive_generations": 1,
+                }
+            },
+        },
+        initial_training=initial,
+        runtime=WorkflowRuntime(
+            train=fake_train,
+            md=fake_md,
+            descriptors=lambda _model, frames: toy_raw_features(
+                frames, "ordinary"
+            ),
+            predict=perfect_predict,
+        ),
+    )
+    summary = GenerationController(
+        tmp_path / "adaptive-real",
+        "adaptive-real",
+        generation_protocol=ADAPTIVE_GENERATION_PROTOCOL,
+    ).run_generation(GenerationPlan(1, 7, 2), adapter)
+
+    assert tuple(summary.metrics) == (
+        "train",
+        "evaluate",
+        "explore",
+        "select",
+        "label",
+        "diagnose",
+        "merge",
+    )
+    assert summary.metrics["diagnose"]["current_model_force_r2"] == 1.0
+    assert summary.metrics["merge"]["workflow_converged"] is False
+    assert summary.metrics["merge"]["generation_disposition"] in {
+        "continue",
+        "finalize",
+    }
+    assert "model_training_set" in summary.artifacts
+    assert "training_set" in summary.artifacts
+
+
+def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
+    tmp_path,
+):
+    merged = tmp_path / "merged.xyz"
+    previous_model = tmp_path / "previous-nep.txt"
+    training_config = tmp_path / "nep.in"
+    teacher = ToyTeacher("ordinary")
+    ase_write(
+        merged,
+        [teacher.label(toy_candidate_frames("ordinary", 81, 1)[0])],
+        format="extxyz",
+    )
+    previous_model.write_text("previous\n", encoding="utf-8")
+    training_config.write_text("type 1 Fe\n", encoding="utf-8")
+    requests = []
+
+    def fake_train(request, backend):
+        requests.append(request)
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model = request.output_dir / "nep.txt"
+        model.write_text("final\n", encoding="utf-8")
+        return TrainingResult(backend, model, None, None)
+
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {
+                "backend": "gpumd",
+                "config_path": str(training_config),
+            },
+            "md": {"spin": False},
+            "workflow": {},
+        },
+        initial_training=None,
+        active_stage="train",
+        active_generation_kind="finalization",
+        runtime=WorkflowRuntime(train=fake_train),
+    )
+    plan = GenerationPlan(2, 9, 2)
+    train = adapter.run_stage(
+        "train",
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path / "generation-2",
+            plan=plan,
+            artifacts={},
+            previous_artifacts={
+                "training_set": merged,
+                "activated_model": previous_model,
+            },
+            stage_dir=tmp_path / "train",
+            generation_kind="finalization",
+            stage_sequence=("train", "evaluate"),
+        ),
+    )
+    evaluate = adapter.run_stage(
+        "evaluate",
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path / "generation-2",
+            plan=plan,
+            artifacts=train.artifacts,
+            previous_artifacts={},
+            stage_dir=tmp_path / "evaluate",
+            generation_kind="finalization",
+            stage_sequence=("train", "evaluate"),
+        ),
+    )
+
+    assert requests[0].train_file == merged
+    assert evaluate.metrics["accepted"] is True
+    assert evaluate.metrics["workflow_converged"] is True
+    assert evaluate.artifacts["training_set"] == merged
+    assert not {"candidates", "selected_input", "labeled"}.intersection(
+        evaluate.artifacts
+    )
+
+
+def test_finalization_does_not_complete_when_independent_validation_fails(
+    tmp_path,
+):
+    teacher = ToyTeacher("ordinary")
+    merged = tmp_path / "merged.xyz"
+    validation = tmp_path / "validation.xyz"
+    previous_model = tmp_path / "previous-nep.txt"
+    training_config = tmp_path / "nep.in"
+    ase_write(
+        merged,
+        [teacher.label(toy_candidate_frames("ordinary", 91, 1)[0])],
+        format="extxyz",
+    )
+    validation_frame = toy_candidate_frames("ordinary", 92, 1)[0]
+    validation_frame.positions[0, 0] += 0.25
+    ase_write(validation, [teacher.label(validation_frame)], format="extxyz")
+    previous_model.write_text("previous\n", encoding="utf-8")
+    training_config.write_text("type 1 Fe\n", encoding="utf-8")
+
+    def fake_train(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model = request.output_dir / "nep.txt"
+        model.write_text("final\n", encoding="utf-8")
+        return TrainingResult(backend, model, None, None)
+
+    def failing_predict(_model, frames, _backend):
+        force = np.concatenate([frame.get_forces() for frame in frames])
+        return PredictionEvaluation(
+            {"energy_rmse": 0.2, "force_rmse": 0.5},
+            {
+                "force": ParitySeries(force, force + 0.5, "eV/A"),
+            },
+        )
+
+    config = {
+        "training": {
+            "backend": "gpumd",
+            "config_path": str(training_config),
+        },
+        "evaluation": {
+            "validation_path": str(validation),
+            "max_rmse": {"energy_rmse": 0.01, "force_rmse": 0.1},
+        },
+        "md": {"spin": False},
+        "workflow": {},
+    }
+    train_adapter = WorkflowIterationAdapter(
+        config,
+        initial_training=None,
+        active_stage="train",
+        active_generation_kind="finalization",
+        runtime=WorkflowRuntime(train=fake_train, predict=failing_predict),
+    )
+    plan = GenerationPlan(2, 9, 2)
+    train = train_adapter.run_stage(
+        "train",
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path / "generation-2",
+            plan=plan,
+            artifacts={},
+            previous_artifacts={
+                "training_set": merged,
+                "activated_model": previous_model,
+            },
+            stage_dir=tmp_path / "train",
+            generation_kind="finalization",
+            stage_sequence=("train", "evaluate"),
+        ),
+    )
+    evaluate_adapter = WorkflowIterationAdapter(
+        config,
+        initial_training=None,
+        active_stage="evaluate",
+        active_generation_kind="finalization",
+        runtime=WorkflowRuntime(train=fake_train, predict=failing_predict),
+    )
+    outcome = evaluate_adapter.run_stage(
+        "evaluate",
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path / "generation-2",
+            plan=plan,
+            artifacts=train.artifacts,
+            previous_artifacts={},
+            stage_dir=tmp_path / "evaluate",
+            generation_kind="finalization",
+            stage_sequence=("train", "evaluate"),
+        ),
+    )
+
+    assert outcome.metrics["accepted"] is False
+    assert outcome.metrics["workflow_converged"] is False
 
 
 def test_descriptor_backend_receives_every_frame_in_bounded_batches(tmp_path):

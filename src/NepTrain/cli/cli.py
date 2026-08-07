@@ -165,6 +165,10 @@ def _metric_cell(value, previous, *, scale):
     return f"{text} {arrow}{abs(change):.0f}%"
 
 
+def _r2_cell(value):
+    return "-" if value is None else f"{float(value):.4f}"
+
+
 def _display_width(value):
     return sum(
         2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
@@ -201,17 +205,18 @@ def _generation_state(generation, status):
 
 def _print_precision(status):
     print()
-    if status.precision_basis != "validation":
+    if status.precision_basis not in {"validation", "acquisition"}:
         print("精度变化：暂无可比较数据（未配置独立验证集）")
         return
-    print("验证集精度：")
+    acquisition = status.precision_basis == "acquisition"
+    print("新增 DFT 预测精度（训练前）：" if acquisition else "验证集精度：")
     rows = [
         (
             "代",
             "状态",
-            "E/eV",
+            "E/meV·atom⁻¹",
             "F/meV·Å⁻¹",
-            "V/eV",
+            "V/meV·atom⁻¹",
             "M/meV/μB",
             "验收",
         )
@@ -223,7 +228,12 @@ def _print_precision(status):
         "mforce_rmse": None,
     }
     for generation in status.generations:
-        metrics = generation["quality"]["validation_rmse"]
+        metrics = generation["quality"][
+            "acquisition_rmse" if acquisition else "validation_rmse"
+        ]
+        accepted = generation["quality"].get(
+            "acquisition_accepted" if acquisition else "accepted"
+        )
         rows.append(
             (
                 f"G{generation['generation']}",
@@ -231,7 +241,7 @@ def _print_precision(status):
                 _metric_cell(
                     metrics["energy_rmse"],
                     previous["energy_rmse"],
-                    scale=1,
+                    scale=1000,
                 ),
                 _metric_cell(
                     metrics["force_rmse"],
@@ -241,7 +251,7 @@ def _print_precision(status):
                 _metric_cell(
                     metrics["virial_rmse"],
                     previous["virial_rmse"],
-                    scale=1,
+                    scale=1000,
                 ),
                 _metric_cell(
                     metrics["mforce_rmse"],
@@ -250,9 +260,9 @@ def _print_precision(status):
                 ),
                 (
                     "通过"
-                    if generation["quality"]["accepted"] is True
+                    if accepted is True
                     else "未通过"
-                    if generation["quality"]["accepted"] is False
+                    if accepted is False
                     else "等待"
                 ),
             )
@@ -261,6 +271,35 @@ def _print_precision(status):
             if value is not None:
                 previous[name] = value
     _table(rows)
+    if acquisition and any(
+        value is not None
+        for generation in status.generations
+        for value in generation["quality"].get("acquisition_r2", {}).values()
+    ):
+        print()
+        print("新增 DFT 相关性与决策：")
+        r2_rows = [("代", "E R²", "F R²", "V R²", "M R²", "下一步")]
+        for generation in status.generations:
+            quality = generation["quality"]
+            values = quality.get("acquisition_r2", {})
+            disposition = quality.get("generation_disposition")
+            r2_rows.append(
+                (
+                    f"G{generation['generation']}",
+                    _r2_cell(values.get("energy_r2")),
+                    _r2_cell(values.get("force_r2")),
+                    _r2_cell(values.get("virial_r2")),
+                    _r2_cell(values.get("mforce_r2")),
+                    (
+                        "最终训练"
+                        if disposition == "finalize"
+                        else "继续采样"
+                        if disposition == "continue"
+                        else "等待"
+                    ),
+                )
+            )
+        _table(r2_rows)
 
 
 def _compact_job_ids(jobs):

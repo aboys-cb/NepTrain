@@ -123,6 +123,7 @@ def test_generation_report_contains_scientific_progress():
             "retrain": {"metrics": {"training_count": 109}},
             "evaluate": {
                 "metrics": {
+                    "prediction_metric_basis": "per_atom_v1",
                     "accepted": True,
                     "added_training_count": 9,
                     "energy_rmse": 0.01,
@@ -149,11 +150,45 @@ def test_generation_report_contains_scientific_progress():
     assert "40 候选" in event.text
     assert "1 批失败" in event.text
     assert "部分成功并已接受" in event.text
+    assert "E=10 meV/atom" in event.text
     assert "F=200 meV/Å" in event.text
     assert "M=150 meV/μB" in event.text
     assert "meV/spin unit" not in event.text
     assert "温度：300/500 K" in event.text
     assert "最长时长：400 steps" in event.text
+
+
+def test_finalization_notification_does_not_claim_sampling_or_labeling():
+    event = _generation_event(
+        "Fe",
+        4,
+        {"generation": 3, "seed": 19, "max_selected": 100},
+        {
+            "kind": "finalization",
+            "stage_sequence": ["train", "evaluate"],
+            "complete": True,
+            "accepted": True,
+            "stages": {
+                "train": {"metrics": {"training_count": 120}},
+                "evaluate": {
+                    "metrics": {
+                        "prediction_metric_basis": "per_atom_v1",
+                        "accepted": True,
+                        "workflow_converged": True,
+                        "energy_rmse": 0.01,
+                        "force_rmse": 0.1,
+                        "active_model_sha256": "b" * 64,
+                    }
+                },
+            },
+        },
+    )
+
+    assert "最终训练完成" in event.text
+    assert "最终训练集：120 个结构" in event.text
+    assert "未运行 MD、FPS 或 DFT" in event.text
+    assert "采样：" not in event.text
+    assert "标注：" not in event.text
 
 
 def test_terminal_report_is_stable_per_attempt():

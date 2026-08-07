@@ -40,6 +40,8 @@ from .execution import (
     executor_for,
     load_stage_result,
 )
+from .generation_policy import LEGACY_GENERATION_PROTOCOL
+from .generation_policy import generation_disposition
 from .iteration import GenerationController, GenerationPlan, IterationError, StageOutcome
 
 
@@ -209,7 +211,13 @@ class PersistentController:
         self.plans = tuple(_plan(Path(item["path"])) for item in self.manifest["plans"])
         self.initial_training = Path(self.manifest["initial_training"]["path"])
         self.generation_controller = GenerationController(
-            self.workspace.root, self.workflow_id
+            self.workspace.root,
+            self.workflow_id,
+            generation_protocol=str(
+                self.manifest.get(
+                    "generation_protocol", LEGACY_GENERATION_PROTOCOL
+                )
+            ),
         )
         self.executor_factory = executor_factory
         (
@@ -288,8 +296,17 @@ class PersistentController:
 
     def _next(self) -> tuple[GenerationPlan, str, Any] | None:
         ledger = self._ledger()
+        sampling_budget = int(
+            self.manifest.get("sampling_generation_budget", len(self.plans))
+        )
         for plan in self.plans:
             record = ledger.get("generations", {}).get(str(plan.generation), {})
+            if plan.generation > sampling_budget and not record:
+                previous = ledger.get("generations", {}).get(
+                    str(plan.generation - 1), {}
+                )
+                if generation_disposition(previous) != "finalize":
+                    break
             if record.get("complete"):
                 if record.get("accepted") is False:
                     self.state["state"] = "rejected"
@@ -680,13 +697,52 @@ class PersistentController:
             self._save()
 
         if observed_items:
-            with ThreadPoolExecutor(
-                max_workers=min(
-                    _MAX_PARALLEL_OBSERVATIONS,
-                    len(observed_items),
+            observations = []
+            observed_by_target: dict[str, list[dict[str, Any]]] = {}
+            for item in observed_items:
+                observed_by_target.setdefault(str(item["target"]), []).append(
+                    item
                 )
-            ) as pool:
-                observations = list(pool.map(observe, observed_items))
+
+            def observe_target(target_items):
+                target = self.targets[str(target_items[0]["target"])]
+                executor = self.executor_factory(target)
+                inspect_many = getattr(executor, "inspect_many", None)
+                if callable(inspect_many):
+                    handles = [
+                        ExecutionHandle.from_mapping(item["handle"])
+                        for item in target_items
+                    ]
+                    statuses = inspect_many(handles)
+                    if len(statuses) != len(target_items):
+                        raise ControllerError(
+                            "batch executor returned the wrong number of "
+                            "inspection results"
+                        )
+                    return [
+                        (item, executor, handle, status)
+                        for item, handle, status in zip(
+                            target_items,
+                            handles,
+                            statuses,
+                            strict=True,
+                        )
+                    ]
+                with ThreadPoolExecutor(
+                    max_workers=min(
+                        _MAX_PARALLEL_OBSERVATIONS,
+                        len(target_items),
+                    )
+                ) as pool:
+                    return list(pool.map(observe, target_items))
+
+            target_groups = list(observed_by_target.values())
+            with ThreadPoolExecutor(max_workers=len(target_groups)) as pool:
+                for target_observations in pool.map(
+                    observe_target,
+                    target_groups,
+                ):
+                    observations.extend(target_observations)
 
             completed = [
                 observation
@@ -1571,7 +1627,7 @@ class PersistentController:
             ]
             if not rejected:
                 raise ControllerError("controller says rejected but ledger has no rejected generation")
-            self.generation_controller.reopen_rejected(rejected[0], from_stage="retrain")
+            self.generation_controller.reopen_rejected(rejected[0])
         current = self.state.get("current")
         if current is not None:
             if current.get("kind") == "task_group":
@@ -2235,20 +2291,22 @@ def stop_workflow(
             result["current_execution"] = {"action": "none"}
             return finish()
         if current.get("kind") == "task_group":
-            records = []
+            records_by_task: dict[str, dict[str, Any]] = {}
+            cancellable_by_target: dict[
+                str,
+                list[tuple[dict[str, Any], ExecutionHandle]],
+            ] = {}
             for item in current["tasks"]:
                 handle_value = item.get("handle")
                 if item.get("collected_bundle"):
-                    records.append(
-                        {
-                            "target": item["target"],
-                            "execution_id": (
-                                (handle_value or {}).get("execution_id")
-                            ),
-                            "action": "completed",
-                            "detail": "result was already collected and preserved",
-                        }
-                    )
+                    records_by_task[str(item["task_id"])] = {
+                        "target": item["target"],
+                        "execution_id": (
+                            (handle_value or {}).get("execution_id")
+                        ),
+                        "action": "completed",
+                        "detail": "result was already collected and preserved",
+                    }
                     continue
                 if handle_value is None:
                     record = {
@@ -2261,50 +2319,74 @@ def stop_workflow(
                     item["cancellation_requested_at"] = _now()
                     item["terminal_failure"] = True
                     item["failure"] = record["detail"]
-                    records.append(record)
+                    records_by_task[str(item["task_id"])] = record
                     continue
                 target_name = str(item["target"])
                 handle = ExecutionHandle.from_mapping(handle_value)
+                cancellable_by_target.setdefault(target_name, []).append(
+                    (item, handle)
+                )
+
+            for target_name, target_items in cancellable_by_target.items():
                 executor = controller.executor_factory(
                     controller.targets[target_name]
                 )
                 try:
-                    status = executor.cancel(handle)
+                    cancel_many = getattr(executor, "cancel_many", None)
+                    handles = tuple(handle for _, handle in target_items)
+                    statuses = (
+                        tuple(cancel_many(handles))
+                        if callable(cancel_many)
+                        else tuple(executor.cancel(handle) for handle in handles)
+                    )
                 except ExecutionError as error:
                     raise ControllerError(
-                        f"failed to cancel {target_name} execution "
-                        f"{handle.execution_id}: {error}"
+                        f"failed to cancel {target_name} task group: {error}"
                     ) from error
-                record = {
-                    "target": target_name,
-                    "executor": handle.executor,
-                    "execution_id": handle.execution_id,
-                    "action": status.state,
-                    "detail": status.detail,
-                }
-                item["cancellation"] = record
-                item["cancellation_requested_at"] = _now()
-                item["observed_state"] = status.state
-                item["observed_at"] = _now()
-                item["detail"] = status.detail
-                records.append(record)
-                if status.state not in {
-                    "cancelled",
-                    "failed",
-                    "completed",
-                    "cancelling",
-                }:
+                if len(statuses) != len(target_items):
                     raise ControllerError(
-                        f"{current['stage']} task cancellation returned unsafe state "
-                        f"{status.state}"
+                        "batch executor returned the wrong number of "
+                        "cancellation results"
                     )
-                if status.state in {"cancelled", "failed"}:
-                    item["terminal_failure"] = True
-                    item["failure"] = (
-                        status.detail or "execution cancelled by user"
-                    )
-                elif status.state == "completed":
-                    item.pop("cancellation_requested_at", None)
+                for (item, handle), status in zip(
+                    target_items,
+                    statuses,
+                    strict=True,
+                ):
+                    record = {
+                        "target": target_name,
+                        "executor": handle.executor,
+                        "execution_id": handle.execution_id,
+                        "action": status.state,
+                        "detail": status.detail,
+                    }
+                    item["cancellation"] = record
+                    item["cancellation_requested_at"] = _now()
+                    item["observed_state"] = status.state
+                    item["observed_at"] = _now()
+                    item["detail"] = status.detail
+                    records_by_task[str(item["task_id"])] = record
+                    if status.state not in {
+                        "cancelled",
+                        "failed",
+                        "completed",
+                        "cancelling",
+                    }:
+                        raise ControllerError(
+                            f"{current['stage']} task cancellation returned "
+                            f"unsafe state {status.state}"
+                        )
+                    if status.state in {"cancelled", "failed"}:
+                        item["terminal_failure"] = True
+                        item["failure"] = (
+                            status.detail or "execution cancelled by user"
+                        )
+                    elif status.state == "completed":
+                        item.pop("cancellation_requested_at", None)
+            records = [
+                records_by_task[str(item["task_id"])]
+                for item in current["tasks"]
+            ]
             current["cancellations"] = records
             current["stopped_at"] = _now()
             controller.state["state"] = "stopped"

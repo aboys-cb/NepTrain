@@ -29,6 +29,12 @@ from NepTrain.core.workflow import (
     start_workflow,
 )
 from NepTrain.core.workflow_workspace import WorkflowWorkspace
+from NepTrain.core.iteration import (
+    GenerationController,
+    GenerationPlan,
+    StageOutcome,
+)
+from NepTrain.core.generation_policy import ADAPTIVE_GENERATION_PROTOCOL
 
 
 def _write(path: Path, text: str = "fixture\n") -> Path:
@@ -185,6 +191,127 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     plans = [json.loads(path.read_text()) for path in result.plans]
     assert [plan["max_selected"] for plan in plans] == [100, 100, 100]
     assert all("temperatures" not in plan and "steps" not in plan for plan in plans)
+
+
+def test_convergence_workflow_reserves_one_train_only_finalization_plan(tmp_path):
+    config, initial = _inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  seed: 17\n",
+            (
+                "  seed: 17\n"
+                "  convergence:\n"
+                "    acquisition_min_r2:\n"
+                "      energy_r2: 0.95\n"
+                "      force_r2: 0.95\n"
+                "    group_min_force_r2: 0.90\n"
+                "    max_outlier_fraction: 0.05\n"
+                "    min_selected: 50\n"
+                "    consecutive_generations: 1\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    result = prepare_workflow(config, initial, tmp_path / "adaptive")
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+
+    assert manifest["generation_protocol"] == "adaptive_v2"
+    assert manifest["sampling_generation_budget"] == 3
+    assert len(result.plans) == 4
+
+
+def test_status_accepts_finalization_before_unused_sampling_plans(tmp_path):
+    config, initial = _inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  seed: 17\n",
+            (
+                "  seed: 17\n"
+                "  convergence:\n"
+                "    acquisition_min_r2: {energy_r2: 0.95, force_r2: 0.95}\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "adaptive-status")
+
+    class Adapter:
+        def run_stage(self, stage, context):
+            path = context.work_dir / f"{stage}.txt"
+            path.write_text(stage + "\n", encoding="utf-8")
+            artifacts = {f"g{context.generation}_{stage}": path}
+            metrics = {}
+            if stage == "train":
+                data = context.work_dir / "model-train.xyz"
+                data.write_text(f"train-{context.generation}\n", encoding="utf-8")
+                artifacts["model_training_set"] = data
+            elif stage == "evaluate":
+                artifacts["activated_model"] = path
+                if context.generation_kind == "finalization":
+                    artifacts["training_set"] = context.artifacts[
+                        "model_training_set"
+                    ]
+                    signals = context.work_dir / "signals.json"
+                    signals.write_text("{}\n", encoding="utf-8")
+                    artifacts["signals"] = signals
+                    metrics = {"accepted": True, "workflow_converged": True}
+            elif stage == "merge":
+                data = context.work_dir / "merged.xyz"
+                data.write_text("merged\n", encoding="utf-8")
+                signals = context.work_dir / "signals.json"
+                signals.write_text("{}\n", encoding="utf-8")
+                artifacts.update(training_set=data, signals=signals)
+                metrics = {
+                    "accepted": True,
+                    "workflow_converged": False,
+                    "generation_disposition": "finalize",
+                }
+            return StageOutcome(artifacts, metrics)
+
+    plans = [
+        GenerationPlan(**json.loads(path.read_text(encoding="utf-8")))
+        for path in preparation.plans
+    ]
+    controller = GenerationController(
+        preparation.output_dir,
+        preparation.workflow_id,
+        generation_protocol=ADAPTIVE_GENERATION_PROTOCOL,
+    )
+    controller.run_generation(plans[0], Adapter())
+    controller.run_generation(plans[1], Adapter())
+
+    status = workflow_status(preparation.output_dir)
+
+    assert status.state == "complete"
+    assert status.completed_generations == 2
+    assert status.total_generations == 4
+    assert status.generations[1]["kind"] == "finalization"
+    assert status.generations[2]["state"] == "not_started"
+
+
+def test_extending_adaptive_budget_preserves_the_reserved_plan(tmp_path):
+    config, initial = _inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  seed: 17\n",
+            (
+                "  seed: 17\n"
+                "  convergence:\n"
+                "    acquisition_min_r2: {energy_r2: 0.95, force_r2: 0.95}\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "adaptive-extend")
+    original = [path.read_bytes() for path in preparation.plans]
+
+    extended = extend_workflow(preparation, 5)
+    manifest = json.loads(extended.manifest.read_text(encoding="utf-8"))
+
+    assert len(extended.plans) == 6
+    assert [path.read_bytes() for path in extended.plans[:4]] == original
+    assert manifest["sampling_generation_budget"] == 5
 
 
 def test_prepare_only_cli_does_not_start_controller(tmp_path: Path, capsys):
@@ -462,6 +589,38 @@ def test_status_precision_table_shows_generation_deltas(capsys):
     assert "160 ↓20%" in output
 
 
+def test_status_shows_pretraining_acquisition_error_for_convergence(capsys):
+    status = SimpleNamespace(
+        precision_basis="acquisition",
+        generations=(
+            {
+                "generation": 3,
+                "state": "accepted",
+                "quality": {
+                    "acquisition_accepted": True,
+                    "acquisition_rmse": {
+                        "energy_rmse": 0.0025,
+                        "force_rmse": 0.08,
+                        "virial_rmse": 0.025,
+                        "mforce_rmse": None,
+                    },
+                },
+            },
+        ),
+        generation=3,
+        stage=None,
+    )
+
+    _print_precision(status)
+
+    output = capsys.readouterr().out
+    assert "新增 DFT 预测精度（训练前）：" in output
+    assert "2.5" in output
+    assert "80" in output
+    assert "25" in output
+    assert "通过" in output
+
+
 def test_status_does_not_present_training_error_as_validation(capsys):
     status = SimpleNamespace(
         precision_basis=None,
@@ -543,6 +702,52 @@ def test_generation_status_reports_activation_result_not_retrain_candidate():
     assert summary["training"]["after_count"] == 97
     assert summary["training"]["active_model_sha256"] == "parent-model"
     assert summary["training"]["model_updated"] is False
+
+
+def test_generation_status_does_not_relabel_legacy_metrics_as_per_atom():
+    plan = {
+        "generation": 1,
+        "max_selected": 1,
+        "selection_novelty_threshold": 0.0,
+        "completion_coverage_threshold": 0.0,
+    }
+    legacy = _generation_science(
+        plan,
+        {
+            "stages": {
+                "diagnose": {
+                    "metrics": {
+                        "current_model_energy_rmse": 0.1,
+                        "current_model_force_rmse": 0.2,
+                        "current_model_virial_rmse": 3.0,
+                    }
+                }
+            }
+        },
+    )
+    current = _generation_science(
+        plan,
+        {
+            "stages": {
+                "diagnose": {
+                    "metrics": {
+                        "prediction_metric_basis": "per_atom_v1",
+                        "current_model_energy_rmse": 0.004,
+                        "current_model_force_rmse": 0.08,
+                        "current_model_virial_rmse": 0.02,
+                    }
+                }
+            }
+        },
+    )
+
+    assert legacy["quality"]["acquisition_rmse"] == {
+        "energy_rmse": None,
+        "force_rmse": None,
+        "virial_rmse": None,
+        "mforce_rmse": None,
+    }
+    assert current["quality"]["acquisition_rmse"]["energy_rmse"] == 0.004
 
 
 def test_completed_workflow_extends_plans(tmp_path: Path):

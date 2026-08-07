@@ -13,6 +13,7 @@ from NepTrain.core.iteration import (
     IterationError,
     StageOutcome,
 )
+from NepTrain.core.generation_policy import ADAPTIVE_GENERATION_PROTOCOL
 
 
 class _PublishingAdapter:
@@ -67,6 +68,51 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
     assert "最新验收代：1" in (workspace.results_dir / "summary.md").read_text()
     accepted = (workspace.results_dir / "current").resolve()
     assert accepted.stat().st_mode & 0o070 == 0o070
+
+
+def test_acquisition_publication_pairs_model_with_its_actual_training_set(
+    tmp_path: Path,
+):
+    workspace = WorkflowWorkspace.create(tmp_path / "adaptive-publication")
+
+    class Adapter:
+        def run_stage(self, stage, context):
+            path = context.work_dir / f"{stage}.txt"
+            path.write_text(stage + "\n", encoding="utf-8")
+            artifacts = {f"{stage}_evidence": path}
+            metrics = {}
+            if stage == "train":
+                base = context.work_dir / "base.xyz"
+                base.write_text("base dataset\n", encoding="utf-8")
+                artifacts["model_training_set"] = base
+            elif stage == "evaluate":
+                artifacts["activated_model"] = path
+            elif stage == "merge":
+                merged = context.work_dir / "merged.xyz"
+                merged.write_text("base plus new labels\n", encoding="utf-8")
+                signals = context.work_dir / "signals.json"
+                signals.write_text("{}\n", encoding="utf-8")
+                artifacts.update(training_set=merged, signals=signals)
+                metrics = {
+                    "accepted": True,
+                    "generation_disposition": "continue",
+                    "workflow_converged": False,
+                }
+            return StageOutcome(artifacts, metrics)
+
+    GenerationController(
+        workspace.root,
+        "adaptive-publication",
+        generation_protocol=ADAPTIVE_GENERATION_PROTOCOL,
+    ).run_generation(GenerationPlan(1, 7, 2), Adapter())
+
+    assert (workspace.results_dir / "train.xyz").read_text() == "base dataset\n"
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    merged = Path(
+        ledger["generations"]["1"]["stages"]["merge"]["artifacts"]
+        ["training_set"]["path"]
+    )
+    assert merged.read_text() == "base plus new labels\n"
 
 
 def test_result_publication_failure_does_not_accept_generation(tmp_path: Path):

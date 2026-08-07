@@ -16,6 +16,11 @@ from typing import Any, Mapping
 import uuid
 
 from .content_addressing import canonical_sha256, file_sha256
+from .generation_policy import (
+    ADAPTIVE_GENERATION_PROTOCOL,
+    LEGACY_GENERATION_PROTOCOL,
+)
+from .generation_policy import generation_stage_sequence
 from .persistence import atomic_write_json
 from .workflow_workspace import WorkflowWorkspace
 from .sampling_route import load_sampling_routes
@@ -147,6 +152,18 @@ def _normalise_manifest(
         raise WorkflowError(
             f"workflow manifest is incomplete or malformed: {manifest_path}"
         )
+    generation_protocol = str(
+        value.get("generation_protocol", LEGACY_GENERATION_PROTOCOL)
+    )
+    if generation_protocol not in {
+        LEGACY_GENERATION_PROTOCOL,
+        ADAPTIVE_GENERATION_PROTOCOL,
+    }:
+        raise WorkflowError(
+            f"workflow manifest has unsupported generation protocol: "
+            f"{generation_protocol}"
+        )
+    value["generation_protocol"] = generation_protocol
     value["instance_id"] = _manifest_instance_id(value, manifest_path)
     return value
 
@@ -251,8 +268,9 @@ def _plans(
     else:
         selection_threshold = float(novelty["selection_threshold"])
         completion_threshold = float(novelty["completion_threshold"])
+    sampling_generations = int(settings.get("max_model_generations", 1))
     plans = progressive_plans(
-        int(settings.get("max_model_generations", 1)),
+        sampling_generations + (1 if settings.get("convergence") else 0),
         seed=int(settings.get("seed", 20260721)),
         max_selected=int(selection.get("max_selected", 100)),
         selection_novelty_threshold=selection_threshold,
@@ -595,6 +613,11 @@ def prepare_workflow(
         sampling_frames=sampling_frames,
     )
     settings = config.get("workflow", {})
+    generation_protocol = (
+        ADAPTIVE_GENERATION_PROTOCOL
+        if settings.get("convergence")
+        else LEGACY_GENERATION_PROTOCOL
+    )
     selected_id = workflow_id or str(settings.get("id", output.name))
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", selected_id):
         raise WorkflowError(
@@ -606,6 +629,7 @@ def prepare_workflow(
     source_dependencies = _dependencies(config)
     spec = {
         "workflow_id": selected_id,
+        "generation_protocol": generation_protocol,
         "structure_id_version": STRUCTURE_ID_VERSION,
         "config": config,
         "initial_training": str(initial),
@@ -682,6 +706,10 @@ def prepare_workflow(
         "layout_version": workspace.version,
         "structure_id_version": STRUCTURE_ID_VERSION,
         "orchestration": "controller",
+        "generation_protocol": generation_protocol,
+        "sampling_generation_budget": int(
+            settings.get("max_model_generations", 1)
+        ),
         "workflow_id": selected_id,
         "instance_id": uuid.uuid4().hex,
         "spec_sha256": spec_sha256,
@@ -717,7 +745,9 @@ def extend_workflow(
                 "workflow can only be extended from a valid prepared, "
                 "complete, or incomplete generation prefix"
             )
-        current_total = len(preparation.plans)
+        current_total = int(
+            manifest.get("sampling_generation_budget", len(preparation.plans))
+        )
         if total_generations <= current_total:
             raise WorkflowError(
                 f"extension target must exceed current total {current_total}"
@@ -736,12 +766,13 @@ def extend_workflow(
             _read_json(path, role="generation plan")
             for path in preparation.plans
         ]
+        existing_count = len(preparation.plans)
         if [
-            canonical_sha256(asdict(plan)) for plan in all_plans[:current_total]
+            canonical_sha256(asdict(plan)) for plan in all_plans[:existing_count]
         ] != [canonical_sha256(value) for value in existing_values]:
             raise WorkflowError("workflow extension changed an existing generation plan")
 
-        new_plans = all_plans[current_total:]
+        new_plans = all_plans[existing_count:]
         new_plan_paths: list[Path] = []
         workspace = WorkflowWorkspace.locate(preparation.output_dir)
         for plan in new_plans:
@@ -752,6 +783,7 @@ def extend_workflow(
         manifest["plans"].extend(
             {"path": str(path), "sha256": file_sha256(path)} for path in new_plan_paths
         )
+        manifest["sampling_generation_budget"] = int(total_generations)
         extension = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "from_generations": current_total,
@@ -891,7 +923,11 @@ def _workflow_progress(
         stages = record.get("stages", {})
         completed = []
         missing_seen = False
-        for stage in _STAGES:
+        try:
+            sequence = generation_stage_sequence(record)
+        except ValueError as error:
+            raise WorkflowError(str(error)) from error
+        for stage in sequence:
             if stage not in stages:
                 missing_seen = True
             elif missing_seen:
@@ -939,12 +975,12 @@ def _workflow_progress(
                             stage,
                             f"committed artifact drifted or is missing: {path}",
                         )
-        if len(completed) < len(_STAGES):
+        if len(completed) < len(sequence):
             if record.get("complete"):
                 raise WorkflowError(
                     "generation is marked complete before all stages finished"
                 )
-            stage = _STAGES[len(completed)]
+            stage = sequence[len(completed)]
             issue = projection_damage()
             if issue is not None:
                 return issue
@@ -983,6 +1019,19 @@ def _workflow_progress(
             if issues:
                 return damaged(generation, None, "; ".join(issues))
         latest_accepted = (generation, record)
+        final_stage = generation_stage_sequence(record)[-1]
+        final_metrics = stages.get(final_stage, {}).get("metrics", {})
+        if final_metrics.get("workflow_converged") is True:
+            issue = projection_damage()
+            if issue is not None:
+                return issue
+            return _WorkflowProgress(
+                "complete",
+                generation,
+                None,
+                None,
+                f"workflow finalized in model generation {generation}",
+            )
     issue = projection_damage()
     if issue is not None:
         return issue
@@ -1031,18 +1080,41 @@ def _generation_science(
     else:
         state = "in_progress"
 
+    metric_names = (
+        "energy_rmse",
+        "force_rmse",
+        "virial_rmse",
+        "mforce_rmse",
+    )
+    acquisition_basis = diagnose.get("prediction_metric_basis")
+    validation_basis = evaluate.get("prediction_metric_basis")
     acquisition_rmse = {
-        name: diagnose.get(f"current_model_{name}")
-        for name in ("energy_rmse", "force_rmse", "virial_rmse", "mforce_rmse")
+        name: (
+            diagnose.get(f"current_model_{name}")
+            if acquisition_basis == "per_atom_v1"
+            else None
+        )
+        for name in metric_names
     }
     validation_rmse = {
-        name: evaluate.get(name)
-        for name in ("energy_rmse", "force_rmse", "virial_rmse", "mforce_rmse")
+        name: (
+            evaluate.get(name)
+            if validation_basis == "per_atom_v1"
+            else None
+        )
+        for name in metric_names
     }
+    decision = merge if (record or {}).get("kind") == "acquisition" else evaluate
+    acquisition_r2 = {
+        name: diagnose.get(f"current_model_{name}")
+        for name in ("energy_r2", "force_r2", "virial_r2", "mforce_r2")
+    }
+    sequence = _STAGES if record is None else generation_stage_sequence(record)
     return {
         "generation": int(plan["generation"]),
+        "kind": None if record is None else record.get("kind", "legacy"),
         "state": state,
-        "completed_stages": tuple(stage for stage in _STAGES if stage in stages),
+        "completed_stages": tuple(stage for stage in sequence if stage in stages),
         "plan": {
             "max_selected": int(plan["max_selected"]),
             "selection_novelty_threshold": float(
@@ -1079,7 +1151,9 @@ def _generation_science(
         "training": {
             "before_count": train.get("training_count"),
             "merged_count": merge.get("training_count"),
-            "after_count": retrain.get("training_count"),
+            "after_count": retrain.get(
+                "training_count", train.get("training_count")
+            ),
             "added_count": evaluate.get("added_training_count", merge.get("added_count")),
             "model_updated": evaluate.get(
                 "model_updated", retrain.get("model_updated")
@@ -1088,7 +1162,20 @@ def _generation_science(
         },
         "quality": {
             "acquisition_rmse": acquisition_rmse,
+            "acquisition_r2": acquisition_r2,
             "validation_rmse": validation_rmse,
+            "acquisition_metric_basis": acquisition_basis,
+            "validation_metric_basis": validation_basis,
+            "acquisition_accepted": decision.get("acquisition_accepted"),
+            "acquisition_convergence_streak": decision.get(
+                "acquisition_convergence_streak"
+            ),
+            "acquisition_convergence_required": decision.get(
+                "acquisition_convergence_required"
+            ),
+            "generation_disposition": decision.get(
+                "generation_disposition"
+            ),
             "accepted": evaluate.get("accepted"),
             "validation_count": evaluate.get("evaluated_count"),
             "spin_validation_count": evaluate.get("spin_frame_count"),
@@ -1106,7 +1193,7 @@ def _generation_science(
                 ).items()
             },
             "counts_by_maturity": dict(
-                evaluate.get("scenario_counts_by_maturity", {})
+                decision.get("scenario_counts_by_maturity", {})
             ),
         },
     }
@@ -1594,7 +1681,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         )
         next_action = (
             f"neptrain workflow extend {workflow_path} "
-            f"{len(preparation.plans) + 1}"
+            f"{int(manifest.get('sampling_generation_budget', len(preparation.plans))) + 1}"
         )
     elif controller_state == "stalled":
         state = "stalled"
@@ -1714,7 +1801,11 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         precision_basis=(
             "validation"
             if config.get("evaluation", {}).get("validation_path")
-            else None
+            else (
+                "acquisition"
+                if config.get("workflow", {}).get("convergence")
+                else None
+            )
         ),
     )
 

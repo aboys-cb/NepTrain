@@ -203,17 +203,59 @@ sampling:
 候选结构、完整 `train.xyz`、自动 novelty 阈值与 FPS 使用同一种规约。切换规约后，
 旧规约下的绝对 novelty 阈值不能直接复用；`novelty: auto` 会重新按当前训练集估计。
 
-当所有温度和时长都已覆盖时，配置了独立验证且指标通过的 workflow 才会进入
-`complete`。没有独立验证的流程会停在 `coverage_exhausted`：它表示当前描述符和
-采样路径已找不到覆盖缺口，不等价于模型已经通过独立精度验证。
+novelty 只回答“这个结构在描述符空间里是否值得送 DFT”，不能单独证明势函数精度
+已经收敛。需要自动停止时，可让 workflow 检查旧模型在本轮新 DFT 标签上的真实
+误差；这些结构尚未参与本轮重训，因此可作为在线 acquisition canary：
 
-这里的“一代”严格绑定一个模型哈希。Controller 会枚举该模型下所有已解锁
+```yaml
+workflow:
+  max_model_generations: 24
+  convergence:
+    acquisition_min_r2:
+      energy_r2: 0.95
+      force_r2: 0.95
+      virial_r2: 0.90
+    group_min_force_r2: 0.90
+    min_selected: 50
+    max_outlier_fraction: 0.05
+    acquisition_max_rmse:
+      energy_rmse: 0.01    # 可选的绝对误差安全上限，eV/atom
+      force_rmse: 0.15     # eV/Å
+      virial_rmse: 0.10    # eV/atom
+    consecutive_generations: 1
+```
+
+这套判据只使用“本轮 FPS 选出的最远结构、DFT 标注之后、并入训练集之前”的旧模型
+预测，避免拿训练过同一批结构的模型证明自己收敛。默认要求至少 50 个有效标签；整批
+Energy/Force/Virial 的 R²、每个元素的 Force R²、每个实际温压条件的 Force R² 都要
+过线，同时三倍参考标准差之外的残差比例不能超过 `max_outlier_fraction`。对常量切片，
+完全一致记为 R²=1，否则记为 0，避免未定义值被误判为通过。`acquisition_max_rmse`
+是可选的绝对误差安全上限，适合与 R² 联用，防止高方差数据仅靠相关性过关。
+
+这批结构本身已经是相对训练集的 FPS 最远点，因此默认一代通过即可；确实担心 DFT
+样本波动时才把 `consecutive_generations` 调大。workflow 还要求所有生产温压条件已到
+`production_ready`，因此低温的一次好结果不会提前终止高温探索。这里没有适用于所有
+体系的固定阈值：上例是通用起点，声子、弹性或高精度热力学任务仍应使用面向目标性质
+的独立验证集。能量和 virial 的 RMSE 单位为 `eV/atom`，力为 `eV/Å`。
+
+未配置 `workflow.convergence` 且没有独立验证的流程仍会停在
+`coverage_exhausted`：它只表示当前描述符和采样路径已找不到覆盖缺口，不等价于
+模型已经通过物理精度验证。
+
+这里的“一代”严格绑定一个模型哈希。采样代按
+`train → evaluate → explore → select → label → diagnose → merge` 推进：先用上一代
+合并后的完整训练集得到新模型，再让这个模型驱动本代 MD。Controller 会枚举该模型下所有已解锁
 scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交；全部进入终态后
 再合并候选并执行 FPS。不同 route 可通过 `execution.sampling_route_targets`
 送到不同平台。所有候选必须由同一个模型产生；候选池 manifest 和每个 extxyz 帧都会记录
-`sampling_model_sha256`。诊断超过阈值或 MD 发生物理失败时才更新模型；新模型
-完成 evaluate 并写入 lineage 后，下一轮 MD 才能开始。旧模型轨迹不能混入新模型
-候选池。
+`sampling_model_sha256`。旧模型轨迹不能混入新模型候选池。
+
+采样判据通过后，本代仍会先合并最后一批 DFT 标签，但不会把已看过这些标签的模型
+用于收敛判断。Controller 随后创建一个 `finalization` 代，只执行
+`train → evaluate`：在最终完整训练集上训练并验收最终模型，不再运行 MD、FPS 或 DFT。
+`complete` 只由这个终代产生。为保证最后一个采样代也能自动完成，准备 workflow 时会
+在 `max_model_generations` 个采样预算之外预留一个终代；若采样预算用尽仍未通过，预留
+代不会被误用作普通采样。
 
 route 指纹由 route id、模板内容哈希、结构输入内容哈希、规范化 conditions 和
 progression 共同生成。场景身份还包含具体结构哈希、温度、压强和采样模型哈希。
@@ -388,15 +430,16 @@ NepTrain · Fe-spin
 300 K ✓ → 500 K ● 3.2/10 ps（2/4 条轨迹完成）→ 700 K ○
 
 验证集精度：
-代    状态    E/eV          F/meV·Å⁻¹    V/eV          M/meV/μB    验收
-G1    完成    0.0180        210           0.0410        168          通过
-G2    完成    0.0142 ↓21%   176 ↓16%      0.0350 ↓15%  149 ↓11%     通过
+代    状态    E/meV·atom⁻¹  F/meV·Å⁻¹    V/meV·atom⁻¹  M/meV/μB    验收
+G1    完成    18.0           210           41.0           168          通过
+G2    完成    14.2 ↓21%      176 ↓16%      35.0 ↓15%      149 ↓11%     通过
 G3    采样中  -             -             -             -            等待
 ```
 
 ps 进度来自 MD 已写出的实际 step 和模板中的有效 timestep，不使用墙钟时间估算；
 远端文件暂时不可见时会明确显示“ps 暂不可读”。未配置独立验证集时，状态页不把
-训练误差冒充为泛化精度，而是显示“暂无可比较数据”。
+训练误差冒充为泛化精度；若配置了 `workflow.convergence`，这里改为显示旧模型对
+本轮新增 DFT 标签的训练前误差，否则显示“暂无可比较数据”。
 
 `--jobs` 按“代次 + 阶段 + attempt”压缩同一批任务。即使同时运行 20 个 MD 或
 100 个 DFT 标注任务，也只显示每批的完成、运行、等待和失败计数；逐任务结构仍
@@ -431,9 +474,9 @@ workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 
   workflow，不能原样 retry。
 - `complete`：完整 stage 链和（若配置）独立 validation 已验收。
 
-`workflow.max_model_generations` 是最大模型代数预算，不是成功条件。配置 `evaluation`
-时，所有生产温度、最长时长、replica、轨迹标签诊断和独立 validation 同时通过
-后才会提前结束。预算用尽但仍未收敛时状态为 `budget_exhausted`，连续两轮没有
+`workflow.max_model_generations` 是采样代预算，不包含自动预留的最终训练代，也不是
+成功条件。配置 `evaluation` 时，最终训练代还必须通过独立 validation 才能完成。
+预算用尽但仍未收敛时状态为 `budget_exhausted`，连续两轮没有
 新覆盖或模型改进时状态为 `stalled`，都不会伪装成 `complete`。
 
 `evaluation` 可以整块省略。此时 workflow 仍可采样、标注、重训和记录场景证据，

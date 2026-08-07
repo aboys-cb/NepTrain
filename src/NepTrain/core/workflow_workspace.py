@@ -334,9 +334,9 @@ class WorkflowWorkspace:
             lines.extend(
                 [
                     f"- 最新验收代：{generation}",
-                    f"- Energy RMSE：{evaluation.get('energy_rmse', 'n/a')}",
-                    f"- Force RMSE：{evaluation.get('force_rmse', 'n/a')}",
-                    f"- Virial RMSE：{evaluation.get('virial_rmse', 'n/a')}",
+                    f"- Energy RMSE (eV/atom)：{evaluation.get('energy_rmse', 'n/a')}",
+                    f"- Force RMSE (eV/Å)：{evaluation.get('force_rmse', 'n/a')}",
+                    f"- Virial RMSE (eV/atom)：{evaluation.get('virial_rmse', 'n/a')}",
                 ]
             )
         lines.extend(
@@ -366,9 +366,14 @@ class WorkflowWorkspace:
             for stage in stages.values()
             for name, record in stage.get("artifacts", {}).items()
         }
+        training_artifact = (
+            "model_training_set"
+            if generation_record.get("kind") == "acquisition"
+            else "training_set"
+        )
         required = {
             "activated_model": "nep.txt",
-            "training_set": "train.xyz",
+            training_artifact: "train.xyz",
             "signals": "metrics.json",
         }
         missing = [name for name in required if name not in artifacts]
