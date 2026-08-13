@@ -517,8 +517,13 @@ class WorkflowIterationAdapter:
         self.config = dict(config)
         self.base_dir = Path(base_dir).expanduser().resolve()
         self.runtime = runtime or WorkflowRuntime()
-        requires_routes = active_stage is None or active_stage == "explore" or (
-            active_stage == "evaluate" and active_generation_kind == "legacy"
+        requires_routes = (
+            active_stage is None
+            or active_stage in {"explore", "merge"}
+            or (
+                active_stage == "evaluate"
+                and active_generation_kind == "legacy"
+            )
         )
         if requires_routes:
             try:
@@ -671,12 +676,17 @@ class WorkflowIterationAdapter:
         options = self.config.get("training", {})
         backend = str(options.get("backend", "gpumd"))
         config_file = self._path(options.get("config_path"))
+        warm_start_enabled = bool(options.get("restart", True))
         output_dir = (
             context.work_dir
             if context.flat_output
             else context.work_dir / role
         )
-        if backend == "torchnep" and warm_start is not None:
+        if (
+            backend == "torchnep"
+            and warm_start is not None
+            and warm_start_enabled
+        ):
             config_file = self._torchnep_finetune_config(
                 config_file, output_dir, options
             )
@@ -688,10 +698,10 @@ class WorkflowIterationAdapter:
             if backend != "torchnep" and options.get("test_path")
             else None,
             restart_file=warm_start
-            if backend == "gpumd" and options.get("restart", True)
+            if backend == "gpumd" and warm_start_enabled
             else None,
             finetune_file=warm_start
-            if backend == "torchnep" and options.get("restart", True)
+            if backend == "torchnep" and warm_start_enabled
             else None,
             continue_steps=int(options.get("restart_steps", 10_000)),
             device=str(options.get("device", "cuda")),

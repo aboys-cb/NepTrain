@@ -1238,6 +1238,60 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert all(request.test_file is None for request in training_requests)
 
 
+def test_torchnep_restart_false_keeps_full_training_config(tmp_path: Path):
+    training_input = tmp_path / "train.xyz"
+    ase_write(
+        training_input,
+        Atoms("Fe", positions=[[0, 0, 0]], cell=[3, 3, 3], pbc=True),
+        format="extxyz",
+    )
+    config_file = tmp_path / "nep.in"
+    config_file.write_text("type 1 Fe\nlr 0.01\n", encoding="utf-8")
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    requests = []
+
+    def fake_train(request, backend):
+        requests.append(request)
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model = request.output_dir / "nep.txt"
+        model.write_text("nep4 1 Fe\n", encoding="utf-8")
+        return TrainingResult(backend, model, None, None)
+
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {
+                "backend": "torchnep",
+                "config_path": str(config_file),
+                "restart": False,
+            }
+        },
+        initial_training=training_input,
+        runtime=WorkflowRuntime(train=fake_train),
+        active_stage="retrain",
+    )
+    stage_dir = tmp_path / "retrain"
+    _, frame_count, selected_config = adapter._execute_training(
+        StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation",
+            plan=GenerationPlan(1, 7, 1),
+            artifacts={},
+            previous_artifacts={},
+            stage_dir=stage_dir,
+        ),
+        training_input=training_input,
+        role="retraining",
+        warm_start=checkpoint,
+    )
+
+    assert frame_count == 1
+    assert selected_config == config_file
+    assert requests[0].config_file == config_file
+    assert requests[0].finetune_file is None
+    assert not (stage_dir / "retraining" / "torchnep-finetune.in").exists()
+
+
 def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     tmp_path: Path,
 ):

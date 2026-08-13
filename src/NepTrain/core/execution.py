@@ -576,7 +576,7 @@ def build_stage_task(
 
     requested_route_id = str(resolved_stage_input.get("route_id", ""))
     needs_routes = bool(
-        stage == "explore"
+        stage in {"explore", "merge"}
         or (
             stage == "evaluate"
             and resolved_stage_input.get("generation_kind", "legacy") == "legacy"

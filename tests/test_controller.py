@@ -248,6 +248,106 @@ def test_portable_stage_worker_verifies_and_collects_results(tmp_path, monkeypat
     assert not (task.bundle / "result").exists()
 
 
+def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
+    initial = _write(tmp_path / "initial.xyz")
+    structure = _write(tmp_path / "structure.xyz")
+    template = _write(tmp_path / "lammps.in", "run {{ steps }}\n")
+    artifacts = {
+        name: _write(tmp_path / "artifacts" / f"{name}.json")
+        for name in (
+            "model_evaluation",
+            "acquisition_signals",
+            "selection_result",
+            "scenario_plan",
+            "md_attempts",
+        )
+    }
+    artifacts.update(
+        {
+            "training_input": _write(tmp_path / "base-train.xyz"),
+            "labeled": _write(tmp_path / "labels.xyz"),
+            "model": _write(tmp_path / "nep.txt"),
+        }
+    )
+    config = {
+        "training": {},
+        "sampling": {
+            "routes": [
+                {
+                    "id": "default",
+                    "structures": [str(structure)],
+                    "template_path": str(template),
+                    "conditions": {
+                        "temperature_path": [1000, 1600],
+                        "production_temperatures": [1600],
+                        "pressure": 0.0,
+                    },
+                    "progression": {
+                        "steps": {
+                            "smoke_passed": 5,
+                            "short_stable": 10,
+                            "long_stable": 20,
+                            "production_ready": 40,
+                        },
+                        "replicas": {
+                            "smoke_passed": 1,
+                            "short_stable": 1,
+                            "long_stable": 1,
+                            "production_ready": 1,
+                        },
+                    },
+                }
+            ]
+        },
+        "md": {"spin": False},
+        "labeling": {},
+        "workflow": {},
+        "execution": {},
+    }
+    task = build_stage_task(
+        tmp_path / "tasks",
+        workflow_root=tmp_path,
+        workflow_id="adaptive-merge",
+        generation=1,
+        stage="merge",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation",
+            plan=_plan(),
+            artifacts=artifacts,
+            previous_artifacts={},
+            generation_kind="acquisition",
+        ),
+        stage_input={
+            "generation_kind": "acquisition",
+            "generation_protocol": "adaptive_v2",
+        },
+    )
+
+    descriptor = json.loads(task.descriptor.read_text())
+    expected = descriptor["identity"]["sampling_routes"]
+    assert [item["route_id"] for item in expected] == ["default"]
+    adapter = workflow_iteration_module.WorkflowIterationAdapter(
+        descriptor["config"],
+        initial_training=None,
+        base_dir=task.bundle,
+        active_stage="merge",
+        active_generation_kind="acquisition",
+    )
+    assert [
+        {
+            "route_id": route.route_id,
+            "route_fingerprint": route.fingerprint,
+        }
+        for route in adapter.routes
+    ] == expected
+
+
 def test_stage_task_identity_covers_bundle_content_and_workflow_instance(tmp_path):
     initial = _write(tmp_path / "initial.xyz")
     model = _write(tmp_path / "model.txt", "model-one\n")
