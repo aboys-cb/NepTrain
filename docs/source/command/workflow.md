@@ -146,6 +146,16 @@ NepTrain 只向 LAMMPS 模板注入 `temperature`、`pressure`、`steps`、`seed
 `plugin_path`，也不判断模板是 FIRE、NVT/NPT、spin MD、MC+MD 还是 chemical
 swap。物理过程、阻尼、积分器和 spin 参数都由模板决定。
 
+LAMMPS 运行期间，NepTrain 会按 `sampling.candidate_pool.health` 中的体积比和
+最大原子力阈值生成官方 `fix halt` 检查；检查间隔不超过 100 步，也不会大于
+当前 dump 间隔。触发后 LAMMPS 使用 soft halt 保留已经写出的完整帧，NepTrain
+会读取 halt 的 fix ID 和停止步数，将结果记为 `trajectory_halt`，而不是因为进程
+退出码为 0 就误判为完成。只有一个 `run {{ steps }}` 的既有自定义模板会自动插入
+检查；包含多个主 `run` 的模板应在合适位置显式写一行 `{{ halt_commands }}`。
+元素相关最小距离、mforce 和 spin 幅值仍由统一的轨迹健康检查在回收后判断，避免在
+LAMMPS 输入中复制一套不等价的物理算法。把相应 health 阈值设为 `null` 可以关闭
+该项检查。
+
 选择 `md.backend: gpumd` 时，route 的 `template_path` 指向 GPUMD `run.in`。
 NepTrain 支持模板中的 `nve`，并保留模板选择的 `nvt_*`/`npt_*` 方法、耦合
 常数、`time_step` 和 dump 间隔，更新本轮模型、初始温度、步数与确定性

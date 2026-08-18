@@ -27,10 +27,114 @@ _COMPUTE_PROPERTY = re.compile(
     r"^\s*compute\s+(\S+)\s+\S+\s+property/atom\s+(.+?)\s*$",
     re.MULTILINE,
 )
+_FIX_HALT = re.compile(
+    r"Fix halt condition for fix-id (?P<fix_id>\S+) met on step "
+    r"(?P<step>\d+) with value (?P<value>\S+)"
+)
+_MAIN_RUN = re.compile(
+    r"^(?P<indent>[ \t]*)run[ \t]+{{\s*steps\s*}}[ \t]*$",
+    re.MULTILINE,
+)
+_HALT_REASONS = {
+    "neptrain_halt_volume_low": "volume_ratio_below_min",
+    "neptrain_halt_volume_high": "volume_ratio_above_max",
+    "neptrain_halt_force": "max_force_above_limit",
+}
 
 
 class LammpsError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _HaltEvent:
+    fix_id: str
+    step: int
+    value: str
+
+    @property
+    def reason_code(self) -> str:
+        return _HALT_REASONS.get(self.fix_id, "lammps_fix_halt")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "fix_id": self.fix_id,
+            "step": self.step,
+            "value": self.value,
+            "reason_code": self.reason_code,
+        }
+
+
+def _halt_commands(
+    policy: TrajectoryHealthPolicy,
+    *,
+    reference_volume: float,
+    interval: int,
+) -> str:
+    """Render online checks that LAMMPS can evaluate without duplicating MIC logic."""
+
+    commands: list[str] = []
+    if (
+        policy.min_volume_ratio is not None
+        or policy.max_volume_ratio is not None
+    ):
+        commands.append("variable neptrain_volume equal vol")
+    if policy.min_volume_ratio is not None:
+        threshold = reference_volume * policy.min_volume_ratio
+        commands.append(
+            "fix neptrain_halt_volume_low all halt "
+            f"{interval} v_neptrain_volume < {threshold:.17g} "
+            "error soft message yes"
+        )
+    if policy.max_volume_ratio is not None:
+        threshold = reference_volume * policy.max_volume_ratio
+        commands.append(
+            "fix neptrain_halt_volume_high all halt "
+            f"{interval} v_neptrain_volume > {threshold:.17g} "
+            "error soft message yes"
+        )
+    if policy.max_force is not None:
+        commands.extend(
+            [
+                "variable neptrain_force_norm atom "
+                "sqrt(fx*fx+fy*fy+fz*fz)",
+                "compute neptrain_max_force all reduce max "
+                "v_neptrain_force_norm",
+                "variable neptrain_max_force_value equal "
+                "c_neptrain_max_force",
+                "fix neptrain_halt_force all halt "
+                f"{interval} v_neptrain_max_force_value > "
+                f"{policy.max_force:.17g} "
+                "error soft message yes",
+            ]
+        )
+    return "\n".join(commands)
+
+
+def _parse_halt_event(text: str) -> _HaltEvent | None:
+    match = _FIX_HALT.search(text)
+    if match is None:
+        return None
+    return _HaltEvent(
+        fix_id=match.group("fix_id"),
+        step=int(match.group("step")),
+        value=match.group("value"),
+    )
+
+
+def _with_halt_placeholder(template: str) -> str:
+    """Upgrade an existing single-run template without rewriting custom logic."""
+
+    if "halt_commands" in _VARIABLE.findall(template):
+        return template
+    matches = list(_MAIN_RUN.finditer(template))
+    if len(matches) != 1:
+        return template
+    match = matches[0]
+    replacement = (
+        f"{match.group('indent')}{{{{ halt_commands }}}}\n{match.group(0)}"
+    )
+    return template[: match.start()] + replacement + template[match.end() :]
 
 
 def render_template(template: str, variables: Mapping[str, object]) -> str:
@@ -313,6 +417,15 @@ def run_lammps(
     input_file = output_dir / "lammps.in"
     log_file = output_dir / "log.lammps"
     template_variables = dict(variables)
+    policy = health_policy or TrajectoryHealthPolicy()
+    halt_interval = max(
+        1,
+        min(
+            100,
+            int(template_variables.get("dump_interval", 100)),
+            int(template_variables.get("steps", 100)),
+        ),
+    )
     template_variables.update(
         atom_style=atom_style,
         structure_file=data_file.name,
@@ -321,8 +434,15 @@ def run_lammps(
         elements=" ".join(info.elements),
         fix_suffix=fix_suffix,
         trajectory_file=dump_file.name,
+        halt_commands=_halt_commands(
+            policy,
+            reference_volume=float(abs(atoms.get_volume())),
+            interval=halt_interval,
+        ),
     )
-    rendered_input = render_template(template, template_variables)
+    rendered_input = render_template(
+        _with_halt_placeholder(template), template_variables
+    )
     input_file.write_text(rendered_input, encoding="utf-8")
 
     command: list[str] = []
@@ -354,14 +474,29 @@ def run_lammps(
             raise LammpsError(
                 f"requested {mpi_ranks} MPI ranks but LAMMPS reported a {observed}-rank grid"
             )
-    run_completed = completed.returncode == 0
-    failure_reason = (
-        None
-        if run_completed
-        else _failure_reason(
+    log_text = (
+        log_file.read_text(encoding="utf-8", errors="replace")
+        if log_file.is_file()
+        else ""
+    )
+    halt_event = _parse_halt_event(f"{completed.stdout}\n{log_text}")
+    subprocess_completed = completed.returncode == 0
+    run_completed = subprocess_completed and halt_event is None
+    if halt_event is not None:
+        failure_reason = (
+            f"{halt_event.reason_code}: fix {halt_event.fix_id} halted LAMMPS "
+            f"at step {halt_event.step} (value {halt_event.value})"
+        )
+        if not subprocess_completed:
+            failure_reason += "; " + _failure_reason(
+                completed.returncode, completed.stderr, completed.stdout
+            )
+    elif not subprocess_completed:
+        failure_reason = _failure_reason(
             completed.returncode, completed.stderr, completed.stdout
         )
-    )
+    else:
+        failure_reason = None
     try:
         frames = read_lammps_dump(
             dump_file,
@@ -381,7 +516,7 @@ def run_lammps(
         frames,
         atoms,
         process_completed=run_completed,
-        policy=health_policy,
+        policy=policy,
         pre_failure_frames=pre_failure_frames,
         bad_tail_frames=bad_tail_frames,
     )
@@ -392,6 +527,9 @@ def run_lammps(
         )
     health_payload = health.to_dict()
     health_payload["process_failure_reason"] = failure_reason
+    health_payload["halt"] = (
+        halt_event.to_dict() if halt_event is not None else None
+    )
     health_path = output_dir / "trajectory-health.json"
     atomic_write_json(health_path, health_payload)
     result_failure_code = None
@@ -404,6 +542,9 @@ def run_lammps(
         )
         if failure_reason is not None:
             result_failure_reason += f"; LAMMPS also failed ({failure_reason})"
+    elif halt_event is not None:
+        result_failure_code = "trajectory_halt"
+        result_failure_reason = failure_reason
     elif not run_completed:
         result_failure_code = "lammps_nonzero_exit"
         result_failure_reason = failure_reason

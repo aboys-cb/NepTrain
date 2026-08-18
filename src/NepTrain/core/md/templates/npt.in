@@ -15,4 +15,5 @@ thermo 100
 thermo_style custom step temp pe ke etotal press
 dump trajectory all custom {{ dump_interval }} {{ trajectory_file }} id type x y z fx fy fz
 dump_modify trajectory sort id format float %.17g
+{{ halt_commands }}
 run {{ steps }}

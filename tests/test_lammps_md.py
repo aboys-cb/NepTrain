@@ -103,10 +103,12 @@ def test_default_lammps_dump_interval_grows_with_trajectory_length():
             "trajectory_file": "dump.lammpstrj",
             "steps": 500_000,
             "dump_interval": 1000,
+            "halt_commands": "fix stop all halt 100 v_bad != 0 error soft",
         },
     )
 
     assert "dump trajectory all custom 1000 dump.lammpstrj" in rendered
+    assert "fix stop all halt 100" in rendered
 
 
 def test_read_spin_dump_reconstructs_full_vector(tmp_path: Path):
@@ -233,6 +235,74 @@ def test_failed_lammps_run_recovers_complete_frames_and_quarantines_tail(
     assert "Lost atoms" in result.failure_reason
     assert result.health_report is not None
     assert result.health_report.is_file()
+
+
+def test_soft_fix_halt_is_not_misclassified_as_completed(tmp_path: Path, monkeypatch):
+    model = tmp_path / "model.txt"
+    model.write_text("fake model\n", encoding="utf-8")
+    atoms = Atoms("Fe", positions=[[1, 1, 1]], cell=[4, 4, 4], pbc=True)
+    monkeypatch.setitem(
+        sys.modules,
+        "nep_adapters",
+        SimpleNamespace(
+            inspect_model=lambda _path: SimpleNamespace(
+                elements=("Fe",), supports=lambda capability: capability == "none"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "NepTrain.core.md.lammps.resolve_backend", lambda _model, _backend: "cpu"
+    )
+
+    def fake_run(command, *, cwd, env, text, capture_output):
+        del command, env, text, capture_output
+        (Path(cwd) / "dump.lammpstrj").write_text(
+            _ordinary_dump([0, 10, 20]),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "Fix halt condition for fix-id neptrain_halt_force "
+                "met on step 25 with value 101\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("NepTrain.core.md.lammps.subprocess.run", fake_run)
+    output = tmp_path / "trajectory.xyz"
+    result = run_lammps(
+        atoms=atoms,
+        model_file=model,
+        output_dir=tmp_path / "run",
+        output_file=output,
+        template="run {{ steps }}\n",
+        variables={"steps": 100, "dump_interval": 10},
+        inference_backend="cpu",
+        lmp_command="lmp",
+        mpiexec="mpirun",
+        mpi_ranks=1,
+        spin=False,
+    )
+
+    rendered = result.input_file.read_text(encoding="utf-8")
+    health = result.health_report.read_text(encoding="utf-8")
+    recovered = ase_read(output, index=":", format="extxyz")
+
+    assert "variable neptrain_volume equal vol" in rendered
+    assert "fix neptrain_halt_volume_low all halt 10 v_neptrain_volume" in rendered
+    assert "compute neptrain_max_force all reduce max" in rendered
+    assert "v_neptrain_max_force_value > 100" in rendered
+    assert result.completed is False
+    assert result.failure_code == "trajectory_halt"
+    assert "max_force_above_limit" in result.failure_reason
+    assert '"reason_code": "max_force_above_limit"' in health
+    assert [frame.info["md_window"] for frame in recovered] == [
+        "pre_failure",
+        "pre_failure",
+        "bad_tail",
+    ]
 
 
 def test_write_spin_data_uses_direction_then_magnitude(tmp_path: Path):
