@@ -157,7 +157,10 @@ _STAGE_PREVIOUS_ARTIFACTS = {
     "select": (),
     "label": (),
     "diagnose": (),
-    "merge": (),
+    # adaptive_v2 commits acquisition history in its terminal merge stage.
+    # Keep the previous frontier and convergence streak in portable bundles;
+    # legacy merge ignores these small JSON artifacts.
+    "merge": ("signals", "scenario_maturity"),
     "retrain": ("signals", "scenario_maturity"),
     "evaluate": ("signals", "scenario_maturity"),
 }

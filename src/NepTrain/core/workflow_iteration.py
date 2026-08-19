@@ -1124,14 +1124,11 @@ class WorkflowIterationAdapter:
             ladder = self.scenario_ladders[route.route_id]
             route_history_record = previous_route_histories.get(route.route_id)
             route_history = None
-            if route_history_record is not None:
-                if (
-                    route_history_record.get("route_fingerprint")
-                    != route.fingerprint
-                ):
-                    raise WorkflowIterationError(
-                        f"sampling route {route.route_id!r} fingerprint changed"
-                    )
+            if (
+                route_history_record is not None
+                and route_history_record.get("route_fingerprint")
+                == route.fingerprint
+            ):
                 route_history = route_history_record.get("history")
             structure_ids = sorted(
                 {
@@ -1218,14 +1215,11 @@ class WorkflowIterationAdapter:
             ladder = self.scenario_ladders[route.route_id]
             route_history_record = previous_route_histories.get(route.route_id)
             route_history = None
-            if route_history_record is not None:
-                if (
-                    route_history_record.get("route_fingerprint")
-                    != route.fingerprint
-                ):
-                    raise WorkflowIterationError(
-                        f"sampling route {route.route_id!r} fingerprint changed"
-                    )
+            if (
+                route_history_record is not None
+                and route_history_record.get("route_fingerprint")
+                == route.fingerprint
+            ):
                 route_history = route_history_record.get("history")
 
             route_structures = [
@@ -2912,11 +2906,11 @@ class WorkflowIterationAdapter:
             previous_record = previous_routes.get(route_id)
             previous_history = None
             if previous_record is not None:
-                if previous_record.get("route_fingerprint") != route.fingerprint:
-                    raise WorkflowIterationError(
-                        f"scenario history route identity changed for {route_id!r}"
-                    )
-                previous_history = previous_record.get("history")
+                if previous_record.get("route_fingerprint") == route.fingerprint:
+                    previous_history = previous_record.get("history")
+                # A route change is a new sampling experiment.  Its own
+                # scenario plan must still match above, but maturity evidence
+                # from the former route identity must not leak into it.
             attempt_accepted = {
                 str(attempt["attempt_id"]): diagnostic.get(
                     "attempt_accepted", {}

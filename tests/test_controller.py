@@ -269,6 +269,16 @@ def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
             "model": _write(tmp_path / "nep.txt"),
         }
     )
+    previous = {
+        "signals": _write(
+            tmp_path / "previous" / "signals.json",
+            '{"acquisition_convergence_streak": 1}\n',
+        ),
+        "scenario_maturity": _write(
+            tmp_path / "previous" / "scenario-maturity.json",
+            '{"version": 3, "routes": {}}\n',
+        ),
+    }
     config = {
         "training": {},
         "sampling": {
@@ -320,7 +330,7 @@ def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
             generation_dir=tmp_path / "generation",
             plan=_plan(),
             artifacts=artifacts,
-            previous_artifacts={},
+            previous_artifacts=previous,
             generation_kind="acquisition",
         ),
         stage_input={
@@ -330,6 +340,19 @@ def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
     )
 
     descriptor = json.loads(task.descriptor.read_text())
+    assert set(descriptor["previous_artifacts"]) == {
+        "signals",
+        "scenario_maturity",
+    }
+    assert json.loads(
+        (task.bundle / descriptor["previous_artifacts"]["signals"]).read_text()
+    ) == {"acquisition_convergence_streak": 1}
+    assert json.loads(
+        (
+            task.bundle
+            / descriptor["previous_artifacts"]["scenario_maturity"]
+        ).read_text()
+    ) == {"version": 3, "routes": {}}
     expected = descriptor["identity"]["sampling_routes"]
     assert [item["route_id"] for item in expected] == ["default"]
     adapter = workflow_iteration_module.WorkflowIterationAdapter(
@@ -346,6 +369,75 @@ def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
         }
         for route in adapter.routes
     ] == expected
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    (
+        (
+            "train",
+            {
+                "training_set",
+                "activated_model",
+                "activated_checkpoint",
+                "active_model_lineage",
+            },
+        ),
+        ("explore", {"scenario_maturity"}),
+        ("merge", {"signals", "scenario_maturity"}),
+        ("retrain", {"signals", "scenario_maturity"}),
+        ("evaluate", {"signals", "scenario_maturity"}),
+    ),
+)
+def test_portable_stage_previous_artifact_contract(tmp_path, stage, expected):
+    initial = _write(tmp_path / "initial.xyz")
+    previous = {
+        name: _write(tmp_path / "previous" / f"{name}.dat")
+        for name in {
+            "training_set",
+            "activated_model",
+            "activated_checkpoint",
+            "active_model_lineage",
+            "signals",
+            "scenario_maturity",
+        }
+    }
+    plan = GenerationPlan(2, 8, 2)
+
+    task = build_stage_task(
+        tmp_path / f"{stage}-tasks",
+        workflow_root=tmp_path,
+        workflow_id="portable-history-contract",
+        generation=2,
+        stage=stage,
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=plan,
+        config={
+            "training": {},
+            "sampling": {},
+            "md": {"spin": False},
+            "labeling": {},
+            "workflow": {},
+            "execution": {},
+        },
+        initial_training=initial,
+        context=StageContext(
+            generation=2,
+            generation_dir=tmp_path / "generation-2",
+            plan=plan,
+            artifacts={},
+            previous_artifacts=previous,
+            generation_kind="acquisition",
+            stage_input={
+                "generation_kind": "acquisition",
+                "generation_protocol": "adaptive_v2",
+            },
+        ),
+    )
+
+    descriptor = json.loads(task.descriptor.read_text(encoding="utf-8"))
+    assert set(descriptor["previous_artifacts"]) == expected
 
 
 def test_stage_task_identity_covers_bundle_content_and_workflow_instance(tmp_path):

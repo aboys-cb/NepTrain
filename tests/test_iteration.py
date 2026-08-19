@@ -919,6 +919,119 @@ def test_controller_rejects_plan_change_after_generation_started(tmp_path: Path)
         controller.run_workflow((changed,), AcceptingAdapter())
 
 
+def test_route_identity_change_starts_fresh_scenario_history(tmp_path: Path):
+    initial = tmp_path / "initial.xyz"
+    template = tmp_path / "lammps.in"
+    ase_write(
+        initial,
+        Atoms("Fe", positions=[[0, 0, 0]], cell=[4, 4, 4], pbc=True),
+        format="extxyz",
+    )
+    template.write_text("run {{ steps }}\n", encoding="utf-8")
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {"backend": "gpumd", "config_path": str(template)},
+            "md": {"backend": "lammps", "spin": False},
+            "sampling": _sampling(
+                (300.0,), structures=initial, template=template
+            ),
+            "labeling": {"backend": "toy"},
+        },
+        initial_training=initial,
+    )
+    route = adapter.routes[0]
+
+    def write_json(name, value):
+        path = tmp_path / name
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    histories, _ = adapter._record_route_histories(
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(2, 2, 1),
+            artifacts={
+                "scenario_plan": write_json(
+                    "scenario-plan.json",
+                    {
+                        "version": 3,
+                        "routes": [
+                            {
+                                "route_id": route.route_id,
+                                "route_fingerprint": route.fingerprint,
+                                "template_sha256": route.template_sha256,
+                                "structure_ids": [],
+                                "pressure": 0.0,
+                                "attempts": [],
+                                "completed": {},
+                            }
+                        ],
+                    },
+                ),
+                "selection_result": write_json(
+                    "selection-result.json",
+                    {"remaining_novelty_by_condition": {}},
+                ),
+            },
+            previous_artifacts={
+                "scenario_maturity": write_json(
+                    "previous-scenario-maturity.json",
+                    {
+                        "version": 3,
+                        "routes": {
+                            route.route_id: {
+                                "route_fingerprint": "former-route",
+                                "history": {"must_not_be_reused": True},
+                            }
+                        },
+                    },
+                )
+            },
+            stage_dir=tmp_path / "evaluate",
+        ),
+        diagnostic={"attempt_accepted": {}},
+        validation_metrics=None,
+        evidence_validation=None,
+        validation_accepted=None,
+        model_improved=True,
+        novelty_converged=False,
+        final_model_id="model-v2",
+    )
+
+    record = histories["routes"][route.route_id]
+    assert record["route_fingerprint"] == route.fingerprint
+    assert "must_not_be_reused" not in record["history"]
+
+    attempts = adapter.plan_explore_attempts(
+        StageContext(
+            generation=2,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(2, 2, 1),
+            artifacts={"model": initial},
+            previous_artifacts={
+                "scenario_maturity": write_json(
+                    "planning-scenario-maturity.json",
+                    {
+                        "version": 3,
+                        "routes": {
+                            route.route_id: {
+                                "route_fingerprint": "former-route",
+                                "history": {"must_not_be_reused": True},
+                            }
+                        },
+                    },
+                )
+            },
+            stage_dir=tmp_path / "explore",
+        )
+    )
+    assert attempts
+    assert {item["route_fingerprint"] for item in attempts} == {
+        route.fingerprint
+    }
+
+
 def test_controller_runs_one_resource_stage_at_a_time(tmp_path: Path):
     class AcceptingAdapter:
         def run_stage(self, stage, context):
