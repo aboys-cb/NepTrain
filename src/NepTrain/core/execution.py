@@ -26,7 +26,7 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from .content_addressing import canonical_sha256, file_sha256
-from .generation_policy import stage_sequence_for_kind
+from .generation_policy import stage_implementation, stage_sequence_for_kind
 from .iteration import GenerationPlan, StageContext, StageOutcome
 from .persistence import atomic_write_json
 from .sampling_route import load_sampling_routes
@@ -182,6 +182,7 @@ _PORTABLE_ARTIFACT_STEMS = {
 }
 _STAGE_DIRECTORY_LABELS = {
     "train": "train",
+    "validate": "validate",
     "explore": "md",
     "select": "select",
     "label": "label",
@@ -189,6 +190,7 @@ _STAGE_DIRECTORY_LABELS = {
     "merge": "merge",
     "retrain": "retrain",
     "evaluate": "evaluate",
+    "update": "update",
 }
 
 
@@ -569,7 +571,8 @@ def build_stage_task(
 ) -> StageTask:
     """Build an immutable, self-contained task directory."""
 
-    if stage not in _STAGE_CONFIG_PATH_FIELDS:
+    implementation_stage = stage_implementation(stage, context.stage_sequence)
+    if implementation_stage not in _STAGE_CONFIG_PATH_FIELDS:
         raise ExecutionError(f"unsupported stage task: {stage}")
 
     resolved_stage_input = {
@@ -579,9 +582,9 @@ def build_stage_task(
 
     requested_route_id = str(resolved_stage_input.get("route_id", ""))
     needs_routes = bool(
-        stage in {"explore", "merge"}
+        implementation_stage in {"explore", "merge"}
         or (
-            stage == "evaluate"
+            implementation_stage == "evaluate"
             and resolved_stage_input.get("generation_kind", "legacy") == "legacy"
         )
     )
@@ -657,7 +660,7 @@ def build_stage_task(
                 _resolve_path(resource_path, workflow_root)
             )
 
-    path_fields = set(_STAGE_CONFIG_PATH_FIELDS[stage])
+    path_fields = set(_STAGE_CONFIG_PATH_FIELDS[implementation_stage])
     if empty_label:
         path_fields.clear()
     if (
@@ -667,7 +670,7 @@ def build_stage_task(
     ):
         path_fields.clear()
     evaluation = portable_config.get("evaluation", {})
-    if stage == "evaluate":
+    if implementation_stage == "evaluate":
         validation_field = (
             "evaluation.validation_path"
             if evaluation.get("validation_path")
@@ -826,11 +829,12 @@ def build_stage_task(
         "plan": asdict(plan),
         "stage_input": resolved_stage_input,
         "artifacts": copy_artifacts(
-            context.artifacts, _STAGE_ARTIFACTS[stage]
+            context.artifacts,
+            _STAGE_ARTIFACTS[implementation_stage],
         ),
         "previous_artifacts": copy_artifacts(
             context.previous_artifacts,
-            _STAGE_PREVIOUS_ARTIFACTS[stage],
+            _STAGE_PREVIOUS_ARTIFACTS[implementation_stage],
         ),
     }
     records = [
@@ -994,12 +998,25 @@ def run_stage_worker(bundle_path: str | Path) -> int:
             generation_kind = str(
                 worker_stage_input.get("generation_kind", "legacy")
             )
+            generation_protocol = str(
+                worker_stage_input.get("generation_protocol", "adaptive_v2")
+            )
+            raw_stage_sequence = worker_stage_input.get("stage_sequence")
+            stage_sequence = (
+                tuple(str(stage) for stage in raw_stage_sequence)
+                if isinstance(raw_stage_sequence, list)
+                else stage_sequence_for_kind(
+                    generation_kind,
+                    generation_protocol,
+                )
+            )
             adapter = WorkflowIterationAdapter(
                 config,
                 initial_training=resolve(initial_value) if initial_value else None,
                 base_dir=bundle,
                 active_stage=str(descriptor["identity"]["stage"]),
                 active_generation_kind=generation_kind,
+                active_stage_sequence=stage_sequence,
             )
             outcome = adapter.run_stage(
                 descriptor["identity"]["stage"],
@@ -1013,7 +1030,7 @@ def run_stage_worker(bundle_path: str | Path) -> int:
                     stage_input=worker_stage_input,
                     flat_output=True,
                     generation_kind=generation_kind,
-                    stage_sequence=stage_sequence_for_kind(generation_kind),
+                    stage_sequence=stage_sequence,
                 ),
             )
             result_artifacts = {}

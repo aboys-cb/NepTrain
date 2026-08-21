@@ -11,12 +11,18 @@ import tempfile
 from typing import Any, Mapping
 
 from .content_addressing import canonical_sha256, file_sha256
+from .generation_policy import (
+    ACTIVE_LEARNING_ACQUISITION_STAGES,
+    generation_stage_sequence,
+    stage_for_role,
+)
 from .persistence import atomic_write_json
 
 
 _LAYOUT_VERSION = 4
 _STAGE_DIRECTORIES = {
     "train": "train",
+    "validate": "validate",
     "explore": "md",
     "select": "select",
     "label": "label",
@@ -24,6 +30,7 @@ _STAGE_DIRECTORIES = {
     "merge": "dataset",
     "retrain": "retrain",
     "evaluate": "evaluate",
+    "update": "update",
 }
 _PUBLICATION_FILENAMES = (
     "nep.txt",
@@ -220,11 +227,22 @@ class WorkflowWorkspace:
     def generation_dir(self, generation: int) -> Path:
         return self.generations_dir / f"{generation:04d}"
 
-    def stage_dir(self, generation: int, stage: str) -> Path:
+    def stage_dir(
+        self,
+        generation: int,
+        stage: str,
+        *,
+        stage_sequence: tuple[str, ...] | None = None,
+    ) -> Path:
         try:
             relative = _STAGE_DIRECTORIES[stage]
         except KeyError as error:
             raise ValueError(f"unknown workflow stage: {stage}") from error
+        if (
+            stage == "explore"
+            and stage_sequence == ACTIVE_LEARNING_ACQUISITION_STAGES
+        ):
+            relative = "explore"
         return self.generation_dir(generation) / relative
 
     def snapshot_inputs(
@@ -310,6 +328,8 @@ class WorkflowWorkspace:
         stages = generation_record.get("stages", {})
         return {
             "generation": generation,
+            "kind": generation_record.get("kind", "legacy"),
+            "stage_sequence": list(generation_stage_sequence(generation_record)),
             "accepted": generation_record.get("accepted"),
             "complete": bool(generation_record.get("complete")),
             "metrics": {
@@ -321,7 +341,12 @@ class WorkflowWorkspace:
     @staticmethod
     def _summary_markdown(summary: Mapping[str, Any]) -> str:
         generation = int(summary["generation"])
-        evaluation = summary["metrics"].get("evaluate", {})
+        record = {
+            "kind": summary.get("kind"),
+            "stage_sequence": summary.get("stage_sequence"),
+        }
+        validation_stage = stage_for_role(record, "validate")
+        evaluation = summary["metrics"].get(validation_stage or "evaluate", {})
         lines = ["# NepTrain workflow 结果", ""]
         if evaluation.get("evaluation_configured") is False:
             lines.extend(

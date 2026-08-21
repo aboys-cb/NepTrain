@@ -10,7 +10,7 @@ selection, and labeling as standalone tasks, or compose the same steps into a
 resumable active-learning workflow.
 
 ```text
-train → md → select → label → merge → retrain → evaluate
+train → validate → explore → select → label → evaluate → update
 ```
 
 Standalone commands and automated workflows use the same scientific adapters
@@ -174,6 +174,7 @@ Inspect and control it with:
 ```bash
 neptrain workflow status fe-workflow --jobs
 neptrain workflow resume fe-workflow
+neptrain workflow restart fe-workflow --generation 3 --from label --dry-run
 neptrain workflow stop fe-workflow
 neptrain workflow extend fe-workflow 5
 ```

@@ -277,7 +277,7 @@ class GenerationController:
                     raise IterationError(str(error)) from error
             generation_record["kind"] = kind
             generation_record["stage_sequence"] = list(
-                stage_sequence_for_kind(kind)
+                stage_sequence_for_kind(kind, self.generation_protocol)
             )
             self._write(self._ledger)
         try:
@@ -402,7 +402,13 @@ class GenerationController:
                 artifacts=dict(artifacts),
                 previous_artifacts=dict(previous_artifacts),
                 stage_dir=(
-                    self.workspace.stage_dir(plan.generation, requested)
+                    self.workspace.stage_dir(
+                        plan.generation,
+                        requested,
+                        stage_sequence=tuple(
+                            generation_stage_sequence(generation_record)
+                        ),
+                    )
                     if self.workspace is not None
                     else generation_dir
                 ),
@@ -412,6 +418,9 @@ class GenerationController:
                 stage_input={
                     "generation_kind": str(generation_record["kind"]),
                     "generation_protocol": self.generation_protocol,
+                    "stage_sequence": list(
+                        generation_stage_sequence(generation_record)
+                    ),
                 },
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
@@ -548,7 +557,13 @@ class GenerationController:
                 artifacts=dict(artifacts),
                 previous_artifacts=dict(previous_artifacts),
                 stage_dir=(
-                    self.workspace.stage_dir(plan.generation, requested)
+                    self.workspace.stage_dir(
+                        plan.generation,
+                        requested,
+                        stage_sequence=tuple(
+                            generation_stage_sequence(generation_record)
+                        ),
+                    )
                     if self.workspace is not None
                     else generation_dir
                 ),
@@ -558,6 +573,9 @@ class GenerationController:
                 stage_input={
                     "generation_kind": str(generation_record["kind"]),
                     "generation_protocol": self.generation_protocol,
+                    "stage_sequence": list(
+                        generation_stage_sequence(generation_record)
+                    ),
                 },
             )
             context.work_dir.mkdir(parents=True, exist_ok=True)
@@ -566,6 +584,50 @@ class GenerationController:
             # controllers use ``stage_context`` + ``commit_stage`` and share
             # the same commit primitive below.
             return self._commit_outcome(plan, requested, outcome)
+
+    def reopen_from(self, plan: GenerationPlan, *, from_stage: str) -> None:
+        """Reopen an entered generation from one reached stage.
+
+        Completed stage records at and after ``from_stage`` are archived as a
+        recovery attempt.  Earlier scientific artifacts remain authoritative.
+        """
+        with self._lock():
+            self._ledger = self._load()
+            generation_record, _, _, _, _ = self._generation_state(plan)
+            sequence = generation_stage_sequence(generation_record)
+            if from_stage not in sequence:
+                raise IterationError(f"unknown recovery stage: {from_stage}")
+            if generation_record.get("complete") and generation_record.get(
+                "accepted"
+            ) is True:
+                raise IterationError(
+                    "an accepted generation cannot be reopened in place"
+                )
+            completed = len(generation_record["stages"])
+            start = sequence.index(from_stage)
+            if start > completed:
+                raise IterationError(
+                    f"generation {plan.generation} has not reached stage "
+                    f"{from_stage}"
+                )
+            archived = {
+                stage: generation_record["stages"].pop(stage)
+                for stage in sequence[start:]
+                if stage in generation_record["stages"]
+            }
+            recoveries = generation_record.setdefault("recovery_attempts", [])
+            recoveries.append(
+                {
+                    "attempt": len(recoveries) + 1,
+                    "from_stage": from_stage,
+                    "accepted": generation_record.get("accepted"),
+                    "stages": archived,
+                }
+            )
+            generation_record.pop("complete", None)
+            generation_record.pop("accepted", None)
+            generation_record.pop("publication", None)
+            self._write(self._ledger)
 
     def reopen_rejected(
         self, plan: GenerationPlan, *, from_stage: str | None = None
@@ -577,31 +639,13 @@ class GenerationController:
             sequence = generation_stage_sequence(generation_record)
             if from_stage is None:
                 from_stage = "retrain" if "retrain" in sequence else "train"
-            if from_stage not in sequence:
-                raise IterationError(f"unknown recovery stage: {from_stage}")
             if not generation_record.get("complete") or generation_record.get(
                 "accepted"
             ) is not False:
                 raise IterationError(
                     f"generation {plan.generation} is not complete and rejected"
                 )
-            start = sequence.index(from_stage)
-            archived = {
-                stage: generation_record["stages"].pop(stage)
-                for stage in sequence[start:]
-            }
-            recoveries = generation_record.setdefault("recovery_attempts", [])
-            recoveries.append(
-                {
-                    "attempt": len(recoveries) + 1,
-                    "from_stage": from_stage,
-                    "accepted": False,
-                    "stages": archived,
-                }
-            )
-            generation_record.pop("complete", None)
-            generation_record.pop("accepted", None)
-            self._write(self._ledger)
+        self.reopen_from(plan, from_stage=from_stage)
 
     def _summary(self, plan: GenerationPlan) -> GenerationSummary:
         generation_record, _, artifacts, metrics, _ = self._generation_state(plan)

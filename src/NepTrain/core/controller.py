@@ -41,7 +41,11 @@ from .execution import (
     load_stage_result,
 )
 from .generation_policy import LEGACY_GENERATION_PROTOCOL
-from .generation_policy import generation_disposition
+from .generation_policy import (
+    generation_disposition,
+    generation_stage_sequence,
+    stage_for_role,
+)
 from .iteration import GenerationController, GenerationPlan, IterationError, StageOutcome
 
 
@@ -51,6 +55,7 @@ class ControllerError(RuntimeError):
 
 _RESOURCE_FOR_STAGE = {
     "train": "training",
+    "validate": "analysis",
     "explore": "sampling",
     "select": "analysis",
     "label": "labeling",
@@ -58,6 +63,7 @@ _RESOURCE_FOR_STAGE = {
     "merge": "analysis",
     "retrain": "training",
     "evaluate": "analysis",
+    "update": "analysis",
 }
 _EXECUTION_UNKNOWN_GRACE_SECONDS = 300.0
 _MAX_PARALLEL_OBSERVATIONS = 4
@@ -159,6 +165,17 @@ class ControllerTick:
     target: str | None = None
     execution_id: str | None = None
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class RestartPlan:
+    generation: int
+    from_stage: str
+    task_scope: str
+    reused_stages: tuple[str, ...]
+    restarted_stages: tuple[str, ...]
+    preserved_tasks: int = 0
+    retried_tasks: int = 0
 
 
 class PersistentController:
@@ -294,6 +311,21 @@ class PersistentController:
             role="scientific ledger",
         )
 
+    def _stage_dir(self, generation: int, stage: str) -> Path:
+        if stage != "explore":
+            return self.workspace.stage_dir(generation, stage)
+        record = self._ledger().get("generations", {}).get(str(generation))
+        sequence = (
+            generation_stage_sequence(record)
+            if isinstance(record, Mapping)
+            else None
+        )
+        return self.workspace.stage_dir(
+            generation,
+            stage,
+            stage_sequence=sequence,
+        )
+
     def _next(self) -> tuple[GenerationPlan, str, Any] | None:
         ledger = self._ledger()
         sampling_budget = int(
@@ -313,9 +345,10 @@ class PersistentController:
                     self.state["reason"] = f"generation {plan.generation} failed evaluation"
                     self._save()
                     return None
+                validation_stage = stage_for_role(record, "validate")
                 evaluate = (
                     record.get("stages", {})
-                    .get("evaluate", {})
+                    .get(validation_stage or "evaluate", {})
                     .get("metrics", {})
                 )
                 if evaluate.get("workflow_converged") is True:
@@ -430,7 +463,7 @@ class PersistentController:
         attempt: int,
         outcome: StageOutcome,
     ) -> Any:
-        root = self.workspace.stage_dir(plan.generation, stage)
+        root = self._stage_dir(plan.generation, stage)
         installed = {}
         for name, source in outcome.artifacts.items():
             destination = root / source.name
@@ -506,7 +539,7 @@ class PersistentController:
             if link_name == work.name:
                 link_name = bundle.name
 
-        stage_root = self.workspace.stage_dir(generation, stage)
+        stage_root = self._stage_dir(generation, stage)
         if link_name_override is not None:
             if not link_name_override or Path(link_name_override).name != link_name_override:
                 raise ControllerError("calculation link name must be a simple name")
@@ -1656,6 +1689,12 @@ class PersistentController:
                             "failed_at": _now(),
                             "failure": item.get("detail")
                             or self.state.get("reason", "manual retry"),
+                            "failure_kind": item.get("failure_kind"),
+                            "failure_bundle": item.get("failure_bundle"),
+                            "invalid_bundle": item.get("invalid_bundle"),
+                            "failure_collection_error": item.get(
+                                "failure_collection_error"
+                            ),
                         }
                     )
                     target_name = str(item["target"])
@@ -1703,6 +1742,10 @@ class PersistentController:
                     item.pop("detail", None)
                     item.pop("failure_kind", None)
                     item.pop("retryable", None)
+                    item.pop("failure_bundle", None)
+                    item.pop("invalid_bundle", None)
+                    item.pop("failure_collection_error", None)
+                    item.pop("completed_at", None)
                     item.pop("cancellation", None)
                     item.pop("cancellation_requested_at", None)
                     retried += 1
@@ -1736,6 +1779,182 @@ class PersistentController:
         self.state["state"] = "idle"
         self.state.pop("reason", None)
         self._save()
+
+    @staticmethod
+    def _current_execution_is_terminal(current: Mapping[str, Any]) -> bool:
+        if current.get("kind") == "task_group":
+            return all(
+                item.get("collected_bundle")
+                or item.get("terminal_failure")
+                or item.get("observed_state")
+                in {"completed", "failed", "cancelled"}
+                for item in current.get("tasks", [])
+            )
+        if current.get("handle") is None:
+            return True
+        return current.get("observed_state") in {
+            "completed",
+            "failed",
+            "cancelled",
+        }
+
+    def plan_restart(
+        self,
+        *,
+        generation: int,
+        from_stage: str,
+        task_scope: str = "failed",
+    ) -> RestartPlan:
+        """Validate and describe an explicit restart without changing state."""
+
+        if task_scope not in {"failed", "all"}:
+            raise ControllerError("restart task scope must be 'failed' or 'all'")
+        ledger = self._ledger()
+        records = ledger.get("generations", {})
+        entered = sorted(
+            int(key)
+            for key, value in records.items()
+            if isinstance(value, Mapping) and value.get("stages") is not None
+        )
+        if generation not in entered:
+            raise ControllerError(f"generation {generation} has not started")
+        if generation != entered[-1]:
+            raise ControllerError(
+                "restart only supports the latest entered generation; "
+                f"generation {entered[-1]} already depends on generation {generation}"
+            )
+        record = records[str(generation)]
+        if record.get("complete") and record.get("accepted") is True:
+            raise ControllerError(
+                "restart does not rewrite an accepted generation; start or "
+                "extend the workflow with a new generation instead"
+            )
+        try:
+            sequence = generation_stage_sequence(record)
+        except ValueError as error:
+            raise ControllerError(str(error)) from error
+        if from_stage not in sequence:
+            raise ControllerError(
+                f"stage {from_stage!r} is not part of generation {generation}; "
+                f"choose one of: {', '.join(sequence)}"
+            )
+        stage_records = record.get("stages", {})
+        completed_count = 0
+        while (
+            completed_count < len(sequence)
+            and sequence[completed_count] in stage_records
+        ):
+            completed_count += 1
+        if any(stage in stage_records for stage in sequence[completed_count + 1 :]):
+            raise ControllerError(
+                f"generation {generation} has a non-contiguous stage ledger"
+            )
+        start = sequence.index(from_stage)
+        if start > completed_count:
+            expected = sequence[completed_count]
+            raise ControllerError(
+                f"generation {generation} has not reached {from_stage}; "
+                f"its next stage is {expected}"
+            )
+
+        current = self.state.get("current")
+        preserved_tasks = 0
+        retried_tasks = 0
+        if current is not None:
+            current_generation = int(current.get("generation", -1))
+            current_stage = str(current.get("stage", ""))
+            if current_generation != generation:
+                raise ControllerError(
+                    "controller execution does not belong to the requested generation"
+                )
+            if not self._current_execution_is_terminal(current):
+                raise ControllerError(
+                    "the current execution is not terminal; stop and reconcile its "
+                    "scheduler jobs before restarting"
+                )
+            if (
+                task_scope == "failed"
+                and current_stage == from_stage
+                and current.get("kind") == "task_group"
+            ):
+                tasks = list(current.get("tasks", []))
+                preserved_tasks = sum(
+                    bool(item.get("collected_bundle")) for item in tasks
+                )
+                retried_tasks = len(tasks) - preserved_tasks
+                if retried_tasks == 0:
+                    raise ControllerError(
+                        f"{from_stage} has no failed or unfinished tasks to retry"
+                    )
+
+        return RestartPlan(
+            generation=generation,
+            from_stage=from_stage,
+            task_scope=task_scope,
+            reused_stages=tuple(sequence[:start]),
+            restarted_stages=tuple(sequence[start:]),
+            preserved_tasks=preserved_tasks,
+            retried_tasks=retried_tasks,
+        )
+
+    def restart_from(
+        self,
+        *,
+        generation: int,
+        from_stage: str,
+        task_scope: str = "failed",
+    ) -> RestartPlan:
+        """Restart the latest unfinished generation from a chosen stage."""
+
+        plan = self.plan_restart(
+            generation=generation,
+            from_stage=from_stage,
+            task_scope=task_scope,
+        )
+        generation_plan = next(
+            item for item in self.plans if item.generation == generation
+        )
+        current = self.state.get("current")
+        retry_current_group = bool(
+            task_scope == "failed"
+            and current is not None
+            and int(current.get("generation", -1)) == generation
+            and current.get("stage") == from_stage
+            and current.get("kind") == "task_group"
+        )
+
+        try:
+            self.generation_controller.reopen_from(
+                generation_plan,
+                from_stage=from_stage,
+            )
+        except IterationError as error:
+            raise ControllerError(str(error)) from error
+        if retry_current_group:
+            assert current is not None
+            for item in current["tasks"]:
+                if not item.get("collected_bundle"):
+                    item["retryable"] = True
+            self.state["state"] = "failed"
+            self.state["reason"] = "explicit stage restart"
+            self.retry()
+            return plan
+
+        if current is not None:
+            archived = dict(current)
+            archived["superseded_at"] = _now()
+            archived["superseded_by"] = {
+                "generation": generation,
+                "from_stage": from_stage,
+                "task_scope": task_scope,
+            }
+            self.state.setdefault("history", []).append(archived)
+        self.state["current"] = None
+        self.state["state"] = "idle"
+        self.state.pop("reason", None)
+        self.state.pop("preserve_current_on_retry", None)
+        self._save()
+        return plan
 
     def resume_stopped(self) -> None:
         """Reconcile stop/cancel state before a controller is restarted."""
@@ -2016,6 +2235,11 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                 controller._save()
                 return 0
             except Exception as error:
+                # An internal controller failure does not say that a submitted
+                # scheduler task failed.  Preserve immutable handles so resume
+                # reconciles the existing work instead of submitting duplicates.
+                if controller.state.get("current") is not None:
+                    controller.state["preserve_current_on_retry"] = True
                 controller.state["state"] = "failed"
                 controller.state["reason"] = str(error)
                 controller._save()

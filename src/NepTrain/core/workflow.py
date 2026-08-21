@@ -17,10 +17,11 @@ import uuid
 
 from .content_addressing import canonical_sha256, file_sha256
 from .generation_policy import (
+    ACTIVE_LEARNING_GENERATION_PROTOCOL,
     ADAPTIVE_GENERATION_PROTOCOL,
     LEGACY_GENERATION_PROTOCOL,
 )
-from .generation_policy import generation_stage_sequence
+from .generation_policy import generation_stage_sequence, stage_for_role
 from .persistence import atomic_write_json
 from .workflow_workspace import WorkflowWorkspace
 from .sampling_route import load_sampling_routes
@@ -46,6 +47,22 @@ class WorkflowResume:
     workflow_id: str
     action: str
     manifest: Path
+    controller_pid: int | None = None
+    controller_exit_code: int | None = None
+
+
+@dataclass(frozen=True)
+class WorkflowRestart:
+    workflow_id: str
+    action: str
+    manifest: Path
+    generation: int
+    from_stage: str
+    task_scope: str
+    reused_stages: tuple[str, ...]
+    restarted_stages: tuple[str, ...]
+    preserved_tasks: int = 0
+    retried_tasks: int = 0
     controller_pid: int | None = None
     controller_exit_code: int | None = None
 
@@ -158,6 +175,7 @@ def _normalise_manifest(
     if generation_protocol not in {
         LEGACY_GENERATION_PROTOCOL,
         ADAPTIVE_GENERATION_PROTOCOL,
+        ACTIVE_LEARNING_GENERATION_PROTOCOL,
     }:
         raise WorkflowError(
             f"workflow manifest has unsupported generation protocol: "
@@ -614,10 +632,25 @@ def prepare_workflow(
     )
     settings = config.get("workflow", {})
     generation_protocol = (
-        ADAPTIVE_GENERATION_PROTOCOL
+        ACTIVE_LEARNING_GENERATION_PROTOCOL
         if settings.get("convergence")
         else LEGACY_GENERATION_PROTOCOL
     )
+    if (
+        (output / "workflow-manifest.json").is_file()
+        or (output / ".neptrain" / "layout.json").is_file()
+    ):
+        existing_workspace = WorkflowWorkspace.locate(output)
+        if existing_workspace.manifest.is_file():
+            generation_protocol = str(
+                _normalise_manifest(
+                    _read_json(
+                        existing_workspace.manifest,
+                        role="workflow manifest",
+                    ),
+                    existing_workspace.manifest,
+                )["generation_protocol"]
+            )
     selected_id = workflow_id or str(settings.get("id", output.name))
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", selected_id):
         raise WorkflowError(
@@ -1066,10 +1099,17 @@ def _generation_science(
     explore = metrics("explore")
     select = metrics("select")
     label = metrics("label")
-    diagnose = metrics("diagnose")
-    merge = metrics("merge")
+    acquisition_evaluate_stage = (
+        None if record is None else stage_for_role(record, "evaluate")
+    )
+    update_stage = None if record is None else stage_for_role(record, "update")
+    validate_stage = (
+        None if record is None else stage_for_role(record, "validate")
+    )
+    diagnose = metrics(acquisition_evaluate_stage or "diagnose")
+    merge = metrics(update_stage or "merge")
     retrain = metrics("retrain")
-    evaluate = metrics("evaluate")
+    evaluate = metrics(validate_stage or "evaluate")
 
     if record is None:
         state = "not_started"
@@ -2032,6 +2072,83 @@ def resume_workflow(
     )
 
 
+def restart_workflow(
+    output_dir: str | Path,
+    *,
+    generation: int,
+    from_stage: str,
+    task_scope: str = "failed",
+    dry_run: bool = False,
+    foreground: bool = False,
+    poll_interval: float | None = None,
+) -> WorkflowRestart:
+    """Restart the latest unfinished generation from an explicit stage."""
+
+    output = Path(output_dir).expanduser().resolve()
+    preparation = _coerce_preparation(output)
+    from .controller import (
+        ControllerError,
+        PersistentController,
+        controller_running,
+        start_controller,
+    )
+
+    with _workflow_lock(output):
+        if controller_running(output):
+            raise WorkflowError(
+                "workflow is running; stop it before choosing a restart stage"
+            )
+        try:
+            controller = PersistentController(output)
+            plan = controller.plan_restart(
+                generation=generation,
+                from_stage=from_stage,
+                task_scope=task_scope,
+            )
+            if dry_run:
+                controller_result = None
+                action = "restart_preview"
+            else:
+                controller.restart_from(
+                    generation=generation,
+                    from_stage=from_stage,
+                    task_scope=task_scope,
+                )
+                controller_result = None
+                action = "restart"
+        except ControllerError as error:
+            raise WorkflowError(str(error)) from error
+
+    if not dry_run:
+        try:
+            controller_result = start_controller(
+                output,
+                foreground=foreground,
+                poll_interval=poll_interval,
+            )
+        except ControllerError as error:
+            raise WorkflowError(str(error)) from error
+
+    return WorkflowRestart(
+        workflow_id=preparation.workflow_id,
+        action=action,
+        manifest=preparation.manifest,
+        generation=plan.generation,
+        from_stage=plan.from_stage,
+        task_scope=plan.task_scope,
+        reused_stages=plan.reused_stages,
+        restarted_stages=plan.restarted_stages,
+        preserved_tasks=plan.preserved_tasks,
+        retried_tasks=plan.retried_tasks,
+        controller_pid=(
+            None if dry_run or foreground else controller_result
+        ),
+        controller_exit_code=(
+            controller_result if not dry_run and foreground else None
+        ),
+    )
+
+
 def start_workflow(
     output_dir: str | Path,
     *,
@@ -2081,11 +2198,13 @@ def start_workflow(
 __all__ = [
     "WorkflowError",
     "WorkflowPreparation",
+    "WorkflowRestart",
     "WorkflowResume",
     "WorkflowStatus",
     "workflow_status",
     "extend_workflow",
     "prepare_workflow",
+    "restart_workflow",
     "resume_workflow",
     "start_workflow",
 ]

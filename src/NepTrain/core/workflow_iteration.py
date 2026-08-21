@@ -21,6 +21,7 @@ from .candidate_pool import (
     write_candidate_pool,
 )
 from .content_addressing import file_sha256
+from .composition import reduced_composition
 from .descriptor_features import (
     ELEMENTWISE_MEAN_STD,
     GLOBAL_MEAN,
@@ -31,6 +32,7 @@ from .fps import (
     adaptive_novelty_threshold,
     hierarchical_farthest_point_sampling,
 )
+from .generation_policy import stage_implementation
 from .labeling import LabelRequest, LabelResult, label
 from .iteration import (
     StageContext,
@@ -513,15 +515,36 @@ class WorkflowIterationAdapter:
         runtime: WorkflowRuntime | None = None,
         active_stage: str | None = None,
         active_generation_kind: str = "legacy",
+        active_stage_sequence: tuple[str, ...] | None = None,
     ):
         self.config = dict(config)
         self.base_dir = Path(base_dir).expanduser().resolve()
         self.runtime = runtime or WorkflowRuntime()
+        implementation_stage = (
+            stage_implementation(active_stage, active_stage_sequence)
+            if active_stage is not None and active_stage_sequence is not None
+            else active_stage
+        )
+        raw_exclusions = self.config.get("sampling", {}).get(
+            "excluded_compositions", []
+        )
+        if not isinstance(raw_exclusions, list):
+            raise WorkflowIterationError(
+                "sampling.excluded_compositions must be a list of chemical formulas"
+            )
+        try:
+            self.excluded_compositions = {
+                reduced_composition(value) for value in raw_exclusions
+            }
+        except (KeyError, ValueError) as error:
+            raise WorkflowIterationError(
+                f"invalid sampling.excluded_compositions: {error}"
+            ) from error
         requires_routes = (
-            active_stage is None
-            or active_stage in {"explore", "merge"}
+            implementation_stage is None
+            or implementation_stage in {"explore", "merge"}
             or (
-                active_stage == "evaluate"
+                implementation_stage == "evaluate"
                 and active_generation_kind == "legacy"
             )
         )
@@ -544,8 +567,8 @@ class WorkflowIterationAdapter:
             )
             for route in self.routes
         }
-        requires_initial = active_stage is None or (
-            active_stage == "train" and initial_training is not None
+        requires_initial = implementation_stage is None or (
+            implementation_stage == "train" and initial_training is not None
         )
         self.initial_training = (
             self._path(initial_training) if requires_initial else None
@@ -561,7 +584,9 @@ class WorkflowIterationAdapter:
             if self.evaluation_configured
             else None
         )
-        requires_validation = active_stage is None or active_stage == "evaluate"
+        requires_validation = (
+            implementation_stage is None or implementation_stage == "evaluate"
+        )
         if (
             requires_validation
             and self.evaluation_configured
@@ -584,10 +609,10 @@ class WorkflowIterationAdapter:
         if self.config.get("md", {}).get("spin", False):
             required_thresholds.add("mforce_rmse")
         missing_thresholds = sorted(required_thresholds - set(thresholds or {}))
-        requires_thresholds = active_stage is None or active_stage in {
-            "diagnose",
-            "evaluate",
-        }
+        requires_thresholds = (
+            implementation_stage is None
+            or implementation_stage in {"diagnose", "evaluate"}
+        )
         if (
             requires_thresholds
             and self.evaluation_configured
@@ -598,10 +623,10 @@ class WorkflowIterationAdapter:
                 + ", ".join(missing_thresholds)
             )
         requires_training_config = (
-            active_stage is None
-            or active_stage == "retrain"
+            implementation_stage is None
+            or implementation_stage == "retrain"
             or (
-                active_stage == "train"
+                implementation_stage == "train"
                 and (
                     initial_training is not None
                     or active_generation_kind in {"acquisition", "finalization"}
@@ -630,6 +655,9 @@ class WorkflowIterationAdapter:
             return None
         return self._path(value)
 
+    def _sampling_structure_allowed(self, frame: Atoms) -> bool:
+        return reduced_composition(frame) not in self.excluded_compositions
+
     @staticmethod
     def _labeling_kpoints(
         options: Mapping[str, Any],
@@ -647,14 +675,19 @@ class WorkflowIterationAdapter:
         return tuple(values)
 
     def run_stage(self, stage: str, context: StageContext) -> StageOutcome:
+        implementation_stage = stage_implementation(stage, context.stage_sequence)
         if context.generation_kind in {"acquisition", "finalization"}:
-            method = getattr(self, f"_{context.generation_kind}_{stage}", None)
+            method = getattr(
+                self,
+                f"_{context.generation_kind}_{implementation_stage}",
+                None,
+            )
             if method is None:
                 raise WorkflowIterationError(
                     f"stage {stage} is not valid for a {context.generation_kind} generation"
                 )
             return method(context)
-        method = getattr(self, f"_{stage}", None)
+        method = getattr(self, f"_{implementation_stage}", None)
         if method is None:
             raise WorkflowIterationError(f"unsupported workflow stage: {stage}")
         outcome = method(context)
@@ -1135,6 +1168,7 @@ class WorkflowIterationAdapter:
                     structure_id(frame)
                     for path in route.structure_paths
                     for frame in _read_frames(path)
+                    if self._sampling_structure_allowed(frame)
                 }
             )
             attempts = ladder.schedule(
@@ -1226,6 +1260,7 @@ class WorkflowIterationAdapter:
                 frame
                 for path in route.structure_paths
                 for frame in _read_frames(path)
+                if self._sampling_structure_allowed(frame)
             ]
             structure_by_id = {
                 structure_id(atoms): atoms for atoms in route_structures

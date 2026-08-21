@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -52,6 +53,10 @@ from NepTrain.core.execution import (
     run_stage_worker,
 )
 from NepTrain.core.iteration import GenerationPlan, StageContext, StageOutcome
+from NepTrain.core.generation_policy import (
+    ACTIVE_LEARNING_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_GENERATION_PROTOCOL,
+)
 from NepTrain.core.scientific_data import (
     INPUT_STRUCTURE_ID_KEY,
     structure_id,
@@ -961,6 +966,59 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
         == "input/train.dat"
     )
 
+    v3_context = StageContext(
+        generation=1,
+        generation_dir=tmp_path / "generation-v3",
+        plan=_plan(),
+        artifacts=current,
+        previous_artifacts={},
+        generation_kind="acquisition",
+        stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+        stage_input={
+            "generation_kind": "acquisition",
+            "generation_protocol": ACTIVE_LEARNING_GENERATION_PROTOCOL,
+            "stage_sequence": list(ACTIVE_LEARNING_ACQUISITION_STAGES),
+        },
+    )
+    v3_descriptors = {}
+    for stage in ("validate", "evaluate", "update"):
+        task = build_stage_task(
+            tmp_path / f"{stage}-tasks-v3",
+            workflow_root=tmp_path,
+            workflow_id="activation-v3",
+            generation=1,
+            stage=stage,
+            attempt=1,
+            target=ExecutionTarget("local", "process"),
+            plan=_plan(),
+            config=config,
+            initial_training=initial,
+            context=v3_context,
+        )
+        v3_descriptors[stage] = json.loads(task.descriptor.read_text())
+
+    assert set(v3_descriptors["validate"]["artifacts"]) == set(current)
+    assert tuple(
+        v3_descriptors["validate"]["stage_input"]["stage_sequence"]
+    ) == ACTIVE_LEARNING_ACQUISITION_STAGES
+    assert set(v3_descriptors["evaluate"]["artifacts"]) == {
+        "labeled",
+        "model",
+    }
+    assert {
+        "training_input",
+        "labeled",
+        "model",
+        "acquisition_signals",
+    }.issubset(v3_descriptors["update"]["artifacts"])
+    assert (
+        v3_descriptors["validate"]["config"]["evaluation"]["validation_path"]
+        == "input/config/evaluation/validation_path.xyz"
+    )
+    assert "validation_path" not in v3_descriptors["evaluate"]["config"].get(
+        "evaluation", {}
+    )
+
     previous = {
         "training_set": current["training_set"],
         "activated_model": _write(
@@ -1386,17 +1444,9 @@ def test_controller_uses_reserved_plan_only_after_acquisition_requests_finalizat
     record = {
         "plan_sha256": plan.sha256,
         "kind": "acquisition",
-        "stage_sequence": [
-            "train",
-            "evaluate",
-            "explore",
-            "select",
-            "label",
-            "diagnose",
-            "merge",
-        ],
+        "stage_sequence": list(ACTIVE_LEARNING_ACQUISITION_STAGES),
         "stages": {
-            "merge": {
+            "update": {
                 "artifacts": {},
                 "metrics": {
                     "accepted": True,
@@ -1423,7 +1473,7 @@ def test_controller_uses_reserved_plan_only_after_acquisition_requests_finalizat
     assert controller._next() is None
     assert controller.state["state"] == "budget_exhausted"
 
-    record["stages"]["merge"]["metrics"][
+    record["stages"]["update"]["metrics"][
         "generation_disposition"
     ] = "finalize"
     workspace.ledger.write_text(
@@ -1446,6 +1496,79 @@ def test_controller_uses_reserved_plan_only_after_acquisition_requests_finalizat
     assert next_work is not None
     assert next_work[0].generation == 2
     assert next_work[1:] == ("train", "finalization-context")
+
+
+def test_controller_completes_v3_from_finalization_validate_metrics(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  max_model_generations: 1\n",
+            (
+                "  max_model_generations: 1\n"
+                "  convergence:\n"
+                "    acquisition_min_r2:\n"
+                "      energy_r2: 0.95\n"
+                "      force_r2: 0.95\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    plans = [
+        GenerationPlan(**json.loads(path.read_text()))
+        for path in preparation.plans
+    ]
+    workspace.ledger.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workflow_id": preparation.workflow_id,
+                "generations": {
+                    "1": {
+                        "plan_sha256": plans[0].sha256,
+                        "kind": "acquisition",
+                        "stage_sequence": list(
+                            ACTIVE_LEARNING_ACQUISITION_STAGES
+                        ),
+                        "stages": {
+                            "update": {
+                                "artifacts": {},
+                                "metrics": {
+                                    "accepted": True,
+                                    "generation_disposition": "finalize",
+                                },
+                            }
+                        },
+                        "accepted": True,
+                        "complete": True,
+                    },
+                    "2": {
+                        "plan_sha256": plans[1].sha256,
+                        "kind": "finalization",
+                        "stage_sequence": ["train", "validate"],
+                        "stages": {
+                            "validate": {
+                                "artifacts": {},
+                                "metrics": {
+                                    "accepted": True,
+                                    "workflow_converged": True,
+                                },
+                            }
+                        },
+                        "accepted": True,
+                        "complete": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = PersistentController(preparation.output_dir)
+
+    assert controller._next() is None
+    assert controller.state["state"] == "complete"
+    assert "generation 2" in controller.state["reason"]
 
 
 def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
@@ -1879,6 +2002,274 @@ def test_status_audits_and_resume_repairs_committed_result_projection(tmp_path):
     assert repaired.action == "repair"
     assert committed_model.is_file()
     assert workflow_status(preparation.output_dir).state == "complete"
+
+
+def test_controller_restart_archives_downstream_state_without_deleting_history(
+    tmp_path,
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    plan = controller.plans[0]
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    sequence = [
+        "train",
+        "evaluate",
+        "explore",
+        "select",
+        "label",
+        "diagnose",
+        "merge",
+    ]
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    ledger["generations"]["1"] = {
+        "plan_sha256": plan.sha256,
+        "kind": "acquisition",
+        "stage_sequence": sequence,
+        "stages": {
+            stage: {"artifacts": {}, "metrics": {}}
+            for stage in sequence[:4]
+        },
+    }
+    workspace.ledger.write_text(json.dumps(ledger), encoding="utf-8")
+    assert controller._stage_dir(1, "explore").name == "md"
+    controller.state.update(
+        {
+            "state": "stalled",
+            "current": {
+                "kind": "task_group",
+                "generation": 1,
+                "stage": "label",
+                "attempt": 1,
+                "tasks": [
+                    {"task_id": "ok", "collected_bundle": "ok-result"},
+                    {
+                        "task_id": "failed",
+                        "terminal_failure": True,
+                        "observed_state": "failed",
+                    },
+                ],
+            },
+        }
+    )
+    controller._save()
+
+    preview = controller.plan_restart(
+        generation=1,
+        from_stage="label",
+        task_scope="failed",
+    )
+    assert preview.reused_stages == tuple(sequence[:4])
+    assert preview.preserved_tasks == 1
+    assert preview.retried_tasks == 1
+
+    applied = controller.restart_from(
+        generation=1,
+        from_stage="select",
+        task_scope="all",
+    )
+    assert applied.restarted_stages == tuple(sequence[3:])
+    assert controller.state["state"] == "idle"
+    assert controller.state["current"] is None
+    assert controller.state["history"][-1]["superseded_by"] == {
+        "generation": 1,
+        "from_stage": "select",
+        "task_scope": "all",
+    }
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    generation = ledger["generations"]["1"]
+    assert set(generation["stages"]) == set(sequence[:3])
+    assert set(generation["recovery_attempts"][0]["stages"]) == {"select"}
+
+
+def test_controller_restart_label_retries_failed_tasks_and_preserves_successes(
+    tmp_path, monkeypatch
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    plan = controller.plans[0]
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    sequence = [
+        "train",
+        "evaluate",
+        "explore",
+        "select",
+        "label",
+        "diagnose",
+        "merge",
+    ]
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    ledger["generations"]["1"] = {
+        "plan_sha256": plan.sha256,
+        "kind": "acquisition",
+        "stage_sequence": sequence,
+        "stages": {
+            stage: {"artifacts": {}, "metrics": {}}
+            for stage in sequence[:4]
+        },
+    }
+    workspace.ledger.write_text(json.dumps(ledger), encoding="utf-8")
+    assert controller._stage_dir(1, "explore").name == "md"
+    controller.state.update(
+        {
+            "state": "stalled",
+            "current": {
+                "kind": "task_group",
+                "generation": 1,
+                "stage": "label",
+                "attempt": 1,
+                "tasks": [
+                    {
+                        "task_id": "ok",
+                        "target": "label",
+                        "bundle": "ok-bundle",
+                        "batch_index": 0,
+                        "frame_indices": [0],
+                        "collected_bundle": "ok-result",
+                    },
+                    {
+                        "task_id": "failed",
+                        "target": "label",
+                        "bundle": "failed-bundle",
+                        "batch_index": 1,
+                        "frame_indices": [1],
+                        "terminal_failure": True,
+                        "observed_state": "failed",
+                        "retryable": False,
+                    },
+                ],
+            },
+        }
+    )
+    controller._save()
+
+    rebuilt = []
+
+    def fake_build(*args, **kwargs):
+        rebuilt.append(kwargs)
+        return SimpleNamespace(
+            task_id="failed-attempt-2",
+            bundle=workspace.tasks_dir / "failed-attempt-2",
+        )
+
+    monkeypatch.setattr(controller_module, "build_stage_task", fake_build)
+    result = controller.restart_from(
+        generation=1,
+        from_stage="label",
+        task_scope="failed",
+    )
+
+    assert result.preserved_tasks == 1
+    assert result.retried_tasks == 1
+    assert len(rebuilt) == 1
+    assert rebuilt[0]["attempt"] == 2
+    assert rebuilt[0]["stage_input"] == {
+        "batch_index": 1,
+        "frame_indices": [1],
+    }
+    current = controller.state["current"]
+    assert current["attempt"] == 2
+    assert current["tasks"][0]["task_id"] == "ok"
+    assert current["tasks"][0]["collected_bundle"] == "ok-result"
+    assert current["tasks"][1]["task_id"] == "failed-attempt-2"
+    assert controller.state["state"] == "launching"
+
+
+def test_controller_restart_can_reopen_latest_rejected_generation(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    plan = controller.plans[0]
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    sequence = [
+        "train",
+        "evaluate",
+        "explore",
+        "select",
+        "label",
+        "diagnose",
+        "merge",
+    ]
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    ledger["generations"]["1"] = {
+        "plan_sha256": plan.sha256,
+        "kind": "acquisition",
+        "stage_sequence": sequence,
+        "stages": {
+            stage: {
+                "artifacts": {},
+                "metrics": {"accepted": False} if stage == "merge" else {},
+            }
+            for stage in sequence
+        },
+        "complete": True,
+        "accepted": False,
+    }
+    workspace.ledger.write_text(json.dumps(ledger), encoding="utf-8")
+    controller.state.update(
+        {"state": "rejected", "current": None, "reason": "evaluation failed"}
+    )
+    controller._save()
+
+    result = controller.restart_from(
+        generation=1,
+        from_stage="select",
+        task_scope="all",
+    )
+
+    assert result.reused_stages == ("train", "evaluate", "explore")
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    generation = ledger["generations"]["1"]
+    assert "complete" not in generation
+    assert "accepted" not in generation
+    assert set(generation["stages"]) == {"train", "evaluate", "explore"}
+    assert set(generation["recovery_attempts"][0]["stages"]) == set(
+        sequence[3:]
+    )
+
+
+def test_controller_restart_v3_evaluate_does_not_rewind_validate(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(preparation.output_dir)
+    plan = controller.plans[0]
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    completed = ACTIVE_LEARNING_ACQUISITION_STAGES[:5]
+    ledger["generations"]["1"] = {
+        "plan_sha256": plan.sha256,
+        "kind": "acquisition",
+        "stage_sequence": list(ACTIVE_LEARNING_ACQUISITION_STAGES),
+        "stages": {
+            stage: {"artifacts": {}, "metrics": {}} for stage in completed
+        },
+    }
+    workspace.ledger.write_text(json.dumps(ledger), encoding="utf-8")
+    assert controller._stage_dir(1, "explore").name == "explore"
+    controller.state.update(
+        {
+            "state": "failed",
+            "current": {
+                "generation": 1,
+                "stage": "evaluate",
+                "attempt": 1,
+                "handle": None,
+            },
+        }
+    )
+    controller._save()
+
+    result = controller.restart_from(
+        generation=1,
+        from_stage="evaluate",
+        task_scope="all",
+    )
+
+    assert result.reused_stages == completed
+    assert result.restarted_stages == ("evaluate", "update")
+    ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
+    assert set(ledger["generations"]["1"]["stages"]) == set(completed)
 
 
 def test_resume_refuses_irrecoverable_committed_artifact_damage(tmp_path):
@@ -4341,6 +4732,53 @@ def test_controller_recovers_after_repeated_transport_errors(tmp_path, monkeypat
     assert state["current"]["task_id"] == task_id
     assert transport_calls == ["running", "degraded", "degraded", "degraded"]
     assert state["current"]["handle"]["execution_id"] == "701234"
+
+
+def test_internal_controller_failure_preserves_live_handle_for_resume(
+    tmp_path, monkeypatch,
+):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    bundle = preparation.output_dir / ".neptrain/jobs/live-task"
+
+    def fail_after_submission(controller, *, should_stop=None):
+        controller.state["current"] = {
+            "task_id": "live-task",
+            "generation": 1,
+            "stage": "train",
+            "resource": "training",
+            "target": "gpu",
+            "attempt": 1,
+            "bundle": str(bundle),
+            "handle": {
+                "task_id": "live-task",
+                "target": "gpu",
+                "executor": "slurm",
+                "execution_id": "701999",
+                "local_bundle": str(bundle),
+            },
+        }
+        raise RuntimeError("controller persistence failed")
+
+    monkeypatch.setattr(PersistentController, "tick", fail_after_submission)
+
+    with pytest.raises(RuntimeError, match="persistence failed"):
+        run_controller(preparation.output_dir, poll_interval=0.2)
+
+    failed = json.loads(
+        (preparation.output_dir / ".neptrain/controller.json").read_text()
+    )
+    assert failed["state"] == "failed"
+    assert failed["preserve_current_on_retry"] is True
+    assert failed["current"]["handle"]["execution_id"] == "701999"
+
+    controller = PersistentController(preparation.output_dir)
+    controller.retry()
+
+    assert controller.state["state"] == "launching"
+    assert "preserve_current_on_retry" not in controller.state
+    assert controller.state["current"]["attempt"] == 1
+    assert controller.state["current"]["handle"]["execution_id"] == "701999"
 
 
 def test_detached_controller_completes_a_real_multi_process_workflow(tmp_path):

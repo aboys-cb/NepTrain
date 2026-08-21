@@ -103,6 +103,35 @@ def test_schema_v8_loads_without_migration(tmp_path):
     assert changes == []
 
 
+def test_sampling_accepts_excluded_reduced_compositions(tmp_path):
+    value = _project()
+    value["sampling"]["excluded_compositions"] = ["Al2Co3Fe6Ni3Ta2"]
+
+    config, _ = load_config(_write(tmp_path, value))
+
+    assert config["sampling"]["excluded_compositions"] == [
+        "Al2Co3Fe6Ni3Ta2"
+    ]
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    [
+        "Al2Co3Fe6Ni3Ta2",
+        ["not-a-formula"],
+        ["Al2Co3Fe6Ni3Ta2", "Al4Co6Fe12Ni6Ta4"],
+    ],
+)
+def test_sampling_rejects_invalid_or_duplicate_excluded_compositions(
+    tmp_path, excluded,
+):
+    value = _project()
+    value["sampling"]["excluded_compositions"] = excluded
+
+    with pytest.raises(ConfigError, match="excluded_compositions"):
+        load_config(_write(tmp_path, value))
+
+
 def test_acquisition_convergence_policy_is_validated(tmp_path):
     value = _project(
         workflow={

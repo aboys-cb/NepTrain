@@ -13,7 +13,11 @@ from NepTrain.core.iteration import (
     IterationError,
     StageOutcome,
 )
-from NepTrain.core.generation_policy import ADAPTIVE_GENERATION_PROTOCOL
+from NepTrain.core.generation_policy import (
+    ACTIVE_LEARNING_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    ADAPTIVE_GENERATION_PROTOCOL,
+)
 
 
 class _PublishingAdapter:
@@ -43,6 +47,59 @@ class _PublishingAdapter:
                 artifacts["signals"] = path
                 artifacts["activated_model"] = path
         return StageOutcome(artifacts=artifacts, metrics=metrics)
+
+
+def test_workspace_keeps_old_stage_directories_and_adds_v3_names(tmp_path: Path):
+    workspace = WorkflowWorkspace.create(tmp_path / "layout")
+
+    assert workspace.stage_dir(1, "diagnose").name == "diagnose"
+    assert workspace.stage_dir(1, "merge").name == "dataset"
+    assert workspace.stage_dir(1, "explore").name == "md"
+    assert workspace.stage_dir(
+        1,
+        "explore",
+        stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+    ).name == "explore"
+    assert workspace.stage_dir(1, "validate").name == "validate"
+    assert workspace.stage_dir(1, "evaluate").name == "evaluate"
+    assert workspace.stage_dir(1, "update").name == "update"
+
+
+def test_v3_publication_reads_validation_metrics_from_validate(tmp_path: Path):
+    class Adapter:
+        def run_stage(self, stage, context):
+            path = context.work_dir / f"{stage}.txt"
+            path.write_text(stage + "\n", encoding="utf-8")
+            artifacts = {f"{stage}_evidence": path}
+            metrics = {}
+            if stage == "train":
+                artifacts["model_training_set"] = path
+            elif stage == "validate":
+                artifacts.update(activated_model=path, signals=path)
+                metrics = {
+                    "energy_rmse": 0.01,
+                    "force_rmse": 0.02,
+                    "virial_rmse": 0.03,
+                }
+            elif stage == "evaluate":
+                metrics = {"current_model_energy_rmse": 9.0}
+            elif stage == "update":
+                metrics = {"accepted": True}
+            return StageOutcome(artifacts, metrics)
+
+    workspace = WorkflowWorkspace.create(tmp_path / "v3-publication")
+    controller = GenerationController(
+        workspace.root,
+        "v3-publication",
+        generation_protocol=ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    )
+    controller.run_generation(GenerationPlan(1, 7, 2), Adapter())
+
+    generation_dir = workspace.generation_dir(1)
+    assert (generation_dir / "explore").is_dir()
+    assert not (generation_dir / "md").exists()
+    summary = (workspace.results_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Energy RMSE (eV/atom)：0.01" in summary
 
 
 def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: Path):

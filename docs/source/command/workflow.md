@@ -252,8 +252,8 @@ Energy/Force/Virial 的 R²、每个元素的 Force R²、每个实际温压条�
 `coverage_exhausted`：它只表示当前描述符和采样路径已找不到覆盖缺口，不等价于
 模型已经通过物理精度验证。
 
-这里的“一代”严格绑定一个模型哈希。采样代按
-`train → evaluate → explore → select → label → diagnose → merge` 推进：先用上一代
+这里的“一代”严格绑定一个模型哈希。新建流程使用 `active_learning_v3`，采样代按
+`train → validate → explore → select → label → evaluate → update` 推进：先用上一代
 合并后的完整训练集得到新模型，再让这个模型驱动本代 MD。Controller 会枚举该模型下所有已解锁
 scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交；全部进入终态后
 再合并候选并执行 FPS。不同 route 可通过 `execution.sampling_route_targets`
@@ -262,7 +262,7 @@ scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交�
 
 采样判据通过后，本代仍会先合并最后一批 DFT 标签，但不会把已看过这些标签的模型
 用于收敛判断。Controller 随后创建一个 `finalization` 代，只执行
-`train → evaluate`：在最终完整训练集上训练并验收最终模型，不再运行 MD、FPS 或 DFT。
+`train → validate`：在最终完整训练集上训练并验收最终模型，不再运行 MD、FPS 或 DFT。
 `complete` 只由这个终代产生。为保证最后一个采样代也能自动完成，准备 workflow 时会
 在 `max_model_generations` 个采样预算之外预留一个终代；若采样预算用尽仍未通过，预留
 代不会被误用作普通采样。
@@ -405,13 +405,15 @@ neptrain workflow run fe-workflow
 不需要人工检查快照时，也可以直接运行
 `neptrain workflow run project.yaml`，一次完成创建和启动。
 
-输出目录默认使用 `workflow.id`。Controller 默认脱离终端，按 ledger 推进：
+输出目录默认使用 `workflow.id`。启用收敛判据的新流程按 ledger 推进：
 
 ```text
-train → explore → select → label → diagnose → merge → retrain → evaluate
+train → validate → explore → select → label → evaluate → update
 ```
 
 训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。
+既有 `adaptive_v2` 目录继续保留原来的 `evaluate/diagnose/merge` stage 和路径；
+新版本按 manifest 中已经固化的 protocol 读取，不会重命名或混写旧目录。
 
 `workflow run <目录>` 只允许状态为 `prepared` 的目录第一次启动。
 `workflow resume <目录>` 只用于已经启动过的暂停、失败、中断或可修复损坏状态；
@@ -424,9 +426,39 @@ train → explore → select → label → diagnose → merge → retrain → ev
 neptrain workflow status fe-workflow
 neptrain workflow status fe-workflow --jobs
 neptrain workflow resume fe-workflow
+neptrain workflow restart fe-workflow --generation 3 --from label --dry-run
 neptrain workflow stop fe-workflow
 neptrain workflow extend fe-workflow 5
 ```
+
+`resume` 延续 Controller 当前记录的执行意图，不回退已经提交到 ledger 的科学阶段。
+需要明确重算本代某个阶段时使用 `restart`。先用 `--dry-run` 查看复用和重算范围，
+确认后去掉该选项执行：
+
+```bash
+# 保留已经成功的 DFT shard，只重试失败或未完成的 shard
+neptrain workflow restart fe-workflow \
+  --generation 3 --from label --tasks failed --dry-run
+neptrain workflow restart fe-workflow \
+  --generation 3 --from label --tasks failed
+
+# 放弃本代已有的选择结果，从 select 开始全部重算
+neptrain workflow restart fe-workflow \
+  --generation 3 --from select --tasks all
+```
+
+`restart` 只操作最新且尚未完成的代次。指定阶段之前的 artifact 保持权威；该阶段
+及其下游的已提交记录转入 `recovery_attempts`，当前执行转入 history，不会删除
+失败证据。若 current 是 `label` 或 `explore` task group，`--tasks failed` 保留
+已收集且校验通过的 shard，只为失败或未完成 shard 创建新 attempt；`--tasks all`
+则重建整组任务。仍有 scheduler 作业未终止时 restart 会拒绝执行，必须先 stop 并
+完成状态核对，避免重复提交。
+
+`--from` 使用该 generation 的 ledger 中实际记录的 stage 名。新
+`active_learning_v3` 中 `evaluate` 表示“对新增标签评估旧模型”；旧
+`adaptive_v2` 中 `evaluate` 仍表示“采样前模型验证”，新增标签评估仍叫
+`diagnose`。CLI 不对这个有歧义的名称做猜测或静默转换，`--dry-run` 会列出实际
+复用和重算的阶段。
 
 默认状态页优先显示当前代次、采样温度路径、实际 MD 进度和历代验证精度。例如：
 
@@ -456,8 +488,9 @@ ps 进度来自 MD 已写出的实际 step 和模板中的有效 timestep，不�
 完整保留在 `--json` 输出中。
 
 `workflow status --json` 的 stdout 使用
-`neptrain.workflow-status.v1`；run/resume、stop 和 extend 分别使用稳定的
-`workflow-control.v1`、`workflow-stop.v1` 和 `workflow-extend.v1`。诊断不混入
+`neptrain.workflow-status.v1`；run/resume、restart、stop 和 extend 分别使用稳定的
+`workflow-control.v1`、`workflow-restart.v1`、`workflow-stop.v1` 和
+`workflow-extend.v1`。诊断不混入
 JSON stdout。`workflow-control.v1` 始终包含 `workflow_id`、`project`、
 `manifest` 和 `action`；`action` 明确区分 `prepare`、`start`、`resume`、
 `repair` 与 `noop`，不再另写一份重复的 `started` 布尔状态。
@@ -480,8 +513,8 @@ workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 
   resume 只修复 hash 一致的冗余副本和可见投影；无法证明来源时在提交新任务前
   fail closed。
 - `budget_exhausted`：模型代数预算耗尽，先 `workflow extend`，不是成功。
-- `stalled`：相同模型与策略继续运行不会增加证据；必须修改科学策略并新建
-  workflow，不能原样 retry。
+- `stalled`：当前执行不能通过普通 `resume` 继续；检查原因后可用
+  `workflow restart --from ...` 明确选择重算位置，或者修改策略后新建 workflow。
 - `complete`：完整 stage 链和（若配置）独立 validation 已验收。
 
 `workflow.max_model_generations` 是采样代预算，不包含自动预留的最终训练代，也不是
@@ -516,19 +549,21 @@ neptrain workflow stop fe-workflow --keep-jobs
 ```text
 generations/0001/
 ├── train/
-├── md/
+├── validate/
+├── explore/
 ├── select/
 ├── label/
-├── diagnose/
-├── dataset/
-├── retrain/
-└── evaluate/
+├── evaluate/
+└── update/
 ```
+
+旧 `adaptive_v2` workflow 仍使用原来的 `evaluate/diagnose/dataset` 目录；这些目录不会
+自动迁移。一个 generation 内只使用其 ledger 已记录的那套 stage sequence。
 
 训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；
 `calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 Matplotlib
 从 `loss.out` 自动生成 `training-convergence.png` 和可审计的
-`training-report.json`。配置独立验证集时，evaluate 还会生成按验收阈值归一化的
+`training-report.json`。配置独立验证集时，validate 还会生成按验收阈值归一化的
 `evaluation-metrics.png` 与 `evaluation-report.json`；图中 1× 线就是配置阈值。
 同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction parity 图
 `evaluation-parity.png`，spin 模型会增加 magnetic-force 面板。对应报告记录

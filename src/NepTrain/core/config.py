@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
+from .composition import reduced_composition
 from .sampling_route import MATURITY_STAGES
 
 
@@ -46,6 +47,7 @@ _FIELDS: dict[str, set[str]] = {
     "sampling": {
         "routes",
         "candidate_pool",
+        "excluded_compositions",
         "selection",
     },
     "labeling": {
@@ -431,6 +433,27 @@ def validate_config(config: Mapping[str, Any]) -> None:
     sampling_routes = _validate_sampling_routes(sampling)
     candidate_pool = _mapping(sampling, "candidate_pool")
     selection = _mapping(sampling, "selection")
+    excluded_compositions = sampling.get("excluded_compositions", [])
+    if not isinstance(excluded_compositions, list) or any(
+        not isinstance(value, str) or not value.strip()
+        for value in excluded_compositions
+    ):
+        raise ConfigError(
+            "sampling.excluded_compositions must be a list of chemical formulas"
+        )
+    excluded_keys = []
+    for formula in excluded_compositions:
+        try:
+            excluded_keys.append(reduced_composition(formula))
+        except (KeyError, ValueError) as error:
+            raise ConfigError(
+                "sampling.excluded_compositions contains an invalid chemical "
+                f"formula: {formula}"
+            ) from error
+    if len(set(excluded_keys)) != len(excluded_keys):
+        raise ConfigError(
+            "sampling.excluded_compositions contains duplicate reduced compositions"
+        )
     if int(candidate_pool.get("pre_failure_frames", 2)) < 0:
         raise ConfigError(
             "sampling.candidate_pool.pre_failure_frames must be non-negative"

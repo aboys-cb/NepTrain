@@ -8,7 +8,7 @@ NepTrain 是 NEP 模型生命周期的统一命令行工具。它既能独立运
 标注和采样，也能把同一套步骤组合成可恢复的主动学习 workflow。
 
 ```text
-train → md → select → label → merge → retrain → evaluate
+train → validate → explore → select → label → evaluate → update
 ```
 
 手动命令和自动 workflow 使用相同的训练、MD、Label Adapter 和执行 target；
@@ -577,11 +577,12 @@ workflow/
 需要重新开始时创建新的 workflow 目录，它会得到新的随机 instance id，不会复用
 旧 task/result。
 
-每代目录直接是 `train/`、`md/`、`select/`、`label/`、`diagnose/`、
-`dataset/`、`retrain/` 和 `evaluate/`。训练输出、loss 和模型发布到对应阶段
+新流程每代目录直接是 `train/`、`validate/`、`explore/`、`select/`、`label/`、
+`evaluate/` 和 `update/`。既有 `adaptive_v2` workflow 保留原来的
+`evaluate/diagnose/dataset` 路径，不自动迁移。训练输出、loss 和模型发布到对应阶段
 目录，`calculation` 软链指向真实执行目录。训练阶段会用 Matplotlib 发布
 `training-convergence.png` 和 `training-report.json`；配置独立验证集时，
-evaluate 阶段还会发布按阈值归一化的 `evaluation-metrics.png`，以及 Energy、
+validate 阶段还会发布按阈值归一化的 `evaluation-metrics.png`，以及 Energy、
 Force、Virial（spin 模型另含 magnetic force）的 reference/prediction parity 图
 `evaluation-parity.png`。每张图都有对应的 JSON 报告记录数据来源、点数和 RMSE。
 

@@ -15,16 +15,19 @@ from NepTrain.cli.cli import (
     _print_job_batches,
     _print_precision,
     run_project_command,
+    run_restart_command,
     run_resume_command,
     run_status_command,
 )
 from NepTrain.core.workflow import (
     WorkflowError,
+    WorkflowRestart,
     WorkflowResume,
     _generation_science,
     workflow_status,
     extend_workflow,
     prepare_workflow,
+    restart_workflow,
     resume_workflow,
     start_workflow,
 )
@@ -34,7 +37,10 @@ from NepTrain.core.iteration import (
     GenerationPlan,
     StageOutcome,
 )
-from NepTrain.core.generation_policy import ADAPTIVE_GENERATION_PROTOCOL
+from NepTrain.core.generation_policy import (
+    ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    ADAPTIVE_GENERATION_PROTOCOL,
+)
 
 
 def _write(path: Path, text: str = "fixture\n") -> Path:
@@ -216,9 +222,53 @@ def test_convergence_workflow_reserves_one_train_only_finalization_plan(tmp_path
     result = prepare_workflow(config, initial, tmp_path / "adaptive")
     manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
 
-    assert manifest["generation_protocol"] == "adaptive_v2"
+    assert manifest["generation_protocol"] == ACTIVE_LEARNING_GENERATION_PROTOCOL
     assert manifest["sampling_generation_budget"] == 3
     assert len(result.plans) == 4
+
+
+def test_existing_adaptive_v2_preparation_remains_idempotent(
+    tmp_path, monkeypatch
+):
+    config, initial = _inputs(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  seed: 17\n",
+            (
+                "  seed: 17\n"
+                "  convergence:\n"
+                "    acquisition_min_r2:\n"
+                "      energy_r2: 0.95\n"
+                "      force_r2: 0.95\n"
+                "    group_min_force_r2: 0.90\n"
+                "    max_outlier_fraction: 0.05\n"
+                "    min_selected: 50\n"
+                "    consecutive_generations: 1\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    import NepTrain.core.workflow as workflow_module
+
+    monkeypatch.setattr(
+        workflow_module,
+        "ACTIVE_LEARNING_GENERATION_PROTOCOL",
+        ADAPTIVE_GENERATION_PROTOCOL,
+    )
+    output = tmp_path / "adaptive-v2"
+    first = prepare_workflow(config, initial, output)
+    first_manifest = json.loads(first.manifest.read_text(encoding="utf-8"))
+    assert first_manifest["generation_protocol"] == ADAPTIVE_GENERATION_PROTOCOL
+
+    monkeypatch.setattr(
+        workflow_module,
+        "ACTIVE_LEARNING_GENERATION_PROTOCOL",
+        ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    )
+    second = prepare_workflow(config, initial, output)
+
+    assert second == first
+    assert json.loads(second.manifest.read_text(encoding="utf-8")) == first_manifest
 
 
 def test_status_accepts_finalization_before_unused_sampling_plans(tmp_path):
@@ -750,6 +800,82 @@ def test_generation_status_does_not_relabel_legacy_metrics_as_per_atom():
     assert current["quality"]["acquisition_rmse"]["energy_rmse"] == 0.004
 
 
+def test_generation_status_normalizes_v2_and_v3_stage_names_identically():
+    plan = {
+        "generation": 1,
+        "max_selected": 10,
+        "selection_novelty_threshold": 0.0,
+        "completion_coverage_threshold": 0.0,
+    }
+    role_metrics = {
+        "validation": {
+            "prediction_metric_basis": "per_atom_v1",
+            "force_rmse": 0.08,
+            "accepted": True,
+            "active_model_sha256": "model",
+        },
+        "evaluation": {
+            "prediction_metric_basis": "per_atom_v1",
+            "current_model_force_rmse": 0.12,
+            "current_model_force_r2": 0.97,
+        },
+        "update": {
+            "training_count": 120,
+            "added_count": 20,
+            "generation_disposition": "continue",
+        },
+    }
+
+    def record(sequence, validation, evaluation, update):
+        return {
+            "kind": "acquisition",
+            "stage_sequence": list(sequence),
+            "stages": {
+                validation: {"metrics": role_metrics["validation"]},
+                evaluation: {"metrics": role_metrics["evaluation"]},
+                update: {"metrics": role_metrics["update"]},
+            },
+        }
+
+    v2 = _generation_science(
+        plan,
+        record(
+            (
+                "train",
+                "evaluate",
+                "explore",
+                "select",
+                "label",
+                "diagnose",
+                "merge",
+            ),
+            "evaluate",
+            "diagnose",
+            "merge",
+        ),
+    )
+    v3 = _generation_science(
+        plan,
+        record(
+            (
+                "train",
+                "validate",
+                "explore",
+                "select",
+                "label",
+                "evaluate",
+                "update",
+            ),
+            "validate",
+            "evaluate",
+            "update",
+        ),
+    )
+
+    assert v3["quality"] == v2["quality"]
+    assert v3["training"] == v2["training"]
+
+
 def test_completed_workflow_extends_plans(tmp_path: Path):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -958,6 +1084,123 @@ def test_resume_command_uses_existing_workflow_interface(
     assert payload["project"] == str(preparation.output_dir)
     assert payload["controller_pid"] == 123
     assert "job_ids" not in payload
+
+
+def test_restart_command_exposes_explicit_stage_and_task_scope(
+    tmp_path: Path, monkeypatch, capsys
+):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    expected = WorkflowRestart(
+        workflow_id=preparation.workflow_id,
+        action="restart_preview",
+        manifest=preparation.manifest,
+        generation=3,
+        from_stage="label",
+        task_scope="failed",
+        reused_stages=("train", "evaluate", "explore", "select"),
+        restarted_stages=("label", "diagnose", "merge"),
+        preserved_tasks=70,
+        retried_tasks=30,
+    )
+
+    def fake_restart(path, **options):
+        assert Path(path) == preparation.output_dir
+        assert options == {
+            "generation": 3,
+            "from_stage": "label",
+            "task_scope": "failed",
+            "dry_run": True,
+            "foreground": False,
+            "poll_interval": None,
+        }
+        return expected
+
+    monkeypatch.setattr("NepTrain.core.workflow.restart_workflow", fake_restart)
+    run_restart_command(
+        SimpleNamespace(
+            project=str(preparation.output_dir),
+            generation=3,
+            from_stage="label",
+            tasks="failed",
+            dry_run=True,
+            foreground=False,
+            poll_interval=None,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["protocol"] == "neptrain.workflow-restart.v1"
+    assert payload["action"] == "restart_preview"
+    assert payload["project"] == str(preparation.output_dir)
+    assert payload["reused_stages"] == [
+        "train",
+        "evaluate",
+        "explore",
+        "select",
+    ]
+    assert payload["preserved_tasks"] == 70
+    assert payload["retried_tasks"] == 30
+    assert "controller_pid" not in payload
+
+
+def test_restart_dry_run_does_not_change_ledger_or_controller_state(tmp_path: Path):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    plan = GenerationPlan(**json.loads(preparation.plans[0].read_text()))
+    sequence = [
+        "train",
+        "evaluate",
+        "explore",
+        "select",
+        "label",
+        "diagnose",
+        "merge",
+    ]
+    ledger = {
+        "version": 1,
+        "workflow_id": preparation.workflow_id,
+        "generations": {
+            "1": {
+                "plan_sha256": plan.sha256,
+                "kind": "acquisition",
+                "stage_sequence": sequence,
+                "stages": {
+                    stage: {"artifacts": {}, "metrics": {}}
+                    for stage in sequence[:4]
+                },
+            }
+        },
+    }
+    workspace.ledger.write_text(json.dumps(ledger), encoding="utf-8")
+    workspace.controller_file.write_text(
+        json.dumps(
+            {
+                "protocol": "neptrain.controller.v1",
+                "workflow_id": preparation.workflow_id,
+                "state": "stalled",
+                "history": [],
+                "current": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger_before = workspace.ledger.read_bytes()
+    controller_before = workspace.controller_file.read_bytes()
+
+    result = restart_workflow(
+        preparation.output_dir,
+        generation=1,
+        from_stage="label",
+        dry_run=True,
+    )
+
+    assert result.action == "restart_preview"
+    assert result.reused_stages == tuple(sequence[:4])
+    assert result.restarted_stages == tuple(sequence[4:])
+    assert workspace.ledger.read_bytes() == ledger_before
+    assert workspace.controller_file.read_bytes() == controller_before
 
 
 def test_resume_completed_workflow_is_an_idempotent_noop(

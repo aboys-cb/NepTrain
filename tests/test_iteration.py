@@ -34,7 +34,14 @@ from NepTrain.core.workflow_iteration import (
     _evaluation_quality,
     _structure_descriptors,
 )
-from NepTrain.core.generation_policy import ADAPTIVE_GENERATION_PROTOCOL
+from NepTrain.core.generation_policy import (
+    ACTIVE_LEARNING_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_FINALIZATION_STAGES,
+    ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    ADAPTIVE_GENERATION_PROTOCOL,
+    generation_stage_sequence,
+    stage_for_role,
+)
 from NepTrain.core.reporting import ParitySeries
 from NepTrain.core.dft.toy import ToyTeacher
 from NepTrain.core.labeling import LabelResult
@@ -238,6 +245,143 @@ def test_adaptive_generation_finalizes_in_a_train_evaluate_only_generation(
     ]
 
 
+def test_active_learning_v3_uses_unambiguous_public_stage_names(tmp_path):
+    calls = []
+
+    class Adapter:
+        def run_stage(self, stage, context):
+            calls.append(
+                (
+                    context.generation,
+                    stage,
+                    tuple(context.stage_input["stage_sequence"]),
+                )
+            )
+            path = context.work_dir / f"{stage}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+            metrics = {}
+            if context.generation_kind == "acquisition" and stage == "update":
+                metrics = {
+                    "accepted": True,
+                    "generation_disposition": "finalize",
+                }
+            elif context.generation_kind == "finalization" and stage == "validate":
+                metrics = {"accepted": True, "workflow_converged": True}
+            return StageOutcome({f"g{context.generation}_{stage}": path}, metrics)
+
+    controller = GenerationController(
+        tmp_path / "active-learning-v3",
+        "active-learning-v3",
+        generation_protocol=ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    )
+    adapter = Adapter()
+    controller.run_generation(GenerationPlan(1, 1, 2), adapter)
+    controller.run_generation(GenerationPlan(2, 2, 2), adapter)
+
+    assert [stage for generation, stage, _ in calls if generation == 1] == list(
+        ACTIVE_LEARNING_ACQUISITION_STAGES
+    )
+    assert [stage for generation, stage, _ in calls if generation == 2] == list(
+        ACTIVE_LEARNING_FINALIZATION_STAGES
+    )
+    assert all(
+        sequence
+        == (
+            ACTIVE_LEARNING_ACQUISITION_STAGES
+            if generation == 1
+            else ACTIVE_LEARNING_FINALIZATION_STAGES
+        )
+        for generation, _, sequence in calls
+    )
+
+
+def test_active_learning_v3_dispatches_evaluate_separately_from_validate():
+    calls = []
+
+    class Adapter(WorkflowIterationAdapter):
+        def __init__(self):
+            pass
+
+        def _acquisition_evaluate(self, context):
+            calls.append("validate-implementation")
+            return StageOutcome({}, {})
+
+        def _acquisition_diagnose(self, context):
+            calls.append("evaluate-implementation")
+            return StageOutcome({}, {})
+
+        def _acquisition_merge(self, context):
+            calls.append("update-implementation")
+            return StageOutcome({}, {"accepted": True})
+
+    adapter = Adapter()
+    for stage in ("validate", "evaluate", "update"):
+        adapter.run_stage(
+            stage,
+            StageContext(
+                generation=1,
+                generation_dir=Path("."),
+                plan=GenerationPlan(1, 1, 2),
+                artifacts={},
+                previous_artifacts={},
+                generation_kind="acquisition",
+                stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+            ),
+        )
+
+    assert calls == [
+        "validate-implementation",
+        "evaluate-implementation",
+        "update-implementation",
+    ]
+
+
+def test_stage_roles_disambiguate_v2_and_v3_evaluate():
+    v2 = {
+        "kind": "acquisition",
+        "stage_sequence": [
+            "train",
+            "evaluate",
+            "explore",
+            "select",
+            "label",
+            "diagnose",
+            "merge",
+        ],
+    }
+    v3 = {
+        "kind": "acquisition",
+        "stage_sequence": list(ACTIVE_LEARNING_ACQUISITION_STAGES),
+    }
+
+    assert stage_for_role(v2, "validate") == "evaluate"
+    assert stage_for_role(v2, "evaluate") == "diagnose"
+    assert stage_for_role(v2, "update") == "merge"
+    assert stage_for_role(v3, "validate") == "validate"
+    assert stage_for_role(v3, "evaluate") == "evaluate"
+    assert stage_for_role(v3, "update") == "update"
+
+    with pytest.raises(
+        ValueError,
+        match="generation kind and stage sequence are inconsistent",
+    ):
+        generation_stage_sequence(
+            {
+                "kind": "acquisition",
+                "stage_sequence": [
+                    "train",
+                    "validate",
+                    "explore",
+                    "select",
+                    "label",
+                    "diagnose",
+                    "update",
+                ],
+            }
+        )
+
+
 def test_rejected_finalization_reopens_from_train(tmp_path):
     class Adapter:
         def __init__(self):
@@ -275,8 +419,37 @@ def test_rejected_finalization_reopens_from_train(tmp_path):
     assert controller.next_stage(plan) == "train"
 
 
+@pytest.mark.parametrize(
+    ("protocol", "stages", "evaluation_stage", "update_stage"),
+    [
+        (
+            ADAPTIVE_GENERATION_PROTOCOL,
+            (
+                "train",
+                "evaluate",
+                "explore",
+                "select",
+                "label",
+                "diagnose",
+                "merge",
+            ),
+            "diagnose",
+            "merge",
+        ),
+        (
+            ACTIVE_LEARNING_GENERATION_PROTOCOL,
+            ACTIVE_LEARNING_ACQUISITION_STAGES,
+            "evaluate",
+            "update",
+        ),
+    ],
+)
 def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
     tmp_path,
+    protocol,
+    stages,
+    evaluation_stage,
+    update_stage,
 ):
     teacher = ToyTeacher("ordinary")
     initial = tmp_path / "initial.xyz"
@@ -372,21 +545,13 @@ def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
     summary = GenerationController(
         tmp_path / "adaptive-real",
         "adaptive-real",
-        generation_protocol=ADAPTIVE_GENERATION_PROTOCOL,
+        generation_protocol=protocol,
     ).run_generation(GenerationPlan(1, 7, 2), adapter)
 
-    assert tuple(summary.metrics) == (
-        "train",
-        "evaluate",
-        "explore",
-        "select",
-        "label",
-        "diagnose",
-        "merge",
-    )
-    assert summary.metrics["diagnose"]["current_model_force_r2"] == 1.0
-    assert summary.metrics["merge"]["workflow_converged"] is False
-    assert summary.metrics["merge"]["generation_disposition"] in {
+    assert tuple(summary.metrics) == stages
+    assert summary.metrics[evaluation_stage]["current_model_force_r2"] == 1.0
+    assert summary.metrics[update_stage]["workflow_converged"] is False
+    assert summary.metrics[update_stage]["generation_disposition"] in {
         "continue",
         "finalize",
     }
@@ -394,8 +559,17 @@ def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
     assert "training_set" in summary.artifacts
 
 
+@pytest.mark.parametrize(
+    ("stage_sequence", "validation_stage"),
+    [
+        (("train", "evaluate"), "evaluate"),
+        (ACTIVE_LEARNING_FINALIZATION_STAGES, "validate"),
+    ],
+)
 def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
     tmp_path,
+    stage_sequence,
+    validation_stage,
 ):
     merged = tmp_path / "merged.xyz"
     previous_model = tmp_path / "previous-nep.txt"
@@ -445,20 +619,20 @@ def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
             },
             stage_dir=tmp_path / "train",
             generation_kind="finalization",
-            stage_sequence=("train", "evaluate"),
+            stage_sequence=stage_sequence,
         ),
     )
     evaluate = adapter.run_stage(
-        "evaluate",
+        validation_stage,
         StageContext(
             generation=2,
             generation_dir=tmp_path / "generation-2",
             plan=plan,
             artifacts=train.artifacts,
             previous_artifacts={},
-            stage_dir=tmp_path / "evaluate",
+            stage_dir=tmp_path / validation_stage,
             generation_kind="finalization",
-            stage_sequence=("train", "evaluate"),
+            stage_sequence=stage_sequence,
         ),
     )
 
@@ -672,6 +846,55 @@ def test_progression_keeps_the_user_selection_limit_constant():
     plans = progressive_plans(4, max_selected=100)
 
     assert [plan.max_selected for plan in plans] == [100, 100, 100, 100]
+
+
+def test_excluded_composition_is_not_scheduled_for_md(tmp_path: Path):
+    excluded = Atoms(
+        "Al2Co3Fe6Ni3Ta2",
+        positions=np.arange(48, dtype=float).reshape(16, 3) * 0.1,
+        cell=[20, 20, 20],
+        pbc=True,
+    )
+    allowed = Atoms(
+        "Al3Co3Fe4Ni3Ta3",
+        positions=np.arange(48, dtype=float).reshape(16, 3) * 0.11,
+        cell=[20, 20, 20],
+        pbc=True,
+    )
+    structures = tmp_path / "structures.extxyz"
+    model = tmp_path / "nep.txt"
+    template = tmp_path / "template.in"
+    training = tmp_path / "training.extxyz"
+    ase_write(structures, [excluded, allowed], format="extxyz")
+    ase_write(training, [allowed], format="extxyz")
+    model.write_text("model\n", encoding="utf-8")
+    template.write_text("template\n", encoding="utf-8")
+    sampling = _sampling(
+        structures=structures,
+        template=template,
+        max_selected=4,
+    )
+    sampling["excluded_compositions"] = ["Al2Co3Fe6Ni3Ta2"]
+    adapter = WorkflowIterationAdapter(
+        {
+            "training": {"backend": "gpumd"},
+            "md": {"backend": "lammps", "spin": False},
+            "sampling": sampling,
+            "labeling": {"backend": "toy"},
+        },
+        initial_training=training,
+    )
+    context = StageContext(
+        generation=1,
+        generation_dir=tmp_path,
+        plan=GenerationPlan(1, 7, 4),
+        artifacts={"model": model},
+        previous_artifacts={},
+    )
+
+    attempts = adapter.plan_explore_attempts(context)
+
+    assert len(attempts) == 1
 
 
 def test_regular_label_floor_is_derived_from_the_user_maximum():
@@ -898,6 +1121,33 @@ def test_rejected_generation_can_reopen_from_retrain_with_history(tmp_path: Path
         "metrics"
     ]["accepted"] is False
     assert generation["stages"]["evaluate"]["metrics"]["accepted"] is True
+
+
+def test_incomplete_generation_can_restart_from_reached_stage(tmp_path: Path):
+    class Adapter:
+        def run_stage(self, stage, context):
+            artifact = context.generation_dir / f"{stage}.json"
+            artifact.write_text("{}\n", encoding="utf-8")
+            return StageOutcome({f"{stage}_artifact": artifact}, {})
+
+    plan = progressive_plans(1)[0]
+    root = tmp_path / "restart-incomplete"
+    controller = GenerationController(root, "restart-incomplete")
+    adapter = Adapter()
+    for expected in ("train", "explore", "select", "label"):
+        assert controller.next_stage(plan) == expected
+        controller.run_stage(plan, adapter)
+
+    assert controller.next_stage(plan) == "diagnose"
+    controller.reopen_from(plan, from_stage="select")
+    assert controller.next_stage(plan) == "select"
+
+    ledger = json.loads((root / "workflow-ledger.json").read_text())
+    generation = ledger["generations"]["1"]
+    assert set(generation["stages"]) == {"train", "explore"}
+    recovery = generation["recovery_attempts"][0]
+    assert recovery["from_stage"] == "select"
+    assert set(recovery["stages"]) == {"select", "label"}
 
 
 def test_controller_rejects_plan_change_after_generation_started(tmp_path: Path):

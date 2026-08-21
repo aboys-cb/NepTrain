@@ -227,7 +227,7 @@ def test_doctor_infers_all_project_target_requirements():
 def test_workflow_commands_are_grouped():
     completed = _help("workflow", "--help")
     assert completed.returncode == 0
-    assert "{init,run,status,resume,extend,stop}" in completed.stdout
+    assert "{init,run,status,resume,restart,extend,stop}" in completed.stdout
 
 
 def test_workflow_stop_exposes_explicit_job_preservation():

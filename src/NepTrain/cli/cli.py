@@ -92,6 +92,7 @@ _STATE_LABELS = {
 }
 _STAGE_LABELS = {
     "train": "训练",
+    "validate": "模型验证",
     "explore": "采样",
     "select": "选样",
     "label": "标注",
@@ -99,6 +100,7 @@ _STAGE_LABELS = {
     "merge": "合并训练集",
     "retrain": "重新训练",
     "evaluate": "评估",
+    "update": "更新训练集",
 }
 
 
@@ -576,6 +578,35 @@ def run_resume_command(args):
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     payload = _workflow_resume_payload(result)
+    _print_json(payload)
+
+
+def run_restart_command(args):
+    from dataclasses import asdict
+
+    from NepTrain.core.workflow import WorkflowError, restart_workflow
+    from NepTrain.core.workflow_workspace import WorkflowWorkspace
+
+    try:
+        result = restart_workflow(
+            args.project,
+            generation=args.generation,
+            from_stage=args.from_stage,
+            task_scope=args.tasks,
+            dry_run=args.dry_run,
+            foreground=args.foreground,
+            poll_interval=args.poll_interval,
+        )
+    except WorkflowError as error:
+        raise SystemExit(f"NepTrain: error: {error}") from error
+    payload = asdict(result)
+    payload["protocol"] = "neptrain.workflow-restart.v1"
+    payload["manifest"] = str(result.manifest)
+    payload["project"] = str(WorkflowWorkspace.locate(result.manifest).root)
+    if result.controller_pid is None:
+        payload.pop("controller_pid")
+    if result.controller_exit_code is None:
+        payload.pop("controller_exit_code")
     _print_json(payload)
 
 
@@ -2062,6 +2093,36 @@ def build_workflow_commands(subparsers):
     )
     resume.set_defaults(func=run_resume_command)
     resume.add_argument("project")
+
+    restart = actions.add_parser(
+        "restart",
+        help="Restart the latest unfinished generation from an explicit stage.",
+    )
+    restart.set_defaults(func=run_restart_command)
+    restart.add_argument("project")
+    restart.add_argument("--generation", type=int, required=True)
+    restart.add_argument(
+        "--from",
+        dest="from_stage",
+        required=True,
+        help="First stage to execute again.",
+    )
+    restart.add_argument(
+        "--tasks",
+        choices=["failed", "all"],
+        default="failed",
+        help=(
+            "For a retained task group, retry only failed tasks (default) "
+            "or rebuild every task."
+        ),
+    )
+    restart.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the restart plan without changing workflow state.",
+    )
+    restart.add_argument("--foreground", action="store_true")
+    restart.add_argument("--poll-interval", type=float)
 
     extend = actions.add_parser(
         "extend", help="Increase the maximum model-generation budget."
