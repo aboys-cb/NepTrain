@@ -71,12 +71,12 @@ def run_native_abacus(
         parameters,
         spin_frame=spin_frame,
     )
-    basis_type = str(parameters.get("basis_type", "pw")).strip().lower()
+    require_orbitals = _requires_orbitals(parameters)
     resource_provenance, pp_files, orb_files = validate_abacus_resources(
         request.resource_dir,
         request.resource_manifest,
         input_frame,
-        require_orbitals=basis_type == "lcao",
+        require_orbitals=require_orbitals,
     )
     case_dir = new_attempt_directory(
         request.work_dir,
@@ -248,6 +248,15 @@ def _parameter_enabled(value: object) -> bool:
     }
 
 
+def _requires_orbitals(parameters: Mapping[str, object]) -> bool:
+    """Return whether ABACUS needs numerical orbitals for this calculation."""
+
+    basis_type = str(parameters.get("basis_type", "pw")).strip().lower()
+    return basis_type == "lcao" or _parameter_enabled(
+        parameters.get("sc_mag_switch")
+    )
+
+
 def validate_abacus_spin_contract(
     parameters: dict[str, str],
     *,
@@ -289,7 +298,7 @@ def _render_case(
     if str(parameters.get("smearing_method", "")).strip().lower() == "gau":
         parameters["smearing_method"] = "gaussian"
     parameters["pseudo_dir"] = str(resource_dir)
-    if str(parameters.get("basis_type", "pw")).strip().lower() == "lcao":
+    if _requires_orbitals(parameters):
         parameters["orbital_dir"] = str(resource_dir)
     parameters["cal_force"] = "1"
     parameters["cal_stress"] = "1"
@@ -306,8 +315,7 @@ def _render_case(
     else:
         parameters.pop("kspacing", None)
     _write_input(case_dir / "INPUT", parameters)
-    basis_type = str(parameters.get("basis_type", "pw")).strip().lower()
-    active_orb_files = orb_files if basis_type == "lcao" else {}
+    active_orb_files = orb_files if _requires_orbitals(parameters) else {}
     ordered_indices = _write_stru(
         case_dir / "STRU",
         atoms,

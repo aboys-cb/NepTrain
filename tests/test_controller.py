@@ -3998,6 +3998,38 @@ def test_slurm_permanent_submission_rejection_is_terminal(tmp_path):
         executor.launch(task)
 
 
+def test_slurm_wall_time_policy_rejection_is_terminal(tmp_path):
+    bundle = tmp_path / "task"
+    bundle.mkdir()
+    task = StageTask("abc", "demo", 1, "explore", "slurm", bundle)
+
+    class RejectedRunner(SlurmRunner):
+        def __call__(self, args, **kwargs):
+            args = list(args)
+            if args[0] == "sbatch":
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    "",
+                    "sbatch: error: QOSMaxWallDurationPerJobLimit\n"
+                    "sbatch: error: Batch job submission failed: Job violates "
+                    "accounting/QOS policy (job submit limit, user's size "
+                    "and/or time limits)",
+                )
+            return super().__call__(args, **kwargs)
+
+    executor = SlurmExecutor(
+        ExecutionTarget("slurm", "slurm", partition="cpu", time="86400"),
+        runner=RejectedRunner(),
+    )
+
+    with pytest.raises(
+        PermanentExecutionError,
+        match="QOSMaxWallDurationPerJobLimit",
+    ):
+        executor.launch(task)
+
+
 def test_slurm_terminal_state_overrides_stale_running_worker_file(tmp_path):
     bundle = tmp_path / "task"
     bundle.mkdir()

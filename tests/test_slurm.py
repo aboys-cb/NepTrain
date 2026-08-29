@@ -4,6 +4,7 @@ import subprocess
 
 from NepTrain.core.slurm import (
     SlurmScript,
+    SlurmSubmissionError,
     SlurmSubmissionThrottled,
     aggregate_states,
     parse_submission_job_id,
@@ -84,6 +85,27 @@ def test_shared_state_and_submission_policy_cover_site_annotations():
     assert submission_is_throttled(
         "sbatch: error: QOSMaxSubmitJobPerUserLimit"
     )
+
+
+def test_wall_time_policy_error_is_not_submission_throttling():
+    detail = (
+        "sbatch: error: QOSMaxWallDurationPerJobLimit\n"
+        "sbatch: error: Batch job submission failed: Job violates "
+        "accounting/QOS policy (job submit limit, user's size and/or time limits)"
+    )
+
+    assert not submission_is_throttled(detail)
+
+    def rejected(command):
+        return subprocess.CompletedProcess(command, 1, "", detail)
+
+    try:
+        submit_job(rejected, "job.sbatch")
+    except SlurmSubmissionError as error:
+        assert type(error) is SlurmSubmissionError
+        assert "QOSMaxWallDurationPerJobLimit" in str(error)
+    else:  # pragma: no cover - assertion explains the expected exception
+        raise AssertionError("wall-time policy rejection was misclassified")
 
 
 def test_shared_setup_line_uses_packaged_remote_copy(tmp_path):

@@ -249,6 +249,13 @@ def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
     resources = tmp_path / "resources"
     _resource_files(resources, elements=("Fe", "Al"))
     arguments = _arguments(tmp_path, source, resources)
+    input_path = Path(arguments.incar)
+    input_path.write_text(
+        input_path.read_text(encoding="utf-8").replace(
+            "basis_type lcao", "basis_type pw"
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", _fake_command(tmp_path, _spin_log()))
 
     result = label(
@@ -289,7 +296,11 @@ def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
     ):
         assert setting in rendered_input
     assert "sc_direction_only" not in rendered_input
+    assert f"orbital_dir {resources.resolve()}" in rendered_input
     structure = (case / "STRU").read_text(encoding="utf-8")
+    assert "NUMERICAL_ORBITAL" in structure
+    assert "Fe.ORB" in structure
+    assert "Al.ORB" in structure
     assert "mag 1 0 0 sc 1 1 1" in structure
     assert "mag 0 0 3 sc 1 1 1" in structure
     assert "mag 0 2 0 sc 1 1 1" in structure

@@ -179,6 +179,10 @@ def submission_is_throttled(detail: str) -> bool:
 
     normalized = re.sub(r"[^a-z0-9]+", " ", detail.lower())
     compact = normalized.replace(" ", "")
+    # Slurm appends generic wording such as "job submit limit" to some
+    # permanent policy errors. Retrying a wall-time violation cannot help.
+    if "qosmaxwalldurationperjoblimit" in compact:
+        return False
     markers = (
         "qosmaxsubmitjobperuserlimit",
         "assocmaxsubmitjoblimit",
