@@ -810,6 +810,101 @@ class ScenarioLadder:
         )
         return state
 
+    def production_status(
+        self,
+        structure_ids: Sequence[str],
+        *,
+        route_id: str = "default",
+        route_fingerprint: str = "default",
+        pressure: float,
+        model_id: str,
+        history: Mapping[str, Any],
+        min_coverage: float = 1.0,
+        min_successful_replicas: int | None = None,
+    ) -> dict[str, Any]:
+        """Summarise current-model production coverage for one route.
+
+        Coverage is required both across the route as a whole and within every
+        production temperature.  This permits a small number of isolated
+        failures without allowing an entire difficult temperature to vanish
+        behind a good aggregate fraction.
+        """
+
+        if (
+            not np.isfinite(float(min_coverage))
+            or not 0.0 < float(min_coverage) <= 1.0
+        ):
+            raise ScenarioMaturityError(
+                "production minimum coverage must be greater than 0 and at most 1"
+            )
+        required_successes = (
+            self.replicas["production_ready"]
+            if min_successful_replicas is None
+            else min_successful_replicas
+        )
+        if (
+            isinstance(required_successes, bool)
+            or not isinstance(required_successes, int)
+            or not 1
+            <= required_successes
+            <= self.replicas["production_ready"]
+        ):
+            raise ScenarioMaturityError(
+                "production minimum successful replicas must be a positive "
+                "integer no greater than the production replica count"
+            )
+
+        state = self._validated_history(history)
+        scenarios = state["scenarios"]
+        structures = sorted(set(str(value) for value in structure_ids))
+        by_temperature: dict[str, dict[str, Any]] = {}
+        verified_total = 0
+        for temperature in self.production_temperatures:
+            verified = 0
+            for structure in structures:
+                record = self._record(
+                    scenarios,
+                    route_id,
+                    route_fingerprint,
+                    structure,
+                    temperature,
+                    pressure,
+                )
+                successes = sum(
+                    item.get("accepted") is True
+                    and item.get("target_level") == "production_ready"
+                    and item.get("model_id") == model_id
+                    for item in record.get("evidence", [])
+                )
+                verified += int(successes >= required_successes)
+            total = len(structures)
+            fraction = float(verified / total) if total else 0.0
+            verified_total += int(verified)
+            by_temperature[f"{temperature:g}"] = {
+                "verified": int(verified),
+                "total": total,
+                "coverage": fraction,
+            }
+        total = len(structures) * len(self.production_temperatures)
+        coverage = float(verified_total / total) if total else 0.0
+        ready = bool(
+            total
+            and coverage >= float(min_coverage)
+            and all(
+                item["coverage"] >= float(min_coverage)
+                for item in by_temperature.values()
+            )
+        )
+        return {
+            "ready": ready,
+            "minimum_coverage": float(min_coverage),
+            "minimum_successful_replicas": required_successes,
+            "verified": verified_total,
+            "total": total,
+            "coverage": coverage,
+            "by_temperature": by_temperature,
+        }
+
     def production_ready(
         self,
         structure_ids: Sequence[str],
@@ -819,26 +914,22 @@ class ScenarioLadder:
         pressure: float,
         model_id: str,
         history: Mapping[str, Any],
+        min_coverage: float = 1.0,
+        min_successful_replicas: int | None = None,
     ) -> bool:
-        """Return whether every requested production condition trusts this model."""
+        """Return whether current-model production coverage meets policy."""
 
-        state = self._validated_history(history)
-        scenarios = state["scenarios"]
-        return all(
-            (
-                record := self._record(
-                    scenarios,
-                    route_id,
-                    route_fingerprint,
-                    str(structure),
-                    temperature,
-                    pressure,
-                )
-            ).get("maturity")
-            == "production_ready"
-            and record.get("verified_model_id") == model_id
-            for structure in sorted(set(str(value) for value in structure_ids))
-            for temperature in self.production_temperatures
+        return bool(
+            self.production_status(
+                structure_ids,
+                route_id=route_id,
+                route_fingerprint=route_fingerprint,
+                pressure=pressure,
+                model_id=model_id,
+                history=history,
+                min_coverage=min_coverage,
+                min_successful_replicas=min_successful_replicas,
+            )["ready"]
         )
 
     @staticmethod

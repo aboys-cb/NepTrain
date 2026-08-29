@@ -11,7 +11,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from .composition import reduced_composition
-from .sampling_route import MATURITY_STAGES
+from .sampling_route import MATURITY_STAGES, normalized_progression
 
 
 CURRENT_SCHEMA_VERSION = 8
@@ -142,6 +142,8 @@ _WORKFLOW_CONVERGENCE_FIELDS = {
     "max_outlier_fraction",
     "min_selected",
     "consecutive_generations",
+    "production_min_coverage",
+    "production_min_successful_replicas",
 }
 _RMSE_FIELDS = {
     "energy_rmse",
@@ -753,6 +755,44 @@ def validate_config(config: Mapping[str, Any]) -> None:
                     "workflow.convergence.consecutive_generations must be "
                     "a positive integer"
                 )
+            production_coverage = convergence.get(
+                "production_min_coverage", 1.0
+            )
+            if (
+                isinstance(production_coverage, bool)
+                or not isinstance(production_coverage, (int, float))
+                or not math.isfinite(float(production_coverage))
+                or not 0.0 < float(production_coverage) <= 1.0
+            ):
+                raise ConfigError(
+                    "workflow.convergence.production_min_coverage must be "
+                    "finite and greater than 0 and at most 1"
+                )
+            production_successes = convergence.get(
+                "production_min_successful_replicas"
+            )
+            if production_successes is not None:
+                production_replica_counts = [
+                    normalized_progression(route.get("progression"))[
+                        "replicas"
+                    ]["production_ready"]
+                    for route in sampling_routes
+                ]
+                smallest_replica_count = min(
+                    production_replica_counts
+                )
+                if (
+                    isinstance(production_successes, bool)
+                    or not isinstance(production_successes, int)
+                    or not 1
+                    <= production_successes
+                    <= smallest_replica_count
+                ):
+                    raise ConfigError(
+                        "workflow.convergence.production_min_successful_replicas "
+                        "must be a positive integer no greater than every "
+                        "route's production_ready replica count"
+                    )
     if evaluation:
         if not evaluation.get("validation_path"):
             raise ConfigError(

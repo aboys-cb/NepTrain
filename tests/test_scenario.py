@@ -297,6 +297,123 @@ def test_production_readiness_is_rechecked_after_model_changes():
     )
 
 
+def test_production_coverage_tolerates_isolated_failures_per_temperature():
+    ladder = _ladder(
+        path=(300.0,),
+        production=(300.0,),
+        replicas={
+            "smoke_passed": 1,
+            "short_stable": 1,
+            "long_stable": 1,
+            "production_ready": 3,
+        },
+    )
+    structures = [f"structure-{index}" for index in range(10)]
+    history = None
+    for generation in range(1, 5):
+        attempts = ladder.schedule(
+            structures,
+            pressure=0.0,
+            generation=generation,
+            seed=generation,
+            limit=len(structures) * 3,
+            model_id="model-1",
+            history=history,
+        )
+        accepted = {
+            attempt.attempt_id: not (
+                generation == 4
+                and (
+                    attempt.structure_id == structures[-1]
+                    or attempt.replica == 3
+                )
+            )
+            for attempt in attempts
+        }
+        history = ladder.record(
+            attempts,
+            completed=dict(accepted),
+            diagnostic_accepted=dict(accepted),
+            history=history,
+            validation_accepted=None,
+            model_improved=False,
+            novelty_converged=True,
+            final_model_id="model-1",
+        )
+
+    strict = ladder.production_status(
+        structures,
+        pressure=0.0,
+        model_id="model-1",
+        history=history,
+    )
+    tolerant = ladder.production_status(
+        structures,
+        pressure=0.0,
+        model_id="model-1",
+        history=history,
+        min_coverage=0.9,
+        min_successful_replicas=2,
+    )
+
+    assert strict["ready"] is False
+    assert tolerant["ready"] is True
+    assert tolerant["verified"] == 9
+    assert tolerant["total"] == 10
+    assert tolerant["by_temperature"]["300"]["coverage"] == pytest.approx(0.9)
+    assert tolerant["minimum_successful_replicas"] == 2
+
+
+def test_production_coverage_cannot_hide_a_weak_temperature():
+    ladder = _ladder(
+        path=(300.0, 700.0),
+        production=(300.0, 700.0),
+    )
+    structures = [f"structure-{index}" for index in range(10)]
+    history = None
+    for generation in range(1, 6):
+        attempts = ladder.schedule(
+            structures,
+            pressure=0.0,
+            generation=generation,
+            seed=generation,
+            limit=100,
+            model_id="model-1",
+            history=history,
+        )
+        accepted = {
+            attempt.attempt_id: not (
+                attempt.target_level == "production_ready"
+                and attempt.temperature == 700.0
+                and attempt.structure_id in structures[-4:]
+            )
+            for attempt in attempts
+        }
+        history = ladder.record(
+            attempts,
+            completed=dict(accepted),
+            diagnostic_accepted=dict(accepted),
+            history=history,
+            validation_accepted=None,
+            model_improved=False,
+            novelty_converged=True,
+            final_model_id="model-1",
+        )
+
+    status = ladder.production_status(
+        structures,
+        pressure=0.0,
+        model_id="model-1",
+        history=history,
+        min_coverage=0.8,
+    )
+
+    assert status["coverage"] == pytest.approx(0.8)
+    assert status["by_temperature"]["300"]["coverage"] == pytest.approx(1.0)
+    assert status["by_temperature"]["700"]["coverage"] == pytest.approx(0.6)
+    assert status["ready"] is False
+
+
 def test_novel_structures_do_not_block_duration_progression():
     ladder = _ladder(path=(300.0,), production=(300.0,))
     first = ladder.schedule(

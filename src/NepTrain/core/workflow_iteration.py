@@ -2927,6 +2927,16 @@ class WorkflowIterationAdapter:
         }
         histories: dict[str, Any] = {}
         all_ready = True
+        production_min_coverage = float(
+            self.config.get("workflow", {})
+            .get("convergence", {})
+            .get("production_min_coverage", 1.0)
+        )
+        production_min_successful_replicas = (
+            self.config.get("workflow", {})
+            .get("convergence", {})
+            .get("production_min_successful_replicas")
+        )
         total_counts: dict[str, int] = {}
         no_progress = []
         for route_plan in scenario_plan["routes"]:
@@ -2982,14 +2992,21 @@ class WorkflowIterationAdapter:
                 novelty_converged_by_attempt=novelty_by_attempt,
                 final_model_id=final_model_id,
             )
-            ready = ladder.production_ready(
+            production_status = ladder.production_status(
                 route_plan["structure_ids"],
                 route_id=route_id,
                 route_fingerprint=route.fingerprint,
                 pressure=float(route_plan["pressure"]),
                 model_id=final_model_id,
                 history=route_history,
+                min_coverage=production_min_coverage,
+                min_successful_replicas=(
+                    int(production_min_successful_replicas)
+                    if production_min_successful_replicas is not None
+                    else None
+                ),
             )
+            ready = bool(production_status["ready"])
             all_ready = all_ready and ready
             for level, count in route_history["counts_by_maturity"].items():
                 total_counts[level] = total_counts.get(level, 0) + int(count)
@@ -2999,6 +3016,7 @@ class WorkflowIterationAdapter:
                 "route_fingerprint": route.fingerprint,
                 "template_sha256": route.template_sha256,
                 "production_ready": ready,
+                "production_status": production_status,
                 "history": route_history,
             }
         return (
@@ -3009,6 +3027,10 @@ class WorkflowIterationAdapter:
                 "no_progress_rounds": min(no_progress, default=0),
                 "last_model_id": final_model_id,
                 "validation_accepted": validation_accepted,
+                "production_min_coverage": production_min_coverage,
+                "production_min_successful_replicas": (
+                    production_min_successful_replicas
+                ),
             },
             all_ready,
         )

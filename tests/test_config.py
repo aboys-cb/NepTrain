@@ -165,6 +165,8 @@ def test_r2_acquisition_convergence_policy_is_validated(tmp_path):
                 "max_outlier_fraction": 0.05,
                 "min_selected": 50,
                 "consecutive_generations": 1,
+                "production_min_coverage": 0.9,
+                "production_min_successful_replicas": 2,
             }
         }
     )
@@ -174,6 +176,8 @@ def test_r2_acquisition_convergence_policy_is_validated(tmp_path):
     convergence = config["workflow"]["convergence"]
     assert convergence["acquisition_min_r2"]["force_r2"] == pytest.approx(0.95)
     assert convergence["min_selected"] == 50
+    assert convergence["production_min_coverage"] == pytest.approx(0.9)
+    assert convergence["production_min_successful_replicas"] == 2
 
 
 @pytest.mark.parametrize(
@@ -192,6 +196,26 @@ def test_r2_acquisition_convergence_policy_is_validated(tmp_path):
                 "consecutive_generations": 0,
             },
             "positive integer",
+        ),
+        (
+            {
+                "acquisition_min_r2": {
+                    "energy_r2": 0.95,
+                    "force_r2": 0.95,
+                },
+                "production_min_coverage": 0.0,
+            },
+            "greater than 0 and at most 1",
+        ),
+        (
+            {
+                "acquisition_min_r2": {
+                    "energy_r2": 0.95,
+                    "force_r2": 0.95,
+                },
+                "production_min_successful_replicas": 4,
+            },
+            "no greater than every route's production_ready replica count",
         ),
         (
             {"acquisition_min_r2": {"energy_r2": 0.95}},
