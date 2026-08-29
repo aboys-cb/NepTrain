@@ -353,6 +353,7 @@ class PersistentController:
                 )
                 if evaluate.get("workflow_converged") is True:
                     self.state["state"] = "complete"
+                    self.state["completed_generation"] = plan.generation
                     self.state["reason"] = (
                         f"workflow converged after model generation {plan.generation}"
                     )
@@ -1415,8 +1416,15 @@ class PersistentController:
 
         next_value = self._next()
         if next_value is None:
+            terminal_state = str(self.state["state"])
             return ControllerTick(
-                str(self.state["state"]), detail=str(self.state.get("reason", ""))
+                terminal_state,
+                generation=(
+                    self.state.get("completed_generation")
+                    if terminal_state == "complete"
+                    else None
+                ),
+                detail=str(self.state.get("reason", "")),
             )
         plan, stage, context = next_value
         if stage == "explore":

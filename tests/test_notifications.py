@@ -184,11 +184,55 @@ def test_finalization_notification_does_not_claim_sampling_or_labeling():
         },
     )
 
-    assert "最终训练完成" in event.text
+    assert "最终模型已就绪" in event.text
+    assert "最终代：G3（计划上限 G4）" in event.text
     assert "最终训练集：120 个结构" in event.text
-    assert "未运行 MD、FPS 或 DFT" in event.text
+    assert "不再运行 MD、FPS 或 DFT" in event.text
     assert "采样：" not in event.text
     assert "标注：" not in event.text
+
+
+def test_finalization_notification_omits_empty_quality_placeholders():
+    event = _generation_event(
+        "Fe",
+        4,
+        {"generation": 3, "max_selected": 100},
+        {
+            "kind": "finalization",
+            "complete": True,
+            "accepted": True,
+            "stages": {
+                "train": {"metrics": {"training_count": 120}},
+                "evaluate": {
+                    "metrics": {
+                        "accepted": True,
+                        "workflow_converged": True,
+                        "active_model_sha256": "b" * 64,
+                    }
+                },
+            },
+        },
+    )
+
+    assert "RMSE" not in event.text
+    assert "E=-" not in event.text
+
+
+def test_complete_terminal_report_uses_actual_completed_generation():
+    tick = SimpleNamespace(
+        state="complete",
+        generation=None,
+        stage=None,
+        detail="workflow converged after model generation 15",
+    )
+    state = {"state": "complete", "completed_generation": 15}
+
+    event = _terminal_event("Fe", 17, state, tick)
+
+    assert "工作流已收敛并完成" in event.text
+    assert "结束位置：G15（计划上限 G17）" in event.text
+    assert "17/17" not in event.text
+    assert "workflow converged" not in event.text
 
 
 def test_terminal_report_is_stable_per_attempt():

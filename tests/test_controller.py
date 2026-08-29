@@ -1568,6 +1568,7 @@ def test_controller_completes_v3_from_finalization_validate_metrics(tmp_path):
 
     assert controller._next() is None
     assert controller.state["state"] == "complete"
+    assert controller.state["completed_generation"] == 2
     assert "generation 2" in controller.state["reason"]
 
 

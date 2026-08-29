@@ -250,23 +250,30 @@ def _generation_event(
     icon = "⚠️" if partial else "✅"
     outcome = "部分成功并已接受" if partial else "本轮已接受"
     if generation_kind == "finalization":
+        final_quality = any(value is not None for value in quality.values())
         lines = [
-            f"🎯 [NepTrain] G{generation}/{total_generations} 最终训练完成",
+            "🎯 [NepTrain] 最终模型已就绪",
             *_workflow_identity(workflow_id, workflow_path),
+            f"最终代：G{generation}（计划上限 G{total_generations}）",
             (
                 "最终训练集："
                 f"{_number(training.get('after_count'))} 个结构"
             ),
-            f"{quality_label}："
-            f"E={_metric(quality.get('energy_rmse'), scale=1000, unit='meV/atom')}，"
-            f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}，"
-            f"V={_metric(quality.get('virial_rmse'), scale=1000, unit='meV/atom')}，"
-            f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/μB')}",
-            "结论：最终模型已验收；本代未运行 MD、FPS 或 DFT",
+            "结果：最终模型已验收",
+            "说明：本代仅执行收尾训练与验证，不再运行 MD、FPS 或 DFT",
         ]
         model = training.get("active_model_sha256")
         if model:
-            lines.insert(-1, f"模型：{str(model)[:12]}")
+            lines.insert(-2, f"模型：{str(model)[:12]}")
+        if final_quality:
+            lines.insert(
+                -2,
+                f"{quality_label}："
+                f"E={_metric(quality.get('energy_rmse'), scale=1000, unit='meV/atom')}，"
+                f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}，"
+                f"V={_metric(quality.get('virial_rmse'), scale=1000, unit='meV/atom')}，"
+                f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/μB')}",
+            )
         return NotificationEvent(
             f"generation:{generation}:accepted",
             "\n".join(lines),
@@ -324,7 +331,15 @@ def _terminal_event(
     state = str(getattr(tick, "state", controller_state.get("state", "failed")))
     current = controller_state.get("current")
     current = current if isinstance(current, Mapping) else {}
-    generation = getattr(tick, "generation", None) or current.get("generation")
+    generation = (
+        getattr(tick, "generation", None)
+        or (
+            controller_state.get("completed_generation")
+            if state == "complete"
+            else None
+        )
+        or current.get("generation")
+    )
     stage = getattr(tick, "stage", None) or current.get("stage")
     attempt = current.get("attempt", 1)
     detail = (
@@ -341,7 +356,7 @@ def _terminal_event(
         "coverage_exhausted": "⚠️",
     }
     labels = {
-        "complete": "流程完成",
+        "complete": "工作流已收敛并完成",
         "failed": "流程失败",
         "rejected": "评估未通过",
         "stalled": "流程停滞",
@@ -351,11 +366,21 @@ def _terminal_event(
     lines = [
         f"{icons.get(state, 'ℹ️')} [NepTrain] {labels.get(state, state)}",
         *_workflow_identity(workflow_id, workflow_path),
-        f"进度：{generation or total_generations}/{total_generations}",
     ]
+    if state == "complete":
+        if generation is None:
+            lines.append(f"结束位置：计划上限 G{total_generations}")
+        else:
+            lines.append(
+                f"结束位置：G{generation}（计划上限 G{total_generations}）"
+            )
+        lines.append("状态：最终结果已保存，流程正常结束")
+    else:
+        lines.append(f"进度：{generation or total_generations}/{total_generations}")
     if stage:
         lines.append(f"位置：G{generation or '-'} / {stage}")
-    lines.append(f"原因：{detail}")
+    if state != "complete":
+        lines.append(f"原因：{detail}")
     if state != "complete":
         lines.append("已完成的科学结果和失败证据均保留，可检查后 resume")
     event_id = (
