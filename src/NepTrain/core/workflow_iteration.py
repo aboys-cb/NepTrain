@@ -89,6 +89,24 @@ PredictionRunner = Callable[
 _DESCRIPTOR_BATCH_SIZE = 4096
 _CANDIDATE_VALIDATION_REGRESSION_FACTOR = 1.02
 _PREDICTION_METRIC_BASIS = "per_atom_v1"
+_LITE_SPIN_DESCRIPTOR = re.compile(
+    r"^\s*spin_descriptor\s+spin_nep_lite\s*$", re.MULTILINE
+)
+_DECLARED_SPIN_MODE = re.compile(r"^\s*spin_mode\s+(\d+)\s*(?:#.*)?$", re.MULTILINE)
+
+
+def _declared_spin_mode(text: str) -> int | None:
+    """Return the ``spin_mode`` declared by a training config, if any.
+
+    ``spin_mode 0`` disables magnetism while 1/2/3 select different magnetic
+    descriptor families (1 = ``spin_nep_lite``, 3 = the O/C magnetic
+    polynomial).  A spin workflow only needs to know that the training config
+    produces a spin model; which family it uses is the trainer's business and
+    is checked on the trained model itself.
+    """
+
+    match = _DECLARED_SPIN_MODE.search(text)
+    return int(match.group(1)) if match else None
 
 
 def _nep_descriptors(model: Path, frames: Sequence[Atoms]) -> np.ndarray:
@@ -639,9 +657,14 @@ class WorkflowIterationAdapter:
         ):
             config_path = self._path(self.config.get("training", {}).get("config_path"))
             text = config_path.read_text(encoding="utf-8")
-            if not re.search(r"^\s*spin_descriptor\s+spin_nep_lite\s*$", text, re.MULTILINE):
+            spin_mode = _declared_spin_mode(text)
+            if not _LITE_SPIN_DESCRIPTOR.search(text) and not (
+                spin_mode is not None and spin_mode >= 1
+            ):
                 raise WorkflowIterationError(
-                    "spin workflow training config must use spin_descriptor spin_nep_lite"
+                    "spin workflow training config must declare a spin model: "
+                    "spin_descriptor spin_nep_lite or spin_mode >= 1 "
+                    "(spin_mode 3 = O/C magnetic polynomial, nep4_spin3)"
                 )
 
     def _path(self, value: str | Path | None) -> Path:

@@ -1601,6 +1601,45 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert all(request.test_file is None for request in training_requests)
 
 
+def test_spin_workflow_accepts_spin3_training_config(tmp_path: Path):
+    """md.spin=true accepts any spin model family, not only spin_nep_lite."""
+
+    initial = tmp_path / "initial-spin.xyz"
+    template = tmp_path / "lammps-spin.in"
+    ase_write(
+        initial,
+        Atoms("Fe", positions=[[0, 0, 0]], cell=[4, 4, 4], pbc=True),
+        format="extxyz",
+    )
+    template.write_text("run {{ steps }}\n", encoding="utf-8")
+
+    def build(config_text: str) -> WorkflowIterationAdapter:
+        config_file = tmp_path / "nep-spin.in"
+        config_file.write_text(config_text, encoding="utf-8")
+        return WorkflowIterationAdapter(
+            {
+                "training": {
+                    "backend": "torchnep",
+                    "config_path": str(config_file),
+                },
+                "md": {"backend": "lammps", "spin": True},
+                "sampling": _sampling(
+                    (300.0,), structures=initial, template=template
+                ),
+                "labeling": {"backend": "toy"},
+            },
+            initial_training=initial,
+        )
+
+    # nep4_spin3: the O/C magnetic polynomial is a spin model as well.
+    build("type 5 Fe Co Ni Ti Al\nspin_mode 3\nspin_compress 2\n")
+    # the lite descriptor keeps working
+    build("type 5 Fe Co Ni Ti Al\nspin_descriptor spin_nep_lite\n")
+    # a non-magnetic training config is still rejected
+    with pytest.raises(WorkflowIterationError, match="must declare a spin model"):
+        build("type 5 Fe Co Ni Ti Al\nspin_mode 0\n")
+
+
 def test_torchnep_restart_false_keeps_full_training_config(tmp_path: Path):
     training_input = tmp_path / "train.xyz"
     ase_write(
