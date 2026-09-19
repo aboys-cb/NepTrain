@@ -10,6 +10,30 @@ import subprocess
 from typing import Callable, Mapping, Sequence
 
 
+def normalized_time_limit(value: object, default: str = "01:00:00") -> str:
+    """Return a ``sbatch --time`` value for a configured wall clock.
+
+    Unquoted YAML wall-clock literals such as ``24:00:00`` are sexagesimal
+    integers, so a config may hand us ``86400``.  Slurm reads a bare number as
+    *minutes*, so such a value must be interpreted as seconds and rendered as
+    ``HH:MM:SS`` (or ``D-HH:MM:SS``).  Explicit ``HH:MM``/``HH:MM:SS``/
+    ``D-HH:MM:SS`` strings pass through unchanged.
+    """
+
+    text = str(value if value is not None else default).strip()
+    if re.fullmatch(r"[0-9]+", text):
+        seconds = int(text)
+        days, remainder = divmod(seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if days:
+            return f"{days}-{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    if not re.fullmatch(r"[0-9:-]+", text):
+        raise ValueError(f"invalid Slurm time limit: {text!r}")
+    return text
+
+
 ACTIVE_STATES = frozenset(
     {
         "CONFIGURING",
@@ -122,7 +146,7 @@ def render_script(spec: SlurmScript) -> str:
         "#!/bin/bash",
         f"#SBATCH --job-name={spec.job_name}",
         f"#SBATCH --output={spec.output_path}",
-        f"#SBATCH --time={spec.time_limit}",
+        f"#SBATCH --time={normalized_time_limit(spec.time_limit)}",
         f"#SBATCH --partition={spec.partition}",
     ]
     if spec.array is not None:

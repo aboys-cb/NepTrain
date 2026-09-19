@@ -14,6 +14,43 @@ from NepTrain.core.slurm import (
     submit_job,
     submission_is_throttled,
 )
+from NepTrain.core.execution import ExecutionTarget
+
+
+def test_execution_target_normalizes_sexagesimal_yaml_time():
+    """Unquoted YAML `24:00:00` arrives as 86400 and must render as hours."""
+
+    base = {"executor": "slurm", "partition": "cpu", "qos": "huge-cpu"}
+
+    assert (
+        ExecutionTarget.from_mapping("a", {**base, "time": 86400}).time
+        == "1-00:00:00"
+    )
+    assert ExecutionTarget.from_mapping("b", {**base, "time": 1800}).time == "00:30:00"
+    assert ExecutionTarget.from_mapping("b2", {**base, "time": 14400}).time == "04:00:00"
+    assert (
+        ExecutionTarget.from_mapping("c", {**base, "time": 90000}).time
+        == "1-01:00:00"
+    )
+    assert (
+        ExecutionTarget.from_mapping("d", {**base, "time": "04:00:00"}).time
+        == "04:00:00"
+    )
+    assert ExecutionTarget.from_mapping("e", {**base}).time == "01:00:00"
+
+    target = ExecutionTarget.from_mapping("f", {**base, "time": 86400})
+    script = render_script(
+        SlurmScript(
+            job_name="nt-time",
+            output_path="/work/logs/out.log",
+            workdir="/work",
+            command="neptrain stage-worker /work/bundle",
+            partition="cpu",
+            time_limit=target.time,
+            qos="huge-cpu",
+        )
+    )
+    assert "#SBATCH --time=1-00:00:00" in script
 
 
 def test_shared_script_renderer_owns_resources_environment_and_array():

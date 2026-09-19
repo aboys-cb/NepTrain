@@ -38,6 +38,7 @@ from .slurm import (
     SlurmScript,
     SlurmSubmissionError,
     SlurmSubmissionThrottled,
+    normalized_time_limit,
     aggregate_states,
     parse_submission_job_id,
     query_job,
@@ -378,8 +379,12 @@ class ExecutionTarget:
                 raise ExecutionError(
                     f"execution target {name}.{field_name} contains unsafe characters"
                 )
-        if not re.fullmatch(r"[0-9:-]+", str(value.get("time", "01:00:00"))):
-            raise ExecutionError(f"execution target {name}.time is invalid")
+        try:
+            time_limit = normalized_time_limit(value.get("time", "01:00:00"))
+        except ValueError as error:
+            raise ExecutionError(
+                f"execution target {name}.time is invalid"
+            ) from error
         if executor == "slurm" and not value.get("partition"):
             raise ExecutionError(
                 f"Slurm execution target {name} requires partition"
@@ -474,7 +479,7 @@ class ExecutionTarget:
             else None,
             partition=str(value["partition"]) if value.get("partition") else None,
             qos=str(value["qos"]) if value.get("qos") else None,
-            time=str(value.get("time", "01:00:00")),
+            time=time_limit,
             cpus_per_task=int(cpus) if cpus is not None else None,
             gpus_per_node=int(gpus) if gpus is not None else None,
             directives=directives,
