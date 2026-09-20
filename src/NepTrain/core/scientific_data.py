@@ -13,12 +13,16 @@ from collections.abc import Iterable
 import numpy as np
 from ase import Atoms
 
-from .spin import SpinDataError, validate_spin_structure
+from .spin import MFORCE_KEY, SPIN_KEY, SpinDataError, validate_spin_structure
 
 
 STRUCTURE_ID_VERSION = "neptrain.structure-id.v3"
 GEOMETRY_ID_VERSION = "neptrain.geometry-id.v2"
 INPUT_STRUCTURE_ID_KEY = "neptrain_input_structure_id"
+# Labels are compared with a tolerance far below the accuracy of the labels
+# themselves: merging frames that were written at different extxyz precisions
+# can shift the last persisted digit without changing the reference state.
+LABEL_MATCH_ATOL = 1e-6
 
 
 class ScientificDataError(ValueError):
@@ -216,12 +220,76 @@ def validate_labeled_frames(frames: Iterable[Atoms]) -> list[str]:
     return identifiers
 
 
+def _labeled_state_matches(left: Atoms, right: Atoms) -> bool:
+    """Return whether two frames of one structure carry the same labels."""
+
+    if abs(reference_energy(left) - reference_energy(right)) > LABEL_MATCH_ATOL:
+        return False
+    deltas = [
+        np.max(np.abs(reference_forces(left) - reference_forces(right))),
+        np.max(
+            np.abs(
+                np.asarray(left.info["virial"], dtype=np.float64)
+                - np.asarray(right.info["virial"], dtype=np.float64)
+            )
+        ),
+    ]
+    for key in (SPIN_KEY, MFORCE_KEY):
+        first = left.arrays.get(key)
+        second = right.arrays.get(key)
+        if (first is None) != (second is None):
+            return False
+        if first is not None:
+            deltas.append(
+                np.max(
+                    np.abs(
+                        np.asarray(first, dtype=np.float64)
+                        - np.asarray(second, dtype=np.float64)
+                    )
+                )
+            )
+    return all(float(delta) <= LABEL_MATCH_ATOL for delta in deltas)
+
+
+def deduplicate_labeled_frames(frames: Iterable[Atoms]) -> tuple[list[Atoms], int]:
+    """Drop repeated copies of one labeled state; refuse label conflicts.
+
+    Atom properties are persisted at extxyz's eight-decimal precision, so a
+    round-tripped copy of a frame is not byte-identical to its source while
+    still being the same model input with the same reference state.  Keeping
+    one copy of such a pair is lossless; keeping only one of two *conflicting*
+    label sets would not be, so that case raises ``ScientificDataError``.
+    """
+
+    kept: list[Atoms] = []
+    seen: dict[str, Atoms] = {}
+    duplicates = 0
+    for index, atoms in enumerate(frames):
+        identifier = structure_id(atoms)
+        previous = seen.get(identifier)
+        if previous is None:
+            seen[identifier] = atoms
+            kept.append(atoms)
+        elif _labeled_state_matches(previous, atoms):
+            duplicates += 1
+        else:
+            raise ScientificDataError(
+                f"frame {index}: the same physical structure carries two "
+                "different label sets"
+            )
+    if not kept:
+        raise ScientificDataError("labeled result contains no frames")
+    return kept, duplicates
+
+
 __all__ = [
     "GEOMETRY_ID_VERSION",
     "INPUT_STRUCTURE_ID_KEY",
+    "LABEL_MATCH_ATOL",
     "STRUCTURE_ID_VERSION",
     "ScientificDataError",
     "bind_labeled_frames_to_inputs",
+    "deduplicate_labeled_frames",
     "geometry_id",
     "labeled_input_structure_ids",
     "reference_energy",

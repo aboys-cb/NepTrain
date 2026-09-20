@@ -54,6 +54,7 @@ from .sampling_route import (
 )
 from .scientific_data import (
     ScientificDataError,
+    deduplicate_labeled_frames,
     labeled_input_structure_ids,
     reference_forces,
     structure_id,
@@ -2568,23 +2569,22 @@ class WorkflowIterationAdapter:
         original = _read_frames(context.artifacts["training_input"])
         labeled = _read_frames(context.artifacts["labeled"], allow_empty=True)
         try:
-            original_ids = validate_labeled_frames(original)
-            labeled_ids = (
-                validate_labeled_frames(labeled) if labeled else []
+            validate_labeled_frames(original)
+            if labeled:
+                validate_labeled_frames(labeled)
+            # A merged dataset may store the same state twice at extxyz's
+            # persisted precision; that is lossless to collapse, while two
+            # different label sets for one structure still fail closed.
+            original, duplicate_input_count = deduplicate_labeled_frames(original)
+            labeled, duplicate_labeled_count = (
+                deduplicate_labeled_frames(labeled) if labeled else ([], 0)
             )
         except ScientificDataError as error:
             raise WorkflowIterationError(
                 f"training merge input violates the scientific data contract: {error}"
             ) from error
-        if len(set(original_ids)) != len(original_ids):
-            raise WorkflowIterationError(
-                "training input contains duplicate physical structures; "
-                "deduplicate it explicitly before recovery"
-            )
-        if len(set(labeled_ids)) != len(labeled_ids):
-            raise WorkflowIterationError(
-                "new labels contain duplicate physical structures"
-            )
+        original_ids = [structure_id(frame) for frame in original]
+        labeled_ids = [structure_id(frame) for frame in labeled]
         overlap = set(original_ids) & set(labeled_ids)
         if overlap:
             raise WorkflowIterationError(
@@ -2605,7 +2605,8 @@ class WorkflowIterationAdapter:
             metrics={
                 "training_count": len(merged),
                 "added_count": len(labeled),
-                "duplicate_labeled_count": 0,
+                "duplicate_labeled_count": duplicate_labeled_count,
+                "duplicate_input_count": duplicate_input_count,
             },
         )
 

@@ -6,6 +6,7 @@ from ase.io import read, write
 
 from NepTrain.core.scientific_data import (
     ScientificDataError,
+    deduplicate_labeled_frames,
     structure_id,
     validate_labeled_frames,
 )
@@ -95,3 +96,48 @@ def test_gpumd_force_array_is_supported_but_conflicts_fail_closed():
     frame.calc.results["forces"] = np.ones((2, 3))
     with pytest.raises(ScientificDataError, match="conflicting force labels"):
         validate_labeled_frames([frame])
+
+
+def test_deduplicate_labeled_frames_collapses_round_trip_copies(tmp_path):
+    """A copy rounded to extxyz precision is the same labeled state."""
+
+    original = Atoms(
+        "FeCoNi",
+        positions=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [2.2000000123456789, 0.0, 0.0],
+                [0.0, 2.2000000123456789, 0.0],
+            ]
+        ),
+        cell=[6, 6, 6],
+        pbc=True,
+    )
+    original.calc = SinglePointCalculator(
+        original, energy=-1.0, forces=np.zeros((3, 3))
+    )
+    original.info["virial"] = np.zeros((3, 3))
+
+    path = tmp_path / "state.xyz"
+    write(path, original, format="extxyz")
+    restored = read(path)
+
+    assert structure_id(original) == structure_id(restored)
+    kept, duplicates = deduplicate_labeled_frames([original, restored])
+    assert duplicates == 1
+    assert len(kept) == 1
+
+
+def test_deduplicate_labeled_frames_rejects_conflicting_labels():
+    """One physical structure with two different label sets must fail closed."""
+
+    frame = _frame()
+    conflicting = frame.copy()
+    conflicting.calc = SinglePointCalculator(
+        conflicting, energy=-9.0, forces=np.zeros((2, 3))
+    )
+    conflicting.info["virial"] = np.zeros((3, 3))
+
+    assert structure_id(frame) == structure_id(conflicting)
+    with pytest.raises(ScientificDataError, match="different label sets"):
+        deduplicate_labeled_frames([frame, conflicting])
