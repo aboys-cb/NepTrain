@@ -53,6 +53,17 @@ class ControllerError(RuntimeError):
     """Raised when a workflow controller cannot safely make progress."""
 
 
+# ``stop_controller`` writes this marker before it sends SIGTERM, which is the
+# only way the controller can tell an intentional stop apart from an external
+# signal (a node reboot or a site reaper sends the same signal).
+STOP_REQUEST_NAME = "controller.stop-request"
+
+# Transient controller faults are retried in place so a hiccup on shared
+# storage does not end a multi-day run; the bound keeps a genuinely broken
+# workflow from spinning forever instead of failing loudly.
+MAX_INTERNAL_FAILURES = 10
+
+
 _RESOURCE_FOR_STAGE = {
     "train": "training",
     "validate": "analysis",
@@ -2134,8 +2145,10 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
     if interval < 0.2:
         raise ControllerError("execution.poll_interval must be at least 0.2 seconds")
     stop_event = threading.Event()
+    stop_signals: list[int] = []
 
-    def request_stop(_signum, _frame) -> None:
+    def request_stop(signum, _frame) -> None:
+        stop_signals.append(int(signum))
         stop_event.set()
 
     previous_handlers = {
@@ -2156,6 +2169,25 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                 f"{os.getpid()}\n", encoding="utf-8"
             )
             controller = PersistentController(workspace.root)
+            # A state of running/degraded/waiting means the previous controller
+            # stopped without reaching a terminal state - it crashed, was
+            # killed, or its node went down.  That is worth reporting once we
+            # take over, because a killed process cannot report itself.
+            previous_state = str(controller.state.get("state") or "")
+            previous_heartbeat = controller.state.get("heartbeat_at")
+            previous_reason = str(controller.state.get("reason") or "")
+            resume_after_interruption = previous_state in {
+                "running",
+                "degraded",
+                "waiting",
+            }
+            stop_marker = workspace.internal_dir / STOP_REQUEST_NAME
+            if stop_marker.exists():
+                # Any marker left over belongs to a stop that already finished.
+                try:
+                    stop_marker.unlink()
+                except OSError:
+                    pass
             controller.state["pid"] = os.getpid()
             controller.state["started_at"] = _now()
             controller.state["state"] = "running"
@@ -2194,6 +2226,48 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         flush=True,
                     )
 
+            def report_controller_event(
+                event_id: str, tick: ControllerTick
+            ) -> None:
+                """Push a controller-level event, not a workflow stage result."""
+
+                if notifier is None:
+                    return
+                from .notifications import NotificationEvent, _terminal_event
+
+                try:
+                    event = _terminal_event(
+                        controller.workflow_id,
+                        len(controller.plans),
+                        controller.state,
+                        tick,
+                        workflow_path=workspace.root,
+                    )
+                    notifier.enqueue(NotificationEvent(event_id, event.text))
+                except Exception as error:
+                    print(
+                        f"NepTrain notification warning: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            if resume_after_interruption:
+                detail = (
+                    f"上一次控制器没有正常收尾就结束了（状态 {previous_state}"
+                    + (
+                        f"，最后心跳 {previous_heartbeat}"
+                        if previous_heartbeat
+                        else ""
+                    )
+                    + (f"，原因 {previous_reason}" if previous_reason else "")
+                    + "）。本次启动已接管并继续，账本与已提交的作业保持不变。"
+                )
+                report_controller_event(
+                    "controller-restarted:"
+                    f"{previous_heartbeat or previous_state}",
+                    ControllerTick("stalled", detail=detail),
+                )
+
             try:
                 while not stop_event.is_set():
                     try:
@@ -2208,6 +2282,10 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                                 "transport_failures", 0
                             ):
                                 controller.state["transport_failures"] = 0
+                                controller._save()
+                            if controller.state.get("internal_failures"):
+                                controller.state["internal_failures"] = 0
+                                controller.state.pop("last_internal_error", None)
                                 controller._save()
                     except ExecutionError as error:
                         failures = (
@@ -2227,6 +2305,24 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                             "degraded",
                             detail=str(error),
                         )
+                    except Exception as error:
+                        # A transient fault (shared-storage hiccup, malformed
+                        # scheduler reply, ...) must not end a multi-day run;
+                        # the workflow keeps its immutable handles and retries.
+                        failures = (
+                            int(controller.state.get("internal_failures", 0))
+                            + 1
+                        )
+                        controller.state["internal_failures"] = failures
+                        controller.state["last_internal_error"] = (
+                            f"{type(error).__name__}: {error}"
+                        )
+                        controller.state["state"] = "degraded"
+                        controller.state.pop("reason", None)
+                        controller._save()
+                        tick = ControllerTick("degraded", detail=str(error))
+                        if failures >= MAX_INTERNAL_FAILURES:
+                            raise
                     report_progress(tick)
                     if tick.state in {
                         "complete",
@@ -2238,10 +2334,40 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                     }:
                         return 0 if tick.state == "complete" else 2
                     stop_event.wait(interval)
+                # A stop request is recorded on disk by stop_controller(); the
+                # same SIGTERM without that marker comes from outside the
+                # workflow (site reaper, node shutdown, ...) and is reported.
+                requested = (workspace.internal_dir / STOP_REQUEST_NAME).exists()
+                if requested:
+                    try:
+                        (workspace.internal_dir / STOP_REQUEST_NAME).unlink()
+                    except OSError:
+                        pass
+                    controller.state["state"] = "stopped"
+                    controller.state["reason"] = "controller stopped by user"
+                    controller._save()
+                    return 0
+                name = (
+                    signal.Signals(stop_signals[-1]).name
+                    if stop_signals
+                    else "unknown"
+                )
                 controller.state["state"] = "stopped"
-                controller.state["reason"] = "controller stopped by user"
+                controller.state["reason"] = (
+                    f"controller terminated by an external signal ({name})"
+                )
                 controller._save()
-                return 0
+                report_controller_event(
+                    f"controller-signal:{name}:{controller.state.get('heartbeat_at')}",
+                    ControllerTick(
+                        "stalled",
+                        detail=(
+                            f"控制器收到外部终止信号 {name}（不是 workflow stop 命令），"
+                            "流程未失败、账本保持不变，resume 即可继续。"
+                        ),
+                    ),
+                )
+                return 1
             except Exception as error:
                 # An internal controller failure does not say that a submitted
                 # scheduler task failed.  Preserve immutable handles so resume
@@ -2366,6 +2492,12 @@ def stop_controller(project: str | Path) -> None:
         raise ControllerError("running controller has no valid pid record") from error
     if not _process_matches(pid, workspace.root):
         raise ControllerError("refusing to signal a pid that is not this workflow controller")
+    # Record that the incoming SIGTERM is an intentional stop; without this
+    # marker the controller treats the signal as an external termination and
+    # reports it.
+    marker = workspace.internal_dir / STOP_REQUEST_NAME
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(_now(), encoding="utf-8")
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:

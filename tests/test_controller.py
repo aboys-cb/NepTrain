@@ -1600,6 +1600,12 @@ def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
 
     def request_stop_on_first_tick(_controller, *, should_stop=None):
         assert should_stop is not None
+        # An intentional stop is announced by the marker written by
+        # stop_controller(); the signal alone means an external termination.
+        workspace = WorkflowWorkspace.locate(preparation.output_dir)
+        (workspace.internal_dir / controller_module.STOP_REQUEST_NAME).write_text(
+            "requested\n", encoding="utf-8"
+        )
         installed_handlers[signal.SIGTERM](signal.SIGTERM, None)
         return ControllerTick("running")
 
@@ -1625,6 +1631,134 @@ def test_run_controller_scopes_stop_event_and_restores_signal_handlers(
     assert not WorkflowWorkspace.locate(
         preparation.output_dir
     ).controller_pid.exists()
+
+
+def test_stop_controller_records_an_intentional_stop_request(tmp_path, monkeypatch):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    workspace.controller_pid.write_text("4242\n", encoding="utf-8")
+    signals: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        controller_module, "controller_running", lambda _root: not signals
+    )
+    monkeypatch.setattr(
+        controller_module, "_process_matches", lambda _pid, _root: True
+    )
+    monkeypatch.setattr(
+        controller_module.os,
+        "kill",
+        lambda pid, signum: signals.append((pid, signum)),
+    )
+
+    stop_controller(preparation.output_dir)
+
+    marker = workspace.internal_dir / controller_module.STOP_REQUEST_NAME
+    assert marker.is_file()
+    assert signals == [(4242, signal.SIGTERM)]
+
+
+def test_external_signal_stop_is_reported(tmp_path, monkeypatch):
+    """A SIGTERM without a stop request comes from outside the workflow."""
+
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    previous_handlers = {signal.SIGTERM: object(), signal.SIGINT: object()}
+    installed_handlers = {}
+
+    monkeypatch.setattr(
+        controller_module.signal, "getsignal", lambda signum: previous_handlers[signum]
+    )
+
+    def record_signal(signum, handler):
+        if callable(handler):
+            installed_handlers[signum] = handler
+        return previous_handlers[signum]
+
+    monkeypatch.setattr(controller_module.signal, "signal", record_signal)
+
+    events: list[tuple[str, str]] = []
+
+    class RecordingNotifier:
+        def observe(self, **_kwargs):
+            return None
+
+        def enqueue(self, event):
+            events.append((event.event_id, event.text))
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "NepTrain.core.notifications.build_workflow_notifier",
+        lambda *_args, **_kwargs: RecordingNotifier(),
+    )
+
+    def request_stop_on_first_tick(_controller, *, should_stop=None):
+        installed_handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return ControllerTick("running")
+
+    monkeypatch.setattr(PersistentController, "tick", request_stop_on_first_tick)
+
+    assert run_controller(preparation.output_dir, poll_interval=0.2) == 1
+
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    state = json.loads(workspace.controller_file.read_text(encoding="utf-8"))
+    assert state["state"] == "stopped"
+    assert "external signal" in state["reason"]
+    assert "SIGTERM" in state["reason"]
+    assert any("external signal" in text or "外部终止信号" in text for _, text in events)
+
+
+def test_transient_controller_fault_is_retried_in_place(tmp_path, monkeypatch):
+    """A non-transport fault must not end a multi-day run."""
+
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    attempts = {"count": 0}
+
+    def flaky_tick(_controller, *, should_stop=None):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RuntimeError("transient storage hiccup")
+        return ControllerTick("complete")
+
+    monkeypatch.setattr(PersistentController, "tick", flaky_tick)
+
+    assert run_controller(preparation.output_dir, poll_interval=0.2) == 0
+    assert attempts["count"] == 3
+
+    state = json.loads(
+        WorkflowWorkspace.locate(
+            preparation.output_dir
+        ).controller_file.read_text(encoding="utf-8")
+    )
+    # The stubbed tick never writes a workflow state, so only the retry
+    # bookkeeping is asserted here: the controller survived and reset it.
+    assert not state.get("internal_failures")
+    assert not state.get("last_internal_error")
+
+
+def test_internal_faults_beyond_the_limit_fail_loudly(tmp_path, monkeypatch):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+
+    def always_broken(_controller, *, should_stop=None):
+        raise RuntimeError("permanent controller fault")
+
+    monkeypatch.setattr(PersistentController, "tick", always_broken)
+
+    with pytest.raises(RuntimeError, match="permanent controller fault"):
+        run_controller(preparation.output_dir, poll_interval=0.2)
+
+    state = json.loads(
+        WorkflowWorkspace.locate(
+            preparation.output_dir
+        ).controller_file.read_text(encoding="utf-8")
+    )
+    assert state["state"] == "failed"
+    assert "permanent controller fault" in state["reason"]
 
 
 def test_notification_failure_never_changes_controller_result(
