@@ -20,8 +20,10 @@ path described below.
 
 ```bash
 cd examples/distillation-deepmd
-pip install 'NepTrain[deepmd,torchnep]'
+python -m pip install -e '../..[deepmd,torchnep]'
 ```
+
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Verify the commands and CUDA runtime:
 

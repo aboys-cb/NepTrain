@@ -16,8 +16,11 @@ TorchNEP Student，最后可选跑一代完整 workflow：
 
 ```bash
 cd examples/distillation-mace
-pip install 'NepTrain[mace,torchnep]'
+python -m pip install -e '../..[mace,torchnep]'
 ```
+
+从当前源码安装，确保 NepTrain 与附带的占位符模板匹配；MD 计算节点也应使用同一
+源码版本。`gpumd-nve.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
 
 先按机器驱动安装合适的 PyTorch，再安装上面的 extra。确认环境：
 

@@ -118,9 +118,11 @@ neptrain md structures/ \
 
 将 `--backend` 改为 `gpumd` 即可使用 GPUMD。无模板时 NepTrain 会生成
 NVE/NVT/NPT 输入；`--seed` 控制初速度随机种子，`--pressure` 的 GPUMD 单位为
-GPa。提供 `run.in` 模板时，模板仍负责 ensemble、thermostat/barostat 类型、
-耦合常数、`time_step` 和 dump 间隔；NepTrain 只写入本轮模型、初始温度、NPT
-目标压强、步数和种子，并确保 dump 包含力。NVE 用初始温度生成速度但不控温。
+GPa。提供 `run.in` 模板时，只替换 `{{ model_file }}`、`{{ temperature }}`、
+`{{ pressure }}`、`{{ steps }}`、`{{ seed }}` 等显式占位符；系综、固定值和多阶段
+命令由模板决定，不再按参数位置覆盖。模板需显式设置 `time_step` 和 `dump_exyz`，
+建议使用 `dump_exyz {{ dump_interval }} 0 1` 输出力。旧模板中需要随任务变化的
+常量应改成占位符，参见 [GPUMD 模板说明](docs/source/command/workflow.md)。
 GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留稳定段和炸前
 帧。Spin MD 仍只支持 LAMMPS DynSpin。
 

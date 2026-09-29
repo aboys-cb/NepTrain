@@ -58,9 +58,26 @@ neptrain md structures/ \
 ```
 
 不提供模板时会生成可直接运行的 NVE/NVT/NPT 输入。提供 `--template run.in` 时，
-ensemble、thermostat/barostat 类型、耦合常数、`time_step` 和 dump 间隔来自
-模板；NepTrain 更新模型、初始温度、NPT 目标压强、步数和种子。GPUMD 压强单位
-为 GPa。NVE 仍使用 `--temperature` 初始化速度，但不在运行中控温。
+NepTrain 只替换 `{{ temperature }}` 等显式占位符，不限制系综类型，也不自动改写
+温压、速度初始化、步数或 dump 设置。固定数值保持原样，具体命令是否合法由 GPUMD
+检查。`--ensemble` 只选择内置默认输入；自定义模板决定实际系综。
+
+例如，以下模板使用任务温度初始化速度，随后进行 NVE 采样：
+
+```text
+potential {{ model_file }}
+velocity {{ temperature }} seed {{ seed }}
+ensemble nve
+time_step {{ timestep_fs }}
+dump_exyz {{ dump_interval }} 0 1
+run {{ steps }}
+```
+
+温度单位为 K，`{{ pressure }}` 为 GPa，`{{ timestep_fs }}` 为 fs（从任务时间步长
+的 ps 换算）。完整变量和轨迹输出要求见 [工作流模板说明](workflow.md)。旧模板中
+希望随任务变化的常量需要改成占位符，尤其是 `potential`、`velocity` 和 `run`；
+原来的按参数位置自动覆盖行为已移除。
+
 两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧；
 GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS
 DynSpin。

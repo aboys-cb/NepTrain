@@ -16,8 +16,10 @@ candidates → MACE teacher → energy/forces/virial
 
 ```bash
 cd examples/distillation-mace
-pip install 'NepTrain[mace,torchnep]'
+python -m pip install -e '../..[mace,torchnep]'
 ```
+
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Install a PyTorch build suitable for your driver first, then verify:
 

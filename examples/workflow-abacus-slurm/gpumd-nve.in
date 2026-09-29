@@ -1,6 +1,7 @@
-potential nep.txt
-velocity 300
+# NepTrain template: run via project.yaml; placeholders are rendered before GPUMD.
+potential {{ model_file }}
+velocity {{ temperature }} seed {{ seed }}
 ensemble nve
 time_step 0.5
 dump_exyz 1 0 1
-run 10
+run {{ steps }}

@@ -108,26 +108,17 @@ msgid ""
 "  -o trajectories.xyz\n"
 msgstr ""
 
-#: ../../source/command/manual.md:60 526bc8ada6d0458aaa187408dcb18658
-msgid ""
-"不提供模板时会生成可直接运行的 NVE/NVT/NPT 输入。提供 `--template run.in` "
-"时， ensemble、thermostat/barostat 类型、耦合常数、`time_step` 和 dump 间隔来"
-"自 模板；NepTrain 更新模型、初始温度、NPT 目标压强、步数和种子。GPUMD 压强单"
-"位 为 GPa。NVE 仍使用 `--temperature` 初始化速度，但不在运行中控温。 两种 "
-"backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧； "
-"GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS "
-"DynSpin。"
-msgstr ""
-"Without a template, NepTrain generates runnable NVE/NVT/NPT input. With `--"
-"template run.in`, the template owns the ensemble, thermostat/barostat type, "
-"coupling constants, `time_step`, and dump interval; NepTrain updates the "
-"model, initial temperature, NPT target pressure, step count, and seed. GPUMD "
-"pressure is in GPa. NVE still uses `--temperature` to initialize velocities "
-"but does not thermostat the run. Both backends write `trajectory-"
-"health.json` and identify the stable segment, pre-failure frames, and bad "
-"tail. If GPUMD exits nonzero after writing complete dump frames, NepTrain "
-"still recovers those frames. Spin MD is supported only through LAMMPS "
-"DynSpin."
+msgid "不提供模板时会生成可直接运行的 NVE/NVT/NPT 输入。提供 `--template run.in` 时， NepTrain 只替换 `{{ temperature }}` 等显式占位符，不限制系综类型，也不自动改写 温压、速度初始化、步数或 dump 设置。固定数值保持原样，具体命令是否合法由 GPUMD 检查。`--ensemble` 只选择内置默认输入；自定义模板决定实际系综。"
+msgstr "Without a template, NepTrain generates runnable NVE/NVT/NPT input. With `--template run.in`, NepTrain replaces only explicit placeholders such as `{{ temperature }}`. It does not restrict ensemble types or automatically rewrite temperature, pressure, velocity initialization, step counts, or dump settings. Fixed values remain unchanged; GPUMD validates the commands. `--ensemble` only selects built-in default input; a custom template determines the actual ensemble."
+
+msgid "例如，以下模板使用任务温度初始化速度，随后进行 NVE 采样："
+msgstr "For example, this template initializes velocities at the task temperature and then runs NVE sampling:"
+
+msgid "温度单位为 K，`{{ pressure }}` 为 GPa，`{{ timestep_fs }}` 为 fs（从任务时间步长 的 ps 换算）。完整变量和轨迹输出要求见 [工作流模板说明](workflow.md)。旧模板中 希望随任务变化的常量需要改成占位符，尤其是 `potential`、`velocity` 和 `run`； 原来的按参数位置自动覆盖行为已移除。"
+msgstr "Temperature is in K, `{{ pressure }}` is in GPa, and `{{ timestep_fs }}` is in fs (converted from the task timestep in ps). See [Workflow templates](workflow.md) for all variables and trajectory requirements. Replace constants in old templates with placeholders wherever values should follow the task, especially in `potential`, `velocity`, and `run`; automatic positional overrides have been removed."
+
+msgid "两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧； GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS DynSpin。"
+msgstr "Both backends write `trajectory-health.json` and identify stable, pre-failure, and bad-tail frames. If GPUMD exits nonzero after writing complete dump frames, those frames are still recovered. Spin MD is supported only through LAMMPS DynSpin."
 
 #: ../../source/command/manual.md:68 01cb13f765a54029aa3df83a8e919c41
 msgid "手动采样"

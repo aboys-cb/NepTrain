@@ -20,9 +20,9 @@ from ..nep.calculator import resolve_backend
 from ..persistence import atomic_write_json
 from ..spin import SPIN_KEY, spin_from_lammps, spin_to_lammps, validate_spin_structure
 from .health import TrajectoryHealthPolicy, classify_trajectory
+from .template import VARIABLE as _VARIABLE, render_template as _render_template
 
 
-_VARIABLE = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}")
 _COMPUTE_PROPERTY = re.compile(
     r"^\s*compute\s+(\S+)\s+\S+\s+property/atom\s+(.+?)\s*$",
     re.MULTILINE,
@@ -138,20 +138,10 @@ def _with_halt_placeholder(template: str) -> str:
 
 
 def render_template(template: str, variables: Mapping[str, object]) -> str:
-    required = set(_VARIABLE.findall(template))
-    missing = sorted(required.difference(variables))
-    if missing:
-        raise LammpsError(f"missing LAMMPS template variables: {', '.join(missing)}")
-
-    def replace(match: re.Match[str]) -> str:
-        value = variables[match.group(1)]
-        return "" if value is None else str(value)
-
-    rendered = _VARIABLE.sub(replace, template)
-    unresolved = _VARIABLE.findall(rendered)
-    if unresolved:
-        raise LammpsError(f"unresolved LAMMPS template variables: {unresolved}")
-    return rendered
+    try:
+        return _render_template(template, variables, backend="LAMMPS")
+    except ValueError as error:
+        raise LammpsError(str(error)) from error
 
 
 def compute_property_columns(rendered_input: str) -> dict[str, str]:

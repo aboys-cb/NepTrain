@@ -1,7 +1,8 @@
+# NepTrain template: run via project.yaml; placeholders are rendered before GPUMD.
 # Minimal stable sampling template for the three-atom tutorial system.
-potential nep.txt
-velocity 50
+potential {{ model_file }}
+velocity {{ temperature }} seed {{ seed }}
 ensemble nve
 time_step 0.1
 dump_exyz 1 0 1
-run 2
+run {{ steps }}

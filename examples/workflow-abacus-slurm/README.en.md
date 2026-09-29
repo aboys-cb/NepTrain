@@ -19,8 +19,10 @@ the corresponding UPF file.
 
 ```bash
 cd examples/workflow-abacus-slurm
-pip install 'NepTrain[torchnep]'
+python -m pip install -e '../..[torchnep]'
 ```
+
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Training nodes need TorchNEP, MD nodes need GPUMD, and labeling nodes need
 ABACUS. Put their conda/module setup in `env-training.sh`, `env-gpumd.sh`, and

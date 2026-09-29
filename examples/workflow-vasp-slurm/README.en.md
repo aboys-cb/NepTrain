@@ -21,8 +21,10 @@ From the repository root:
 
 ```bash
 cd examples/workflow-vasp-slurm
-pip install 'NepTrain[torchnep]'
+python -m pip install -e '../..[torchnep]'
 ```
+
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Training nodes must run `neptrain` and TorchNEP, MD nodes must run `gpumd`, and
 labeling nodes must run `vasp_std`. Record the conda/module setup for each node

@@ -8,8 +8,8 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
-from NepTrain.core.gpumd.io import GpumdInputError, RunInput
-from NepTrain.core.md import MdRequest, run_md
+from NepTrain.core.gpumd.io import RunInput
+from NepTrain.core.md import MdError, MdRequest, run_md
 from NepTrain.core.md.dump import adaptive_dump_interval
 
 
@@ -99,143 +99,159 @@ def test_default_gpumd_nve_input_keeps_velocity_initialisation(
     assert result.completed is True
 
 
-def test_custom_gpumd_nve_template_is_adapted_without_temperature_parameters(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    ("ensemble", "rendered_ensemble"),
+    [
+        ("nve", "nve"),
+        ("nvt_nhc 100 {{ temperature }} 100", "nvt_nhc 100 500.0 100"),
+        ("user_defined_ensemble {{ temperature }}", "user_defined_ensemble 500.0"),
+    ],
+)
+def test_custom_gpumd_template_renders_without_ensemble_inference(
+    tmp_path: Path, monkeypatch, ensemble: str, rendered_ensemble: str
 ):
     template = tmp_path / "route.in"
     template.write_text(
-        "ensemble nve\nrun 100000\n",
+        "# {{ route_id }} replica {{ replica }} {{ route_fingerprint }}\n"
+        "potential {{ model_file }}\n"
+        "velocity {{ temperature }} seed {{ seed }}\n"
+        f"ensemble {ensemble}\n"
+        "time_step {{ timestep_fs }}\n"
+        "dump_exyz {{ dump_interval }} 0 1\n"
+        "run {{ steps }}\n",
         encoding="utf-8",
     )
     captured = {}
 
     def fake_run(command, *, stdout, stderr, cwd, check):
-        del stdout, stderr, check
         captured["input"] = (Path(cwd) / "run.in").read_text(encoding="utf-8")
+        assert (Path(cwd) / "model.xyz").is_file()
+        assert (Path(cwd) / "nep.txt").read_text() == "fake model\n"
         _write_dump(Path(cwd), [_atoms()], [25.0])
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", fake_run)
     result = run_md(
-        _request(tmp_path, template_path=template),
+        _request(
+            tmp_path, template_path=template, ensemble="custom-route",
+            replica=3, route_id="route_b", route_fingerprint="abc123",
+        ),
         "gpumd",
     )
 
-    assert "potential nep.txt" in captured["input"]
-    assert "velocity 500.0 seed 9" in captured["input"]
-    assert "ensemble nve" in captured["input"]
-    assert "dump_exyz 1 0 1" in captured["input"]
+    assert captured["input"] == (
+        "# route_b replica 3 abc123\n"
+        "potential nep.txt\n"
+        "velocity 500.0 seed 9\n"
+        f"ensemble {rendered_ensemble}\n"
+        "time_step 1.0\n"
+        "dump_exyz 1 0 1\n"
+        "run 25\n"
+    )
     assert result.completed is True
+    assert result.last_step == 25
 
 
-def test_custom_gpumd_npt_template_receives_scalar_pressure(
-    tmp_path: Path, monkeypatch
-):
+def test_gpumd_template_preserves_fixed_values_comments_and_multiple_stages(tmp_path):
+    text = (
+        "# User owns all commands, including stages and force output.\n"
+        "potential custom-nep.txt\n"
+        "velocity 50 seed 17\n"
+        "ensemble nvt_nhc 50 900 100  # Heating ramp\n"
+        "time_step 2\n"
+        "dump_exyz 1000 0 0\n"
+        "run 100000\n\n"
+        "ensemble npt_scr 900 600 100 1 2 3 4 5 6 100 101 102 103 104 105 1000\n"
+        "run {{ steps }}\n"
+    )
+    template = tmp_path / "route.in"
+    template.write_text(text, encoding="utf-8")
+    run = RunInput(tmp_path / "nep.txt")
+    run.read_run(template)
+    run.configure(temperature=500, pressure=2.5, steps=25, timestep_fs=1, seed=9)
+    output = tmp_path / "rendered.in"
+    run.write_run(output)
+
+    assert output.read_text() == text.replace("{{ steps }}", "25")
+    assert run.dump_interval() == 1000
+    assert run.timestep_fs() == 2
+    # Rendering again uses the original placeholders, not the previous result.
+    run.configure(temperature=600, pressure=3, steps=50, timestep_fs=1, seed=10)
+    run.write_run(output)
+    assert output.read_text() == text.replace("{{ steps }}", "50")
+
+
+def test_gpumd_template_only_replaces_explicit_pressure_components(tmp_path):
     template = tmp_path / "route.in"
     template.write_text(
-        "\n".join(
-            [
-                "potential nep.txt",
-                "velocity 50",
-                (
-                    "ensemble npt_scr 50 50 100 "
-                    "0 0 0 0 0 0 100 101 102 103 104 105 1000"
-                ),
-                "time_step 2",
-                "dump_exyz 1000 0 0",
-                "run 100000",
-            ]
-        )
-        + "\n",
+        "ensemble npt_scr 300 {{ temperature }} 100 "
+        "{{ pressure }} 2 3 4 5 6 100 101 102 103 104 105 1000\n",
         encoding="utf-8",
     )
-    captured = {}
-
-    def fake_run(command, *, stdout, stderr, cwd, check):
-        del stdout, stderr, check
-        captured["input"] = (Path(cwd) / "run.in").read_text(encoding="utf-8")
-        _write_dump(Path(cwd), [_atoms()], [50.0])
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", fake_run)
-    result = run_md(
-        _request(tmp_path, template_path=template, pressure=2.5),
-        "gpumd",
+    run = RunInput(tmp_path / "nep.txt")
+    run.read_run(template)
+    run.configure(temperature=500, pressure=2.5, steps=25, timestep_fs=1, seed=9)
+    output = tmp_path / "rendered.in"
+    run.write_run(output)
+    assert output.read_text() == (
+        "ensemble npt_scr 300 500 100 "
+        "2.5 2 3 4 5 6 100 101 102 103 104 105 1000\n"
     )
 
-    assert (
-        "ensemble npt_scr 500.0 500.0 100 "
-        "2.5 2.5 2.5 0 0 0 100 101 102 103 104 105 1000"
-        in captured["input"]
-    )
-    assert "velocity 500.0 seed 9" in captured["input"]
-    assert "dump_exyz 25 0 1" in captured["input"]
-    assert "time_step 2" in captured["input"]
-    assert result.completed is True
+
+def test_gpumd_template_does_not_inject_missing_commands(tmp_path):
+    template = tmp_path / "route.in"
+    text = "# Commands need not contain a recognized ensemble.\nrun {{ steps }}\n"
+    template.write_text(text, encoding="utf-8")
+    run = RunInput(tmp_path / "nep.txt")
+    run.read_run(template)
+    run.configure(temperature=500, pressure=0, steps=25, timestep_fs=1, seed=9)
+    output = tmp_path / "rendered.in"
+    run.write_run(output)
+    assert output.read_text() == text.replace("{{ steps }}", "25")
+
+
+def test_gpumd_missing_template_variable_fails_before_launch(tmp_path, monkeypatch):
+    template = tmp_path / "route.in"
+    template.write_text("ensemble custom {{ unknown_temperature }}\n")
+
+    def unexpected_run(*args, **kwargs):
+        pytest.fail("GPUMD must not launch with unresolved placeholders")
+
+    monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", unexpected_run)
+    with pytest.raises(MdError, match="missing GPUMD template variables: unknown_temperature"):
+        run_md(_request(tmp_path, template_path=template), "gpumd")
 
 
 @pytest.mark.parametrize(
-    ("controls", "expected"),
+    ("text", "message"),
     [
-        ("0 100 1000", "2.5 100 1000"),
-        (
-            "0 0 0 100 101 102 1000",
-            "2.5 2.5 2.5 100 101 102 1000",
-        ),
+        ("run 25\n", "must define dump_exyz"),
+        ("dump_exyz 0 0 1\n", "interval must be positive"),
+        ("dump_exyz bad 0 1\n", "integer interval"),
+        ("dump_exyz 1 0 1 0 1\n", "separated dump_exyz"),
+        ("dump_exyz 1 0 1\n", "time_step must be positive"),
     ],
 )
-def test_gpumd_npt_pressure_forms_are_updated_without_losing_coupling(
-    tmp_path: Path, controls: str, expected: str
-):
-    template = tmp_path / "run.in"
-    template.write_text(
-        "\n".join(
-            [
-                "potential old-nep.txt",
-                "velocity 50",
-                f"ensemble npt_scr 50 50 100 {controls}",
-                "time_step 1",
-                "dump_exyz 10 0 0",
-                "run 100",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+def test_gpumd_checks_trajectory_contract_before_launch(tmp_path, text, message):
+    template = tmp_path / "route.in"
+    template.write_text(text)
+    with pytest.raises(MdError, match=message):
+        run_md(_request(tmp_path, template_path=template), "gpumd")
+
+
+def test_default_gpumd_npt_keeps_pressure_mapping(tmp_path):
     run = RunInput(tmp_path / "nep.txt")
-    run.read_run(template)
-    run.configure(
-        temperature=500,
-        pressure=2.5,
-        steps=25,
-        timestep_fs=1,
-        seed=9,
+    run.use_default(
+        ensemble="npt", temperature=500, pressure=2.5, steps=25,
+        timestep_fs=1, seed=9,
     )
-    rendered = tmp_path / "rendered.in"
-    run.write_run(rendered)
-
-    assert f"ensemble npt_scr 500 500 100 {expected}" in rendered.read_text(
-        encoding="utf-8"
+    output = tmp_path / "rendered.in"
+    run.write_run(output)
+    assert (
+        "ensemble npt_scr 500 500 100 2.5 2.5 2.5 0 0 0 100 100 100 100 100 100 1000\n"
+        in output.read_text()
     )
-
-
-def test_gpumd_rejects_an_ambiguous_npt_pressure_form(tmp_path: Path):
-    template = tmp_path / "run.in"
-    template.write_text(
-        "ensemble npt_scr 50 50 100 0 0 0 0\nrun 10\n",
-        encoding="utf-8",
-    )
-    run = RunInput(tmp_path / "nep.txt")
-    run.read_run(template)
-
-    with pytest.raises(GpumdInputError, match="pressure controls"):
-        run.configure(
-            temperature=500,
-            pressure=2.5,
-            steps=25,
-            timestep_fs=1,
-            seed=9,
-        )
 
 
 def test_gpumd_health_quarantines_a_physically_bad_tail(

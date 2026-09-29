@@ -18,8 +18,11 @@
 
 ```bash
 cd examples/workflow-abacus-slurm
-pip install 'NepTrain[torchnep]'
+python -m pip install -e '../..[torchnep]'
 ```
+
+从当前源码安装，确保 NepTrain 与附带的占位符模板匹配；MD 计算节点也应使用同一
+源码版本。`gpumd-nve.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
 
 训练节点需要 TorchNEP，MD 节点需要 GPUMD，标注节点需要 ABACUS。把三类节点
 使用的 conda/module 设置分别写入 `env-training.sh`、`env-gpumd.sh` 和

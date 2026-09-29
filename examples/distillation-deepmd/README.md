@@ -21,8 +21,11 @@
 
 ```bash
 cd examples/distillation-deepmd
-pip install 'NepTrain[deepmd,torchnep]'
+python -m pip install -e '../..[deepmd,torchnep]'
 ```
+
+从当前源码安装，确保 NepTrain 与附带的占位符模板匹配；MD 计算节点也应使用同一
+源码版本。`gpumd-nve.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
 
 确认命令可见：
 

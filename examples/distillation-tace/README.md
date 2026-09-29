@@ -19,11 +19,14 @@ TACE 目前按官方仓库安装。本教程固定到已经核对过 `tace-eval`
 ```bash
 cd examples/distillation-tace
 pip install torch
-pip install 'NepTrain[torchnep]'
+python -m pip install -e '../..[torchnep]'
 pip install \
   'TACE[cueq12] @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
 export TACE_USE_CUE=1
 ```
+
+从当前源码安装，确保 NepTrain 与附带的占位符模板匹配；MD 计算节点也应使用同一
+源码版本。`gpumd-nve.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
 
 先确认命令来自同一个环境：
 

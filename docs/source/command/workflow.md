@@ -156,13 +156,31 @@ LAMMPS 运行期间，NepTrain 会按 `sampling.candidate_pool.health` 中的体
 LAMMPS 输入中复制一套不等价的物理算法。把相应 health 阈值设为 `null` 可以关闭
 该项检查。
 
-选择 `md.backend: gpumd` 时，route 的 `template_path` 指向 GPUMD `run.in`。
-NepTrain 支持模板中的 `nve`，并保留模板选择的 `nvt_*`/`npt_*` 方法、耦合
-常数、`time_step` 和 dump 间隔，更新本轮模型、初始温度、步数与确定性
-velocity seed；对 `npt_ber` 和
-`npt_scr` 还会按模板的 isotropic、orthorhombic 或 triclinic 形式写入目标压强
-（GPa）。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。Spin workflow
-仍明确使用 LAMMPS DynSpin。
+选择 `md.backend: gpumd` 时，route 的 `template_path` 指向带占位符的 GPUMD
+`run.in`。NepTrain 与 LAMMPS 使用相同的 `{{ name }}` 替换语法，不限制模板中的
+系综类型，不按参数位置推断温压，也不插入或改写物理命令。升降温、非等向压强、
+多个 `run` 阶段和固定数值都由模板控制；未知变量会在启动前报错。
+
+GPUMD 模板可用变量：
+
+- `temperature`（K）、`pressure`（GPa）、`steps`、`seed`。
+- `timestep_fs`（fs，由任务的 ps 时间步长换算）。
+- `dump_interval`（按任务步数计算的建议输出间隔，只有显式引用才生效）。
+- `replica`、`route_id`、`route_fingerprint`。
+- `model_file`（`nep.txt`）、`structure_file`（`model.xyz`）、
+  `trajectory_file`（`dump.xyz`）；这些是运行目录中准备或回收的固定文件名。
+
+例如 `ensemble nvt_nhc 100 {{ temperature }} 100` 保留起始温度 100 K，只替换终止
+温度。NPT 的压强占位符应放在希望受任务条件控制的分量上；其它分量及耦合常数保持
+原样。工作流按 route 条件组织任务，因此需要模板显式引用相应温压变量，才能实际
+施加这些条件。旧的纯数值模板仍按字面执行，不再自动更新温压、步数或种子。
+
+模板须显式设置 `time_step` 和输出到单个 `dump.xyz` 的 `dump_exyz`；分文件输出
+尚不支持。建议使用 `dump_exyz {{ dump_interval }} 0 1` 输出力以供轨迹健康检查。
+固定 dump 间隔不会自动缩短，须保证运行期间有完整帧输出。当前步号恢复沿用末次
+`time_step`（缺失 Time 时还使用末次 dump 间隔）；变时间步长或变输出间隔的多阶段
+轨迹尚不能保证恢复正确步号。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。
+Spin workflow 仍使用 LAMMPS DynSpin。
 
 每条 route 的 `conditions.temperature_path` 是有顺序的温度探路路径。例如
 `[300, 500, 700, 900]` 会先验证 300 K，只有通过后才解锁 500 K。

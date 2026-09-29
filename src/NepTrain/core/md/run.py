@@ -158,6 +158,9 @@ def _run_gpumd(
                 steps=request.steps,
                 timestep_fs=timestep_fs,
                 seed=request.seed,
+                replica=request.replica,
+                route_id=request.route_id,
+                route_fingerprint=request.route_fingerprint,
             )
         dump_interval = run.dump_interval()
         effective_timestep_fs = run.timestep_fs()

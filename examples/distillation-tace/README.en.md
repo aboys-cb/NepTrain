@@ -20,11 +20,13 @@ the commit whose `tace-eval` interface was checked:
 ```bash
 cd examples/distillation-tace
 pip install torch
-pip install 'NepTrain[torchnep]'
+python -m pip install -e '../..[torchnep]'
 pip install \
   'TACE[cueq12] @ git+https://github.com/xvzemin/tace.git@4b977dcc13ee87d8ba6cceba3ffb7abe43c087c8'
 export TACE_USE_CUE=1
 ```
+
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Verify that both commands come from the same environment:
 
