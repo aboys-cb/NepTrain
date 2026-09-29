@@ -788,7 +788,7 @@ def _doctor_command_tools(command: str) -> list[str]:
     return tools
 
 
-def _doctor_target_requirements(config, target_name, target):
+def _doctor_target_requirements(config, target_name, target, *, base_dir=None):
     """Resolve the commands and Python packages used on one project target."""
 
     execution = config["execution"]
@@ -832,14 +832,17 @@ def _doctor_target_requirements(config, target_name, target):
         labeling = config["labeling"]
         backend = str(labeling.get("backend", "vasp"))
         if backend == "vasp":
-            add_command(
-                environment.get(
-                    "NEPTRAIN_VASP_COMMAND",
-                    "mpirun -n 1 vasp_ncl"
-                    if config["md"].get("spin", False)
-                    else "mpirun -n 1 vasp_std",
-                )
-            )
+            from NepTrain.core.dft.vasp.io import default_vasp_command
+
+            command = environment.get("NEPTRAIN_VASP_COMMAND")
+            if command is None:
+                input_file = labeling.get("input_path")
+                if input_file is not None:
+                    input_file = Path(input_file).expanduser()
+                    if not input_file.is_absolute() and base_dir is not None:
+                        input_file = Path(base_dir) / input_file
+                command = default_vasp_command(input_file)
+            add_command(command)
         elif backend == "abacus":
             add_command(
                 environment.get(
@@ -1060,6 +1063,7 @@ def run_doctor(args):
                 checked_config,
                 str(name),
                 target,
+                base_dir=project.parent,
             )
             probe = _doctor_target_probe(
                 target,

@@ -7,7 +7,7 @@ read_data {{ structure_file }}
 pair_style {{ pair_style }}
 pair_coeff * * {{ model_file }} {{ elements }}
 
-timestep 0.001
+timestep {{ timestep_ps }}
 velocity all create {{ temperature }} {{ seed }} mom yes rot yes dist gaussian
 fix integrator all nvt{{ fix_suffix }} temp {{ temperature }} {{ temperature }} 0.1
 

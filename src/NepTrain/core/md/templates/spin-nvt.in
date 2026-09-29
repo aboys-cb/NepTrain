@@ -7,7 +7,7 @@ read_data {{ structure_file }}
 pair_style {{ pair_style }}
 pair_coeff * * {{ model_file }} {{ elements }}
 
-timestep 0.001
+timestep {{ timestep_ps }}
 velocity all create {{ temperature }} {{ seed }} mom yes rot yes dist gaussian
 compute spin all property/atom sp spx spy spz fmx fmy fmz fx fy fz
 fix integrator all dynspin/glsd/nvt{{ fix_suffix }} temp {{ temperature }} {{ temperature }} 0.1 dynspin alpha 0.01 stemp {{ spin_temperature }} seed {{ seed }} fm_units field lattice on midpoint_iter 3

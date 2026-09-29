@@ -13,6 +13,8 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from ..structures import StructureReadError, read_structures
+
 from ..content_addressing import file_sha256
 from ..scientific_data import (
     ScientificDataError,
@@ -212,23 +214,10 @@ _ADAPTERS: dict[str, _AdapterSpec] = {
 
 
 def _source_frames(source: Path) -> list[Atoms]:
-    paths = [source]
-    if source.is_dir():
-        paths = sorted(
-            {
-                path
-                for pattern in ("*.xyz", "*.extxyz", "*.vasp", "POSCAR*")
-                for path in source.glob(pattern)
-                if path.is_file()
-            }
-        )
-    loaded_frames = []
-    for path in paths:
-        loaded = ase_read(path, index=":")
-        if not isinstance(loaded, list):
-            loaded = [loaded]
-        loaded_frames.extend(loaded)
-    return loaded_frames
+    try:
+        return read_structures(source)
+    except StructureReadError as error:
+        raise LabelingError(str(error)) from error
 
 
 def _annotate_provenance(

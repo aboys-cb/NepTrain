@@ -15,7 +15,7 @@ from ase.calculators.vasp import Vasp
 
 from ...content_addressing import file_sha256
 from ..attempts import new_attempt_directory
-from .io import VaspInput, read_vasp_input
+from .io import VaspInput, is_noncollinear, prepare_vector_moments, read_vasp_input
 from . import deltaspin
 from ...spin import validate_spin_structure as validate_canonical_spin
 from .resources import validate_vasp_resources
@@ -106,6 +106,19 @@ def run_native_vasp(
         resort = np.arange(len(atoms))
         if electronic_mode == "deltaspin":
             input_atoms, resort = deltaspin.prepare_input(calculator, atoms)
+        elif electronic_mode == "noncollinear":
+            initial = calculator.list_float_params.get("magmom")
+            if initial is not None:
+                values = np.asarray(initial, dtype=float)
+                if values.shape != (3 * len(atoms),):
+                    raise NativeVaspError("noncollinear MAGMOM requires three finite values per atom")
+                initial = values.reshape(-1, 3)
+            else:
+                initial = atoms.arrays.get("initial_magmoms")
+            if initial is not None:
+                input_atoms, resort = prepare_vector_moments(calculator, atoms, initial)
+            else:
+                calculator.set(ispin=1)
         calculator.calculate(input_atoms, ("energy", "forces", "stress"))
         if not calculator.converged:
             raise NativeVaspError(f"VASP electronic SCF did not converge in {case_dir}")
@@ -182,10 +195,8 @@ def _validate_single_point_input(calculator: VaspInput) -> str:
             return "deltaspin"
     except ValueError as error:
         raise NativeVaspError(str(error)) from error
-    if calculator.bool_params.get("lnoncollinear"):
-        raise NativeVaspError("VASP labeling forbids LNONCOLLINEAR")
-    if calculator.bool_params.get("lsorbit"):
-        raise NativeVaspError("VASP labeling forbids LSORBIT")
+    if is_noncollinear(calculator):
+        return "noncollinear"
     magmom = calculator.list_float_params.get("magmom")
     if (
         ispin != 2
@@ -232,6 +243,10 @@ def validate_vasp_structure(
     if initial is None:
         return
     values = np.asarray(initial, dtype=float)
+    if electronic_mode == "noncollinear":
+        if values.shape != (len(atoms), 3) or not np.isfinite(values).all():
+            raise NativeVaspError("noncollinear initial magnetic moments require three finite values per atom")
+        return
     if values.ndim != 1 and np.any(np.abs(values) > 0.0):
         raise NativeVaspError(
             "VASP labeling forbids noncollinear initial magnetic moments"

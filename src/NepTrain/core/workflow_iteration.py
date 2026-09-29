@@ -14,6 +14,8 @@ from ase import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .structures import StructureReadError, read_structures
+
 from .candidate_pool import (
     CandidatePoolError,
     regular_batch_minimum,
@@ -489,24 +491,10 @@ class WorkflowRuntime:
 
 
 def _read_frames(path: Path, *, allow_empty: bool = False) -> list[Atoms]:
-    paths = (
-        sorted(
-            item
-            for pattern in ("*.xyz", "*.extxyz", "*.vasp", "POSCAR*")
-            for item in path.glob(pattern)
-        )
-        if path.is_dir()
-        else [path]
-    )
-    frames: list[Atoms] = []
-    for item in paths:
-        if allow_empty and item.is_file() and item.stat().st_size == 0:
-            continue
-        loaded = ase_read(item, index=":", format=None)
-        frames.extend(loaded if isinstance(loaded, list) else [loaded])
-    if not frames and not allow_empty:
-        raise WorkflowIterationError(f"no structures found in {path}")
-    return frames
+    try:
+        return read_structures(path, allow_empty=allow_empty)
+    except StructureReadError as error:
+        raise WorkflowIterationError(str(error)) from error
 
 
 def _condition_stratum(stratum: str) -> str:

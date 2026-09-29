@@ -26,6 +26,8 @@ from typing import Any, Mapping, Sequence
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from .structures import StructureReadError, read_structures
+
 from .content_addressing import canonical_sha256, file_sha256
 from .execution import ExecutionError, ExecutionTarget, ExecutionTransport
 from .persistence import atomic_write_json
@@ -165,24 +167,10 @@ def _copy(source: Path, destination: Path) -> str:
 
 
 def _frames(source: Path) -> list:
-    source = source.expanduser().resolve()
-    paths = [source]
-    if source.is_dir():
-        paths = sorted(
-            {
-                path
-                for pattern in ("*.xyz", "*.extxyz", "*.vasp", "POSCAR*")
-                for path in source.glob(pattern)
-                if path.is_file()
-            }
-        )
-    frames = []
-    for path in paths:
-        loaded = ase_read(path, index=":")
-        frames.extend(loaded if isinstance(loaded, list) else [loaded])
-    if not frames:
-        raise ManualTaskError(f"no readable structures found in {source}")
-    return frames
+    try:
+        return read_structures(source)
+    except StructureReadError as error:
+        raise ManualTaskError(str(error)) from error
 
 
 def target_from_project(

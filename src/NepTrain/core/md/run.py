@@ -284,6 +284,8 @@ def run_md(request: MdRequest, backend: str) -> MdResult:
         "temperature": request.temperature,
         "spin_temperature": request.spin_temperature,
         "pressure": request.pressure,
+        "timestep_ps": request.timestep,
+        "timestep_fs": request.timestep * 1000.0,
         "steps": request.steps,
         "seed": request.seed,
         "replica": request.replica,

@@ -205,3 +205,15 @@ def test_al_tutorial_seed_contains_complete_training_labels(tmp_path):
     for frame in [*train, *validation]:
         assert frame.get_forces().shape == (4, 3)
         assert frame.info["virial"].shape == (3, 3)
+
+
+@pytest.mark.parametrize(("backend", "text", "expected"), [
+    ("lammps", "units metal\ntimestep {{ timestep_ps }}\n", 0.001),
+    ("gpumd", "time_step {{ timestep_fs }}\n", 0.001),
+    ("lammps", "units metal\ntimestep 0.005\n", 0.005),
+    ("gpumd", "time_step 5\n", 0.005),
+])
+def test_workflow_progress_understands_explicit_timing_placeholders(tmp_path, backend, text, expected):
+    path = tmp_path / "md.in"
+    path.write_text(text)
+    assert _md_timestep_ps({"template_path": path.name}, backend=backend, base_dir=tmp_path) == pytest.approx(expected)

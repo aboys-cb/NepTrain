@@ -1274,11 +1274,22 @@ def _md_timestep_ps(
     if not template.is_absolute():
         template = base_dir / template
     try:
-        lines = template.read_text(
+        text = template.read_text(
             encoding="utf-8", errors="replace"
-        ).splitlines()
+        )
     except OSError:
         return None
+    # Workflow requests use MdRequest's default 0.001 ps unless the template
+    # supplies a fixed value. Resolve only timing placeholders for this view.
+    from .md.template import VARIABLE
+
+    text = VARIABLE.sub(
+        lambda match: {"timestep_ps": "0.001", "timestep_fs": "1.0"}.get(
+            match.group(1), match.group(0)
+        ),
+        text,
+    )
+    lines = text.splitlines()
     command = "time_step" if backend == "gpumd" else "timestep"
     commands = [
         raw.split("#", 1)[0].strip().split()

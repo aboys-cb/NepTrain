@@ -6,14 +6,12 @@ import os
 from pathlib import Path
 
 from ase import Atoms
-from ase.calculators.vasp import Vasp
 from ase.io import write as ase_write
 from rich.progress import track
 
 from ...structures import read_structures
 from .native import NativeVaspRequest, run_native_vasp
-from .io import read_vasp_input
-from .deltaspin import enabled as deltaspin_enabled
+from .io import default_vasp_command
 
 
 def calculate_vasp(atoms: Atoms, args, *, case_index: int = 1):
@@ -30,16 +28,12 @@ def calculate_vasp(atoms: Atoms, args, *, case_index: int = 1):
     resource_manifest = Path(raw_manifest).expanduser().resolve()
     input_file = (
         Path(args.incar)
-        if args.incar is not None and os.path.exists(args.incar)
+        if args.incar is not None
         else Path(__file__).with_name("INCAR")
     )
-    input_settings = Vasp()
-    read_vasp_input(input_settings, input_file)
-    executable = "vasp_ncl" if deltaspin_enabled(input_settings) else "vasp_std"
-    command = os.environ.get(
-        "NEPTRAIN_VASP_COMMAND",
-        f"mpirun -n {args.n_cpu} {executable}",
-    )
+    command = os.environ.get("NEPTRAIN_VASP_COMMAND")
+    if command is None:
+        command = default_vasp_command(input_file, n_cpu=args.n_cpu)
     result = run_native_vasp(
         atoms,
         NativeVaspRequest(

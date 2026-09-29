@@ -117,6 +117,7 @@ class RunInput:
             "pressure": pressure,
             "steps": steps,
             "timestep_fs": timestep_fs,
+            "timestep_ps": timestep_fs / 1000.0,
             "seed": seed,
             "replica": replica,
             "route_id": route_id,

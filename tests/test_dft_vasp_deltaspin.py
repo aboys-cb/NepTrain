@@ -202,3 +202,47 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
     assert manifest["deltaspin"]["mforce_unit"] == "eV/uB"
     assert "OUTCAR" in manifest["output_sha256"]
     assert "neptrain_input_structure_id" in frame.info
+
+
+@pytest.mark.parametrize("mode", ["LNONCOLLINEAR=.TRUE.", "LSORBIT=.TRUE."])
+@pytest.mark.parametrize("initial_source", ["incar", "structure", "default"])
+def test_unconstrained_ncl_writes_vector_magmom_and_only_ordinary_labels(
+    tmp_path, monkeypatch, mode, initial_source
+):
+    monkeypatch.delenv("NEPTRAIN_VASP_COMMAND", raising=False)
+    atoms = Atoms("FeAlFe", positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]], cell=[6, 6, 6], pbc=True)
+    moments = np.asarray([[0.1, 0, 2], [0.2, 0, 0.1], [-0.1, 0, 2]])
+    incar = "IBRION=-1\nNSW=0\n" + mode + "\n"
+    if initial_source == "incar":
+        incar += "MAGMOM=" + " ".join(map(str, moments.ravel())) + "\n"
+    elif initial_source == "structure":
+        atoms.set_initial_magnetic_moments(moments)
+    request = _request(tmp_path, atoms, incar)
+
+    class ReplayVasp(VaspInput):
+        def _run(self, **kwargs):
+            assert kwargs["command"].endswith("vasp_ncl")
+            parsed = Vasp()
+            read_vasp_input(parsed, Path(self.directory) / "INCAR")
+            assert parsed.int_params["ispin"] == 1
+            if initial_source != "default":
+                np.testing.assert_array_equal(
+                    np.asarray(parsed.list_float_params["magmom"]).reshape(-1, 3),
+                    moments[[0, 2, 1]],
+                )
+            assert read(Path(self.directory) / "POSCAR").get_chemical_symbols() == ["Fe", "Fe", "Al"]
+            return 0, ""
+
+        def read_results(self):
+            self.converged = True
+            # ASE normally restores its own atom ordering in read_results.
+            forces = np.asarray([[1., 2, 3], [4, 5, 6], [7, 8, 9]])
+            self.results = {"energy": -5., "forces": forces if initial_source != "default" else forces[[0, 2, 1]], "stress": np.arange(6.)}
+
+    monkeypatch.setattr(native, "VaspInput", ReplayVasp)
+    frame = read(label(request, "vasp").output_file)
+    np.testing.assert_array_equal(frame.get_forces(), [[1, 2, 3], [7, 8, 9], [4, 5, 6]])
+    assert frame.info["dft_electronic_mode"] == "noncollinear"
+    assert "spin" not in frame.arrays and "mforce" not in frame.arrays
+    manifest = json.loads(next(request.work_dir.glob("*/vasp-result.json")).read_text())
+    assert manifest["spin_force_labels"] is False

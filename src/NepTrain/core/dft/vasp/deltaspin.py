@@ -69,26 +69,22 @@ def validate_input(calculator) -> None:
 
 def prepare_input(calculator, atoms):
     """Group atoms once so targets and ASE's POSCAR share exactly one order."""
-    symbols = np.asarray(atoms.get_chemical_symbols())
-    order = np.concatenate([np.flatnonzero(symbols == s) for s in dict.fromkeys(symbols)])
-    ordered = atoms[order]
-    targets = np.asarray(ordered.arrays["spin"], dtype=float)
+    from .io import prepare_vector_moments
+
     params = custom_parameters(calculator)
     if "deltaspin_atoms" in params and len(numbers(params["deltaspin_atoms"])) != len(atoms):
         raise DeltaSpinError("DELTASPIN_ATOMS must have one entry per input atom; omit it for automatic generation")
+    ordered, resort = prepare_vector_moments(calculator, atoms, atoms.arrays["spin"])
+    params = custom_parameters(calculator)
     params.update(
         ldeltaspin=".TRUE.",
         deltaspin_atoms=" ".join(["1"] * len(atoms)),
         deltaspin_components="1 1 1",
-        m_deltaspin=" ".join(f"{value:.16g}" for value in targets.ravel()),
-        magmom=" ".join(f"{value:.16g}" for value in targets.ravel()),
+        m_deltaspin=params["magmom"],
     )
-    # ASE's collinear MAGMOM formatter cannot handle a flat 3N list.
-    # Write the already ordered vector list verbatim, without ISPIN inference.
-    calculator.set(custom=params, magmom=None, ispin=1)
-    ordered.set_initial_magnetic_moments(targets)
+    calculator.set(custom=params)
     ordered.arrays.pop("mforce", None)
-    return ordered, np.argsort(order)
+    return ordered, resort
 
 
 @dataclass(frozen=True)

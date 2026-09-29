@@ -672,13 +672,34 @@ def test_spin_migration_is_explicit_atomic_and_json_clean(tmp_path):
     assert "mforces" not in restored.arrays
 
 
-def test_doctor_checks_noncollinear_vasp_for_spin_workflow():
+@pytest.mark.parametrize(("incar", "executable"), [
+    ("ISPIN = 1", "vasp_std"),
+    ("ISPIN = 2", "vasp_std"),
+    ("LDELTASPIN = .TRUE.", "vasp_ncl"),
+    ("LNONCOLLINEAR = .TRUE.", "vasp_ncl"),
+    ("LSORBIT = .TRUE.", "vasp_ncl"),
+    ("LDELTASPIN=.FALSE.; LNONCOLLINEAR=.FALSE.; LSORBIT=.FALSE.", "vasp_std"),
+])
+@pytest.mark.parametrize("md_spin", [False, True])
+def test_doctor_and_execution_select_vasp_from_incar(tmp_path, incar, executable, md_spin):
+    from NepTrain.core.dft.vasp.io import default_vasp_command
+
+    path = tmp_path / "custom.INCAR"
+    path.write_text(incar + "\n")
     config = {
-        "md": {"backend": "lammps", "spin": True},
-        "labeling": {"backend": "vasp"},
+        "md": {"backend": "lammps", "spin": md_spin},
+        "labeling": {"backend": "vasp", "input_path": "custom.INCAR"},
         "execution": {"stage_targets": {"labeling": "local"}},
     }
     target = ExecutionTarget(name="local", executor="process", command="neptrain")
-    tools, packages, roles = _doctor_target_requirements(config, "local", target)
-    assert "vasp_ncl" in tools
-    assert "vasp_std" not in tools
+    tools, _, _ = _doctor_target_requirements(config, "local", target, base_dir=tmp_path)
+    assert executable in tools
+    assert default_vasp_command(path, n_cpu=4) == f"mpirun -n 4 {executable}"
+    override = ExecutionTarget(name="local", executor="process", command="neptrain",
+                               environment={"NEPTRAIN_VASP_COMMAND": "srun custom_vasp"})
+    config["labeling"]["input_path"] = "missing.INCAR"
+    tools, _, _ = _doctor_target_requirements(config, "local", override, base_dir=tmp_path)
+    assert "custom_vasp" in tools
+    assert "vasp_std" not in tools and "vasp_ncl" not in tools
+    with pytest.raises(FileNotFoundError):
+        default_vasp_command(tmp_path / "missing.INCAR")

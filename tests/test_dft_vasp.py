@@ -113,13 +113,20 @@ def _request(tmp_path: Path) -> LabelRequest:
     )
 
 
+@pytest.mark.parametrize("directory_input", [False, True])
 def test_vasp_nonmagnetic_single_point_is_normalized_and_provenanced(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, directory_input
 ):
     native = __import__("NepTrain.core.dft.vasp.native", fromlist=["VaspInput"])
     monkeypatch.setattr(native, "VaspInput", _FakeVaspInput)
 
-    result = label(_request(tmp_path), "vasp")
+    request = _request(tmp_path)
+    if directory_input:
+        source_dir = tmp_path / "structures"
+        source_dir.mkdir()
+        request.source.rename(source_dir / "selected.extxyz")
+        request = replace(request, source=source_dir)
+    result = label(request, "vasp")
     restored = read(result.output_file)
 
     assert restored.get_potential_energy() == pytest.approx(-7.25)

@@ -16,7 +16,8 @@ class StructureReadError(RuntimeError):
 def read_structures(
     source: str | Path,
     *,
-    patterns: Sequence[str] = ("*.vasp", "*.xyz"),
+    patterns: Sequence[str] = ("*.xyz", "*.extxyz", "*.vasp", "POSCAR*"),
+    allow_empty: bool = False,
 ) -> list[Atoms]:
     """Read every matching structure and fail instead of returning partial data."""
 
@@ -39,6 +40,8 @@ def read_structures(
             raise StructureReadError(
                 f"structure input does not exist: {file_path}"
             )
+        if allow_empty and file_path.stat().st_size == 0:
+            continue
         try:
             loaded = ase_read(file_path, index=":")
         except Exception as error:
@@ -46,7 +49,7 @@ def read_structures(
                 f"failed to read structure input {file_path}: {error}"
             ) from error
         frames.extend(loaded if isinstance(loaded, list) else [loaded])
-    if not frames:
+    if not frames and not allow_empty:
         raise StructureReadError(f"no structures found in {path}")
     return frames
 

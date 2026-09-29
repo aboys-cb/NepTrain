@@ -27,8 +27,8 @@ msgstr "Create a workflow"
 msgid "命令生成自旋 LAMMPS 模板、DeltaSpin INCAR 和 POTCAR manifest 模板。准备带 `spin/mforce` 的训练集、NEP 训练输入和带 `spin` 的采样初态，再填写资源路径与 Slurm 分区。每个原子都需要三分量 `spin`，非磁性原子的零目标也要显式写出。"
 msgstr "The command creates a spin LAMMPS template, a DeltaSpin INCAR, and a POTCAR manifest template. Supply training data containing `spin/mforce`, a NEP training input, and sampling structures containing `spin`, then configure resource paths and Slurm partitions. Every atom needs a three-component `spin`, including explicit zero targets for nonmagnetic atoms."
 
-msgid "默认启动命令使用 `mpirun -n N vasp_ncl`；普通 VASP 标注仍使用 `vasp_std`。若集群使用其它启动方式，在 labeling target 的 `environment` 或 setup script 设置 `NEPTRAIN_VASP_COMMAND`，例如 `srun vasp_ncl`。该程序必须是支持 `LDELTASPIN` 的构建，仅有同名可执行文件还不够。"
-msgstr "The default launcher is `mpirun -n N vasp_ncl`; ordinary VASP labeling still uses `vasp_std`. For other launchers, set `NEPTRAIN_VASP_COMMAND` in the labeling target environment or setup script, for example `srun vasp_ncl`. The executable must implement `LDELTASPIN`; its filename alone does not establish support."
+msgid "VASP 的默认程序由 INCAR 决定：`LDELTASPIN`、`LNONCOLLINEAR` 或 `LSORBIT` 任一为真时使用 `mpirun -n N vasp_ncl`，其余情况（包括共线 `ISPIN=2`）使用 `vasp_std`。`doctor` 与实际执行共用此规则，不根据 `md.spin` 推断。若集群使用其它启动方式，在 labeling target 的 `environment` 或 setup script 设置 `NEPTRAIN_VASP_COMMAND`，例如 `srun vasp_ncl`。DeltaSpin 计算需要支持 `LDELTASPIN` 的构建。"
+msgstr "The default VASP executable is selected from INCAR: if LDELTASPIN, LNONCOLLINEAR, or LSORBIT is true, use mpirun -n N vasp_ncl; otherwise use vasp_std, including collinear ISPIN=2. Doctor and execution share this rule and do not infer it from md.spin. Override the command with NEPTRAIN_VASP_COMMAND in the labeling target environment or setup script, for example srun vasp_ncl. DeltaSpin requires a build supporting LDELTASPIN."
 
 msgid "这是生成项目中的相关配置片段。POTCAR 的路径、TITEL、SHA256 和 family 仍按普通 VASP 流程校验。训练、MD 和标注节点需要使用包含本功能的同一版本 NepTrain。"
 msgstr "This is the relevant fragment of the generated project. POTCAR paths, TITEL, SHA256, and family are validated as in ordinary VASP workflows. Training, MD, and labeling nodes must use the same NepTrain revision containing this feature."
@@ -74,3 +74,6 @@ msgstr "Output `spin` contains converged moments in μB. `mforce` comes from the
 
 msgid "接口面向输出 `ion elem cx cy cz Mx My Mz |M|` 和 `MFx MFy MFz` 表的 VASP 6 DeltaSpin；不读取旧 VASP65 的磁性力格式。不同版本或磁矩定义的数据混用前，需要独立核对符号、单位和导数一致性。"
 msgstr "This adapter requires the VASP 6 DeltaSpin tables `ion elem cx cy cz Mx My Mz |M|` and `MFx MFy MFz`; legacy VASP65 magnetic-force output is not accepted. Independently check signs, units, and derivative consistency before mixing versions or moment definitions."
+
+msgid "普通非共线或 SOC 自洽可以生成能量、原子力和 virial 标签，但不会生成 `spin/mforce`。其 `MAGMOM` 从 INCAR 的 3N 个数或结构的三分量初始磁矩读取；DeltaSpin 则统一用每帧 `spin` 作为初始猜测和约束目标。"
+msgstr "Unconstrained noncollinear or SOC SCF produces energy, atomic forces, and virial labels, but no spin/mforce. Its MAGMOM comes from the 3N INCAR values or the structure’s vector initial moments. DeltaSpin always uses each frame’s spin for both the initial guess and constraint target."

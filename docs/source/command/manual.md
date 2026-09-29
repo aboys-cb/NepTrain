@@ -78,6 +78,8 @@ run {{ steps }}
 希望随任务变化的常量需要改成占位符，尤其是 `potential`、`velocity` 和 `run`；
 原来的按参数位置自动覆盖行为已移除。
 
+结构目录统一识别 `*.xyz`、`*.extxyz`、`*.vasp` 和 `POSCAR*`，按文件名排序读取；手动标注、工作流和 DFT 后端使用相同规则。
+
 两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧；
 GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS
 DynSpin。

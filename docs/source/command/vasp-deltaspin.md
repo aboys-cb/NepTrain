@@ -11,7 +11,9 @@ cd fe-spin
 
 命令生成自旋 LAMMPS 模板、DeltaSpin INCAR 和 POTCAR manifest 模板。准备带 `spin/mforce` 的训练集、NEP 训练输入和带 `spin` 的采样初态，再填写资源路径与 Slurm 分区。每个原子都需要三分量 `spin`，非磁性原子的零目标也要显式写出。
 
-默认启动命令使用 `mpirun -n N vasp_ncl`；普通 VASP 标注仍使用 `vasp_std`。若集群使用其它启动方式，在 labeling target 的 `environment` 或 setup script 设置 `NEPTRAIN_VASP_COMMAND`，例如 `srun vasp_ncl`。该程序必须是支持 `LDELTASPIN` 的构建，仅有同名可执行文件还不够。
+VASP 的默认程序由 INCAR 决定：`LDELTASPIN`、`LNONCOLLINEAR` 或 `LSORBIT` 任一为真时使用 `mpirun -n N vasp_ncl`，其余情况（包括共线 `ISPIN=2`）使用 `vasp_std`。`doctor` 与实际执行共用此规则，不根据 `md.spin` 推断。若集群使用其它启动方式，在 labeling target 的 `environment` 或 setup script 设置 `NEPTRAIN_VASP_COMMAND`，例如 `srun vasp_ncl`。DeltaSpin 计算需要支持 `LDELTASPIN` 的构建。
+
+普通非共线或 SOC 自洽可以生成能量、原子力和 virial 标签，但不会生成 `spin/mforce`。其 `MAGMOM` 从 INCAR 的 3N 个数或结构的三分量初始磁矩读取；DeltaSpin 则统一用每帧 `spin` 作为初始猜测和约束目标。
 
 ```yaml
 md:

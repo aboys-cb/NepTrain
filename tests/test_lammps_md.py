@@ -35,7 +35,9 @@ def test_custom_template_receives_route_variables_without_ensemble_inference(
 ):
     template = tmp_path / "custom.in"
     template.write_text(
-        "{{ route_id }} {{ replica }} {{ temperature }} {{ steps }}\n",
+        "{{ route_id }} {{ replica }} {{ temperature }} {{ steps }}\n"
+        "timestep {{ timestep_ps }} # {{ timestep_fs }} fs\n"
+        "timestep 0.002\n",
         encoding="utf-8",
     )
     captured = {}
@@ -65,6 +67,7 @@ def test_custom_template_receives_route_variables_without_ensemble_inference(
         seed=9,
         replica=3,
         ensemble="mc-md-custom",
+        timestep=0.005,
         template_path=template,
         route_id="route_b",
         route_fingerprint="f" * 64,
@@ -73,10 +76,15 @@ def test_custom_template_receives_route_variables_without_ensemble_inference(
     result = run_md(request, "lammps")
 
     assert result.completed is True
+    rendered = render_template(captured["template"], captured["variables"])
+    assert "timestep 0.005 # 5.0 fs" in rendered
+    assert "timestep 0.002" in rendered
     assert captured["variables"] == {
         "temperature": 500,
         "spin_temperature": None,
         "pressure": 2,
+        "timestep_ps": 0.005,
+        "timestep_fs": 5.0,
         "steps": 25,
         "seed": 9,
         "replica": 3,
@@ -98,6 +106,7 @@ def test_default_lammps_dump_interval_grows_with_trajectory_length():
             "model_file": "nep.txt",
             "elements": "Fe",
             "temperature": 600,
+            "timestep_ps": 0.005,
             "seed": 7,
             "fix_suffix": "",
             "trajectory_file": "dump.lammpstrj",
@@ -107,6 +116,7 @@ def test_default_lammps_dump_interval_grows_with_trajectory_length():
         },
     )
 
+    assert "timestep 0.005" in rendered
     assert "dump trajectory all custom 1000 dump.lammpstrj" in rendered
     assert "fix stop all halt 100" in rendered
 

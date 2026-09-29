@@ -147,3 +147,24 @@ def test_structure_reader_rejects_unreadable_input(tmp_path):
 
     with pytest.raises(StructureReadError, match="failed to read"):
         read_structures(source)
+
+
+def test_all_structure_entrypoints_share_patterns_and_order(tmp_path):
+    from NepTrain.core.labeling.interface import _source_frames
+    from NepTrain.core.manual import _frames
+    from NepTrain.core.workflow_iteration import _read_frames
+
+    expected = []
+    for i, name in enumerate(["POSCAR", "POSCAR-copy", "a.extxyz", "b.vasp", "c.xyz"]):
+        atoms = Atoms("Al", positions=[[i, 0, 0]], cell=[10, 10, 10], pbc=True)
+        write(tmp_path / name, atoms, format="vasp" if "POSCAR" in name or name.endswith("vasp") else "extxyz")
+        expected.append(i)
+    (tmp_path / "ignored.xyz").mkdir()
+    for reader in (read_structures, _source_frames, _frames, _read_frames):
+        frames = reader(tmp_path)
+        assert [frame.positions[0, 0] for frame in frames] == expected
+    empty = tmp_path / "empty.extxyz"
+    empty.touch()
+    assert _read_frames(empty, allow_empty=True) == []
+    with pytest.raises(StructureReadError):
+        read_structures(empty)

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import warnings
 
+import numpy as np
 from ase.config import ASEEnvDeprecationWarning
 from ase.calculators.vasp import Vasp
 
@@ -75,3 +76,38 @@ def read_vasp_input(calculator, filename):
         calculator.read_incar(handle.name)
     if custom:
         calculator.set(custom=custom)
+
+
+def is_noncollinear(calculator) -> bool:
+    return bool(
+        calculator.bool_params.get("lnoncollinear")
+        or calculator.bool_params.get("lsorbit")
+    )
+
+
+def default_vasp_command(input_file=None, *, n_cpu: int = 1) -> str:
+    """Select the same INCAR-derived executable for execution and preflight."""
+    from .deltaspin import enabled
+
+    calculator = Vasp()
+    path = Path(input_file).expanduser() if input_file is not None else Path(__file__).with_name("INCAR")
+    read_vasp_input(calculator, path)
+    executable = "vasp_ncl" if enabled(calculator) or is_noncollinear(calculator) else "vasp_std"
+    return f"mpirun -n {n_cpu} {executable}"
+
+
+def prepare_vector_moments(calculator, atoms, moments):
+    """Keep vector MAGMOM and POSCAR in the same element-grouped order."""
+    values = np.asarray(moments, dtype=float)
+    if values.shape != (len(atoms), 3) or not np.isfinite(values).all():
+        raise ValueError("noncollinear MAGMOM requires three finite values per atom")
+    symbols = np.asarray(atoms.get_chemical_symbols())
+    order = np.concatenate([np.flatnonzero(symbols == s) for s in dict.fromkeys(symbols)])
+    ordered = atoms[order]
+    values = values[order]
+    params = dict(calculator.input_params.get("custom") or {})
+    params["magmom"] = " ".join(f"{value:.16g}" for value in values.ravel())
+    # ASE's scalar MAGMOM formatter cannot serialize an explicit 3N list.
+    calculator.set(custom=params, magmom=None, ispin=1)
+    ordered.set_initial_magnetic_moments(values)
+    return ordered, np.argsort(order)

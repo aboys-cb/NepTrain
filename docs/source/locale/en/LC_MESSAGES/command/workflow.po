@@ -1319,3 +1319,6 @@ msgstr ""
 
 msgid "`workflow init` 只生成当前选择的 `lammps.in` 和标注后端输入。Spin 流程可使用 `--spin --dft-backend abacus` 或 `--spin --dft-backend vasp`；后者生成 [VASP DeltaSpin](vasp-deltaspin.md) INCAR。"
 msgstr "`workflow init` generates only the selected `lammps.in` and labeling input. Spin workflows may use `--spin --dft-backend abacus` or `--spin --dft-backend vasp`; the latter generates a [VASP DeltaSpin](vasp-deltaspin.md) INCAR."
+
+msgid "两种 MD 后端均提供 `timestep_ps`（ps）和 `timestep_fs`（fs）占位符。仅显式引用时才填充；模板中写死的时间步长保持原样。内置 LAMMPS 模板使用 `timestep {{ timestep_ps }}`。任务接口的时间步长默认是 0.001 ps，命令行和工作流未另外设置时沿用此值。压力按所选软件和模板的原生单位直接填充，不做后端间转换。"
+msgstr "Both MD backends expose timestep_ps (ps) and timestep_fs (fs). Only explicit placeholders are filled; fixed template values remain unchanged. Built-in LAMMPS templates use `timestep {{ timestep_ps }}`. The task interface defaults to 0.001 ps, also used by CLI and workflow requests unless otherwise set. Pressure is filled in the native units of the selected engine and template, without conversion between backends."
