@@ -1316,3 +1316,6 @@ msgstr ""
 #~ "      virial_rmse: 0.03    # eV/atom\n"
 #~ "    consecutive_generations: 2\n"
 #~ msgstr ""
+
+msgid "`workflow init` 只生成当前选择的 `lammps.in` 和标注后端输入。Spin 流程可使用 `--spin --dft-backend abacus` 或 `--spin --dft-backend vasp`；后者生成 [VASP DeltaSpin](vasp-deltaspin.md) INCAR。"
+msgstr "`workflow init` generates only the selected `lammps.in` and labeling input. Spin workflows may use `--spin --dft-backend abacus` or `--spin --dft-backend vasp`; the latter generates a [VASP DeltaSpin](vasp-deltaspin.md) INCAR."

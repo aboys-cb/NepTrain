@@ -519,3 +519,6 @@ msgstr ""
 "satisfies this contract. A damaged `execution.json`, missing `result.json`, "
 "or inconsistent order produces a diagnosable failure rather than exposing a "
 "partial `labeled.xyz` as complete."
+
+msgid "VASP 的 `ISPIN=2` 仍只生成普通 energy/force/virial 标签。带 DeltaSpin 扩展的 VASP 6 可通过 `LDELTASPIN=.TRUE.` 标注完整 `spin/mforce`，并支持 SOC；配置和 INCAR 写法见 [VASP DeltaSpin](vasp-deltaspin.md)。"
+msgstr "VASP `ISPIN=2` still produces ordinary energy/force/virial labels. VASP 6 with the DeltaSpin extension can label full `spin/mforce` through `LDELTASPIN=.TRUE.`, including SOC; see [VASP DeltaSpin](vasp-deltaspin.md) for configuration and INCAR syntax."

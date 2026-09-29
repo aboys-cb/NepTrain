@@ -120,8 +120,6 @@ def init_project(
         raise ValueError("ensemble must be npt or nvt")
     if dft_backend not in {"vasp", "abacus"}:
         raise ValueError("dft_backend must be vasp or abacus")
-    if spin and dft_backend != "abacus":
-        raise ValueError("spin workflows require --dft-backend abacus")
     root = Path(destination).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     project = root / "project.yaml"
@@ -158,7 +156,7 @@ def init_project(
     shutil.copyfile(source, root / "lammps.in")
     if dft_backend == "vasp":
         shutil.copyfile(
-            files("NepTrain.core.dft.vasp").joinpath("INCAR"),
+            files("NepTrain.core.dft.vasp").joinpath("INCAR.deltaspin" if spin else "INCAR"),
             root / "INCAR",
         )
         manifest = root / "vasp-resources.json"

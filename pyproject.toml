@@ -75,7 +75,7 @@ tag_regex = "^v(?P<version>[0-9.]+(?:b[0-9]+)?)$"
 local_scheme = "no-local-version"  # or "node-and-date"
 
 [tool.setuptools.package-data]
-"NepTrain.core.dft.vasp" = ["INCAR" ]
+"NepTrain.core.dft.vasp" = ["INCAR", "INCAR.deltaspin"]
 "NepTrain.core.dft.abacus" = ["INPUT" ]
 
 "NepTrain.core.md" = ["templates/*.in"]

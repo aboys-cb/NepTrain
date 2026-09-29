@@ -388,23 +388,6 @@ def test_native_abacus_spin_requires_magnetic_force(tmp_path: Path, monkeypatch)
         module.run_abacus(_arguments(tmp_path, source, resources))
 
 
-def test_vasp_production_adapter_still_rejects_spin(tmp_path: Path):
-    source = tmp_path / "selected.xyz"
-    atoms = Atoms("Fe", positions=[[0, 0, 0]], cell=[4, 4, 4], pbc=True)
-    atoms.set_array("spin", np.asarray([[1.0, 0.0, 0.0]]))
-    write(source, atoms, format="extxyz")
-
-    with pytest.raises(LabelingError, match="does not produce spin/mforce"):
-        label(
-            LabelRequest(
-                source=source,
-                output_file=tmp_path / "spin-labeled.xyz",
-                work_dir=tmp_path / "work",
-            ),
-            "vasp",
-        )
-
-
 def test_abacus_rejects_direction_only_for_variable_magnitude_spin(
     tmp_path: Path, monkeypatch
 ):

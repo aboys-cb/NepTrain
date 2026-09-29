@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import re
+import tempfile
 import threading
 import warnings
 
@@ -47,3 +50,28 @@ class VaspInput(Vasp):
 
 
 __all__ = ["VaspInput"]
+
+
+def read_vasp_input(calculator, filename):
+    """Preserve complete DeltaSpin values through ASE's custom-key interface."""
+    text = Path(filename).read_text(encoding="utf-8")
+    ordinary = []
+    custom = {}
+    for line in text.replace("\\\n", " ").splitlines():
+        for assignment in re.split(r"[#!]", line, maxsplit=1)[0].split(";"):
+            key, separator, value = assignment.partition("=")
+            key = key.strip().lower()
+            if not separator:
+                if assignment.strip():
+                    ordinary.append(assignment)
+                continue
+            if key in {"ldeltaspin", "m_deltaspin", "ediff_rho"} or key.startswith("deltaspin_"):
+                custom[key] = value.strip()
+            else:
+                ordinary.append(assignment)
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".INCAR", encoding="utf-8") as handle:
+        handle.write("\n".join(ordinary) + "\n")
+        handle.flush()
+        calculator.read_incar(handle.name)
+    if custom:
+        calculator.set(custom=custom)

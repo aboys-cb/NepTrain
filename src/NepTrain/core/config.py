@@ -620,13 +620,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if md.get("spin", False):
         if md.get("backend") != "lammps":
             raise ConfigError("spin MD currently requires md.backend=lammps")
-        if backend not in {"abacus", "model", "toy"}:
-            raise ConfigError(
-                "spin workflows require labeling.backend=abacus, model, "
-                "or toy; "
-                "VASP collinear ISPIN=2 produces ordinary energy/force "
-                "labels, not spin/mforce labels"
-            )
+
 
     if workflow:
         workflow_id = workflow.get("id")

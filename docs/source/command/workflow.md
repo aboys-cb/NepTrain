@@ -35,9 +35,9 @@ neptrain doctor --project project.yaml
   1000 步输出一帧。自定义模板可以复用该变量，也可以显式固定间隔。
 - `execution.targets.*.setup_script`：module、Python 环境和 LAMMPS plugin。
 
-`workflow init` 默认只生成当前选择的 `lammps.in` 和标注后端输入，不再生成四套
-LAMMPS 模板及两种第一性原理输入。Spin 流程使用
-`--spin --dft-backend abacus`。
+`workflow init` 只生成当前选择的 `lammps.in` 和标注后端输入。Spin 流程可使用
+`--spin --dft-backend abacus` 或 `--spin --dft-backend vasp`；后者生成
+[VASP DeltaSpin](vasp-deltaspin.md) INCAR。
 
 最小 route 只需要：
 

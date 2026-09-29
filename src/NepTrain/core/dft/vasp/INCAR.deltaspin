@@ -1,0 +1,51 @@
+SYSTEM = NepTrain-DeltaSpin-single-point
+ENCUT = 400
+PREC = Accurate
+GGA = PE
+LASPH = .TRUE.
+LNONCOLLINEAR = .TRUE.
+LSORBIT = .TRUE.
+SAXIS = 0 0 1
+ISYM = 0
+ALGO = Normal
+NELMIN = 3
+NELMDL = -1
+ISMEAR = 0
+SIGMA = 0.1
+ICHARG = 2
+ISTART = 0
+LREAL = .FALSE.
+ADDGRID = .TRUE.
+
+# Fe2 example mixing; tune for your material.
+AMIX = 0.10
+BMIX = 0.0001
+AMIX_MAG = 0.80
+BMIX_MAG = 0.0001
+IMIX = 4
+MAXMIX = -45
+MIXFIRST = .FALSE.
+
+LDELTASPIN = .TRUE.
+DELTASPIN_COMPONENTS = 1 1 1
+DELTASPIN_ACTIVATION_RATIO = 10
+DELTASPIN_MOMENT_DEF = 0
+DELTASPIN_TOL = 1E-6
+LORBIT = 11
+# NepTrain generates M_DELTASPIN and DELTASPIN_ATOMS from each frame's spin.
+# NepTrain also sets MAGMOM to those targets, overriding any template value.
+
+IBRION = -1
+ISIF = 2
+NSW = 0
+LCHARG = .FALSE.
+LWAVE = .FALSE.
+NWRITE = 1
+EDIFF = 1E-7
+EDIFF_RHO = 0
+NELM = 400
+KPAR = 1
+NCORE = 1
+# Choose k-point density for the material; not the reference Fe2 KPOINTS mesh.
+KSPACING = 0.2
+KGAMMA = .TRUE.

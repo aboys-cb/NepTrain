@@ -1,4 +1,4 @@
-"""Non-magnetic VASP single-point execution and result normalization."""
+"""VASP ordinary and DeltaSpin single-point labeling."""
 
 from __future__ import annotations
 
@@ -15,12 +15,14 @@ from ase.calculators.vasp import Vasp
 
 from ...content_addressing import file_sha256
 from ..attempts import new_attempt_directory
-from .io import VaspInput
+from .io import VaspInput, read_vasp_input
+from . import deltaspin
+from ...spin import validate_spin_structure as validate_canonical_spin
 from .resources import validate_vasp_resources
 
 
 class NativeVaspError(RuntimeError):
-    """Raised when VASP cannot produce a valid non-magnetic label."""
+    """Raised when VASP cannot produce a valid single-point label."""
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ def run_native_vasp(
         flat_single_case=request.flat_single_case,
     )
     resource_provenance = None
+    magnetic_result = None
     try:
         resource_provenance = validate_vasp_resources(
             request.resource_dir,
@@ -57,7 +60,7 @@ def run_native_vasp(
             atoms,
         )
         calculator = VaspInput(pp_path=request.resource_dir)
-        calculator.read_incar(request.input_file)
+        read_vasp_input(calculator, request.input_file)
         electronic_mode = _validate_single_point_input(calculator)
         validate_vasp_structure(atoms, electronic_mode=electronic_mode)
         settings = {
@@ -99,10 +102,28 @@ def run_native_vasp(
                 kspacing=None,
             )
         calculator.set(**settings)
-        calculator.calculate(atoms, ("energy", "forces", "stress"))
+        input_atoms = atoms
+        resort = np.arange(len(atoms))
+        if electronic_mode == "deltaspin":
+            input_atoms, resort = deltaspin.prepare_input(calculator, atoms)
+        calculator.calculate(input_atoms, ("energy", "forces", "stress"))
         if not calculator.converged:
             raise NativeVaspError(f"VASP electronic SCF did not converge in {case_dir}")
         energy, forces, stress = _validated_results(calculator.results, len(atoms))
+        forces = forces[resort]
+        if electronic_mode == "deltaspin":
+            magnetic_result = deltaspin.read_result(
+                case_dir / "OUTCAR", input_atoms.get_chemical_symbols(),
+                np.asarray(input_atoms.arrays["spin"]),
+            )
+            params = deltaspin.custom_parameters(calculator)
+            if magnetic_result.moment_def != int(params.get("deltaspin_moment_def", "0")):
+                raise deltaspin.DeltaSpinError("DeltaSpin moment definition differs between input and output")
+            if "deltaspin_tol" in params and not np.isclose(
+                magnetic_result.tolerance, deltaspin.numbers(params["deltaspin_tol"])[0],
+                rtol=1e-4, atol=0,
+            ):
+                raise deltaspin.DeltaSpinError("DeltaSpin tolerance differs between input and output")
     except Exception as error:
         _write_manifest(
             case_dir,
@@ -112,12 +133,21 @@ def run_native_vasp(
             electronic_mode=electronic_mode,
             resources=resource_provenance,
         )
+        if isinstance(error, deltaspin.DeltaSpinError):
+            raise NativeVaspError(str(error)) from error
         raise
 
     frame = atoms.copy()
     frame.calc = SinglePointCalculator(frame, energy=energy, forces=forces)
     frame.info["virial"] = _stress_to_virial(stress, frame.get_volume())
     frame.info["dft_electronic_mode"] = electronic_mode
+    if magnetic_result is not None:
+        frame.set_array("spin", magnetic_result.spin[resort])
+        frame.set_array("mforce", magnetic_result.mforce[resort])
+        frame.set_initial_magnetic_moments(magnetic_result.spin[resort])
+        frame.info["deltaspin_moment_def"] = magnetic_result.moment_def
+        frame.info["deltaspin_max_error"] = magnetic_result.max_error
+        frame.info["deltaspin_tolerance"] = magnetic_result.tolerance
     frame.info.setdefault("Config_type", "NepTrain scf ")
     frame.info["Weight"] = 1.0
     _write_manifest(
@@ -128,6 +158,7 @@ def run_native_vasp(
         atom_count=len(frame),
         electronic_mode=electronic_mode,
         resources=resource_provenance,
+        magnetic_result=magnetic_result,
     )
     return frame
 
@@ -145,6 +176,12 @@ def _validate_single_point_input(calculator: VaspInput) -> str:
             "VASP labeling supports non-spin-polarized ISPIN=1 or collinear "
             "ISPIN=2 ordinary energy/force labels"
         )
+    try:
+        if deltaspin.enabled(calculator):
+            deltaspin.validate_input(calculator)
+            return "deltaspin"
+    except ValueError as error:
+        raise NativeVaspError(str(error)) from error
     if calculator.bool_params.get("lnoncollinear"):
         raise NativeVaspError("VASP labeling forbids LNONCOLLINEAR")
     if calculator.bool_params.get("lsorbit"):
@@ -166,7 +203,7 @@ def validate_vasp_input_file(input_file: str | Path) -> str:
 
     calculator = Vasp()
     try:
-        calculator.read_incar(str(Path(input_file).expanduser().resolve()))
+        read_vasp_input(calculator, Path(input_file).expanduser().resolve())
     except Exception as error:
         raise NativeVaspError(f"cannot parse VASP INCAR {input_file}: {error}") from error
     return _validate_single_point_input(calculator)
@@ -179,10 +216,17 @@ def validate_vasp_structure(
 ) -> None:
     """Reject magnetic structure inputs that VASP cannot label faithfully."""
 
+    if electronic_mode == "deltaspin":
+        try:
+            if not validate_canonical_spin(atoms, require_mforce=False):
+                raise NativeVaspError("VASP DeltaSpin requires canonical spin:R:3 input targets")
+        except ValueError as error:
+            raise NativeVaspError(str(error)) from error
+        return
     if "spin" in atoms.arrays:
         raise NativeVaspError(
-            "VASP production labeling does not produce spin/mforce labels; "
-            "use ABACUS DeltaSpin"
+            "VASP spin/mforce labeling requires LDELTASPIN=.TRUE. "
+            "and LNONCOLLINEAR=.TRUE. in INCAR"
         )
     initial = atoms.arrays.get("initial_magmoms")
     if initial is None:
@@ -242,6 +286,7 @@ def _write_manifest(
     atom_count: int | None = None,
     electronic_mode: str | None = None,
     resources: dict | None = None,
+    magnetic_result: deltaspin.DeltaSpinResult | None = None,
 ) -> None:
     inputs = {}
     for name in ("INCAR", "POSCAR", "KPOINTS", "POTCAR"):
@@ -252,11 +297,12 @@ def _write_manifest(
         "backend": "vasp",
         "command": command,
         "status": status,
-        "parser": "ase.calculators.vasp",
+        "parser": ("ase.calculators.vasp+vasp6_deltaspin"
+                   if electronic_mode == "deltaspin" else "ase.calculators.vasp"),
         "ase_version": ase.__version__,
         "input_sha256": inputs,
         "electronic_mode": electronic_mode,
-        "spin_force_labels": False,
+        "spin_force_labels": electronic_mode == "deltaspin",
     }
     outputs = {}
     for name in ("vasprun.xml", "OUTCAR"):
@@ -265,6 +311,15 @@ def _write_manifest(
             outputs[name] = file_sha256(path)
     if outputs:
         payload["output_sha256"] = outputs
+    if magnetic_result is not None:
+        payload["deltaspin"] = {
+            "moment_def": magnetic_result.moment_def,
+            "max_moment_error_uB": magnetic_result.max_error,
+            "tolerance_uB": magnetic_result.tolerance,
+            "spin_unit": "uB",
+            "mforce_unit": "eV/uB",
+            "mforce_convention": "spin_lambda for L=E+lambda.(M-M_target)",
+        }
     if resources is not None:
         payload["pseudopotentials"] = resources
     if error is not None:

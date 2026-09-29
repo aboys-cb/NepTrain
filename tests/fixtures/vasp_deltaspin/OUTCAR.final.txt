@@ -1,0 +1,23 @@
+ DeltaSpin final status
+ SCF convergence        : reached
+ Moment constraint      : reached
+ Maximum moment error   :   8.0856E-08 uB
+ Requested tolerance    :   1.0000E-06 uB
+
+ DeltaSpin final constrained observables
+ DELTASPIN_MOMENT_DEF = 0
+ VASP PROCAR LORBIT=11 Projector Spin Moment (uB)
+ Moments below list constrained atoms; omitted atoms may have induced moments.
+ cx/cy/cz: 1 = constrained, 0 = unconstrained
+   ion elem cx cy cz                Mx                My                Mz               |M|
+--------------------------------------------------------------------------------------------
+     1   Fe  1  1  1      0.3500000809     -0.0000000002      2.6769999639      2.6997831141
+     2   Fe  1  1  1     -0.3500000800     -0.0000000002      2.6769999642      2.6997831143
+
+ Magnetic force (eV/uB)
+ Unconstrained components have lambda = 0.
+   ion elem cx cy cz               MFx               MFy               MFz
+--------------------------------------------------------------------------
+     1   Fe  1  1  1      0.0072313466      0.0000003270      0.0494295373
+     2   Fe  1  1  1     -0.0072396120      0.0000004429      0.0494380481
+ magnetic force = spin_lambda for L=E+lambda.(M-M_target)

@@ -522,7 +522,8 @@ Properties=species:S:1:pos:R:3:spin:R:3:mforce:R:3
 - Spin 结构必须得到 `mforce`，否则标注失败。
 - VASP 允许 `ISPIN=1` 或共线 `ISPIN=2`，但两者都只发布普通
   energy/force/virial 标签；不会把共线磁计算伪装成 `spin/mforce` 数据。
-- ABACUS DeltaSpin 支持全矢量约束并读取最终 magnetization 和 mforce。
+- VASP 6 DeltaSpin 与 ABACUS DeltaSpin 支持全矢量约束并读取最终磁矩和 mforce。
+  VASP 的初始化命令、INCAR 和输出要求见 [VASP DeltaSpin](docs/source/command/vasp-deltaspin.md)。
 - LAMMPS DynSpin dump 根据 `compute property/atom` 定义解析，不写死
   `c_spin[n]` 的意义。
 

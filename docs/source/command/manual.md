@@ -146,9 +146,9 @@ neptrain label candidates.xyz \
 VASP 路径只接受 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这样的单层 setup 目录，并由
 NepTrain 显式写入 ASE `setups`；不会校验 manifest 中的一个文件，却让 ASE
 按默认规则读取另一个文件。
-VASP 的 `ISPIN=2` 只表示共线自旋极化电子计算，结果仍是普通
-energy/force/virial 标签并记录 `dft_electronic_mode`；它不会生成
-`spin/mforce`。非共线、SOC 或真正的 spin-force 标注必须使用 ABACUS DeltaSpin。
+VASP 的 `ISPIN=2` 仍只生成普通 energy/force/virial 标签。带 DeltaSpin 扩展的 VASP 6
+可通过 `LDELTASPIN=.TRUE.` 标注完整 `spin/mforce`，并支持 SOC；配置和 INCAR
+写法见 [VASP DeltaSpin](vasp-deltaspin.md)。
 
 预训练或微调后的等变模型可以作为与 VASP/ABACUS 平级的 Label Adapter：
 

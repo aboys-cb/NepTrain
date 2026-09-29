@@ -72,9 +72,15 @@ def test_init_selects_only_the_requested_spin_abacus_templates(tmp_path):
     ).read_text(encoding="utf-8")
 
 
-def test_init_rejects_spin_vasp_combination(tmp_path):
-    with pytest.raises(ValueError, match="dft-backend abacus"):
-        init_project("local", tmp_path, spin=True)
+def test_init_selects_vasp_deltaspin_template(tmp_path):
+    from NepTrain.core.dft.vasp.native import validate_vasp_input_file
+
+    project = init_project("local", tmp_path, spin=True, dft_backend="vasp")
+    config, _ = load_config(project)
+    assert config["md"]["spin"] is True
+    assert config["labeling"]["backend"] == "vasp"
+    assert validate_vasp_input_file(tmp_path / "INCAR") == "deltaspin"
+    assert "dynspin/glsd/npt" in (tmp_path / "lammps.in").read_text()
 
 
 def test_force_switch_removes_obsolete_generated_dft_input(tmp_path):

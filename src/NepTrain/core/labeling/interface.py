@@ -200,7 +200,7 @@ def _label_model(request: LabelRequest) -> LabelResult:
 
 
 _ADAPTERS: dict[str, _AdapterSpec] = {
-    "vasp": _AdapterSpec(_label_vasp, "dft", supports_spin_input=False),
+    "vasp": _AdapterSpec(_label_vasp, "dft", supports_spin_input=True),
     "abacus": _AdapterSpec(_label_abacus, "dft", supports_spin_input=True),
     "model": _AdapterSpec(
         _label_model,

@@ -593,10 +593,11 @@ def test_spin_md_uses_lattice_temperature_by_default(tmp_path):
     assert "spin_temperature" not in config["sampling"]["routes"][0]["conditions"]
 
 
-def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
+@pytest.mark.parametrize("backend", ["abacus", "vasp"])
+def test_spin_workflow_accepts_deltaspin(tmp_path, backend):
     value = _project(
         md={"spin": True},
-        labeling={"backend": "abacus"},
+        labeling={"backend": backend},
         evaluation={
             "max_rmse": {
                 "energy_rmse": 1,
@@ -608,13 +609,7 @@ def test_spin_workflow_accepts_abacus_deltaspin(tmp_path):
     config, _ = load_config(
         _write(tmp_path, value)
     )
-    assert config["labeling"]["backend"] == "abacus"
-
-
-def test_spin_workflow_rejects_vasp(tmp_path):
-    value = _project(md={"spin": True}, labeling={"backend": "vasp"})
-    with pytest.raises(ConfigError, match=r"VASP.*spin/mforce"):
-        load_config(_write(tmp_path, value))
+    assert config["labeling"]["backend"] == backend
 
 
 def test_dft_kpoints_default_to_input_authoritative_auto_mode(tmp_path):

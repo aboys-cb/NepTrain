@@ -835,7 +835,9 @@ def _doctor_target_requirements(config, target_name, target):
             add_command(
                 environment.get(
                     "NEPTRAIN_VASP_COMMAND",
-                    "mpirun -n 1 vasp_std",
+                    "mpirun -n 1 vasp_ncl"
+                    if config["md"].get("spin", False)
+                    else "mpirun -n 1 vasp_std",
                 )
             )
         elif backend == "abacus":

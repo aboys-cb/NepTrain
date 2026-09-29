@@ -251,3 +251,5 @@ warnings in CI.
 
 - [Issue tracker](https://github.com/aboys-cb/NepTrain/issues)
 - [PyPI](https://pypi.org/project/NepTrain/)
+
+VASP 6 DeltaSpin spin labeling: [configuration and INCAR](docs/source/command/vasp-deltaspin.md).

@@ -670,3 +670,15 @@ def test_spin_migration_is_explicit_atomic_and_json_clean(tmp_path):
     assert "mforce" in restored.arrays
     assert "spins" not in restored.arrays
     assert "mforces" not in restored.arrays
+
+
+def test_doctor_checks_noncollinear_vasp_for_spin_workflow():
+    config = {
+        "md": {"backend": "lammps", "spin": True},
+        "labeling": {"backend": "vasp"},
+        "execution": {"stage_targets": {"labeling": "local"}},
+    }
+    target = ExecutionTarget(name="local", executor="process", command="neptrain")
+    tools, packages, roles = _doctor_target_requirements(config, "local", target)
+    assert "vasp_ncl" in tools
+    assert "vasp_std" not in tools
