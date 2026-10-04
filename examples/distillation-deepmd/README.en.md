@@ -120,8 +120,8 @@ DeepMD labels and publish `nep.txt`; this model is not suitable for MD.
 
 ```bash
 test -s student-nep.txt
-test -s student-train/training-report.json
-test -s student-train/training-convergence.png
+test -s student-train/jobs/000000/calculation/training-report.json
+test -s student-train/jobs/000000/calculation/training-convergence.png
 ```
 
 Training plots are PNG only.
@@ -143,23 +143,23 @@ neptrain workflow run deepmd-distillation-workflow
 neptrain workflow status deepmd-distillation-workflow --jobs
 ```
 
-To observe the controller in the current terminal:
+After preparation, choose this command instead of the background launch above to observe the controller in the current terminal:
 
 ```bash
-neptrain workflow run project.yaml --foreground
+neptrain workflow run deepmd-distillation-workflow --foreground
 ```
 
 ## 7. Inspect the result
 
 | Location | Contents |
 |---|---|
-| `generations/0001/train/` | Initial student and PNG convergence plot |
+| `generations/0001/train/` | Initial student, `training-convergence.png`, and `training-parity-train.png` |
 | `generations/0001/explore/` | GPUMD trajectory and `trajectory-health.json` |
-| `generations/0001/select/` | FPS-selected candidates |
+| `generations/0001/select/` | FPS-selected candidates and `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | New DPA-3 labels |
 | `generations/0001/label/label-provenance.json` | Runner, head, model name, and SHA256 |
 | `generations/0001/update/` | Merged student training set |
-| `generations/0001/evaluate/` | Pre-training prediction error on new labels |
+| `generations/0001/evaluate/` | Prediction error on new labels before training on them, plus `acquisition-parity.png` |
 
 `budget_exhausted` means the one-generation tutorial budget was consumed, not
 that the workflow failed. The configured sampling stages should complete; teacher or MD

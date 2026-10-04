@@ -18,12 +18,14 @@ workflow 只负责计划、状态推进和验收，不复制科学计算逻辑�
 第一次使用可直接选择完整教程：
 
 - [VASP + Slurm workflow](examples/workflow-vasp-slurm/README.md)
+- [VASP DeltaSpin workflow](examples/workflow-vasp-deltaspin/README.md)
+- [全部案例与覆盖范围](examples/README.md)，包括 LAMMPS 替代配置
 - [ABACUS + Slurm workflow](examples/workflow-abacus-slurm/README.md)
 - [DeepMD / DPA 蒸馏](examples/distillation-deepmd/README.md)
 - [MACE 蒸馏](examples/distillation-mace/README.md)
 - [TACE 蒸馏](examples/distillation-tace/README.md)
 
-这些教程都从环境检查和独立标注开始，再进入一代完整 workflow，并说明跑完看
+这些教程都从环境检查和独立标注开始，再进入一代采样流程，并说明跑完看
 哪些日志、标签、provenance 和 PNG 图。
 
 ## 安装
@@ -31,6 +33,17 @@ workflow 只负责计划、状态推进和验收，不复制科学计算逻辑�
 ```bash
 pip install NepTrain
 ```
+
+本仓库的 README、文档和案例对应当前源码。运行仓库案例时，请在仓库根目录
+安装同一份源码；Controller 与计算节点也应使用相同版本：
+
+```bash
+python -m pip install -e .
+# 需要 TorchNEP 时，在已安装合适 PyTorch 的环境中使用：
+python -m pip install -e '.[torchnep]'
+```
+
+`pip install NepTrain` 安装的是发布版，可能尚未包含本仓库最新功能。
 
 TorchNEP 训练需要安装与机器 CUDA 匹配的 PyTorch：
 
@@ -66,8 +79,8 @@ pip install \
 export TACE_USE_CUE=1
 ```
 
-官方二进制算子需要 Ampere 或更新的 GPU；Sai V100 实测会报
-`cudaErrorNoKernelImageForDevice`，不要在 V100 上启用。
+该加速配置面向 Ampere 或更新的 GPU；V100 不启用 `TACE_USE_CUE`，避免
+`cudaErrorNoKernelImageForDevice`。
 
 不提供 `--nep`、需要用 SOAP 做手动采样时安装：
 
@@ -75,15 +88,16 @@ export TACE_USE_CUE=1
 pip install 'NepTrain[soap]'
 ```
 
-LAMMPS、VASP 和 ABACUS 由用户或计算平台提供。使用 NEPAdapters LAMMPS plugin
+GPUMD、LAMMPS、VASP 和 ABACUS 由用户或计算平台提供。使用 NEPAdapters LAMMPS plugin
 时设置：
 
 ```bash
 export LAMMPS_PLUGIN_PATH=/path/to/nepadapters/lib
 ```
 
-NepTrain 只接受 `schema_version: 8`。旧 `train/vasp/gpumd/nep` 命令和旧配置不再
-兼容，也不会被静默迁移。
+NepTrain 只接受 `schema_version: 8`。旧版命令参数和旧配置不再兼容，
+也不会被静默迁移。当前训练入口仍是 `neptrain train`；旧的顶层 `vasp/gpumd/nep`
+命令分别由 `label/md/train` 统一入口替代。
 
 ## 独立运行一个步骤
 
@@ -126,10 +140,31 @@ GPa。提供 `run.in` 模板时，只替换 `{{ model_file }}`、`{{ temperature
 GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留稳定段和炸前
 帧。Spin MD 仍只支持 LAMMPS DynSpin。
 
+### 手动采样
+
+```bash
+neptrain select trajectories.xyz \
+  --base train.xyz \
+  --nep nep.txt \
+  --descriptor-reduction elementwise_mean_std \
+  --max-selected 64 \
+  --min-novelty 0.01 \
+  --out selected.xyz \
+  --report selected.selection.json
+```
+
+手动命令和 workflow 共用按元素集合分组、按来源条件平衡的 FPS 策略。
+`--base` 作为已有训练集 warm start；精确重复结构和描述符重复点不会为填满上限而
+再次入选。`global_mean` 保留原来的全原子平均；推荐多元素体系使用
+`elementwise_mean_std`，分别保留每种元素的描述符均值和标准差，避免不同元素在
+结构平均时相互中和。提供 `--nep` 时使用 NEP 描述符，否则使用 SOAP。JSON 报告记录结构
+身份版本、描述符来源、入选 ID、novelty 和各分组统计。
+
+
 ### 批量标注
 
 ```bash
-neptrain label candidates.xyz \
+neptrain label selected.xyz \
   --backend vasp \
   --input-file INCAR \
   --resources /shared/potpaw_PBE \
@@ -188,7 +223,7 @@ neptrain label candidates.xyz \
 ```
 
 DPA-4 使用同一个适配器和本地 `.pt2` 文件，不增加 workflow backend。当前
-DPA-4 需要 DeePMD-kit 3.2 预发布版；完整下载、标注、Student 冒烟训练和版本边界见
+DPA-4 需要支持相应模型格式的 DeePMD-kit 3.2 或更新版本；完整下载、标注、Student 冒烟训练和版本边界见
 [`examples/distillation-deepmd`](examples/distillation-deepmd/README.md)。
 
 TACE 复用官方 `tace-eval` 批量推理。它先写临时预测 extxyz，NepTrain 再把
@@ -212,25 +247,6 @@ neptrain label candidates.xyz \
 `model-worker` 是 workflow/手动 `label` 调用的内部协议，不作为第二套用户命令；
 用户入口始终是 `neptrain label`。
 
-### 手动采样
-
-```bash
-neptrain select md-300.xyz md-600.xyz \
-  --base train.xyz \
-  --nep nep.txt \
-  --descriptor-reduction elementwise_mean_std \
-  --max-selected 64 \
-  --min-novelty 0.01 \
-  --out selected.xyz \
-  --report selected.selection.json
-```
-
-手动命令和 workflow 共用按元素集合分组、按来源条件平衡的 FPS 策略。
-`--base` 作为已有训练集 warm start；精确重复结构和描述符重复点不会为填满上限而
-再次入选。`global_mean` 保留原来的全原子平均；推荐多元素体系使用
-`elementwise_mean_std`，分别保留每种元素的描述符均值和标准差，避免不同元素在
-结构平均时相互中和。提供 `--nep` 时使用 NEP 描述符，否则使用 SOAP。JSON 报告记录结构
-身份版本、描述符来源、入选 ID、novelty 和各分组统计。
 
 ### Slurm target
 
@@ -238,7 +254,7 @@ neptrain select md-300.xyz md-600.xyz \
 `--target`：
 
 ```bash
-neptrain label candidates.xyz \
+neptrain label selected.xyz \
   --backend vasp \
   --project project.yaml \
   --target label \
@@ -463,8 +479,9 @@ sampling:
 始终使用同一规约。
 
 模型版本之间是硬边界：每轮候选只允许来自该轮激活模型，候选文件和 manifest
-都会记录模型哈希。标签诊断超阈值或 MD 发生物理失败时才更新模型；只有新模型完成
-evaluate 并写入 lineage，下一轮 MD 才会启动。模型更新不会清零已经完成的
+都会记录模型哈希。每个采样代先在进入该代的训练集上训练并启用模型，再运行 MD；
+`evaluate` 用这个采样模型预测本轮新标签，`update` 随后合并数据供下一代训练。
+即使本轮没有新增标签，进入下一采样代时仍会执行训练。模型更新不会清零已经完成的
 smoke、short 或 long 采样证据；只有最终 production 认证重新绑定当前模型。
 因此既不会把旧模型轨迹混入新候选池，也不会让每一代无意义地退回 smoke。
 
@@ -473,9 +490,10 @@ smoke、short 或 long 采样证据；只有最终 production 认证重新绑定
 彼此独立。`novelty: auto` 会以当前完整 `train.xyz` 为参考，只用同元素训练结构
 拟合描述符中心和尺度，再从留一最近邻距离估计保守覆盖阈值。候选结构只使用该尺度
 变换，不参与阈值坐标系的拟合。一个温压条件在本档 MD 正常完成并通过健康与诊断
-检查后晋级；剩余 novelty 是否落入阈值只决定结构选择、DFT 标注和重训，不再阻止
-健康轨迹进入下一档时长。若本轮没有结构超过阈值，workflow 会跳过 DFT 和重训，
-直接推进采样阶梯。需要固定策略时，可同时配置
+检查后晋级；剩余 novelty 是否落入阈值决定结构选择和 DFT 标注，不再阻止
+健康轨迹进入下一档时长。若本轮没有结构超过阈值，workflow 会跳过空的 DFT
+任务和新标签误差计算，记录覆盖证据；这不等于跳过下一代的训练，也不能补充
+新的精度达标证据。需要固定策略时，可同时配置
 `selection_threshold` 和 `completion_threshold`。
 采样覆盖完成后，还需要新增标注结构的训练前预测误差满足
 `workflow.convergence`，有效标签数和连续达标代数达到要求，再完成最终训练，

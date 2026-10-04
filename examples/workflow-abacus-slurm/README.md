@@ -159,14 +159,14 @@ neptrain workflow stop abacus-tutorial-workflow
 | 位置 | 内容 |
 |---|---|
 | `generations/0001/explore/` | GPUMD 轨迹和健康报告 |
-| `generations/0001/select/` | FPS 选择结果 |
+| `generations/0001/select/` | FPS 结果和 `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | ABACUS 新标签 |
 | `generations/0001/label/label-provenance.json` | INPUT、UPF/ORB 哈希和后端来源 |
 | `generations/0001/update/` | 合并后的训练集 |
-| `generations/0001/train/` | 本代采样模型和训练曲线 PNG |
-| `generations/0001/evaluate/` | 新增标签的训练前预测误差 |
+| `generations/0001/train/` | 本代采样模型、`training-convergence.png` 和 `training-parity-train.png` |
+| `generations/0001/evaluate/` | 新标签的训练前预测误差和 `acquisition-parity.png` |
 
-`evaluation` 只输出辅助测试，不阻止流程继续；采样精度阈值在 `workflow.convergence` 中。
+配置段 `evaluation:` 只控制辅助测试，不阻止流程继续；采样精度阈值在 `workflow.convergence` 中。
 示例阈值仅供教程使用。只有精度、生产覆盖和连续达标要求都满足，才会进入最终训练。
 辅助测试报告位于 `generations/0001/train/`。
 

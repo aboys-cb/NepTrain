@@ -6,6 +6,17 @@ NepTrain 要求 Python 3.10 或更高版本：
 pip install NepTrain
 ```
 
+本仓库的 README、文档和案例对应当前源码。运行仓库案例时，请在仓库根目录
+安装同一份源码；Controller 与计算节点也应使用相同版本：
+
+```bash
+python -m pip install -e .
+# 需要 TorchNEP 时，在已安装合适 PyTorch 的环境中使用：
+python -m pip install -e '.[torchnep]'
+```
+
+`pip install NepTrain` 安装的是发布版，可能尚未包含本仓库最新功能。
+
 TorchNEP：
 
 ```bash
@@ -53,8 +64,8 @@ pip install \
 export TACE_USE_CUE=1
 ```
 
-官方二进制算子需要 Ampere 或更新的 GPU；Sai V100 实测会报
-`cudaErrorNoKernelImageForDevice`，不要在 V100 上启用。
+该加速配置面向 Ampere 或更新的 GPU；V100 不启用 `TACE_USE_CUE`，避免
+`cudaErrorNoKernelImageForDevice`。
 
 手动采样不提供 NEP 模型、需要 SOAP 描述符时：
 
@@ -62,7 +73,7 @@ export TACE_USE_CUE=1
 pip install 'NepTrain[soap]'
 ```
 
-LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和
+GPUMD、LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和
 `LAMMPS_PLUGIN_PATH` 写入 execution target 的 `setup_script`，然后运行：
 
 ```bash

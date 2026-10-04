@@ -5,7 +5,7 @@
 # 用 MACE Teacher 蒸馏一个 NEP Student
 
 这个教程先用固定的 MACE-MP-0 checkpoint 标注12 个带局域位移的 Al 晶体结构，再训练
-TorchNEP Student，最后可选跑一代完整 workflow：
+TorchNEP Student，最后可选跑一代采样流程：
 
 ```text
 候选结构 → MACE Teacher → energy/forces/virial
@@ -108,13 +108,13 @@ neptrain train labeled.xyz \
 
 ```bash
 test -s student-nep.txt
-test -s student-train/training-report.json
-test -s student-train/training-convergence.png
+test -s student-train/jobs/000000/calculation/training-report.json
+test -s student-train/jobs/000000/calculation/training-convergence.png
 ```
 
 训练图只生成 PNG。
 
-## 6. 跑一代完整 workflow
+## 6. 跑一代采样流程
 
 确认 GPUMD 和项目环境：
 
@@ -132,23 +132,23 @@ neptrain workflow run mace-distillation-workflow
 neptrain workflow status mace-distillation-workflow --jobs
 ```
 
-也可以直接在前台运行：
+准备完成后，若希望在当前终端观察 controller，用以下命令替代上面的后台启动命令（两种启动方式选一种）：
 
 ```bash
-neptrain workflow run project.yaml --foreground
+neptrain workflow run mace-distillation-workflow --foreground
 ```
 
 ## 7. 跑完检查什么
 
 | 位置 | 内容 |
 |---|---|
-| `generations/0001/train/` | 初始 Student 和训练曲线 PNG |
+| `generations/0001/train/` | 初始 Student、`training-convergence.png` 和 `training-parity-train.png` |
 | `generations/0001/explore/` | GPUMD 轨迹和健康报告 |
-| `generations/0001/select/` | FPS 选择结果 |
+| `generations/0001/select/` | FPS 结果和 `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | MACE 新标签 |
 | `generations/0001/label/label-provenance.json` | runner、模型名和 SHA256 |
 | `generations/0001/update/` | 合并后的训练集 |
-| `generations/0001/evaluate/` | 新标签的训练前预测误差 |
+| `generations/0001/evaluate/` | 新标签的训练前预测误差和 `acquisition-parity.png` |
 
 本例 `max_model_generations: 1`，所以末尾 `budget_exhausted` 表示教程预算用完，
 不代表任务失败。

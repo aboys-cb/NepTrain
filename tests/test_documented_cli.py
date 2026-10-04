@@ -1,22 +1,21 @@
 from __future__ import annotations
 
-import os
+import argparse
 from pathlib import Path
 import re
 import shlex
-import subprocess
-import sys
 
+import pytest
+
+from NepTrain.cli import cli
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = (
     ROOT / "README.md",
     ROOT / "README.zh-CN.md",
-    *sorted((ROOT / "examples").glob("*/README*.md")),
-    ROOT / "docs/source/command/manual.md",
-    ROOT / "docs/source/command/workflow.md",
+    *sorted((ROOT / "examples").rglob("README*.md")),
+    *sorted((ROOT / "docs/source").rglob("*.md")),
 )
-NESTED = {"workflow", "task", "data"}
 
 
 def _bash_commands(text: str) -> list[str]:
@@ -36,45 +35,39 @@ def _bash_commands(text: str) -> list[str]:
     return commands
 
 
-def test_documented_cli_options_exist_on_the_documented_command():
-    commands = [
-        command
-        for document in DOCUMENTS
-        for command in _bash_commands(document.read_text(encoding="utf-8"))
-    ]
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(ROOT / "src")
-    help_by_surface = {}
-    for command in commands:
-        tokens = shlex.split(command)
-        surface = tuple(tokens[1 : 3 if tokens[1] in NESTED else 2])
-        if surface not in help_by_surface:
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "NepTrain.cli.cli",
-                    *surface,
-                    "--help",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-                env=environment,
-            )
-            assert completed.returncode == 0, (surface, completed.stderr)
-            help_by_surface[surface] = completed.stdout
-        documented_options = {
-            token.split("=", 1)[0]
-            for token in tokens
-            if token.startswith("--")
-        }
-        missing = sorted(
-            option
-            for option in documented_options
-            if option not in help_by_surface[surface]
-        )
-        assert not missing, f"{command}: undocumented parser option(s) {missing}"
+@pytest.fixture(scope="module")
+def documented_parser():
+    """Capture the actual CLI parser before dispatch; never submit documented jobs."""
+
+    class ParserCaptured(Exception):
+        pass
+
+    captured = []
+
+    def capture(parser, *args, **kwargs):
+        captured.append(parser)
+        raise ParserCaptured
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("_ARGCOMPLETE", raising=False)
+        patch.setattr(argparse.ArgumentParser, "parse_args", capture)
+        with pytest.raises(ParserCaptured):
+            cli.main()
+    assert len(captured) == 1
+    return captured[0]
+
+
+@pytest.mark.parametrize(
+    "document", DOCUMENTS, ids=lambda path: str(path.relative_to(ROOT))
+)
+def test_documented_commands_parse(documented_parser, document):
+    for command in _bash_commands(document.read_text(encoding="utf-8")):
+        # shlex handles shell comments but does not run substitutions or commands.
+        tokens = shlex.split(command, comments=True)
+        try:
+            documented_parser.parse_args(tokens[1:])
+        except SystemExit as error:
+            assert error.code == 0, f"{document.relative_to(ROOT)}: {command}"
 
 
 def test_direct_vasp_examples_pin_the_potcar_manifest():
@@ -87,3 +80,40 @@ def test_direct_vasp_examples_pin_the_potcar_manifest():
                 and "--project" not in command
             ):
                 assert "--potcar-manifest" in command, command
+
+
+def test_distillation_training_checks_match_manual_output_layout(
+    documented_parser, tmp_path, monkeypatch
+):
+    """Exercise the manual task layout without running an external trainer."""
+    from NepTrain.core.training import TrainingResult
+
+    document = ROOT / "examples/distillation-mace/README.md"
+    command = next(
+        command
+        for command in _bash_commands(document.read_text())
+        if command.startswith("neptrain train ")
+    )
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "labeled.xyz").write_text("backend fixture\n")
+    (tmp_path / "nep-smoke.in").write_text("backend fixture\n")
+
+    def fake_train(request, backend):
+        model = request.output_dir / "nep.txt"
+        model.write_text("backend fixture\n")
+        # Only stand in for the backend; preparation, worker, and publication are real.
+        for name in ("training-report.json", "training-convergence.png"):
+            (request.output_dir / name).write_text("backend artifact\n")
+        return TrainingResult(backend, model, None, None)
+
+    monkeypatch.setattr("NepTrain.core.training.train", fake_train)
+    args = documented_parser.parse_args(shlex.split(command)[1:])
+    args.func(args)
+    for readme in sorted((ROOT / "examples").glob("distillation-*/README*.md")):
+        checks = re.findall(
+            r"^test -s (student-\S+)$", readme.read_text(), re.MULTILINE
+        )
+        assert checks, readme
+        for relative in checks:
+            path = tmp_path / relative
+            assert path.is_file() and path.stat().st_size, (readme, relative)

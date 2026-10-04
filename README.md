@@ -36,6 +36,18 @@ NepTrain requires Python 3.10 or later:
 pip install NepTrain
 ```
 
+This README, the documentation, and repository examples track the current source.
+For these examples, install from the repository root and use the same revision on
+the controller and workers:
+
+```bash
+python -m pip install -e .
+# After installing a suitable PyTorch runtime:
+python -m pip install -e '.[torchnep]'
+```
+
+The published package may not yet include the latest repository features.
+
 Install only the optional runtime you need:
 
 ```bash
@@ -112,7 +124,7 @@ neptrain md structures/ \
 Select representative structures:
 
 ```bash
-neptrain select md-300.xyz md-600.xyz \
+neptrain select trajectories.xyz \
   --base train.xyz \
   --nep nep.txt \
   --max-selected 64 \
@@ -123,7 +135,7 @@ neptrain select md-300.xyz md-600.xyz \
 Label structures with VASP:
 
 ```bash
-neptrain label candidates.xyz \
+neptrain label selected.xyz \
   --backend vasp \
   --input-file INCAR \
   --resources /shared/potpaw_PBE \
@@ -171,10 +183,19 @@ neptrain workflow run workflow
 
 New projects always use the current active-learning flow. Without `workflow.convergence`, automatic accuracy convergence is disabled; add system-specific thresholds using the commented example generated in `project.yaml`.
 
+Each sampling generation starts by training and activating a model on its incoming
+dataset. `evaluate` checks that sampling model against newly labeled structures
+before `update` merges them for the next generation. Even without new labels, a
+subsequent sampling generation still starts with training. Optional test datasets
+are diagnostic only and do not decide convergence or block progression when
+unavailable. Completion requires new-label accuracy, production coverage, and
+the configured passing streak, followed by final training.
+
 Inspect and control it with:
 
 ```bash
 neptrain workflow status workflow --jobs
+neptrain workflow status workflow --details
 neptrain workflow resume workflow
 neptrain workflow restart workflow --generation 3 --from label --dry-run
 neptrain workflow stop workflow
@@ -183,10 +204,13 @@ neptrain workflow extend workflow 15
 
 Workflow control commands default to readable summaries; use `--json` for scripts. `extend workflow 15` sets the total sampling budget to 15; it does not add 15 generations. Follow the printed next action to start or resume.
 
-Human-readable workflow status focuses on the active generation, a compact
-temperature path with observable MD progress in ps, and a per-generation RMSE
-table. `--jobs` groups large MD and labeling batches by generation, stage, and
-attempt; `--json` retains every individual execution record.
+Workflow status shows the current stage, dataset growth, training progress, and
+MD progress as a ps range with readable-trajectory counts. It shows the latest
+three new-label evaluations, convergence thresholds and coverage gaps, plus plot
+paths. `--details` adds all evaluations and optional test diagnostics; `--jobs`
+groups batches by generation, stage, attempt, and target. Job observations are
+cached and have their own timestamps; reading workflow status does not query the
+scheduler. `--json` retains individual records for scripts.
 
 NepTrain accepts only `schema_version: 8`. Unknown fields and legacy project
 formats fail explicitly instead of being migrated silently.
@@ -217,7 +241,7 @@ and absolute workflow path so concurrent runs remain distinguishable.
 
 | Backend | Runtime | Main boundary |
 |---|---|---|
-| VASP | User-provided VASP and pinned POTCAR manifest | Ordinary energy/force/virial labels |
+| VASP | User-provided VASP and pinned POTCAR manifest | Ordinary labels; DeltaSpin-enabled VASP 6 also supports spin/mforce |
 | ABACUS | User-provided ABACUS and pinned UPF/ORB manifest | Ordinary or DeltaSpin spin/mforce labels |
 | MACE | `NepTrain[mace]` | Ordinary structures; no `mforce` |
 | DeepMD / DPA | `NepTrain[deepmd]` | DPA-3 and supported DPA-4 formats; no `mforce` |
@@ -232,6 +256,8 @@ CLI.
 - [English documentation](https://neptrain.readthedocs.io/en/latest/)
 - [中文文档](https://neptrain.readthedocs.io/zh-cn/latest/)
 - [VASP + Slurm workflow](examples/workflow-vasp-slurm/README.en.md)
+- [VASP DeltaSpin workflow](examples/workflow-vasp-deltaspin/README.en.md)
+- [All examples and coverage](examples/README.en.md), including the LAMMPS alternative
 - [ABACUS + Slurm workflow](examples/workflow-abacus-slurm/README.en.md)
 - [DeepMD / DPA distillation](examples/distillation-deepmd/README.en.md)
 - [MACE distillation](examples/distillation-mace/README.en.md)

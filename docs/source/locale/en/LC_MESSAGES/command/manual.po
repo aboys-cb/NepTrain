@@ -33,15 +33,6 @@ msgstr ""
 "collection progress goes to stderr; the final result is a human-readable "
 "summary by default."
 
-#: ../../source/command/manual.md:7 061df1b098b24209a23fffaa0f0250b4
-msgid ""
-"使用 `--project` 时，backend、模板、温度、压强和步数默认读取项目配置；命令行"
-"参数 只覆盖本次需要改变的值。"
-msgstr ""
-"With `--project`, the backend, template, temperature, pressure, and step "
-"count default to project settings. Command-line options override only the "
-"values needed for this run."
-
 #: ../../source/command/manual.md:10 1f34a08e3e69489992ccc014b7cdfccb
 msgid "训练"
 msgstr "Training"
@@ -124,33 +115,6 @@ msgstr "Both backends write `trajectory-health.json` and identify stable, pre-fa
 msgid "手动采样"
 msgstr "Structure selection"
 
-#: ../../source/command/manual.md:70 a1e461eefc004739b153f8da80bf181a
-msgid ""
-"neptrain select md-300.xyz md-600.xyz \\\n"
-"  --base train.xyz \\\n"
-"  --nep nep.txt \\\n"
-"  --backend auto \\\n"
-"  --max-selected 64 \\\n"
-"  --min-novelty 0.01 \\\n"
-"  --out selected.xyz \\\n"
-"  --report selected.selection.json\n"
-msgstr ""
-
-#: ../../source/command/manual.md:81 d9739113ce31449ba2c18b0f037269c4
-msgid ""
-"该命令与自动 workflow 共用同一套层级 FPS：先按精确元素集合分组，再按组规模的 "
-"平方根分配初始名额，并在组内平衡轨迹来源、route、温度和压强。`--base` 中只有 "
-"元素集合相同的结构会参与对应组的 warm start。`--min-novelty` 是归一化描述符 "
-"空间中的严格阈值；精确重复点在阈值为 `0` 时也不会重复入选。"
-msgstr ""
-"This command shares the workflow’s hierarchical FPS policy: candidates are "
-"grouped by exact element set, initial quotas scale with the square root of "
-"group size, and trajectory source, route, temperature, and pressure are "
-"balanced within each group. Only structures in `--base` with the same "
-"element set warm-start that group. `--min-novelty` is a strict threshold in "
-"normalized descriptor space; exact duplicates are not selected even when the "
-"threshold is `0`."
-
 #: ../../source/command/manual.md:86 d4cc8583198145eb88be389f67940065
 msgid ""
 "候选结构先按稳定的 structure ID 去重。提供 `--nep` 时通过 NEPAdapters 计算 "
@@ -170,20 +134,6 @@ msgstr ""
 #: ../../source/command/manual.md:92 4601f844638a4483b97116b45c7f9493
 msgid "批量标注"
 msgstr "Batch labeling"
-
-#: ../../source/command/manual.md:94 256dbdfe48954691a74700ab07efc92c
-msgid ""
-"neptrain label candidates.xyz \\\n"
-"  --backend vasp \\\n"
-"  --input-file INCAR \\\n"
-"  --resources /shared/potpaw_PBE \\\n"
-"  --potcar-manifest vasp-resources.json \\\n"
-"  --project project.yaml \\\n"
-"  --target label \\\n"
-"  --structures-per-job 1 \\\n"
-"  --max-concurrent 20 \\\n"
-"  -o labeled.xyz\n"
-msgstr ""
 
 #: ../../source/command/manual.md:107 92c2d7f5c7874761a5013b511ef52110
 msgid ""
@@ -212,29 +162,6 @@ msgid ""
 "  }\n"
 "}\n"
 msgstr ""
-
-#: ../../source/command/manual.md:126 9c9154790c114a14ab882e3b05c2dbf9
-msgid ""
-"本地 target 在 prepare 时校验真实文件；远程 target 必须在 `execution.targets."
-"<name>.labeling_resource_path` 写目标机绝对路径，并先运行 `neptrain doctor --"
-"project project.yaml`。worker 在真正启动 VASP/ABACUS 前会再校验一次。 VASP 路"
-"径只接受 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这样的单层 setup 目录，并由 NepTrain "
-"显式写入 ASE `setups`；不会校验 manifest 中的一个文件，却让 ASE 按默认规则读"
-"取另一个文件。 VASP 的 `ISPIN=2` 只表示共线自旋极化电子计算，结果仍是普通 "
-"energy/force/virial 标签并记录 `dft_electronic_mode`；它不会生成 `spin/"
-"mforce`。非共线、SOC 或真正的 spin-force 标注必须使用 ABACUS DeltaSpin。"
-msgstr ""
-"A local target validates the real files during preparation. A remote target "
-"must set the target machine’s absolute path in `execution.targets."
-"<name>.labeling_resource_path`, and you should run `neptrain doctor --"
-"project project.yaml` first. The worker validates again before starting VASP "
-"or ABACUS. VASP paths accept only one-level setup directories such as `Fe/"
-"POTCAR` or `Fe_pv/POTCAR`; NepTrain passes that setup explicitly to ASE so "
-"the validated POTCAR is the one used in the calculation. VASP `ISPIN=2` "
-"denotes a collinear spin-polarized electronic calculation, but still "
-"produces ordinary energy/force/virial labels and records "
-"`dft_electronic_mode`; it does not produce `spin/mforce`. Use ABACUS "
-"DeltaSpin for noncollinear, SOC, or genuine spin-force labels."
 
 #: ../../source/command/manual.md:136 32f291aed9494f3b97e96c6f2307fc98
 msgid "预训练或微调后的等变模型可以作为与 VASP/ABACUS 平级的 Label Adapter："
@@ -520,8 +447,29 @@ msgstr ""
 "or inconsistent order produces a diagnosable failure rather than exposing a "
 "partial `labeled.xyz` as complete."
 
-msgid "VASP 的 `ISPIN=2` 仍只生成普通 energy/force/virial 标签。带 DeltaSpin 扩展的 VASP 6 可通过 `LDELTASPIN=.TRUE.` 标注完整 `spin/mforce`，并支持 SOC；配置和 INCAR 写法见 [VASP DeltaSpin](vasp-deltaspin.md)。"
-msgstr "VASP `ISPIN=2` still produces ordinary energy/force/virial labels. VASP 6 with the DeltaSpin extension can label full `spin/mforce` through `LDELTASPIN=.TRUE.`, including SOC; see [VASP DeltaSpin](vasp-deltaspin.md) for configuration and INCAR syntax."
-
 msgid "结构目录统一识别 `*.xyz`、`*.extxyz`、`*.vasp` 和 `POSCAR*`，按文件名排序读取；手动标注、工作流和 DFT 后端使用相同规则。"
 msgstr "Structure directories consistently accept *.xyz, *.extxyz, *.vasp, and POSCAR*, read in filename order. Manual labeling, workflows, and DFT backends share these rules."
+
+msgid "使用 `--project` 时，backend、模板、温度、压强和步数默认读取项目配置；命令行参数 只覆盖本次需要改变的值。MD 项目有多条 route 时，必须用 `--route <id>` 选定一条。 Slurm 任务默认提交后返回；需要等待产物再执行下一步时，加 `--wait` 或运行 `neptrain task wait <运行目录>`。"
+msgstr "With `--project`, the backend, template, temperature, pressure, and step count default to project settings; command-line options override values for the current run. For an MD project with multiple routes, select one with `--route <id>`. Slurm commands return after submission by default. To wait for results before the next step, add `--wait` or run `neptrain task wait <run-directory>`."
+
+msgid "训练图位于运行目录的 `jobs/000000/calculation/`，包括 `training-convergence.png` 和有有效训练器输出时的 `training-parity-train.png`；test 输出可用时另有 `training-parity-test.png`。TorchNEP 原生对角线图对应最后一个 epoch，可能与发布的 best 模型不同。使用远程 target 时，原始图表留在计算侧，可按 `remote.txt` 找到目录； 最终模型发布到 `-o` 指定的路径。"
+msgstr "Training plots are in `jobs/000000/calculation/` under the run directory: `training-convergence.png`, `training-parity-train.png` when valid trainer outputs exist, and `training-parity-test.png` when test outputs are available. Native TorchNEP parity plots use the final epoch, which may differ from the published best model. For remote targets, raw plots remain on the compute side; locate the directory via `remote.txt`. The final model is published to the path specified by `-o`."
+
+msgid "potential {{ model_file }}\nvelocity {{ temperature }} seed {{ seed }}\nensemble nve\ntime_step {{ timestep_fs }}\ndump_exyz {{ dump_interval }} 0 1\nrun {{ steps }}\n"
+msgstr ""
+
+msgid "neptrain select trajectories.xyz \\\n  --base train.xyz \\\n  --nep nep.txt \\\n  --backend auto \\\n  --max-selected 64 \\\n  --min-novelty 0.01 \\\n  --out selected.xyz \\\n  --report selected.selection.json\n"
+msgstr ""
+
+msgid "手动命令使用层级 FPS：先按精确元素集合分组，再按组规模的平方根分配初始名额， 并在组内平衡轨迹来源、route、温度和压强。自动 workflow 使用条件锚点加全局 novelty 分配预算，详见 [工作流采样规则](workflow.md)。`--base` 中只有 元素集合相同的结构会参与对应组的 warm start。`--min-novelty` 是归一化描述符 空间中的严格阈值；精确重复点在阈值为 `0` 时也不会重复入选。"
+msgstr "Manual selection uses hierarchical FPS: group by exact element set, assign initial quotas proportional to the square root of group size, and balance trajectory source, route, temperature, and pressure within each group. Automated workflows use condition anchors and global novelty to allocate the budget; see [workflow sampling rules](workflow.md). Only structures in `--base` with the same element set warm-start a group. `--min-novelty` is a strict threshold in normalized descriptor space; exact duplicates are not selected even at a threshold of `0`."
+
+msgid "上述命令还在输出文件旁生成 `selected.selection-pca.png`：蓝色为过滤、去重后的 候选池，橙色为选中结构，两者共用 PCA 基底。图只帮助检查采样分布，不改变 FPS 选择结果。无有效绘图数据时，报告会说明原因；JSON 供程序和排查使用，日常先看 PNG。"
+msgstr "This command also writes `selected.selection-pca.png` next to the output: blue points show the filtered and deduplicated candidate pool, and orange points show selected structures in the same PCA basis. The plot helps inspect sampling distribution without changing FPS selection. With no valid plot data, the report explains why. JSON supports scripts and troubleshooting; PNG is the usual human-facing view."
+
+msgid "neptrain label selected.xyz \\\n  --backend vasp \\\n  --input-file INCAR \\\n  --resources /shared/potpaw_PBE \\\n  --potcar-manifest vasp-resources.json \\\n  --project project.yaml \\\n  --target label \\\n  --structures-per-job 1 \\\n  --max-concurrent 20 \\\n  -o labeled.xyz\n"
+msgstr ""
+
+msgid "本地 target 在 prepare 时校验真实文件；远程 target 必须在 `execution.targets.<name>.labeling_resource_path` 写目标机绝对路径，并先运行 `neptrain doctor --project project.yaml`。worker 在真正启动 VASP/ABACUS 前会再校验一次。 VASP 路径只接受 `Fe/POTCAR` 或 `Fe_pv/POTCAR` 这样的单层 setup 目录，并由 NepTrain 显式写入 ASE `setups`；不会校验 manifest 中的一个文件，却让 ASE 按默认规则读取另一个文件。 VASP 的 `ISPIN=2` 仍只生成普通 energy/force/virial 标签。带 DeltaSpin 扩展的 VASP 6 可通过 `LDELTASPIN=.TRUE.` 标注完整 `spin/mforce`，并支持 SOC；配置和 INCAR 写法见 [VASP DeltaSpin](vasp-deltaspin.md)。"
+msgstr "Local targets validate real resource files during preparation. For remote targets, set the absolute target-side path in `execution.targets.<name>.labeling_resource_path` and run `neptrain doctor --project project.yaml` first. Workers validate resources again before launching VASP/ABACUS. VASP paths accept only single-level setup directories such as `Fe/POTCAR` or `Fe_pv/POTCAR`, which NepTrain explicitly passes to ASE `setups`; the file checked against the manifest is the file used by ASE. VASP `ISPIN=2` still produces ordinary energy/force/virial labels. DeltaSpin-enabled VASP 6 supports full `spin/mforce` labeling with `LDELTASPIN=.TRUE.`, including SOC; see [VASP DeltaSpin](vasp-deltaspin.md) for configuration and INCAR syntax."

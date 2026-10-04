@@ -5,7 +5,9 @@ target 提交到 Slurm。上传、提交、等待和收集进度写到 stderr；
 适合人阅读的摘要。
 
 使用 `--project` 时，backend、模板、温度、压强和步数默认读取项目配置；命令行参数
-只覆盖本次需要改变的值。
+只覆盖本次需要改变的值。MD 项目有多条 route 时，必须用 `--route <id>` 选定一条。
+Slurm 任务默认提交后返回；需要等待产物再执行下一步时，加 `--wait` 或运行
+`neptrain task wait <运行目录>`。
 
 ## 训练
 
@@ -26,6 +28,12 @@ neptrain train train.xyz \
   --target v100 \
   -o nep.txt
 ```
+
+训练图位于运行目录的 `jobs/000000/calculation/`，包括 `training-convergence.png`
+和有有效训练器输出时的 `training-parity-train.png`；test 输出可用时另有
+`training-parity-test.png`。TorchNEP 原生对角线图对应最后一个 epoch，可能与发布的
+best 模型不同。使用远程 target 时，原始图表留在计算侧，可按 `remote.txt` 找到目录；
+最终模型发布到 `-o` 指定的路径。
 
 ## 批量 MD
 
@@ -87,7 +95,7 @@ DynSpin。
 ## 手动采样
 
 ```bash
-neptrain select md-300.xyz md-600.xyz \
+neptrain select trajectories.xyz \
   --base train.xyz \
   --nep nep.txt \
   --backend auto \
@@ -97,8 +105,9 @@ neptrain select md-300.xyz md-600.xyz \
   --report selected.selection.json
 ```
 
-该命令与自动 workflow 共用同一套层级 FPS：先按精确元素集合分组，再按组规模的
-平方根分配初始名额，并在组内平衡轨迹来源、route、温度和压强。`--base` 中只有
+手动命令使用层级 FPS：先按精确元素集合分组，再按组规模的平方根分配初始名额，
+并在组内平衡轨迹来源、route、温度和压强。自动 workflow 使用条件锚点加全局
+novelty 分配预算，详见 [工作流采样规则](workflow.md)。`--base` 中只有
 元素集合相同的结构会参与对应组的 warm start。`--min-novelty` 是归一化描述符
 空间中的严格阈值；精确重复点在阈值为 `0` 时也不会重复入选。
 
@@ -108,10 +117,14 @@ NEP 描述符；未提供时使用 SOAP（需安装 `NepTrain[soap]`），可用
 需要先过滤异常短键时使用 `--filter 0.6`，并可通过 `--rejected-out` 单独保存被拒
 结构。选择报告默认写在输出文件旁，也可由 `--report` 指定路径。
 
+上述命令还在输出文件旁生成 `selected.selection-pca.png`：蓝色为过滤、去重后的
+候选池，橙色为选中结构，两者共用 PCA 基底。图只帮助检查采样分布，不改变 FPS
+选择结果。无有效绘图数据时，报告会说明原因；JSON 供程序和排查使用，日常先看 PNG。
+
 ## 批量标注
 
 ```bash
-neptrain label candidates.xyz \
+neptrain label selected.xyz \
   --backend vasp \
   --input-file INCAR \
   --resources /shared/potpaw_PBE \

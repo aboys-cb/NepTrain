@@ -123,13 +123,13 @@ neptrain train labeled.xyz \
 
 ```bash
 test -s student-nep.txt
-test -s student-train/training-report.json
-test -s student-train/training-convergence.png
+test -s student-train/jobs/000000/calculation/training-report.json
+test -s student-train/jobs/000000/calculation/training-convergence.png
 ```
 
 训练图只生成 PNG。
 
-## 6. 跑一代完整 workflow
+## 6. 跑一代采样流程
 
 完整链路还需要 `gpumd`：
 
@@ -148,23 +148,23 @@ neptrain workflow run deepmd-distillation-workflow
 neptrain workflow status deepmd-distillation-workflow --jobs
 ```
 
-如果要在当前终端观察 controller，可将最后两步替换为：
+准备完成后，若希望在当前终端观察 controller，用以下命令替代上面的后台启动命令（两种启动方式选一种）：
 
 ```bash
-neptrain workflow run project.yaml --foreground
+neptrain workflow run deepmd-distillation-workflow --foreground
 ```
 
 ## 7. 跑完检查什么
 
 | 位置 | 内容 |
 |---|---|
-| `generations/0001/train/` | 初始 Student 和训练曲线 PNG |
+| `generations/0001/train/` | 初始 Student、`training-convergence.png` 和 `training-parity-train.png` |
 | `generations/0001/explore/` | GPUMD 轨迹与 `trajectory-health.json` |
-| `generations/0001/select/` | FPS 选中的候选 |
+| `generations/0001/select/` | FPS 候选和 `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | DPA-3 新标签 |
 | `generations/0001/label/label-provenance.json` | runner、head、模型名和 SHA256 |
 | `generations/0001/update/` | 合并后的 Student 训练集 |
-| `generations/0001/evaluate/` | 激活结果与评估产物 |
+| `generations/0001/evaluate/` | 新标签的训练前预测误差和 `acquisition-parity.png` |
 
 示例只允许一代。最后显示 `budget_exhausted` 表示一代教程预算用完，不是
 workflow 失败。查看 `status --jobs` 时，八个 stage 应进入完成状态；如果
@@ -207,7 +207,7 @@ checkpoint 的端到端验证。
 | `head ... not found` | 模型没有该 branch | 用 `dp --pt show ... model-branch` 查看 |
 | `cannot access a CUDA device` | 当前进程没拿到 GPU | 检查 Slurm GPU 资源和 PyTorch CUDA |
 | `returned non-finite labels` | Teacher 推理结果异常 | 先用同一模型/结构运行 `dp test` 或 ASE |
-| GPUMD 输出 NaN | Student 或 MD 参数不稳定 | 看健康报告；本例不要把 NVT 改成强耦合 NVT |
+| GPUMD 输出 NaN | Student 或 MD 参数不稳定 | 看健康报告；本例保持固定盒 NVT，不改为 NPT |
 | 输入含 `spin` 被拒绝 | runner 不生成 `mforce` | 使用真正支持磁力标签的 Teacher backend |
 
 参考：[DeePMD-kit 内置模型下载](https://docs.deepmodeling.com/projects/deepmd/en/latest/model/pretrained.html)、

@@ -29,3 +29,6 @@ msgstr "Automated workflows"
 #: ../../source/command/index.rst:2 f8cc644835f84b559112d334b7e421fc
 msgid "命令行使用"
 msgstr "Command-line guide"
+
+msgid "VASP DeltaSpin"
+msgstr ""

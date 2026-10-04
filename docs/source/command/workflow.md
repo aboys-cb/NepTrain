@@ -3,6 +3,7 @@
 第一次运行建议先从标注后端对应的完整教程开始：
 
 - [VASP + Slurm](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-vasp-slurm)
+- [VASP DeltaSpin](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-vasp-deltaspin)
 - [ABACUS + Slurm](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-abacus-slurm)
 - [DeepMD / DPA 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-deepmd)
 - [MACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-mace)
@@ -204,8 +205,8 @@ Spin workflow 仍使用 LAMMPS DynSpin。
 其中的中间温度只做低成本 smoke 探路。
 
 一个温压条件在本档 replica 正常结束并通过轨迹健康与诊断检查后晋级。FPS 覆盖度
-独立决定哪些结构需要标注：发现新颖结构会触发标注和重训，但不会迫使健康轨迹反复
-停留在同一时长。晋级后，Controller 同时解锁下一个温度和当前生产温度的下一档
+独立决定哪些结构需要标注：发现新颖结构会触发标注，标签经 update 合并后用于
+下一代训练，但不会迫使健康轨迹反复停留在同一时长。晋级后，Controller 同时解锁下一个温度和当前生产温度的下一档
 时长。模型更新不会把已经完成的 smoke、short 或 long 证据清零，只有最终
 production 认证需要绑定当前模型哈希。`progression.replicas` 控制各时长需要的
 独立 MD 次数。
@@ -224,8 +225,9 @@ stride 抽帧，也不使用候选数量上限提前裁剪。
 中心和逐特征尺度，再从训练集留一最近邻距离估计保守阈值。候选结构只使用该变换，
 不参与尺度拟合；因此极端候选不会反向压低阈值。候选低于训练集已有分辨率时不送
 DFT。若本轮一个结构也选不到，
-workflow 会跳过 Label Adapter 和重训，直接记录覆盖证据并推进下一档采样，而不是
-报错或提交空的 VASP/ABACUS 作业。需要固定策略时，可显式设置
+workflow 会跳过空的 Label Adapter 任务和新标签误差计算，记录覆盖证据，而不是
+报错或提交空的 VASP/ABACUS 作业。没有新标签不能补充精度达标证据；如果继续
+下一采样代，仍会先执行 train，不会自动复用旧模型跳过训练。需要固定策略时，可显式设置
 `selection_threshold` 和 `completion_threshold`。
 
 多元素体系建议明确选择按元素规约：
@@ -248,8 +250,8 @@ sampling:
 旧规约下的绝对 novelty 阈值不能直接复用；`novelty: auto` 会重新按当前训练集估计。
 
 novelty 只回答“这个结构在描述符空间里是否值得送 DFT”，不能单独证明势函数精度
-已经收敛。需要自动停止时，可让 workflow 检查旧模型在本轮新 DFT 标签上的真实
-误差；这些结构尚未参与本轮重训，因此可作为在线 acquisition canary：
+已经收敛。需要自动停止时，可让 workflow 检查本代采样模型在本轮新标签上的真实
+误差；这些结构尚未加入该模型的训练集，因此可作为在线 acquisition canary：
 
 ```yaml
 workflow:
@@ -600,7 +602,7 @@ generations/0001/
 
 `evaluate/acquisition-parity.png`：本代采样模型对新标注结构的预测与参考值对比，这些结构尚未加入该模型的训练集。直接复用 evaluate 的预测结果。对角线图按可用数据展示 Energy、Force、Virial 和 magnetic force，包含理想对角线、RMSE 与绝对误差分布；能量和 virial 使用每原子单位。大数组只对显示点做确定性抽样，RMSE 仍使用全部有限数据。
 
-`select/selection-pca.png`：蓝色表示排除训练集重叠、去重后的候选结构，橙色叠加本轮选中结构。使用筛选时已有的结构描述符，在同一个 PCA 基底中投影到 PC1/PC2，坐标轴标注解释方差。超过 20,000 个候选时，均匀抽样拟合 PCA 和绘制蓝色背景，全部选中结构仍会显示；报告保留全部候选的坐标和结构 ID。PCA 只用于显示，不改变 FPS 距离、筛选结果或收敛判断。独立 `neptrain select` 同样生成 `<输出文件名>.selection-pca.png`，背景为该命令过滤、去重后的候选池。
+`select/selection-pca.png`：蓝色表示排除训练集重叠、去重后的候选结构，橙色叠加本轮选中结构。使用筛选时已有的结构描述符，在同一个 PCA 基底中投影到 PC1/PC2，坐标轴标注解释方差。超过 20,000 个候选时，均匀抽样拟合 PCA 和绘制蓝色背景，全部选中结构仍会显示；报告保留全部候选的坐标和结构 ID。PCA 只用于显示，不改变 FPS 距离、筛选结果或收敛判断。独立 `neptrain select` 同样生成 `<输出文件去掉扩展名>.selection-pca.png`，背景为该命令过滤、去重后的候选池。
 
 配置可选辅助测试集时，train 另有 `evaluation-parity.png`；配置参考阈值时还有 `evaluation-metrics.png`。这些辅助诊断不影响收敛，也不要求 test 必须存在。每张图都有对应 JSON 报告，记录来源、模型哈希（可用时）、点数和统计量；没有有效绘图数据时只输出注明原因的报告。
 

@@ -5,7 +5,7 @@
 # 用 TACE Teacher 蒸馏一个 NEP Student
 
 这个教程用固定版本的 `TACE-OAM-7M` 标注12 个带局域位移的 Al 晶体结构，再训练
-TorchNEP Student，最后可选跑一代完整 workflow：
+TorchNEP Student，最后可选跑一代采样流程：
 
 ```text
 候选结构 → TACE Teacher → energy/forces/virial
@@ -119,11 +119,11 @@ neptrain train labeled.xyz \
 
 ```bash
 test -s student-nep.txt
-test -s student-train/training-report.json
-test -s student-train/training-convergence.png
+test -s student-train/jobs/000000/calculation/training-report.json
+test -s student-train/jobs/000000/calculation/training-convergence.png
 ```
 
-## 6. 跑一代完整 workflow
+## 6. 跑一代采样流程
 
 ```bash
 command -v gpumd
@@ -133,10 +133,10 @@ neptrain workflow run tace-distillation-workflow
 neptrain workflow status tace-distillation-workflow --jobs
 ```
 
-也可以在前台观察 controller：
+准备完成后，若希望在当前终端观察 controller，用以下命令替代上面的后台启动命令（两种启动方式选一种）：
 
 ```bash
-neptrain workflow run project.yaml --foreground
+neptrain workflow run tace-distillation-workflow --foreground
 ```
 
 本例只允许一代。末尾 `budget_exhausted` 表示教程预算用完，不代表失败。
@@ -145,13 +145,13 @@ neptrain workflow run project.yaml --foreground
 
 | 位置 | 内容 |
 |---|---|
-| `generations/0001/train/` | 初始 Student 和训练曲线 PNG |
+| `generations/0001/train/` | 初始 Student、`training-convergence.png` 和 `training-parity-train.png` |
 | `generations/0001/explore/` | GPUMD 轨迹和健康报告 |
-| `generations/0001/select/` | FPS 选择结果 |
+| `generations/0001/select/` | FPS 结果和 `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | TACE 新标签 |
 | `generations/0001/label/label-provenance.json` | runner、模型名和 SHA256 |
 | `generations/0001/update/` | 合并后的训练集 |
-| `generations/0001/evaluate/` | 新标签的训练前预测误差 |
+| `generations/0001/evaluate/` | 新标签的训练前预测误差和 `acquisition-parity.png` |
 
 ## 8. Spin Teacher 边界
 

@@ -109,8 +109,8 @@ the teacher labels and publish `nep.txt`; the model has no scientific value.
 
 ```bash
 test -s student-nep.txt
-test -s student-train/training-report.json
-test -s student-train/training-convergence.png
+test -s student-train/jobs/000000/calculation/training-report.json
+test -s student-train/jobs/000000/calculation/training-convergence.png
 ```
 
 Training plots are PNG only.
@@ -134,23 +134,23 @@ neptrain workflow run mace-distillation-workflow
 neptrain workflow status mace-distillation-workflow --jobs
 ```
 
-Or run the controller in the foreground:
+After preparation, choose this command instead of the background launch above to observe the controller in the current terminal:
 
 ```bash
-neptrain workflow run project.yaml --foreground
+neptrain workflow run mace-distillation-workflow --foreground
 ```
 
 ## 7. Inspect the result
 
 | Location | Contents |
 |---|---|
-| `generations/0001/train/` | Initial student and PNG convergence plot |
+| `generations/0001/train/` | Initial student, `training-convergence.png`, and `training-parity-train.png` |
 | `generations/0001/explore/` | GPUMD trajectories and health report |
-| `generations/0001/select/` | FPS selection result |
+| `generations/0001/select/` | FPS results and `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | New MACE labels |
 | `generations/0001/label/label-provenance.json` | Runner, model name, and SHA256 |
 | `generations/0001/update/` | Merged training set |
-| `generations/0001/evaluate/` | Pre-training prediction error on new labels |
+| `generations/0001/evaluate/` | Prediction error on new labels before training on them, plus `acquisition-parity.png` |
 
 `budget_exhausted` means the one-generation tutorial budget was consumed; it
 does not mean the workflow failed.

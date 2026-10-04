@@ -156,14 +156,14 @@ neptrain workflow stop abacus-tutorial-workflow
 | Location | Contents |
 |---|---|
 | `generations/0001/explore/` | GPUMD trajectories and health report |
-| `generations/0001/select/` | FPS selection result |
+| `generations/0001/select/` | FPS results and `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | New ABACUS labels |
 | `generations/0001/label/label-provenance.json` | INPUT, UPF/ORB hashes, and backend provenance |
 | `generations/0001/update/` | Merged training set |
-| `generations/0001/train/` | Sampling model and PNG convergence plot |
-| `generations/0001/evaluate/` | Pre-training prediction error on newly labeled structures |
+| `generations/0001/train/` | Sampling model, `training-convergence.png`, and `training-parity-train.png` |
+| `generations/0001/evaluate/` | Prediction error on new labels before training on them, plus `acquisition-parity.png` |
 
-`evaluation` is diagnostic only and does not block progression. Acquisition accuracy thresholds live in
+The `evaluation:` configuration section controls optional diagnostics only and does not block progression. Acquisition accuracy thresholds live in
 `workflow.convergence`; the example values are for the tutorial only. Final training requires accuracy,
 production coverage, and the configured passing streak. Optional test reports are in `generations/0001/train/`.
 
@@ -172,7 +172,7 @@ budget. Determine real failures from stage/job states and logs.
 
 ## 9. Convert it to a production project
 
-- Replace EMT data with labels from the same ABACUS theoretical level.
+- Expand the training set with labels from the same ABACUS theoretical level.
 - Pin UPF files for every element and ORB files for LCAO.
 - Review `ecutwfc`, k points, smearing, magnetism, and SCF convergence.
 - Replace the 10–80-step NPT path with validated sampling.

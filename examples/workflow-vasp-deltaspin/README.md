@@ -61,8 +61,10 @@ neptrain workflow status fe-deltaspin-workflow --jobs
 
 ## 看什么结果
 
+- `generations/0001/train/`：`training-convergence.png` 与 `training-parity-train.png`。
+- `generations/0001/select/selection-pca.png`：候选与选中结构的二维分布。
 - `generations/0001/label/`：真实收敛的 spin/mforce 标签与资源来源。
-- `generations/0001/evaluate/`：新增标签的训练前 E/F/M 预测误差。
+- `generations/0001/evaluate/`：新增标签的训练前 E/F/M 预测误差及 `acquisition-parity.png`。
 - `generations/0001/update/`：更新后的训练集；两个 route 的覆盖分别记录。
 - `workflow status`：说明欠缺的是精度、连续达标还是生产覆盖。
 
@@ -70,4 +72,4 @@ neptrain workflow status fe-deltaspin-workflow --jobs
 这不是 DeltaSpin 失败，也不代表获得可生产使用的势函数。正式计算应扩充温度、应变、磁矩大小和方向覆盖，
 独立验证能量/磁性力导数、磁矩定义及 NPT 稳定性。
 
-本仓库的自动测试覆盖配置、结构生成和输入渲染；本次没有真实运行 VASP、LAMMPS 或自旋训练。
+本仓库的自动测试覆盖配置、结构生成和输入渲染；真实 VASP、LAMMPS 和自旋训练仍需在配置好的计算环境中验证。

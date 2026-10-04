@@ -119,8 +119,8 @@ teacher labels. The resulting model has no scientific value.
 
 ```bash
 test -s student-nep.txt
-test -s student-train/training-report.json
-test -s student-train/training-convergence.png
+test -s student-train/jobs/000000/calculation/training-report.json
+test -s student-train/jobs/000000/calculation/training-convergence.png
 ```
 
 ## 6. Run one complete workflow generation
@@ -133,21 +133,21 @@ neptrain workflow run tace-distillation-workflow
 neptrain workflow status tace-distillation-workflow --jobs
 ```
 
-Use `neptrain workflow run project.yaml --foreground` to observe the controller
-in the current terminal. A final `budget_exhausted` means the one-generation
+After preparation, use `neptrain workflow run tace-distillation-workflow --foreground`
+instead of the background launch above to observe the controller in the current terminal. A final `budget_exhausted` means the one-generation
 tutorial budget was consumed; it is not a failure.
 
 ## 7. Inspect the result
 
 | Location | Contents |
 |---|---|
-| `generations/0001/train/` | Initial student and PNG convergence plot |
+| `generations/0001/train/` | Initial student, `training-convergence.png`, and `training-parity-train.png` |
 | `generations/0001/explore/` | GPUMD trajectory and health report |
-| `generations/0001/select/` | FPS selection result |
+| `generations/0001/select/` | FPS results and `selection-pca.png` |
 | `generations/0001/label/selected-labels.xyz` | New TACE labels |
 | `generations/0001/label/label-provenance.json` | Runner, model name, and SHA256 |
 | `generations/0001/update/` | Merged training set |
-| `generations/0001/evaluate/` | Pre-training prediction error on new labels |
+| `generations/0001/evaluate/` | Prediction error on new labels before training on them, plus `acquisition-parity.png` |
 
 ## 8. Spin-teacher boundary
 

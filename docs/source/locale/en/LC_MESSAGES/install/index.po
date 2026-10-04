@@ -30,9 +30,8 @@ msgstr "NepTrain requires Python 3.10 or later:"
 msgid "pip install NepTrain\n"
 msgstr ""
 
-#: ../../source/install/index.md:9 77dd58bc2f7f493c86e5ec9bae825395
 msgid "TorchNEP："
-msgstr ""
+msgstr "TorchNEP:"
 
 #: ../../source/install/index.md:11 8f2a3ccb505f4da9b66b50f0c4d1fc3b
 msgid ""
@@ -118,15 +117,6 @@ msgstr ""
 "\n"
 "export TACE_USE_CUE=1\n"
 
-#: ../../source/install/index.md:56 48aca5cf680340d1b19903d494fcc01c
-msgid ""
-"官方二进制算子需要 Ampere 或更新的 GPU；Sai V100 实测会报 "
-"`cudaErrorNoKernelImageForDevice`，不要在 V100 上启用。"
-msgstr ""
-"The official binary operators require an Ampere-or-newer GPU. On a Sai "
-"V100 they fail with `cudaErrorNoKernelImageForDevice`; do not enable them "
-"on V100."
-
 #: ../../source/install/index.md:59 0efc325d763f45a5b74213bfbebef403
 msgid "手动采样不提供 NEP 模型、需要 SOAP 描述符时："
 msgstr "If manual sampling has no NEP model and must use SOAP descriptors:"
@@ -134,15 +124,6 @@ msgstr "If manual sampling has no NEP model and must use SOAP descriptors:"
 #: ../../source/install/index.md:61 b8b57abae80a460db485c75d2858dfb7
 msgid "pip install 'NepTrain[soap]'\n"
 msgstr ""
-
-#: ../../source/install/index.md:65 a20682bf0b7e4962aa93c4981328cd06
-msgid ""
-"LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和 `LAMMPS_PLUGIN_PATH` "
-"写入 execution target 的 `setup_script`，然后运行："
-msgstr ""
-"LAMMPS, VASP, ABACUS, and pseudopotentials are supplied by the user or "
-"computing platform. Put module commands, PATH changes, and "
-"`LAMMPS_PLUGIN_PATH` in the execution target’s `setup_script`, then run:"
 
 #: ../../source/install/index.md:68 86779b39f6ec47f1963c730e556e0c49
 msgid "neptrain doctor --project project.yaml\n"
@@ -167,3 +148,18 @@ msgstr ""
 "NepTrain no longer reads legacy environment settings from `~/.NepTrain`. "
 "Put every reproducible execution setting in a schema-v8 `project.yaml` "
 "target or its setup script."
+
+msgid "本仓库的 README、文档和案例对应当前源码。运行仓库案例时，请在仓库根目录 安装同一份源码；Controller 与计算节点也应使用相同版本："
+msgstr "This repository's README, documentation, and examples track the current source. Install the same checkout from the repository root for these examples; the controller and compute nodes should also use the same version:"
+
+msgid "python -m pip install -e .\n# 需要 TorchNEP 时，在已安装合适 PyTorch 的环境中使用：\npython -m pip install -e '.[torchnep]'\n"
+msgstr "python -m pip install -e .\n# For TorchNEP, first install a suitable PyTorch runtime:\npython -m pip install -e '.[torchnep]'\n"
+
+msgid "`pip install NepTrain` 安装的是发布版，可能尚未包含本仓库最新功能。"
+msgstr "`pip install NepTrain` installs the published release, which may not yet include the latest repository features."
+
+msgid "该加速配置面向 Ampere 或更新的 GPU；V100 不启用 `TACE_USE_CUE`，避免 `cudaErrorNoKernelImageForDevice`。"
+msgstr "This acceleration configuration targets Ampere or newer GPUs. Do not enable `TACE_USE_CUE` on V100 to avoid `cudaErrorNoKernelImageForDevice`."
+
+msgid "GPUMD、LAMMPS、VASP、ABACUS 和赝势由用户或计算平台提供。推荐把 module、PATH 和 `LAMMPS_PLUGIN_PATH` 写入 execution target 的 `setup_script`，然后运行："
+msgstr "GPUMD, LAMMPS, VASP, ABACUS, and pseudopotentials are supplied by the user or computing platform. Put modules, PATH, and `LAMMPS_PLUGIN_PATH` in the execution target's `setup_script`, then run:"

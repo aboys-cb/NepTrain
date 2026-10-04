@@ -227,7 +227,7 @@ EXAMPLE_PROJECTS = sorted((ROOT / "examples").glob("*/project*.yaml"))
 
 
 @pytest.mark.parametrize("project", EXAMPLE_PROJECTS, ids=lambda path: f"{path.parent.name}/{path.name}")
-def test_every_example_prepares_v3_with_explicit_convergence(project, tmp_path):
+def test_every_example_prepares_v4_with_explicit_convergence(project, tmp_path):
     """Exercise real preparation with toy labels, never claim real DFT validation."""
     import json
     from NepTrain.core.config import save_config

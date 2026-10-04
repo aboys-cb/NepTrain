@@ -46,11 +46,13 @@ training and inference must support the same format. The `dynspin/glsd/npt` temp
 LAMMPS metal units: K, bar, and ps. GPUMD pressure values in GPa are not automatically converted.
 
 Inspect `generations/0001/label/` for spin/mforce labels and provenance, `evaluate/` for
-pre-training E/F/M errors, and `update/` for the enlarged dataset. Status explains missing
+pre-training E/F/M errors and `acquisition-parity.png`, and `update/` for the enlarged dataset. Status explains missing
 accuracy, passing streaks, or production coverage independently for both routes.
+Also inspect `generations/0001/train/training-convergence.png` and
+`training-parity-train.png`, plus `generations/0001/select/selection-pca.png`.
 
 One generation, 10–80 MD steps, and illustrative thresholds only test the interface.
 `budget_exhausted` is expected and does not mean DeltaSpin failed or the model is accepted.
 Production requires broader structural and spin coverage, derivative/sign checks, consistent
 moment definitions, and NPT stability validation. Automated tests cover configuration,
-generation, and rendering; VASP, LAMMPS, and spin training were not run in this change.
+generation, and rendering; real VASP, LAMMPS, and spin training require validation in the configured compute environment.

@@ -137,16 +137,6 @@ msgstr ""
 "`execution.targets.*.setup_script`: modules, Python environment, and the "
 "LAMMPS plugin."
 
-#: ../../source/command/workflow.md:38 95315c119cb44e6588dd7c7a41babaa0
-msgid ""
-"`workflow init` 默认只生成当前选择的 `lammps.in` 和标注后端输入，不再生成四套 LAMMPS "
-"模板及两种第一性原理输入。Spin 流程使用 `--spin --dft-backend abacus`。"
-msgstr ""
-"By default, `workflow init` generates only the selected `lammps.in` and "
-"labeling-backend input instead of four LAMMPS templates and both first-"
-"principles inputs. For a spin workflow, use `--spin --dft-backend "
-"abacus`."
-
 #: ../../source/command/workflow.md:42 7840c9198999403e955357069dbea7cd
 msgid "最小 route 只需要："
 msgstr "A minimal route needs only:"
@@ -362,24 +352,6 @@ msgstr ""
 "explicitly, intermediate temperatures not in that list run only the low-"
 "cost smoke probe."
 
-#: ../../source/command/workflow.md:162 30ce444756f54ae186eba5848c49b1b8
-msgid ""
-"一个温压条件在本档 replica 正常结束并通过轨迹健康与诊断检查后晋级。FPS 覆盖度 "
-"独立决定哪些结构需要标注：发现新颖结构会触发标注和重训，但不会迫使健康轨迹反复 停留在同一时长。晋级后，Controller "
-"同时解锁下一个温度和当前生产温度的下一档 时长。模型更新不会把已经完成的 smoke、short 或 long 证据清零，只有最终 "
-"production 认证需要绑定当前模型哈希。`progression.replicas` 控制各时长需要的 独立 MD 次数。"
-msgstr ""
-"A temperature-pressure condition advances after the replicas at its "
-"current duration finish normally and pass trajectory health and "
-"diagnostic checks. FPS coverage independently determines which structures"
-" need labels: novel structures trigger labeling and retraining, but do "
-"not force healthy trajectories to repeat the same duration. Advancement "
-"unlocks both the next temperature and the next duration for the current "
-"production temperature. Model updates do not erase completed smoke, "
-"short, or long evidence. Only final production certification is bound to "
-"the current model hash. `progression.replicas` controls the number of "
-"independent MD runs required at each duration."
-
 #: ../../source/command/workflow.md:169 eab36d72bedc43a09b29f0f153020298
 msgid ""
 "所有通过健康检查的 dump 帧都会参与全局选择。FPS 先按精确元素集合分组，只用 相同元素集合的当前 `train.xyz` 做 warm "
@@ -398,33 +370,6 @@ msgstr ""
 "the historical all-atom mean or use element-wise mean and standard-"
 "deviation channels, but neither mode is presented as per-atom local "
 "novelty."
-
-#: ../../source/command/workflow.md:176 6863f9714fc54d8fba7d51e3322219cc
-msgid ""
-"NepTrain 只在 FPS 前去除训练集已有结构和同一 route 内的完全重复结构，不按固定 stride "
-"抽帧，也不使用候选数量上限提前裁剪。 `sampling.selection.max_selected` 是每个采样轮最多送去 Label "
-"Adapter 的结构数， 不是必须填满的配额。`novelty: auto` 只用当前 `train.xyz` 中的同元素结构拟合描述符 "
-"中心和逐特征尺度，再从训练集留一最近邻距离估计保守阈值。候选结构只使用该变换， "
-"不参与尺度拟合；因此极端候选不会反向压低阈值。候选低于训练集已有分辨率时不送 DFT。若本轮一个结构也选不到， workflow 会跳过 "
-"Label Adapter 和重训，直接记录覆盖证据并推进下一档采样，而不是 报错或提交空的 VASP/ABACUS "
-"作业。需要固定策略时，可显式设置 `selection_threshold` 和 `completion_threshold`。"
-msgstr ""
-"Before FPS, NepTrain removes only structures already present in the "
-"training set and exact duplicates within the same route. It does not "
-"subsample by a fixed stride or truncate candidates before descriptor "
-"calculation. `sampling.selection.max_selected` is a ceiling, not a quota "
-"that must be filled. With `novelty: auto`, NepTrain fits the descriptor "
-"center and per-feature scale using only matching-element structures from "
-"the current `train.xyz`, then estimates a conservative threshold from "
-"leave-one-out nearest-neighbour distances in that training set. "
-"Candidates are transformed with the fitted coordinates but do not "
-"influence them, so an extreme candidate cannot lower the threshold. "
-"Candidates below the training set's existing resolution are not sent to "
-"DFT. If no structure is selected, the workflow skips the Label Adapter "
-"and retraining, records the coverage evidence, and advances the sampling "
-"ladder instead of failing or submitting empty VASP/ABACUS jobs. For a "
-"fixed policy, set `selection_threshold` and `completion_threshold` "
-"explicitly."
 
 #: ../../source/command/workflow.md:187 e3a65613f8bb4ef18b2d2b5b489a7e44
 msgid "多元素体系建议明确选择按元素规约："
@@ -465,18 +410,6 @@ msgstr ""
 "and FPS all use the same reduction. Absolute novelty thresholds from "
 "another reduction cannot be reused; `novelty: auto` re-estimates the "
 "threshold from the current training set."
-
-#: ../../source/command/workflow.md:206 15724119d586479f943bb0c830fd7374
-msgid ""
-"novelty 只回答“这个结构在描述符空间里是否值得送 DFT”，不能单独证明势函数精度 已经收敛。需要自动停止时，可让 workflow "
-"检查旧模型在本轮新 DFT 标签上的真实 误差；这些结构尚未参与本轮重训，因此可作为在线 acquisition canary："
-msgstr ""
-"Novelty answers only whether a structure is worth sending to DFT in "
-"descriptor space; by itself it cannot prove that potential accuracy has "
-"converged. For automatic stopping, the workflow can check the old model's"
-" actual errors against the new DFT labels from the current generation. "
-"Because these structures have not yet entered retraining, they act as an "
-"online acquisition canary:"
 
 #: ../../source/command/workflow.md:210 d23b3c717db14be8b0fcec483ebe03dc
 msgid ""
@@ -537,27 +470,6 @@ msgstr ""
 #: ../../source/command/workflow.md:241 d5be0988e0214e5986b7a0f282e9dd4c
 msgid "未配置 `workflow.convergence` 时，不会自动判定精度收敛，即使辅助测试误差很小也一样。 `coverage_exhausted` 只表示当前采样路径没有可调度任务；`budget_exhausted` 表示采样代数预算用尽。 两者都不是成功。若生产覆盖已达标但采样精度或连续达标轮数不足，会继续安排生产条件采样，直到判据通过或预算用尽。"
 msgstr "Without `workflow.convergence`, the workflow cannot declare accuracy convergence, even if optional test errors are small. `coverage_exhausted` means no sampling tasks remain; `budget_exhausted` means the sampling-generation budget is exhausted. Neither is success. Once production coverage is complete, further production probes collect evidence until the acquisition criteria and passing streak are satisfied or the budget is exhausted."
-
-#: ../../source/command/workflow.md:245 d76dbfc8e53847f395d88c897b4a96f5
-msgid ""
-"这里的“一代”严格绑定一个模型哈希。采样代按 `train → evaluate → explore → select → label → "
-"diagnose → merge` 推进：先用上一代 合并后的完整训练集得到新模型，再让这个模型驱动本代 MD。Controller "
-"会枚举该模型下所有已解锁 scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交；全部进入终态后 "
-"再合并候选并执行 FPS。不同 route 可通过 `execution.sampling_route_targets` "
-"送到不同平台。所有候选必须由同一个模型产生；候选池 manifest 和每个 extxyz 帧都会记录 "
-"`sampling_model_sha256`。旧模型轨迹不能混入新模型候选池。"
-msgstr ""
-"A generation is strictly bound to one model hash. An acquisition generation "
-"runs `train -> evaluate -> explore -> select -> label -> diagnose -> merge`: "
-"it first trains a new model on the complete dataset merged by the previous "
-"generation, then uses that model for the current MD. The Controller enumerates "
-"all unlocked scenario attempts for that model and submits them together as "
-"independent process or Slurm tasks. It merges candidates and runs FPS only "
-"after every task reaches a terminal state. Routes may use different platforms "
-"through `execution.sampling_route_targets`. Every candidate must come from "
-"the same model; the candidate-pool manifest and each extxyz frame record "
-"`sampling_model_sha256`. Trajectories from an old model cannot enter a new "
-"model's candidate pool."
 
 #: ../../source/command/workflow.md:253 e19f2550ee5d446e8e0c0650a61bddcc
 msgid "采样判据通过后，本代仍会先合并最后一批 DFT 标签，但不会把已看过这些标签的模型 用于收敛判断。Controller 随后创建一个 `finalization` 代，只执行 `train`：在最终完整训练集上训练最终模型并检查产物与来源一致性，不再运行 MD、FPS 或 DFT。 `complete` 只由这个终代产生。为保证最后一个采样代也能自动完成，准备 workflow 时会 在 `max_model_generations` 个采样预算之外预留一个终代；若采样预算用尽仍未通过，预留 代不会被误用作普通采样。"
@@ -836,22 +748,6 @@ msgstr ""
 " inspection is unnecessary, run `neptrain workflow run project.yaml` to "
 "create and start the workflow in one step."
 
-#: ../../source/command/workflow.md:398 1a32954ef99f4bb2a61c4e07e3f57bbe
-msgid "输出目录默认使用 `workflow.id`。Controller 默认脱离终端，按 ledger 推进："
-msgstr ""
-"The output directory defaults to `workflow.id`. The Controller detaches "
-"from the terminal by default and advances from the ledger:"
-
-#: ../../source/command/workflow.md:400 43f7e7c79b8149eea660b2d14721a553
-msgid "train → explore → select → label → diagnose → merge → retrain → evaluate\n"
-msgstr ""
-
-#: ../../source/command/workflow.md:404 90d30f8355704b4382826a3075bd6e40
-msgid "训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。"
-msgstr ""
-"Training, MD, and labeling stages use the same adapters and execution "
-"targets as standalone commands."
-
 #: ../../source/command/workflow.md:406 f0bfc98e955a45d1b9a00e5a368c2001
 msgid ""
 "`workflow run <目录>` 只允许状态为 `prepared` 的目录第一次启动。 `workflow resume <目录>` "
@@ -868,32 +764,6 @@ msgstr ""
 #: ../../source/command/workflow.md:411 c26716ec4ce9421593f914130f247b9f
 msgid "状态与恢复"
 msgstr "Status and recovery"
-
-#: ../../source/command/workflow.md:413 3feb3d8a6a634147afa4f1fa3d69aae3
-msgid ""
-"neptrain workflow status workflow\n"
-"neptrain workflow status workflow --jobs\n"
-"neptrain workflow resume workflow\n"
-"neptrain workflow stop workflow\n"
-"neptrain workflow extend workflow 15\n"
-msgstr ""
-
-#: ../../source/command/workflow.md:448 9e982c1b005d4bd08530b535f3e16dba
-msgid ""
-"`workflow status --json` 的 stdout 使用 `neptrain.workflow-"
-"status.v1`；run/resume、stop 和 extend 分别使用稳定的 `workflow-control.v1"
-"`、`workflow-stop.v1` 和 `workflow-extend.v1`。诊断不混入 JSON stdout。`workflow-"
-"control.v1` 始终包含 `workflow_id`、`project`、 `manifest` 和 `action`；`action` "
-"明确区分 `prepare`、`start`、`resume`、 `repair` 与 `noop`，不再另写一份重复的 `started` "
-"布尔状态。"
-msgstr ""
-"`workflow status --json` writes `neptrain.workflow-status.v1` to stdout. "
-"Run/resume, stop, and extend use the stable `workflow-control.v1`, "
-"`workflow-stop.v1`, and `workflow-extend.v1` protocols. Diagnostics never"
-" contaminate JSON stdout. `workflow-control.v1` always includes "
-"`workflow_id`, `project`, `manifest`, and `action`; `action` "
-"distinguishes `prepare`, `start`, `resume`, `repair`, and `noop`, "
-"replacing a redundant `started` Boolean."
 
 #: ../../source/command/workflow.md:455 fe12ab3f7bda44ed94bb574ad7c308fe
 msgid ""
@@ -961,13 +831,6 @@ msgstr ""
 "`budget_exhausted`: the model-generation budget is exhausted. Run "
 "`workflow extend`; this is not success."
 
-#: ../../source/command/workflow.md:473 ae68c9b1b64b4818bb93e77e7bb7ba82
-msgid "`stalled`：相同模型与策略继续运行不会增加证据；必须修改科学策略并新建 workflow，不能原样 retry。"
-msgstr ""
-"`stalled`: continuing with the same model and policy cannot add evidence."
-" Change the scientific policy and create a new workflow instead of "
-"retrying unchanged."
-
 #: ../../source/command/workflow.md:475 9f750ce6e3cd4cc4812adc103611edcf
 msgid "`complete`：采样精度和生产覆盖判据已通过，并完成最终训练与模型检查。"
 msgstr "`complete`: acquisition accuracy and production coverage criteria passed, and final training and model checks completed."
@@ -1019,19 +882,6 @@ msgstr ""
 msgid "每代目录直接对应用户关心的阶段："
 msgstr "Each generation directory maps directly to the stages users inspect:"
 
-#: ../../source/command/workflow.md:506 baef258585744b3188e31534afef78d3
-msgid ""
-"generations/0001/\n"
-"├── train/\n"
-"├── md/\n"
-"├── select/\n"
-"├── label/\n"
-"├── diagnose/\n"
-"├── dataset/\n"
-"├── retrain/\n"
-"└── evaluate/\n"
-msgstr ""
-
 #: ../../source/command/workflow.md:518 315453b79f634e1c82e1d9f702e23733
 msgid "训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；`calculation` 软链指向真实执行目录，便于直接排查。各阶段自动出图："
 msgstr "Models, loss files, and stdout/stderr are published in the corresponding stage directory; the `calculation` symlink points to the execution directory for troubleshooting. Stages generate these plots automatically:"
@@ -1041,9 +891,6 @@ msgstr "`train/training-convergence.png` shows training loss. `train/training-pa
 
 msgid "`evaluate/acquisition-parity.png`：本代采样模型对新标注结构的预测与参考值对比，这些结构尚未加入该模型的训练集。直接复用 evaluate 的预测结果。对角线图按可用数据展示 Energy、Force、Virial 和 magnetic force，包含理想对角线、RMSE 与绝对误差分布；能量和 virial 使用每原子单位。大数组只对显示点做确定性抽样，RMSE 仍使用全部有限数据。"
 msgstr "`evaluate/acquisition-parity.png` compares the sampling model predictions with new labels, before those structures enter its training set. It reuses the evaluate predictions. Parity plots include Energy, Force, Virial, and magnetic force where available, with the ideal diagonal, RMSE, and absolute-error distributions. Energy and virial use per-atom units. Large arrays are sampled deterministically for display only; RMSE uses all finite pairs."
-
-msgid "`select/selection-pca.png`：蓝色表示排除训练集重叠、去重后的候选结构，橙色叠加本轮选中结构。使用筛选时已有的结构描述符，在同一个 PCA 基底中投影到 PC1/PC2，坐标轴标注解释方差。超过 20,000 个候选时，均匀抽样拟合 PCA 和绘制蓝色背景，全部选中结构仍会显示；报告保留全部候选的坐标和结构 ID。PCA 只用于显示，不改变 FPS 距离、筛选结果或收敛判断。独立 `neptrain select` 同样生成 `<输出文件名>.selection-pca.png`，背景为该命令过滤、去重后的候选池。"
-msgstr "`select/selection-pca.png` shows eligible candidates in blue after training-overlap removal and deduplication, with selected structures overlaid in orange. Existing selection descriptors are projected into a shared PC1/PC2 basis; axes show explained variance. Above 20,000 candidates, evenly spaced rows are used to fit PCA and draw the blue background, while all selected structures remain visible. The report retains coordinates and structure IDs for every candidate. PCA is for display only and does not change FPS distances, selection, or convergence. Standalone `neptrain select` also generates `<output-stem>.selection-pca.png`, using its filtered and deduplicated candidate pool as the background."
 
 msgid "配置可选辅助测试集时，train 另有 `evaluation-parity.png`；配置参考阈值时还有 `evaluation-metrics.png`。这些辅助诊断不影响收敛，也不要求 test 必须存在。每张图都有对应 JSON 报告，记录来源、模型哈希（可用时）、点数和统计量；没有有效绘图数据时只输出注明原因的报告。"
 msgstr "With an optional auxiliary test set, train also produces `evaluation-parity.png`; configured reference thresholds additionally produce `evaluation-metrics.png`. These diagnostics do not affect convergence or require a test set. Each plot has a JSON report recording its source, model hash where available, counts, and statistics. If no valid plotting data are available, only a report explaining the reason is written."
@@ -1165,23 +1012,6 @@ msgstr ""
 "rerun from scratch, create a new directory instead of deleting "
 "`.neptrain` or editing JSON by hand to “reset” the workflow."
 
-#~ msgid "LAMMPS 模板：物理过程、`timestep`、阻尼、spin 积分参数和 dump 频率。"
-#~ msgstr ""
-#~ "LAMMPS template: physical process, `timestep`,"
-#~ " damping, spin integration parameters, and"
-#~ " dump frequency."
-
-#~ msgid ""
-#~ "workflow:\n"
-#~ "  max_model_generations: 24\n"
-#~ "  convergence:\n"
-#~ "    acquisition_max_rmse:\n"
-#~ "      energy_rmse: 0.003   # eV/atom\n"
-#~ "      force_rmse: 0.10     # eV/Å\n"
-#~ "      virial_rmse: 0.03    # eV/atom\n"
-#~ "    consecutive_generations: 2\n"
-#~ msgstr ""
-
 msgid "`workflow init` 只生成当前选择的 `lammps.in` 和标注后端输入。Spin 流程可使用 `--spin --dft-backend abacus` 或 `--spin --dft-backend vasp`；后者生成 [VASP DeltaSpin](vasp-deltaspin.md) INCAR。"
 msgstr "`workflow init` generates only the selected `lammps.in` and labeling input. Spin workflows may use `--spin --dft-backend abacus` or `--spin --dft-backend vasp`; the latter generates a [VASP DeltaSpin](vasp-deltaspin.md) INCAR."
 
@@ -1239,9 +1069,6 @@ msgstr "A generation is bound to exactly one model hash. New workflows use `acti
 msgid "输出目录默认使用 `workflow.id`。所有新建流程均按新版阶段顺序推进："
 msgstr "The output directory defaults to `workflow.id`. All newly prepared workflows use the current stage sequence:"
 
-msgid "训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。 既有 `adaptive_v2` 目录继续保留原来的 `evaluate/diagnose/merge` stage 和路径； 新版本按 manifest 中已经固化的 protocol 读取，不会重命名或混写旧目录。"
-msgstr "Training, MD, and labeling stages use the same adapters and execution targets as standalone commands. Existing `adaptive_v2` directories retain their original `evaluate/diagnose/merge` stages and paths. The manifest fixes the protocol; newer versions read it without renaming or mixing existing directories."
-
 msgid "`resume` 延续 Controller 当前记录的执行意图，不回退已经提交到 ledger 的科学阶段。 需要明确重算本代某个阶段时使用 `restart`。先用 `--dry-run` 查看复用和重算范围， 确认后去掉该选项执行："
 msgstr "`resume` continues the Controller's recorded execution intent without rolling back scientific stages committed to the ledger. Use `restart` to recompute a specific stage in the current generation. Inspect the reuse and recomputation plan with `--dry-run`, then remove that option to execute:"
 
@@ -1259,9 +1086,6 @@ msgstr "`workflow status --json` writes `neptrain.workflow-status.v1` to stdout.
 
 msgid "`stalled`：当前执行不能通过普通 `resume` 继续；检查原因后可用 `workflow restart --from ...` 明确选择重算位置，或者修改策略后新建 workflow。"
 msgstr "`stalled`: ordinary `resume` cannot continue the current execution. Inspect the cause, then use `workflow restart --from ...` to select a recomputation point, or revise the policy and create a new workflow."
-
-msgid "旧 `adaptive_v2` workflow 仍使用原来的 `evaluate/diagnose/dataset` 目录；这些目录不会 自动迁移。一个 generation 内只使用其 ledger 已记录的那套 stage sequence。"
-msgstr "Existing `adaptive_v2` workflows retain their original `evaluate/diagnose/dataset` directories without automatic migration. Each generation uses only the stage sequence already recorded in its ledger."
 
 msgid "训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。 `train` 完成时检查模型产物和来源、启用模型，并生成可选的辅助测试报告。 新流程不再单独运行 `validate`。既有 `active_learning_v3` 目录仍保留其 `validate` 阶段， `adaptive_v2` 目录继续保留原来的 `evaluate/diagnose/merge` stage 和路径； 新版本按 manifest 中已经固化的 protocol 读取，不会重命名或混写旧目录。"
 msgstr "Training, MD, and labeling stages use the same adapters and execution targets as standalone commands. Training checks model artifacts and provenance, activates the model, and generates optional test diagnostics. New workflows have no separate `validate` stage. Existing `active_learning_v3` directories retain `validate`, and `adaptive_v2` directories retain their original `evaluate/diagnose/merge` stages and paths. The manifest fixes the protocol; newer versions read it without renaming or mixing existing directories."
@@ -1286,3 +1110,30 @@ msgstr "Use `--details` to show all available evaluations and optional auxiliary
 
 msgid "`--jobs` 按“代次 + 阶段 + attempt + 执行目标”压缩同一批任务，显示执行完成、运行、等待和失败计数。历史失败可能已由后续重试恢复；逐任务结构和检查时间保留在 `--json` 中。"
 msgstr "`--jobs` groups tasks by generation, stage, attempt, and execution target, with execution-complete, running, waiting, and failure counts. Historical failures may have been recovered by subsequent retries. Individual tasks and inspection times remain in `--json`."
+
+msgid "[VASP DeltaSpin](https://github.com/aboys-cb/NepTrain/tree/master/examples/workflow-vasp-deltaspin)"
+msgstr "[VASP + Slurm](https://github.com/aboys-cb/NepTrain/blob/master/examples/workflow-vasp-slurm/README.en.md)"
+
+msgid "neptrain smoke --profile recovery --workflow --output ./outputs/workflow-smoke\n"
+msgstr ""
+
+msgid "一个温压条件在本档 replica 正常结束并通过轨迹健康与诊断检查后晋级。FPS 覆盖度 独立决定哪些结构需要标注：发现新颖结构会触发标注，标签经 update 合并后用于 下一代训练，但不会迫使健康轨迹反复停留在同一时长。晋级后，Controller 同时解锁下一个温度和当前生产温度的下一档 时长。模型更新不会把已经完成的 smoke、short 或 long 证据清零，只有最终 production 认证需要绑定当前模型哈希。`progression.replicas` 控制各时长需要的 独立 MD 次数。"
+msgstr "A temperature-pressure condition advances after its replicas finish normally and pass trajectory health and diagnostic checks. FPS coverage independently determines which structures need labels: novel structures trigger labeling, and update merges those labels for training in the next generation. Novelty does not force healthy trajectories to repeat the same duration. Advancement unlocks both the next temperature and the next duration at the current production temperature. Model updates retain completed smoke, short, and long evidence; only final production certification is bound to the current model hash. `progression.replicas` sets the independent MD run count at each duration."
+
+msgid "NepTrain 只在 FPS 前去除训练集已有结构和同一 route 内的完全重复结构，不按固定 stride 抽帧，也不使用候选数量上限提前裁剪。 `sampling.selection.max_selected` 是每个采样轮最多送去 Label Adapter 的结构数， 不是必须填满的配额。`novelty: auto` 只用当前 `train.xyz` 中的同元素结构拟合描述符 中心和逐特征尺度，再从训练集留一最近邻距离估计保守阈值。候选结构只使用该变换， 不参与尺度拟合；因此极端候选不会反向压低阈值。候选低于训练集已有分辨率时不送 DFT。若本轮一个结构也选不到， workflow 会跳过空的 Label Adapter 任务和新标签误差计算，记录覆盖证据，而不是 报错或提交空的 VASP/ABACUS 作业。没有新标签不能补充精度达标证据；如果继续 下一采样代，仍会先执行 train，不会自动复用旧模型跳过训练。需要固定策略时，可显式设置 `selection_threshold` 和 `completion_threshold`。"
+msgstr "Before FPS, NepTrain removes structures already in the training set and exact duplicates within each route. It does not subsample by a fixed stride or truncate candidates with a count cap. `sampling.selection.max_selected` limits how many structures a sampling round sends to the Label Adapter; it is not a quota to fill. `novelty: auto` fits descriptor centers and per-feature scales using only same-element training structures in the current `train.xyz`, then estimates a conservative threshold from leave-one-out nearest-neighbor distances. Candidates use that transform without fitting it, so extreme candidates cannot depress the threshold. Candidates below the training set's existing resolution are not sent to DFT. If no structure is selected, the workflow skips empty Label Adapter jobs and new-label error calculation and records coverage evidence, rather than failing or submitting empty VASP/ABACUS jobs. No new labels means no new accuracy evidence. If another sampling generation follows, it still starts with train; it does not automatically reuse the old model to skip training. Set `selection_threshold` and `completion_threshold` explicitly for a fixed policy."
+
+msgid "novelty 只回答“这个结构在描述符空间里是否值得送 DFT”，不能单独证明势函数精度 已经收敛。需要自动停止时，可让 workflow 检查本代采样模型在本轮新标签上的真实 误差；这些结构尚未加入该模型的训练集，因此可作为在线 acquisition canary："
+msgstr "Novelty only answers whether a structure is worth labeling in descriptor space; it cannot establish model accuracy convergence. For automatic stopping, the workflow can check the current sampling model's actual errors on this round's new labels. Those structures have not entered that model's training set, so they serve as online acquisition canaries:"
+
+msgid "train → explore → select → label → evaluate → update\n"
+msgstr ""
+
+msgid "neptrain workflow status workflow\nneptrain workflow status workflow --jobs\nneptrain workflow status workflow --details\nneptrain workflow resume workflow\nneptrain workflow restart workflow --generation 3 --from label --dry-run\nneptrain workflow stop workflow\nneptrain workflow extend workflow 15\n"
+msgstr ""
+
+msgid "generations/0001/\n├── train/\n├── explore/\n├── select/\n├── label/\n├── evaluate/\n└── update/\n"
+msgstr ""
+
+msgid "`select/selection-pca.png`：蓝色表示排除训练集重叠、去重后的候选结构，橙色叠加本轮选中结构。使用筛选时已有的结构描述符，在同一个 PCA 基底中投影到 PC1/PC2，坐标轴标注解释方差。超过 20,000 个候选时，均匀抽样拟合 PCA 和绘制蓝色背景，全部选中结构仍会显示；报告保留全部候选的坐标和结构 ID。PCA 只用于显示，不改变 FPS 距离、筛选结果或收敛判断。独立 `neptrain select` 同样生成 `<输出文件去掉扩展名>.selection-pca.png`，背景为该命令过滤、去重后的候选池。"
+msgstr "`select/selection-pca.png`: blue points show candidates after excluding training overlap and duplicates; orange points overlay selected structures. Existing selection descriptors are projected onto PC1/PC2 in one shared PCA basis, with explained variance on the axes. Above 20,000 candidates, a uniform subsample is used to fit PCA and draw the blue background; all selected structures remain visible. The report retains coordinates and structure IDs for all candidates. PCA is for visualization only and does not change FPS distances, selection results, or convergence. Standalone `neptrain select` similarly generates `<output-stem>.selection-pca.png`, using its filtered and deduplicated candidate pool as the background."

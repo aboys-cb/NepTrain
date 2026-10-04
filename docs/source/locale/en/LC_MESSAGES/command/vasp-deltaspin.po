@@ -77,3 +77,24 @@ msgstr "This adapter requires the VASP 6 DeltaSpin tables `ion elem cx cy cz Mx 
 
 msgid "普通非共线或 SOC 自洽可以生成能量、原子力和 virial 标签，但不会生成 `spin/mforce`。其 `MAGMOM` 从 INCAR 的 3N 个数或结构的三分量初始磁矩读取；DeltaSpin 则统一用每帧 `spin` 作为初始猜测和约束目标。"
 msgstr "Unconstrained noncollinear or SOC SCF produces energy, atomic forces, and virial labels, but no spin/mforce. Its MAGMOM comes from the 3N INCAR values or the structure’s vector initial moments. DeltaSpin always uses each frame’s spin for both the initial guess and constraint target."
+
+msgid "VASP DeltaSpin"
+msgstr ""
+
+msgid "neptrain workflow init --profile slurm --spin --dft-backend vasp --directory fe-spin\ncd fe-spin\n"
+msgstr ""
+
+msgid "md:\n  backend: lammps\n  spin: true\nlabeling:\n  backend: vasp\n  input_path: ./INCAR\n  resource_path: /path/to/potpaw_PBE\n  potcar_manifest_path: ./vasp-resources.json\n  kpoint_mode: auto\n"
+msgstr ""
+
+msgid "SYSTEM = NepTrain-DeltaSpin-single-point\nENCUT = 400\nPREC = Accurate\nGGA = PE\nLASPH = .TRUE.\nLNONCOLLINEAR = .TRUE.\nLSORBIT = .TRUE.\nSAXIS = 0 0 1\nISYM = 0\nALGO = Normal\nNELMIN = 3\nNELMDL = -1\nISMEAR = 0\nSIGMA = 0.1\nICHARG = 2\nISTART = 0\nLREAL = .FALSE.\nADDGRID = .TRUE.\n\n# Fe2 example mixing; tune for your material.\nAMIX = 0.10\nBMIX = 0.0001\nAMIX_MAG = 0.80\nBMIX_MAG = 0.0001\nIMIX = 4\nMAXMIX = -45\nMIXFIRST = .FALSE.\n\nLDELTASPIN = .TRUE.\nDELTASPIN_COMPONENTS = 1 1 1\nDELTASPIN_ACTIVATION_RATIO = 10\nDELTASPIN_MOMENT_DEF = 0\nDELTASPIN_TOL = 1E-6\nLORBIT = 11\n# NepTrain generates M_DELTASPIN and DELTASPIN_ATOMS from each frame's spin.\n# NepTrain also sets MAGMOM to those targets, overriding any template value.\n\nIBRION = -1\nISIF = 2\nNSW = 0\nLCHARG = .FALSE.\nLWAVE = .FALSE.\nNWRITE = 1\nEDIFF = 1E-7\nEDIFF_RHO = 0\nNELM = 400\nKPAR = 1\nNCORE = 1\n# Choose k-point density for the material; not the reference Fe2 KPOINTS mesh.\nKSPACING = 0.2\nKGAMMA = .TRUE.\n"
+msgstr ""
+
+msgid "import numpy as np\nfrom ase.io import read, write\natoms = read(\"POSCAR\")\nassert atoms.get_chemical_symbols() == [\"Fe\", \"Fe\"]\natoms.set_array(\"spin\", np.array([[0.35, 0, 2.677], [-0.35, 0, 2.677]]))\nwrite(\"selected-spin.xyz\", atoms, format=\"extxyz\")\n"
+msgstr ""
+
+msgid "neptrain label selected-spin.xyz --backend vasp --project project.yaml --wait --output labeled-spin.xyz\n"
+msgstr ""
+
+msgid "from ase.io import read\nframe = read(\"labeled-spin.xyz\")\nprint(frame.arrays[\"spin\"])\nprint(frame.arrays[\"mforce\"])\nprint(frame.info[\"deltaspin_max_error\"], frame.info[\"deltaspin_tolerance\"])\n"
+msgstr ""
