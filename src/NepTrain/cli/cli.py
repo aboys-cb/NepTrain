@@ -1,4 +1,4 @@
-#!/usr/bin/env python 
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # @Time    : 2024/10/24 14:33
 # @Author  : 兵
@@ -73,6 +73,14 @@ def run_smoke_command(args):
             force=args.force,
         )
         result["iteration"] = asdict(iteration)
+    if args.workflow:
+        from NepTrain.core.workflow_smoke import run_workflow_smoke
+
+        result["workflow"] = run_workflow_smoke(
+            Path(args.output) / "workflow",
+            profile="spin" if args.profile == "recovery" else args.profile,
+            seed=args.seed,
+        )
     _print_json(result)
 
 
@@ -92,7 +100,7 @@ _STATE_LABELS = {
 }
 _STAGE_LABELS = {
     "train": "训练",
-    "validate": "模型验证",
+    "validate": "模型检查",
     "explore": "采样",
     "select": "选样",
     "label": "标注",
@@ -208,10 +216,12 @@ def _generation_state(generation, status):
 def _print_precision(status):
     print()
     if status.precision_basis not in {"validation", "acquisition"}:
-        print("精度变化：暂无可比较数据（未配置独立验证集）")
+        print("精度变化：暂无新增结构的训练前预测结果")
         return
     acquisition = status.precision_basis == "acquisition"
-    print("新增 DFT 预测精度（训练前）：" if acquisition else "验证集精度：")
+    print(
+        "新增 DFT 预测精度（训练前）：" if acquisition else "辅助测试精度（仅供参考）："
+    )
     rows = [
         (
             "代",
@@ -230,11 +240,13 @@ def _print_precision(status):
         "mforce_rmse": None,
     }
     for generation in status.generations:
+        if acquisition and generation.get("kind") == "finalization":
+            continue
         metrics = generation["quality"][
             "acquisition_rmse" if acquisition else "validation_rmse"
         ]
         accepted = generation["quality"].get(
-            "acquisition_accepted" if acquisition else "accepted"
+            "acquisition_accepted" if acquisition else "validation_thresholds_met"
         )
         rows.append(
             (
@@ -272,7 +284,14 @@ def _print_precision(status):
         for name, value in metrics.items():
             if value is not None:
                 previous[name] = value
-    _table(rows)
+    if len(rows) > 1:
+        _table(rows)
+    for generation in status.generations:
+        if acquisition and generation.get("kind") == "finalization":
+            print(
+                f"G{generation['generation']} 最终训练："
+                f"{_generation_state(generation, status)}（本代不采样）"
+            )
     if acquisition and any(
         value is not None
         for generation in status.generations
@@ -282,6 +301,8 @@ def _print_precision(status):
         print("新增 DFT 相关性与决策：")
         r2_rows = [("代", "E R²", "F R²", "V R²", "M R²", "下一步")]
         for generation in status.generations:
+            if generation.get("kind") == "finalization":
+                continue
             quality = generation["quality"]
             values = quality.get("acquisition_r2", {})
             disposition = quality.get("generation_disposition")
@@ -428,6 +449,40 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
             print(f"异常：{total_failed} 条采样轨迹失败，失败证据已保留")
 
     _print_precision(status)
+    for generation in status.generations:
+        quality = generation["quality"]
+        test_metrics = quality.get("validation_rmse", {})
+        if status.precision_basis != "validation" and any(
+            value is not None for value in test_metrics.values()
+        ):
+            values = ", ".join(
+                f"{name}={float(value):.4g}"
+                for name, value in test_metrics.items()
+                if value is not None
+            )
+            print(
+                f"G{generation['generation']} 辅助测试（仅供参考，E/V: eV/atom，F: eV/Å，M: eV/μB）：{values}"
+            )
+        for warning in quality.get("validation_warnings", []):
+            print(f"提示 G{generation['generation']}：{warning}")
+    decisions = [
+        generation
+        for generation in status.generations
+        if generation["quality"].get("convergence_reasons")
+        or generation["quality"].get("generation_disposition")
+    ]
+    if decisions:
+        latest = decisions[-1]
+        quality = latest["quality"]
+        print()
+        if quality.get("workflow_converged"):
+            print("收敛判断：采样判据已通过，最终模型训练完成。")
+        elif quality.get("finalization_pending"):
+            print("收敛判断：采样精度与生产覆盖已通过，进入最终训练。")
+        else:
+            print(f"收敛判断（G{latest['generation']}）：尚未收敛")
+        for reason in quality.get("convergence_reasons", []):
+            print(f"  · {reason}")
     if show_jobs:
         _print_job_batches(status.jobs)
     if status.notifications:
@@ -1329,6 +1384,11 @@ def build_smoke(subparsers):
         type=int,
         default=0,
         help="Also run a resumable progressive Toy workflow for this many generations.",
+    )
+    parser.add_argument(
+        "--workflow",
+        action="store_true",
+        help="Also run the fixed v3 decision/recovery suite with deterministic backend doubles (no real MD or DFT).",
     )
     parser.add_argument("--force", action="store_true")
 

@@ -761,7 +761,53 @@ def test_workflow_allows_evaluation_to_be_omitted(tmp_path):
     assert "evaluation" not in config
 
 
-def test_partial_evaluation_is_rejected(tmp_path):
-    value = _project(evaluation={"validation_path": None})
-    with pytest.raises(ConfigError, match="when evaluation is configured"):
+@pytest.mark.parametrize("evaluation", [{}, {"validation_path": None}, {"validation_path": ""}, {"max_rmse": {"energy_rmse": 1}}])
+def test_evaluation_without_dataset_is_allowed(tmp_path, evaluation):
+    value = _project()
+    value["evaluation"] = evaluation
+    config, _ = load_config(_write(tmp_path, value))
+    assert config["evaluation"] == evaluation
+
+
+def test_optional_evaluation_does_not_require_error_thresholds(tmp_path):
+    value = _project()
+    value["evaluation"].pop("max_rmse")
+    config, _ = load_config(_write(tmp_path, value))
+    assert "max_rmse" not in config["evaluation"]
+
+
+@pytest.mark.parametrize("max_selected,min_selected", [(8, 50), (None, 101)])
+def test_convergence_rejects_label_requirement_above_selection_budget(
+    tmp_path, max_selected, min_selected
+):
+    value = _project(
+        workflow={
+            "convergence": {
+                "acquisition_max_rmse": {"energy_rmse": 0.01, "force_rmse": 0.1},
+                "min_selected": min_selected,
+            }
+        }
+    )
+    if max_selected is None:
+        value["sampling"]["selection"].pop("max_selected")
+    else:
+        value["sampling"]["selection"]["max_selected"] = max_selected
+    with pytest.raises(
+        ConfigError,
+        match=r"min_selected .* exceeds .*max_selected .*increase max_selected or lower min_selected",
+    ):
         load_config(_write(tmp_path, value))
+
+
+def test_convergence_allows_exact_selection_budget(tmp_path):
+    value = _project(
+        workflow={
+            "convergence": {
+                "acquisition_max_rmse": {"energy_rmse": 0.01, "force_rmse": 0.1},
+                "min_selected": 8,
+            }
+        }
+    )
+    value["sampling"]["selection"]["max_selected"] = 8
+    config, _ = load_config(_write(tmp_path, value))
+    assert config["workflow"]["convergence"]["min_selected"] == 8

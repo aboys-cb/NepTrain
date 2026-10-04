@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,7 @@ from typing import Any, Callable, Mapping
 from ase.io import read as ase_read
 
 from .content_addressing import canonical_sha256, file_sha256
+from .scientific_data import optional_dataset_issue
 from .persistence import atomic_write_json
 from .workflow_workspace import WorkflowWorkspace
 from .config import (
@@ -227,6 +229,11 @@ class PersistentController:
             *self.manifest.get("plans", []),
             *self.manifest.get("dependencies", []),
         ]:
+            if record.get("role") in {"training_test", "evaluation_validation"}:
+                issue = optional_dataset_issue(Path(record["path"]), role=record["role"])
+                if issue:
+                    logging.getLogger(__name__).warning(issue)
+                    continue
             if not _record_matches(record):
                 raise ControllerError(
                     f"prepared workflow artifact drifted: {record['path']}"
@@ -374,7 +381,7 @@ class PersistentController:
                 if evaluate.get("workflow_stalled") is True:
                     self.state["state"] = "stalled"
                     self.state["reason"] = (
-                        "validation is still outside target and repeated "
+                        "acquisition accuracy is still outside target and repeated "
                         "production probes found no useful model update"
                     )
                     self.state["current"] = None
@@ -386,7 +393,7 @@ class PersistentController:
         self.state["state"] = "budget_exhausted"
         self.state["reason"] = (
             "maximum model generations reached before the production trust envelope "
-            "and validation targets both converged"
+            "and acquisition accuracy targets both converged"
         )
         self.state["current"] = None
         self._save()
@@ -1451,7 +1458,7 @@ class PersistentController:
                 self.state["state"] = "coverage_exhausted"
                 self.state["reason"] = (
                     "sampling coverage is exhausted for the active model, "
-                    "but independent validation has not established workflow "
+                    "but acquisition evidence has not established workflow "
                     "convergence"
                 )
                 self.state["current"] = None

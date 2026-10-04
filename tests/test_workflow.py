@@ -533,7 +533,7 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     assert f"路径：{preparation.output_dir}" in output
     assert "状态：待启动 | 第 1/3 代 | 训练" in output
     assert "300 K ○ → 500 K ○" in output
-    assert "验证集精度：" in output
+    assert "新增 DFT 预测精度（训练前）：" in output
     assert "G1" in output
     assert "未开始" in output
     assert "执行批次：" not in output
@@ -633,7 +633,7 @@ def test_status_precision_table_shows_generation_deltas(capsys):
     _print_precision(status)
 
     output = capsys.readouterr().out
-    assert "验证集精度：" in output
+    assert "辅助测试精度（仅供参考）：" in output
     assert "F/meV·Å⁻¹" in output
     assert "M/meV/μB" in output
     assert "160 ↓20%" in output
@@ -681,10 +681,7 @@ def test_status_does_not_present_training_error_as_validation(capsys):
 
     _print_precision(status)
 
-    assert (
-        "精度变化：暂无可比较数据（未配置独立验证集）"
-        in capsys.readouterr().out
-    )
+    assert "精度变化：暂无新增结构的训练前预测结果" in capsys.readouterr().out
 
 
 def test_jobs_are_compacted_by_generation_stage_and_attempt(capsys):
@@ -1243,3 +1240,104 @@ def test_run_rejects_a_recovery_state_and_points_to_resume(
         match=r"run only starts a prepared workflow.*workflow resume",
     ):
         start_workflow(preparation.output_dir)
+
+
+def test_coverage_exhausted_status_is_not_reported_as_prepared(tmp_path):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    workspace = WorkflowWorkspace.locate(preparation.output_dir)
+    workspace.controller_file.write_text(
+        json.dumps(
+            {
+                "protocol": "neptrain.controller.v1",
+                "workflow_id": preparation.workflow_id,
+                "state": "coverage_exhausted",
+                "reason": "no sampling tasks remain; convergence is not established",
+                "current": None,
+                "history": [],
+            }
+        )
+    )
+    status = workflow_status(preparation.output_dir)
+    assert status.state == "coverage_exhausted"
+    assert "convergence is not established" in status.reason
+    assert status.next_action is None
+
+
+def test_status_explains_sampling_decision_and_optional_test(tmp_path, capsys):
+    from dataclasses import replace
+    from NepTrain.cli.cli import _print_workflow_status
+
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    status = workflow_status(preparation.output_dir)
+    science = _generation_science(
+        {"generation": 1, "max_selected": 10},
+        {"kind": "acquisition", "stage_sequence": ["train", "validate", "explore", "select", "label", "evaluate", "update"],
+         "complete": True, "accepted": True, "stages": {
+             "evaluate": {"metrics": {"prediction_metric_basis": "per_atom_v1", "current_model_force_rmse": 0.08}},
+             "validate": {"metrics": {"prediction_metric_basis": "per_atom_v1", "force_rmse": 0.5,
+                                      "validation_warnings": ["辅助测试有 231 帧重叠"]}},
+             "update": {"metrics": {"generation_disposition": "continue", "convergence_reasons": ["连续达标 1/2 代，仍需采样确认。"]}},
+         }},
+    )
+    _print_workflow_status(replace(status, generations=(science,)), show_jobs=False)
+    output = capsys.readouterr().out
+    assert "新增 DFT 预测精度（训练前）" in output
+    assert "辅助测试（仅供参考" in output
+    assert "231 帧重叠" in output
+    assert "尚未收敛" in output
+    assert "连续达标 1/2 代" in output
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [("accepted", "完成"), ("in_progress", "训练中"), ("rejected", "未通过")],
+)
+def test_finalization_precision_has_no_waiting_acquisition_row(capsys, state, expected):
+    generation = {
+        "generation": 5,
+        "kind": "finalization",
+        "state": state,
+        "quality": {
+            "acquisition_rmse": dict.fromkeys(
+                ("energy_rmse", "force_rmse", "virial_rmse", "mforce_rmse")
+            )
+        },
+    }
+    _print_precision(
+        SimpleNamespace(
+            precision_basis="acquisition",
+            generations=(generation,),
+            generation=5,
+            stage="train",
+        )
+    )
+    text = capsys.readouterr().out
+    assert f"G5 最终训练：{expected}（本代不采样）" in text
+    assert "等待" not in text
+    assert "验收" not in text
+
+
+@pytest.mark.parametrize("contents", [None, "", " \n\t"])
+def test_preparation_skips_unavailable_optional_datasets(tmp_path, caplog, contents):
+    from NepTrain.core.config import load_config, save_config
+
+    source, initial = _inputs(tmp_path)
+    config, _ = load_config(source)
+    optional = tmp_path / "optional.xyz"
+    if contents is not None:
+        optional.write_text(contents)
+    config["training"]["test_path"] = str(optional)
+    config["evaluation"]["validation_path"] = str(optional)
+    save_config(config, source)
+    prepared = prepare_workflow(source, initial, tmp_path / "workflow")
+    portable, _ = load_config(prepared.config_file)
+    assert "test_path" not in portable["training"]
+    assert "validation_path" not in portable["evaluation"]
+    manifest = json.loads(prepared.manifest.read_text())
+    assert not {"training_test", "evaluation_validation"} & {
+        record["role"] for record in manifest["dependencies"]
+    }
+    assert "训练测试集已跳过" in caplog.text
+    assert "辅助测试集已跳过" in caplog.text

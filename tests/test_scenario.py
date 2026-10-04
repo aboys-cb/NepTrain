@@ -566,3 +566,33 @@ def test_temperature_path_must_be_monotonic_and_targets_must_be_on_path():
         _ladder(path=(300.0, 700.0, 500.0))
     with pytest.raises(ScenarioMaturityError, match="subset"):
         _ladder(path=(300.0, 500.0), production=(700.0,))
+
+
+@pytest.mark.parametrize("validation_accepted", [True, False, None])
+def test_extra_production_probes_depend_on_acquisition_not_optional_test(
+    validation_accepted,
+):
+    ladder = _ladder(path=(300.0,), production=(300.0,))
+    history = None
+    for generation in range(1, 5):
+        attempts = ladder.schedule(
+            ["structure-a"],
+            pressure=0.0,
+            generation=generation,
+            seed=1,
+            limit=10,
+            model_id="model-1",
+            history=history,
+        )
+        history = _record(
+            ladder, attempts, history=history, validation_accepted=validation_accepted
+        )
+    kwargs = dict(pressure=0.0, generation=5, seed=1, limit=10, model_id="model-1")
+    assert not ladder.schedule(["structure-a"], history=history, **kwargs)
+    history["acquisition_pending"] = True
+    probe = ladder.schedule(["structure-a"], history=history, **kwargs)
+    assert len(probe) == 1
+    assert probe[0].target_level == "production_ready"
+    assert probe[0].replica == 2
+    history["acquisition_pending"] = False
+    assert not ladder.schedule(["structure-a"], history=history, **kwargs)

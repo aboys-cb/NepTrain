@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import os
+import logging
 from pathlib import Path
 import random
 import re
@@ -17,6 +18,7 @@ from ase.io import read as ase_read
 import numpy as np
 
 from .reporting import build_training_report
+from .scientific_data import optional_dataset_issue
 from .spin import validate_spin_dataset
 
 
@@ -128,6 +130,9 @@ def _prepare_gpumd_inputs(
     sources = [(request.train_file, request.output_dir / "train.xyz")]
     if request.test_file is not None:
         sources.append((request.test_file, request.output_dir / "test.xyz"))
+    else:
+        # A reused run directory must not reintroduce an old optional test set.
+        (request.output_dir / "test.xyz").unlink(missing_ok=True)
     if request.restart_file is not None:
         sources.append(
             (request.restart_file, request.output_dir / "nep.restart")
@@ -183,8 +188,6 @@ def _train_gpumd(
 ) -> TrainingResult:
     if request.finetune_file is not None:
         raise TrainingError("GPUMD training does not support finetune_file")
-    if request.test_file is not None and not request.test_file.is_file():
-        raise TrainingError(f"test data does not exist: {request.test_file}")
     if request.restart_file is not None and not request.restart_file.is_file():
         raise TrainingError(
             f"GPUMD restart does not exist: {request.restart_file}"
@@ -306,6 +309,11 @@ def train(request: TrainingRequest, backend: str) -> TrainingResult:
     if not request.config_file.is_file():
         raise TrainingError(f"training config does not exist: {request.config_file}")
     expects_spin, elements = _validate_training_data(request.train_file)
+    if request.test_file is not None:
+        issue = optional_dataset_issue(request.test_file, role="训练测试集")
+        if issue:
+            logging.getLogger(__name__).warning(issue)
+            request = replace(request, test_file=None)
     if backend == "gpumd":
         result = _train_gpumd(request, elements)
     elif backend == "torchnep":

@@ -703,3 +703,26 @@ def test_doctor_and_execution_select_vasp_from_incar(tmp_path, incar, executable
     assert "vasp_std" not in tools and "vasp_ncl" not in tools
     with pytest.raises(FileNotFoundError):
         default_vasp_command(tmp_path / "missing.INCAR")
+
+
+@pytest.mark.parametrize("profile", ["ordinary", "recovery"])
+def test_workflow_smoke_exercises_production_v3_decisions(tmp_path, profile):
+    completed = _help(
+        "smoke", "--workflow", "--profile", profile, "--output", str(tmp_path / "smoke")
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    report = payload["workflow"]
+    assert report["generation_protocol"] == "active_learning_v3"
+    assert report["backend_mode"] == "deterministic_doubles"
+    assert report["passed"] and all(report["checks"].values())
+    assert len(report["cases"]) == 9
+    assert report["cases"]["no_test"]["generations_completed"] == 5
+    assert report["cases"]["md_recovery"]["generations_completed"] == 6
+    assert report["cases"]["long_streak"]["generations_completed"] == 7
+    assert report["cases"]["insufficient_labels"]["converged"] is False
+    workflow = tmp_path / "smoke/workflow"
+    assert json.loads((workflow / "workflow-smoke-report.json").read_text()) == report
+    assert (
+        "训练集：4 → 12（+8）" in (workflow / "no_test/notifications.txt").read_text()
+    )

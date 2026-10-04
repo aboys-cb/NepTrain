@@ -55,6 +55,7 @@ from .sampling_route import (
     load_sampling_routes,
 )
 from .scientific_data import (
+    optional_dataset_issue,
     ScientificDataError,
     deduplicate_labeled_frames,
     labeled_input_structure_ids,
@@ -90,7 +91,6 @@ PredictionRunner = Callable[
     PredictionEvaluation,
 ]
 _DESCRIPTOR_BATCH_SIZE = 4096
-_CANDIDATE_VALIDATION_REGRESSION_FACTOR = 1.02
 _PREDICTION_METRIC_BASIS = "per_atom_v1"
 _LITE_SPIN_DESCRIPTOR = re.compile(
     r"^\s*spin_descriptor\s+spin_nep_lite\s*$", re.MULTILINE
@@ -301,24 +301,6 @@ def _within_thresholds(
     )
 
 
-def _threshold_score(
-    metrics: Mapping[str, float], thresholds: Mapping[str, Any]
-) -> float:
-    missing = sorted(name for name in thresholds if name not in metrics)
-    if missing:
-        raise WorkflowIterationError(
-            "model evaluation is missing metrics: " + ", ".join(missing)
-        )
-    return max(
-        (
-            float(metrics[name]) / float(limit)
-            for name, limit in thresholds.items()
-            if name in metrics
-        ),
-        default=float("inf"),
-    )
-
-
 def _acquisition_convergence_status(
     diagnostic: Mapping[str, Any],
     policy: Mapping[str, Any],
@@ -331,6 +313,9 @@ def _acquisition_convergence_status(
             "acquisition_convergence_configured": False,
             "acquisition_converged": False,
             "acquisition_convergence_streak": 0,
+            "convergence_reasons": [
+                "未配置 workflow.convergence，采样覆盖完成也不代表精度收敛。"
+            ],
         }
     thresholds = dict(policy.get("acquisition_max_rmse", {}))
     r2_thresholds = dict(policy.get("acquisition_min_r2", {}))
@@ -375,7 +360,7 @@ def _acquisition_convergence_status(
             and all(float(value) <= float(max_outliers) for value in outliers.values())
         )
     )
-    min_selected = int(policy.get("min_selected", 0))
+    min_selected = max(1, int(policy.get("min_selected", 1)))
     enough_evidence = int(diagnostic.get("evaluated_count", 0)) >= min_selected
     acquisition_accepted = bool(
         aggregate_rmse_accepted
@@ -390,6 +375,23 @@ def _acquisition_convergence_status(
     )
     streak = previous_streak + 1 if acquisition_accepted else 0
     required = int(policy.get("consecutive_generations", 1))
+    reasons = []
+    if not enough_evidence:
+        reasons.append(
+            f"本轮有效新标签 {int(diagnostic.get('evaluated_count', 0))}/{min_selected}，证据不足。"
+        )
+    if not aggregate_rmse_accepted:
+        reasons.append("新增结构的训练前 RMSE 未达到配置阈值或缺少指标。")
+    if not aggregate_r2_accepted:
+        reasons.append("新增结构的训练前 R² 未达到配置阈值或缺少指标。")
+    if not attempts_accepted:
+        reasons.append("部分采样轨迹的训练前 RMSE 未达到配置阈值。")
+    if not groups_accepted:
+        reasons.append("元素或温压条件分组的力 R² 未达标或缺少证据。")
+    if not outliers_accepted:
+        reasons.append("异常残差比例未达标或缺少证据。")
+    if acquisition_accepted and streak < required:
+        reasons.append(f"本轮精度达标，连续达标 {streak}/{required} 代，仍需采样确认。")
     return {
         "acquisition_convergence_configured": True,
         "acquisition_metrics": metrics,
@@ -404,6 +406,7 @@ def _acquisition_convergence_status(
         "acquisition_convergence_streak": streak,
         "acquisition_convergence_required": required,
         "acquisition_converged": streak >= required,
+        "convergence_reasons": reasons,
     }
 
 
@@ -594,41 +597,11 @@ class WorkflowIterationAdapter:
         requires_validation = (
             implementation_stage is None or implementation_stage == "evaluate"
         )
-        if (
-            requires_validation
-            and self.evaluation_configured
-            and not validation_value
-        ):
-            raise WorkflowIterationError(
-                "configured evaluation requires evaluation.validation_path"
-            )
         self.validation = (
             self._path(validation_value)
             if requires_validation and validation_value
             else None
         )
-        if self.validation is not None and not self.validation.is_file():
-            raise WorkflowIterationError(
-                f"validation dataset does not exist: {self.validation}"
-            )
-        thresholds = evaluation.get("max_rmse") if self.evaluation_configured else None
-        required_thresholds = {"energy_rmse", "force_rmse"}
-        if self.config.get("md", {}).get("spin", False):
-            required_thresholds.add("mforce_rmse")
-        missing_thresholds = sorted(required_thresholds - set(thresholds or {}))
-        requires_thresholds = (
-            implementation_stage is None
-            or implementation_stage in {"diagnose", "evaluate"}
-        )
-        if (
-            requires_thresholds
-            and self.evaluation_configured
-            and missing_thresholds
-        ):
-            raise WorkflowIterationError(
-                "post-retrain acceptance requires evaluation.max_rmse for "
-                + ", ".join(missing_thresholds)
-            )
         requires_training_config = (
             implementation_stage is None
             or implementation_stage == "retrain"
@@ -870,6 +843,69 @@ class WorkflowIterationAdapter:
             },
         )
 
+    def _validation_diagnostic(
+        self, model: Path, training: Path
+    ) -> tuple[PredictionEvaluation | None, dict[str, Any]]:
+        """Report optional test data; never use it as an acquisition gate."""
+        payload: dict[str, Any] = {
+            "evaluation_configured": self.evaluation_configured,
+            "evaluation_role": "diagnostic",
+            "validation_accepted": None,
+            "validation_independent": None,
+            "validation_overlap_count": 0,
+            "validation_warnings": [],
+            "evaluated_count": 0,
+            "spin_frame_count": 0,
+        }
+        if not self.evaluation_configured:
+            return None, payload
+        warnings = payload["validation_warnings"]
+        issue = optional_dataset_issue(self.validation, role="辅助测试集")
+        if issue:
+            warnings.append(issue)
+            return None, payload
+        training_ids = {structure_id(frame) for frame in _read_frames(training)}
+        try:
+            frames = _read_frames(self.validation)
+            _, spin_count = validate_spin_dataset(frames, require_mforce=True)
+            overlap = sum(structure_id(frame) in training_ids for frame in frames)
+            payload.update(
+                validation_overlap_count=overlap,
+                validation_independent=not bool(overlap),
+                evaluated_count=len(frames),
+                spin_frame_count=spin_count,
+            )
+            if overlap:
+                warnings.append(
+                    f"辅助测试集有 {overlap}/{len(frames)} 帧与训练集重叠；误差仅供参考，不影响采样和收敛。"
+                )
+            options = self.config.get("evaluation", {})
+            evaluation = self.runtime.predict(
+                model, frames, str(options.get("inference_backend", "auto"))
+            )
+            metrics = {name: float(value) for name, value in evaluation.metrics.items()}
+            if not metrics or not all(np.isfinite(value) for value in metrics.values()):
+                warnings.append(
+                    "辅助测试产生空或非有限误差，未判定验证通过；流程仍由采样证据决定。"
+                )
+                return None, payload
+            payload.update(metrics)
+            thresholds = dict(options.get("max_rmse", {}))
+            if thresholds:
+                passed = _within_thresholds(metrics, thresholds)
+                payload["validation_thresholds_met"] = passed
+                payload["validation_accepted"] = passed if not overlap else None
+                if not passed:
+                    warnings.append(
+                        "辅助测试误差未达到参考阈值；不阻止模型启用、采样或流程收敛。"
+                    )
+            return evaluation, payload
+        except Exception as error:
+            warnings.append(
+                f"辅助测试未完成：{type(error).__name__}: {error}；不影响采样判据。"
+            )
+            return None, payload
+
     def _adaptive_evaluate(self, context: StageContext) -> StageOutcome:
         """Qualify the generation model before it can drive acquisition."""
 
@@ -890,84 +926,25 @@ class WorkflowIterationAdapter:
 
         options = self.config.get("evaluation", {})
         thresholds = dict(options.get("max_rmse", {}))
-        evaluation: PredictionEvaluation | None = None
-        metrics: dict[str, float] = {}
-        validation_accepted: bool | None = None
-        parent_metrics: dict[str, float] | None = None
-        candidate_score: float | None = None
-        parent_score: float | None = None
-        candidate_limit: float | None = None
-        evaluated_count = 0
-        spin_count = 0
-        if self.evaluation_configured:
-            assert self.validation is not None
-            frames = _read_frames(self.validation)
-            _, spin_count = validate_spin_dataset(frames, require_mforce=True)
-            training_ids = {
-                structure_id(frame) for frame in _read_frames(training_input)
-            }
-            overlap = sum(structure_id(frame) in training_ids for frame in frames)
-            if overlap:
-                raise WorkflowIterationError(
-                    f"validation dataset overlaps the model training set by {overlap} frames"
-                )
-            evaluation = self.runtime.predict(
-                candidate,
-                frames,
-                str(options.get("inference_backend", "auto")),
-            )
-            metrics = {name: float(value) for name, value in evaluation.metrics.items()}
-            evaluated_count = len(frames)
-            validation_accepted = _within_thresholds(metrics, thresholds)
-            candidate_score = _threshold_score(metrics, thresholds)
-            parent = context.artifacts.get("parent_model")
-            if parent is not None:
-                parent_evaluation = self.runtime.predict(
-                    parent,
-                    frames,
-                    str(options.get("inference_backend", "auto")),
-                )
-                parent_metrics = {
-                    name: float(value)
-                    for name, value in parent_evaluation.metrics.items()
-                }
-                parent_score = _threshold_score(parent_metrics, thresholds)
-                parent_accepted = _within_thresholds(parent_metrics, thresholds)
-                candidate_limit = (
-                    1.0
-                    if parent_accepted
-                    else parent_score * _CANDIDATE_VALIDATION_REGRESSION_FACTOR
-                )
-                if candidate_score > candidate_limit:
-                    raise WorkflowIterationError(
-                        "trained candidate regressed on the independent validation set"
-                    )
-        finite = bool(candidate.is_file() and candidate.stat().st_size > 0) and all(
-            np.isfinite(float(value)) for value in metrics.values()
-        )
-        if not finite:
-            raise WorkflowIterationError(
-                "trained candidate is empty or produced non-finite evaluation metrics"
-            )
-        accepted = bool(
-            finite
-            and (
-                context.generation_kind != "finalization"
-                or validation_accepted is not False
-            )
-        )
+        evaluation, validation = self._validation_diagnostic(candidate, training_input)
+        metrics = dict(evaluation.metrics) if evaluation is not None else {}
+        validation_accepted = validation["validation_accepted"]
+        evaluated_count = validation["evaluated_count"]
+        spin_count = validation["spin_frame_count"]
+        if not candidate.is_file() or candidate.stat().st_size == 0:
+            raise WorkflowIterationError("trained candidate model is missing or empty")
+        accepted = True
         active_lineage = {
             **lineage,
             "active_model_sha256": candidate_sha256,
             "candidate_activation_accepted": True,
             "activation_basis": (
-                "finite independent validation metrics"
-                if self.evaluation_configured
-                else "successful training and non-empty model artifact"
+                "successful training; optional test is diagnostic only"
             ),
             "validation_accepted": validation_accepted,
         }
         evaluation_record = {
+            **validation,
             "version": 1,
             "generation": context.generation,
             "generation_kind": context.generation_kind,
@@ -978,10 +955,6 @@ class WorkflowIterationAdapter:
                 lineage.get("parent_model_sha256") != candidate_sha256
             ),
             "validation_accepted": validation_accepted,
-            "parent_validation_metrics": parent_metrics,
-            "candidate_validation_score": candidate_score,
-            "parent_validation_score": parent_score,
-            "candidate_validation_limit": candidate_limit,
             "evaluated_count": evaluated_count,
         }
         artifacts: dict[str, Path] = {
@@ -999,6 +972,7 @@ class WorkflowIterationAdapter:
                 "candidate_checkpoint"
             ]
         signals = {
+            **validation,
             **metrics,
             "prediction_metric_basis": _PREDICTION_METRIC_BASIS,
             "accepted": accepted,
@@ -1009,7 +983,8 @@ class WorkflowIterationAdapter:
             "spin_frame_count": spin_count,
             "active_model_sha256": candidate_sha256,
             "model_training_set_sha256": file_sha256(training_input),
-            "workflow_converged": context.generation_kind == "finalization" and accepted,
+            "workflow_converged": context.generation_kind == "finalization"
+            and accepted,
             "generation_disposition": (
                 "finalize" if context.generation_kind == "finalization" else None
             ),
@@ -1033,9 +1008,14 @@ class WorkflowIterationAdapter:
                 context.work_dir,
                 series=evaluation.comparisons,
                 source={
-                    "validation_name": self.validation.name if self.validation else None,
+                    "validation_name": (
+                        self.validation.name if self.validation else None
+                    ),
                     "candidate_model_sha256": candidate_sha256,
                     "evaluated_count": evaluated_count,
+                    "evaluation_role": "diagnostic",
+                    "validation_independent": validation["validation_independent"],
+                    "validation_overlap_count": validation["validation_overlap_count"],
                 },
             )
             artifacts["evaluation_parity_report"] = parity.report
@@ -2439,7 +2419,6 @@ class WorkflowIterationAdapter:
         )
         thresholds = dict(
             convergence_policy.get("acquisition_max_rmse", {})
-            or options.get("max_rmse", {})
         )
         quality_gate_configured = bool(thresholds)
         frames = _read_frames(context.artifacts["labeled"], allow_empty=True)
@@ -2631,11 +2610,7 @@ class WorkflowIterationAdapter:
             self.config.get("workflow", {}).get("convergence", {}),
             previous_signals,
         )
-        convergence_evidence = (
-            convergence["acquisition_converged"]
-            if convergence["acquisition_convergence_configured"]
-            else novelty_converged
-        )
+        convergence_evidence = convergence["acquisition_converged"]
         validation_accepted = evaluation.get("validation_accepted")
         history, production_ready = self._record_route_histories(
             context,
@@ -2649,6 +2624,21 @@ class WorkflowIterationAdapter:
         )
         sampling_complete = bool(production_ready and convergence_evidence)
         disposition = "finalize" if sampling_complete else "continue"
+        for route in history["routes"].values():
+            route["history"]["acquisition_pending"] = bool(
+                convergence["acquisition_convergence_configured"]
+                and not convergence["acquisition_converged"]
+            )
+        if not production_ready:
+            for route_id, route in history["routes"].items():
+                status = route["production_status"]
+                for temperature, coverage in status["by_temperature"].items():
+                    if coverage["coverage"] < status["minimum_coverage"]:
+                        convergence["convergence_reasons"].append(
+                            f"{route_id} / {temperature} K：当前模型生产覆盖 "
+                            f"{coverage['coverage']:.0%}，要求 ≥{status['minimum_coverage']:.0%}；"
+                            f"每个场景需 {status['minimum_successful_replicas']} 个成功副本。"
+                        )
         history.update(convergence)
         history.update(
             {
@@ -2695,6 +2685,7 @@ class WorkflowIterationAdapter:
                 "finalization_pending": sampling_complete,
                 "workflow_converged": False,
                 "production_ready": production_ready,
+                "scenario_counts_by_maturity": history["counts_by_maturity"],
             },
         )
 
@@ -2742,19 +2733,6 @@ class WorkflowIterationAdapter:
             context.artifacts["md_attempts"].read_text(encoding="utf-8")
         )["attempts"]
         failed_md = any(not bool(item["completed"]) for item in attempts)
-        previous_signals = (
-            json.loads(
-                context.previous_artifacts["signals"].read_text(
-                    encoding="utf-8"
-                )
-            )
-            if "signals" in context.previous_artifacts
-            else {}
-        )
-        continue_training = bool(
-            previous_signals.get("production_ready") is True
-            and previous_signals.get("validation_accepted") is False
-        )
         parent_model_sha256 = file_sha256(context.artifacts["model"])
         training_count = len(_read_frames(training_input))
         previous_training_count = len(
@@ -2766,7 +2744,6 @@ class WorkflowIterationAdapter:
             and (
                 failed_md
                 or not diagnostic.get("diagnostic_accepted", False)
-                or continue_training
             )
         )
         if not retrain_required:
@@ -3084,15 +3061,54 @@ class WorkflowIterationAdapter:
         )
         lineage_valid = bool(
             lineage.get("parent_model_sha256") == parent_model_sha256
-            and lineage.get("candidate_model_sha256")
-            == candidate_model_sha256
+            and lineage.get("candidate_model_sha256") == candidate_model_sha256
+            and (
+                (candidate_trained and lineage.get("trained_on_current_labels") is True)
+                or (
+                    retraining.get("retrained") is False
+                    and lineage.get("model_updated") is False
+                    and parent_model_sha256 == candidate_model_sha256
+                )
+            )
         )
         if not lineage_valid:
             raise WorkflowIterationError(
                 "evaluate received an inconsistent candidate model lineage"
             )
+        label_thresholds = (
+            self.config.get("workflow", {})
+            .get("convergence", {})
+            .get("acquisition_max_rmse", {})
+        )
+        candidate_attempt_metrics = {}
+        if candidate_trained and label_thresholds:
+            grouped: dict[str, list[Atoms]] = {}
+            for frame in labeled_frames:
+                attempt_id = frame.info.get("scenario_attempt_id")
+                if attempt_id is not None:
+                    grouped.setdefault(str(attempt_id), []).append(frame)
+            for attempt_id, frames in sorted(grouped.items()):
+                candidate_attempt_metrics[attempt_id] = dict(
+                    self.runtime.predict(
+                        candidate_model,
+                        frames,
+                        str(options.get("inference_backend", "auto")),
+                    ).metrics
+                )
         candidate_activation_accepted = bool(
-            not candidate_trained or candidate_finite
+            not candidate_trained
+            or (
+                candidate_finite
+                and bool(label_metrics)
+                and (
+                    not label_thresholds
+                    or _within_thresholds(label_metrics, label_thresholds)
+                )
+                and all(
+                    _within_thresholds(values, label_thresholds)
+                    for values in candidate_attempt_metrics.values()
+                )
+            )
         )
         active_model = (
             candidate_model
@@ -3148,6 +3164,21 @@ class WorkflowIterationAdapter:
         workflow_converged = bool(
             production_ready and convergence["acquisition_converged"]
         )
+        for route in history["routes"].values():
+            route["history"]["acquisition_pending"] = bool(
+                convergence["acquisition_convergence_configured"]
+                and not convergence["acquisition_converged"]
+            )
+        if not production_ready:
+            for route_id, route in history["routes"].items():
+                status = route["production_status"]
+                for temperature, coverage in status["by_temperature"].items():
+                    if coverage["coverage"] < status["minimum_coverage"]:
+                        convergence["convergence_reasons"].append(
+                            f"{route_id} / {temperature} K：当前模型生产覆盖 "
+                            f"{coverage['coverage']:.0%}，要求 ≥{status['minimum_coverage']:.0%}；"
+                            f"每个场景需 {status['minimum_successful_replicas']} 个成功副本。"
+                        )
         history.update(convergence)
         history["workflow_converged"] = workflow_converged
         history["workflow_stalled"] = False
@@ -3161,38 +3192,38 @@ class WorkflowIterationAdapter:
             "candidate_model_sha256": candidate_model_sha256,
             "active_model_sha256": active_model_sha256,
             "candidate_activation_accepted": candidate_activation_accepted,
-            "activation_basis": "finite_new_label_metrics_without_independent_validation",
+            "activation_basis": "new_label_metrics; optional test is diagnostic only",
             "model_updated": active_model_sha256 != parent_model_sha256,
             "trained_on_current_labels": bool(
                 candidate_activation_accepted
                 and lineage.get("trained_on_current_labels")
             ),
-            "training_dataset_sha256": lineage.get(
-                "training_dataset_sha256"
-            ),
+            "training_dataset_sha256": lineage.get("training_dataset_sha256"),
             "training_count": lineage.get("training_count"),
         }
         signals = {
             **convergence,
-            "prediction_metric_basis": diagnostic.get(
-                "prediction_metric_basis"
-            ),
+            "prediction_metric_basis": diagnostic.get("prediction_metric_basis"),
             "accepted": True,
             "evaluation_configured": False,
             "validation_accepted": None,
-            "candidate_activation_accepted": (
-                candidate_activation_accepted
-            ),
+            "candidate_activation_accepted": (candidate_activation_accepted),
             "candidate_activation_reason": (
                 "current model reused; no candidate model update"
                 if not candidate_trained
                 else (
                     "candidate has finite metrics on newly labeled structures"
                     if candidate_activation_accepted
-                    else "candidate produced non-finite new-label metrics"
+                    else "candidate failed new-label metrics"
                 )
             ),
             "candidate_label_metrics": label_metrics,
+            "candidate_attempt_metrics": candidate_attempt_metrics,
+            "added_training_count": len(_read_frames(context.artifacts["training_set"]))
+            - len(_read_frames(context.artifacts["training_input"])),
+            "model_trained_on_current_labels": active_lineage[
+                "trained_on_current_labels"
+            ],
             "candidate_validation_metrics": None,
             "active_model_sha256": active_model_sha256,
             "parent_model_sha256": parent_model_sha256,
@@ -3201,9 +3232,7 @@ class WorkflowIterationAdapter:
             "remaining_novelty": remaining_novelty,
             "novelty_threshold": novelty_threshold,
             "novelty_converged": novelty_converged,
-            "scenario_counts_by_maturity": history[
-                "counts_by_maturity"
-            ],
+            "scenario_counts_by_maturity": history["counts_by_maturity"],
             "sampling_routes": [
                 {
                     "route_id": route.route_id,
@@ -3214,9 +3243,7 @@ class WorkflowIterationAdapter:
             "production_ready": production_ready,
             "workflow_converged": workflow_converged,
             "workflow_stalled": False,
-            "no_progress_rounds": int(
-                history.get("no_progress_rounds", 0)
-            ),
+            "no_progress_rounds": int(history.get("no_progress_rounds", 0)),
         }
         artifacts = {
             "activated_model": active_model,
@@ -3240,402 +3267,37 @@ class WorkflowIterationAdapter:
         return StageOutcome(artifacts=artifacts, metrics=signals)
 
     def _evaluate(self, context: StageContext) -> StageOutcome:
-        if not self.evaluation_configured:
-            return self._evaluate_without_validation(context)
-        options = self.config.get("evaluation", {})
-        assert self.validation is not None
-        frames = _read_frames(self.validation)
-        _, spin_count = validate_spin_dataset(frames, require_mforce=True)
-        training_ids = {
-            structure_id(frame)
-            for frame in _read_frames(context.artifacts["training_set"])
-        }
-        overlap = sum(structure_id(frame) in training_ids for frame in frames)
-        if overlap:
-            raise WorkflowIterationError(
-                f"validation dataset overlaps the merged training set by {overlap} frames"
-            )
-        inference_backend = str(options.get("inference_backend", "auto"))
-        thresholds = dict(options.get("max_rmse", {}))
-        parent_model = context.artifacts["model"]
-        candidate_model = context.artifacts["retrained_model"]
-        parent_model_sha256 = file_sha256(parent_model)
-        candidate_model_sha256 = file_sha256(candidate_model)
-        parent_evaluation = self.runtime.predict(
-            parent_model,
-            frames,
-            inference_backend,
+        outcome = self._evaluate_without_validation(context)
+        evaluation, validation = self._validation_diagnostic(
+            outcome.artifacts["activated_model"], context.artifacts["training_set"]
         )
-        parent_metrics = dict(parent_evaluation.metrics)
-        parent_finite = all(
-            np.isfinite(float(value)) for value in parent_metrics.values()
-        )
-        parent_validation_accepted = _within_thresholds(
-            parent_metrics, thresholds
-        )
-        parent_validation_score = _threshold_score(
-            parent_metrics, thresholds
-        )
-        previous_signals = (
-            json.loads(
-                context.previous_artifacts["signals"].read_text(
-                    encoding="utf-8"
-                )
-            )
-            if "signals" in context.previous_artifacts
-            else {}
-        )
-        previous_validation_score = previous_signals.get("validation_score")
-        training_before = _read_frames(context.artifacts["training_input"])
-        training_after = _read_frames(context.artifacts["training_set"])
-        added_count = len(training_after) - len(training_before)
-        retraining = json.loads(
-            context.artifacts["retraining_decision"].read_text(encoding="utf-8")
-        )
-        lineage = json.loads(
-            context.artifacts["model_lineage"].read_text(encoding="utf-8")
-        )
-        lineage_valid = bool(
-            lineage.get("parent_model_sha256") == parent_model_sha256
-            and lineage.get("candidate_model_sha256")
-            == candidate_model_sha256
-            and (
-                (
-                    retraining.get("retrained") is True
-                    and lineage.get("trained_on_current_labels") is True
-                )
-                or (
-                    retraining.get("retrained") is False
-                    and lineage.get("model_updated") is False
-                    and lineage.get("parent_model_sha256")
-                    == candidate_model_sha256
-                )
-            )
-        )
-        if not lineage_valid:
-            raise WorkflowIterationError(
-                "evaluate received an inconsistent candidate model lineage"
-            )
-
-        candidate_updated = bool(
-            lineage.get("model_updated")
-            and candidate_model_sha256 != parent_model_sha256
-        )
-        candidate_trained = retraining.get("retrained") is True
-        candidate_evaluation = (
-            self.runtime.predict(
-                candidate_model,
-                frames,
-                inference_backend,
-            )
-            if candidate_trained
-            else parent_evaluation
-        )
-        candidate_metrics = dict(candidate_evaluation.metrics)
-        candidate_finite = all(
-            np.isfinite(float(value)) for value in candidate_metrics.values()
-        )
-        candidate_validation_accepted = _within_thresholds(
-            candidate_metrics, thresholds
-        )
-        candidate_validation_score = _threshold_score(
-            candidate_metrics, thresholds
-        )
-        labeled_frames = _read_frames(
-            context.artifacts["labeled"], allow_empty=True
-        )
-        candidate_label_metrics: dict[str, float] = {}
-        candidate_label_attempt_metrics: dict[
-            str, dict[str, float]
-        ] = {}
-        candidate_label_attempt_accepted: dict[str, bool] = {}
-        candidate_label_accepted = True
-        if candidate_trained:
-            candidate_label_metrics = {
-                name: float(value)
-                for name, value in self.runtime.predict(
-                    candidate_model,
-                    labeled_frames,
-                    inference_backend,
-                ).metrics.items()
-            }
-            candidate_label_accepted = _within_thresholds(
-                candidate_label_metrics, thresholds
-            )
-            grouped_labels: dict[str, list[Atoms]] = {}
-            for frame in labeled_frames:
-                attempt_id = frame.info.get("scenario_attempt_id")
-                if attempt_id is not None:
-                    grouped_labels.setdefault(str(attempt_id), []).append(
-                        frame
-                    )
-            for attempt_id, attempt_frames in sorted(
-                grouped_labels.items()
-            ):
-                attempt_metrics = {
-                    name: float(value)
-                    for name, value in self.runtime.predict(
-                        candidate_model,
-                        attempt_frames,
-                        inference_backend,
-                    ).metrics.items()
-                }
-                candidate_label_attempt_metrics[
-                    attempt_id
-                ] = attempt_metrics
-                candidate_label_attempt_accepted[
-                    attempt_id
-                ] = _within_thresholds(attempt_metrics, thresholds)
-            candidate_label_accepted = bool(
-                candidate_label_accepted
-                and all(candidate_label_attempt_accepted.values())
-            )
-
-        if not candidate_trained:
-            candidate_activation_accepted = True
-            activation_reason = "current model reused; no candidate model update"
-            candidate_validation_limit = parent_validation_score
-        else:
-            candidate_validation_limit = (
-                1.0
-                if parent_validation_accepted
-                or not parent_finite
-                else (
-                    parent_validation_score
-                    * _CANDIDATE_VALIDATION_REGRESSION_FACTOR
-                )
-            )
-            validation_gate = bool(
-                candidate_finite
-                and candidate_validation_score
-                <= candidate_validation_limit
-            )
-            candidate_activation_accepted = bool(
-                candidate_finite
-                and candidate_label_accepted
-                and validation_gate
-            )
-            if not candidate_finite:
-                activation_reason = (
-                    "candidate validation produced non-finite metrics"
-                )
-            elif not candidate_label_accepted:
-                activation_reason = (
-                    "candidate failed the newly labeled structure canary"
-                )
-            elif not validation_gate:
-                activation_reason = (
-                    "candidate regressed on the independent validation set"
-                )
-            else:
-                activation_reason = (
-                    "candidate passed new-label and independent validation gates"
-                )
-
-        if candidate_activation_accepted:
-            active_model = candidate_model
-            metrics = candidate_metrics
-            active_model_sha256 = candidate_model_sha256
-            active_checkpoint = (
-                context.artifacts.get("retrained_checkpoint")
-                if candidate_trained
-                else context.artifacts.get("checkpoint")
-            )
-        else:
-            active_model = parent_model
-            metrics = parent_metrics
-            active_model_sha256 = parent_model_sha256
-            active_checkpoint = context.artifacts.get("checkpoint")
-        finite = all(np.isfinite(float(value)) for value in metrics.values())
-        validation_accepted = _within_thresholds(metrics, thresholds)
-        validation_score = _threshold_score(metrics, thresholds)
-        accepted = bool(frames and finite)
-
-        diagnostic = json.loads(
-            context.artifacts["acquisition_signals"].read_text(encoding="utf-8")
-        )
-        selection = json.loads(
-            context.artifacts["selection_result"].read_text(encoding="utf-8")
-        )
-        novelty_threshold = float(
-            selection.get(
-                "resolved_completion_coverage_threshold",
-                context.plan.completion_coverage_threshold,
-            )
-        )
-        remaining_novelty = float(selection.get("remaining_novelty", 0.0))
-        novelty_converged = bool(remaining_novelty <= novelty_threshold)
-        comparison_validation_score = (
-            float(previous_validation_score)
-            if previous_validation_score is not None
-            else parent_validation_score
-        )
-        validation_improved = bool(
-            active_model_sha256 != parent_model_sha256
-            and validation_score < comparison_validation_score * 0.99
-        )
-        signals = {
-            **metrics,
-            "prediction_metric_basis": _PREDICTION_METRIC_BASIS,
-            "accepted": accepted,
-            "evaluation_configured": True,
-            "validation_accepted": validation_accepted,
-            "validation_score": validation_score,
-            "previous_validation_score": previous_validation_score,
-            "validation_improved": validation_improved,
-            "evaluated_count": len(frames),
-            "spin_frame_count": spin_count,
-            "added_training_count": added_count,
-            "model_trained_on_current_labels": bool(
-                candidate_activation_accepted
-                and lineage.get("trained_on_current_labels")
-            ),
-            "active_model_sha256": active_model_sha256,
-            "parent_model_sha256": parent_model_sha256,
-            "candidate_model_sha256": candidate_model_sha256,
-            "candidate_model_updated": candidate_updated,
-            "candidate_activation_accepted": candidate_activation_accepted,
-            "candidate_activation_reason": activation_reason,
-            "candidate_validation_metrics": candidate_metrics,
-            "candidate_validation_score": candidate_validation_score,
-            "candidate_validation_limit": candidate_validation_limit,
-            "candidate_validation_regression_factor": (
-                _CANDIDATE_VALIDATION_REGRESSION_FACTOR
-            ),
-            "candidate_validation_accepted": candidate_validation_accepted,
-            "candidate_label_metrics": candidate_label_metrics,
-            "candidate_label_attempt_metrics": (
-                candidate_label_attempt_metrics
-            ),
-            "candidate_label_attempt_accepted": (
-                candidate_label_attempt_accepted
-            ),
-            "candidate_label_accepted": candidate_label_accepted,
-            "parent_validation_metrics": parent_metrics,
-            "parent_validation_score": parent_validation_score,
-            "parent_validation_accepted": parent_validation_accepted,
-            "parent_validation_finite": parent_finite,
-            "model_updated": active_model_sha256 != parent_model_sha256,
-            "remaining_novelty": remaining_novelty,
-            "novelty_threshold": novelty_threshold,
-            "novelty_converged": novelty_converged,
-            "validation_path": str(self.validation),
-        }
-        active_lineage = {
-            "version": 1,
-            "generation": context.generation,
-            "parent_model_sha256": parent_model_sha256,
-            "candidate_model_sha256": candidate_model_sha256,
-            "active_model_sha256": active_model_sha256,
-            "candidate_activation_accepted": candidate_activation_accepted,
-            "activation_reason": activation_reason,
-            "model_updated": active_model_sha256 != parent_model_sha256,
-            "trained_on_current_labels": bool(
-                candidate_activation_accepted
-                and lineage.get("trained_on_current_labels")
-            ),
-            "training_dataset_sha256": lineage.get(
-                "training_dataset_sha256"
-            ),
-            "training_count": lineage.get("training_count"),
-            "pending_label_count": (
-                0
-                if candidate_activation_accepted
-                and lineage.get("trained_on_current_labels")
-                else added_count
-            ),
-        }
-        artifacts = {
-            "activated_model": active_model,
-            "active_model_lineage": atomic_write_json(
-                context.work_dir / "active-model-lineage.json",
-                active_lineage,
-            ),
-        }
-        if active_checkpoint is not None:
-            artifacts["activated_checkpoint"] = active_checkpoint
-        attempt = 1
-        while (context.work_dir / f"signals-attempt-{attempt}.json").exists():
-            attempt += 1
-        recovering = (context.work_dir / "signals.json").exists()
-        suffix = f"-attempt-{attempt}" if recovering else ""
-        final_model_id = active_model_sha256
-        history, production_ready = self._record_route_histories(
-            context,
-            diagnostic=diagnostic,
-            validation_metrics=metrics,
-            evidence_validation=parent_metrics,
-            validation_accepted=validation_accepted,
-            model_improved=validation_improved,
-            novelty_converged=novelty_converged,
-            final_model_id=final_model_id,
-        )
-        convergence = _acquisition_convergence_status(
-            diagnostic,
-            self.config.get("workflow", {}).get("convergence", {}),
-            previous_signals,
-        )
-        convergence_evidence = (
-            convergence["acquisition_converged"]
-            if convergence["acquisition_convergence_configured"]
-            else novelty_converged
-        )
-        workflow_converged = bool(
-            validation_accepted and production_ready and convergence_evidence
-        )
-        workflow_stalled = bool(
-            not workflow_converged
-            and int(history.get("no_progress_rounds", 0)) >= 2
-        )
-        history.update(convergence)
-        history["workflow_converged"] = workflow_converged
-        history["workflow_stalled"] = workflow_stalled
-        maturity_path = atomic_write_json(
-            context.work_dir / f"scenario-maturity{suffix}.json", history
-        )
-        artifacts["scenario_maturity"] = maturity_path
-        signals.update(
-            **convergence,
-            scenario_counts_by_maturity=history["counts_by_maturity"],
-            sampling_routes=[
-                {
-                    "route_id": route.route_id,
-                    "route_fingerprint": route.fingerprint,
-                }
-                for route in self.routes
-            ],
-            production_ready=production_ready,
-            workflow_converged=workflow_converged,
-            workflow_stalled=workflow_stalled,
-            no_progress_rounds=int(history.get("no_progress_rounds", 0)),
-        )
-        output = atomic_write_json(context.work_dir / f"signals{suffix}.json", signals)
-        artifacts["signals"] = output
-        report = build_evaluation_report(
-            context.work_dir,
-            metrics=candidate_metrics,
-            thresholds=thresholds,
-            parent_metrics=parent_metrics,
-            suffix=suffix,
-        )
-        artifacts["evaluation_report"] = report.report
-        if report.chart is not None:
-            artifacts["evaluation_chart"] = report.chart
-        if candidate_evaluation.comparisons:
-            parity = build_parity_report(
+        signals = {**outcome.metrics, **validation}
+        artifacts = dict(outcome.artifacts)
+        atomic_write_json(artifacts["signals"], signals)
+        if evaluation is not None:
+            report = build_evaluation_report(
                 context.work_dir,
-                series=candidate_evaluation.comparisons,
-                source={
-                    "validation_name": self.validation.name,
-                    "validation_sha256": file_sha256(self.validation),
-                    "candidate_model_sha256": candidate_model_sha256,
-                    "evaluated_count": len(frames),
-                },
-                suffix=suffix,
+                metrics=evaluation.metrics,
+                thresholds=self.config.get("evaluation", {}).get("max_rmse", {}),
             )
-            artifacts["evaluation_parity_report"] = parity.report
-            if parity.chart is not None:
-                artifacts["evaluation_parity"] = parity.chart
+            artifacts["evaluation_report"] = report.report
+            if report.chart is not None:
+                artifacts["evaluation_chart"] = report.chart
+            if evaluation.comparisons:
+                parity = build_parity_report(
+                    context.work_dir,
+                    series=evaluation.comparisons,
+                    source={
+                        "validation_name": self.validation.name,
+                        "active_model_sha256": signals["active_model_sha256"],
+                        "evaluated_count": validation["evaluated_count"],
+                        "evaluation_role": "diagnostic",
+                        "validation_independent": validation["validation_independent"],
+                    },
+                )
+                artifacts["evaluation_parity_report"] = parity.report
+                if parity.chart is not None:
+                    artifacts["evaluation_parity"] = parity.chart
         return StageOutcome(artifacts=artifacts, metrics=signals)
 
 

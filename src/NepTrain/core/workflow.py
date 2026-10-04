@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
 import shlex
@@ -16,6 +17,7 @@ from typing import Any, Mapping
 import uuid
 
 from .content_addressing import canonical_sha256, file_sha256
+from .scientific_data import optional_dataset_issue
 from .generation_policy import (
     ACTIVE_LEARNING_GENERATION_PROTOCOL,
     ADAPTIVE_GENERATION_PROTOCOL,
@@ -577,15 +579,20 @@ def prepare_workflow(
         role="initial training",
         expect_spin=expect_spin,
     )
-    for role, raw_path in (
-        ("training test", config.get("training", {}).get("test_path")),
-        ("evaluation validation", config.get("evaluation", {}).get("validation_path")),
+    for section, key, role in (
+        ("training", "test_path", "训练测试集"),
+        ("evaluation", "validation_path", "辅助测试集"),
     ):
+        raw_path = config.get(section, {}).get(key)
         if raw_path:
+            path = Path(str(raw_path))
+            issue = optional_dataset_issue(path, role=role)
+            if issue:
+                logging.getLogger(__name__).warning(issue)
+                config[section].pop(key, None)
+                continue
             _validate_labeled_dataset_for_preparation(
-                Path(str(raw_path)),
-                role=role,
-                expect_spin=expect_spin,
+                path, role=role, expect_spin=expect_spin,
             )
     labeling_target_name = config["execution"]["stage_targets"]["labeling"]
     labeling_target = config["execution"]["targets"][labeling_target_name]
@@ -705,6 +712,11 @@ def prepare_workflow(
             *existing["plans"],
             *existing.get("dependencies", []),
         ]:
+            if record.get("role") in {"training_test", "evaluation_validation"}:
+                issue = optional_dataset_issue(Path(record["path"]), role=record["role"])
+                if issue:
+                    logging.getLogger(__name__).warning(issue)
+                    continue
             if not _record_matches(record):
                 raise WorkflowError(
                     f"prepared workflow artifact drifted: {record['path']}"
@@ -854,6 +866,11 @@ def _validated_manifest(preparation: WorkflowPreparation) -> dict[str, Any]:
         *manifest["plans"],
         *manifest.get("dependencies", []),
     ]:
+        if record.get("role") in {"training_test", "evaluation_validation"}:
+            issue = optional_dataset_issue(Path(record["path"]), role=record["role"])
+            if issue:
+                logging.getLogger(__name__).warning(issue)
+                continue
         if not _record_matches(record):
             raise WorkflowError(
                 f"prepared workflow artifact drifted: {record['path']}"
@@ -1182,19 +1199,20 @@ def _generation_science(
             "selected_count": select.get("selected_count"),
             "regular_batch_minimum": select.get("regular_batch_minimum"),
             "batch_kind": select.get("batch_kind"),
-            "sampling_model_sha256": explore.get(
-                "sampling_model_sha256"
-            ),
+            "sampling_model_sha256": explore.get("sampling_model_sha256"),
             "counts_by_stratum": dict(select.get("counts_by_stratum", {})),
             "labeled_count": label.get("labeled_count"),
         },
         "training": {
             "before_count": train.get("training_count"),
             "merged_count": merge.get("training_count"),
-            "after_count": retrain.get(
-                "training_count", train.get("training_count")
+            "after_count": merge.get(
+                "training_count",
+                retrain.get("training_count", train.get("training_count")),
             ),
-            "added_count": evaluate.get("added_training_count", merge.get("added_count")),
+            "added_count": evaluate.get(
+                "added_training_count", merge.get("added_count")
+            ),
             "model_updated": evaluate.get(
                 "model_updated", retrain.get("model_updated")
             ),
@@ -1213,28 +1231,29 @@ def _generation_science(
             "acquisition_convergence_required": decision.get(
                 "acquisition_convergence_required"
             ),
-            "generation_disposition": decision.get(
-                "generation_disposition"
-            ),
+            "generation_disposition": decision.get("generation_disposition"),
             "accepted": evaluate.get("accepted"),
             "validation_count": evaluate.get("evaluated_count"),
+            "validation_thresholds_met": evaluate.get("validation_thresholds_met"),
+            "validation_independent": evaluate.get("validation_independent"),
+            "validation_warnings": list(evaluate.get("validation_warnings", [])),
+            "convergence_reasons": list(decision.get("convergence_reasons", [])),
+            "production_ready": decision.get("production_ready"),
+            "workflow_converged": decision.get("workflow_converged"),
+            "finalization_pending": decision.get("finalization_pending"),
             "spin_validation_count": evaluate.get("spin_frame_count"),
         },
         "scenarios": {
             "target_maturities": tuple(explore.get("scenario_targets", ())),
             "attempted_steps": tuple(explore.get("scenario_steps", ())),
-            "attempted_temperatures": tuple(
-                explore.get("scenario_temperatures", ())
-            ),
+            "attempted_temperatures": tuple(explore.get("scenario_temperatures", ())),
             "attempted_temperatures_by_route": {
                 str(route_id): tuple(values)
                 for route_id, values in dict(
                     explore.get("scenario_temperatures_by_route", {})
                 ).items()
             },
-            "counts_by_maturity": dict(
-                decision.get("scenario_counts_by_maturity", {})
-            ),
+            "counts_by_maturity": dict(decision.get("scenario_counts_by_maturity", {})),
         },
     }
 
@@ -1734,6 +1753,13 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             f"neptrain workflow extend {workflow_path} "
             f"{int(manifest.get('sampling_generation_budget', len(preparation.plans))) + 1}"
         )
+    elif controller_state == "coverage_exhausted":
+        state = "coverage_exhausted"
+        reason = str(
+            controller.get(
+                "reason", "no sampling tasks remain; convergence is not established"
+            )
+        )
     elif controller_state == "stalled":
         state = "stalled"
         reason = str(controller.get("reason", "workflow made no progress"))
@@ -1836,10 +1862,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         jobs=tuple(jobs),
         notifications=notification_summary,
         updated_at=(
-            str(
-                controller.get("heartbeat_at")
-                or controller.get("started_at")
-            )
+            str(controller.get("heartbeat_at") or controller.get("started_at"))
             if controller.get("heartbeat_at") or controller.get("started_at")
             else None
         ),
@@ -1849,15 +1872,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             generations,
             base_dir=workspace.root,
         ),
-        precision_basis=(
-            "validation"
-            if config.get("evaluation", {}).get("validation_path")
-            else (
-                "acquisition"
-                if config.get("workflow", {}).get("convergence")
-                else None
-            )
-        ),
+        precision_basis="acquisition",
     )
 
 

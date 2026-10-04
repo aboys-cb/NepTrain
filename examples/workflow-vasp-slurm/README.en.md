@@ -8,7 +8,7 @@ This tutorial is for first-time NepTrain users on Slurm. It exercises a real:
 
 ```text
 seed data → student training → GPUMD sampling → FPS → VASP labeling
-          → dataset merge → student retraining → evaluation
+          → pre-training accuracy assessment → dataset merge → next generation or final training
 ```
 
 The example uses Al and VASP for real labels on newly selected structures. The
@@ -41,7 +41,7 @@ The script creates:
 | File | Purpose |
 |---|---|
 | `train.xyz` | 24 seed structures with energy, forces, and virial |
-| `validation.xyz` | 4 independent tutorial evaluation structures |
+| `validation.xyz` | 4 optional tutorial test structures |
 | `structures/al.xyz` | Initial structure for GPUMD |
 
 These labels come from ASE EMT and only validate workflow mechanics. For
@@ -164,13 +164,17 @@ neptrain workflow stop vasp-tutorial-workflow
 
 | Location | Contents |
 |---|---|
-| `generations/0001/md/` | GPUMD trajectories and health report |
+| `generations/0001/explore/` | GPUMD trajectories and health report |
 | `generations/0001/select/` | FPS selections and report |
 | `generations/0001/label/selected-labels.xyz` | New VASP labels |
 | `generations/0001/label/label-provenance.json` | VASP inputs and resource provenance |
-| `generations/0001/dataset/` | Merged training set |
-| `generations/0001/retrain/` | Retrained model and PNG convergence plot |
-| `generations/0001/evaluate/` | Evaluation result and PNG plots |
+| `generations/0001/update/` | Merged training set |
+| `generations/0001/train/` | Sampling model and PNG convergence plot |
+| `generations/0001/evaluate/` | Pre-training prediction error on newly labeled structures |
+
+`evaluation` is diagnostic only and does not block progression. Acquisition accuracy thresholds live in
+`workflow.convergence`; the example values are for the tutorial only. Final training requires accuracy,
+production coverage, and the configured passing streak. Optional test reports are in `generations/0001/validate/`.
 
 The example sets `max_model_generations: 1`. A final `budget_exhausted` state
 means the tutorial used its one-generation budget; it is not a Slurm or VASP

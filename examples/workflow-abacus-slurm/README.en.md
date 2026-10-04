@@ -8,7 +8,7 @@ This tutorial is for first-time NepTrain users on Slurm. It exercises:
 
 ```text
 seed data → student training → GPUMD sampling → FPS → ABACUS labeling
-          → dataset merge → student retraining → evaluation
+          → pre-training accuracy assessment → dataset merge → next generation or final training
 ```
 
 The example uses Al with an ABACUS plane-wave basis. The repository does not
@@ -151,13 +151,17 @@ neptrain workflow stop abacus-tutorial-workflow
 
 | Location | Contents |
 |---|---|
-| `generations/0001/md/` | GPUMD trajectories and health report |
+| `generations/0001/explore/` | GPUMD trajectories and health report |
 | `generations/0001/select/` | FPS selection result |
 | `generations/0001/label/selected-labels.xyz` | New ABACUS labels |
 | `generations/0001/label/label-provenance.json` | INPUT, UPF/ORB hashes, and backend provenance |
-| `generations/0001/dataset/` | Merged training set |
-| `generations/0001/retrain/` | Retrained model and PNG convergence plot |
-| `generations/0001/evaluate/` | Evaluation result and PNG plots |
+| `generations/0001/update/` | Merged training set |
+| `generations/0001/train/` | Sampling model and PNG convergence plot |
+| `generations/0001/evaluate/` | Pre-training prediction error on newly labeled structures |
+
+`evaluation` is diagnostic only and does not block progression. Acquisition accuracy thresholds live in
+`workflow.convergence`; the example values are for the tutorial only. Final training requires accuracy,
+production coverage, and the configured passing streak. Optional test reports are in `generations/0001/validate/`.
 
 A final `budget_exhausted` state means the example used its one-generation
 budget. Determine real failures from stage/job states and logs.

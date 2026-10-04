@@ -48,6 +48,7 @@ labeling:
   structures_per_job: 1
   max_concurrent: 2
 
+# Optional diagnostic test; it does not control workflow convergence.
 evaluation:
   validation_path: ./validation.xyz
   inference_backend: auto
@@ -58,6 +59,13 @@ evaluation:
 workflow:
   id: abacus-tutorial-workflow
   max_model_generations: 1
+  # Tutorial values only; choose accuracy targets for your own system.
+  convergence:
+    acquisition_max_rmse:
+      energy_rmse: 0.2  # eV/atom
+      force_rmse: 0.5  # eV/Angstrom
+    min_selected: 1
+    consecutive_generations: 1
   seed: 20260727
 
 execution:

@@ -288,3 +288,20 @@ def test_workspace_rejects_previous_layout_versions(tmp_path: Path):
 
     with pytest.raises(ValueError, match="unsupported workflow layout"):
         WorkflowWorkspace.locate(root)
+
+
+@pytest.mark.parametrize("contents", [None, "", " \n\t"])
+def test_snapshot_drops_unavailable_optional_paths(tmp_path, contents):
+    workspace = WorkflowWorkspace.create(tmp_path / "workflow")
+    initial = tmp_path / "initial.xyz"
+    initial.write_text("required data")
+    optional = tmp_path / "optional.xyz"
+    if contents is not None:
+        optional.write_text(contents)
+    snapshot, initial_copy = workspace.snapshot_inputs({
+        "training": {"test_path": str(optional)},
+        "evaluation": {"validation_path": str(optional)},
+    }, initial)
+    assert initial_copy.read_text() == "required data"
+    assert "test_path" not in snapshot["training"]
+    assert "validation_path" not in snapshot["evaluation"]

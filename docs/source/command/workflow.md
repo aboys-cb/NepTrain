@@ -8,6 +8,20 @@
 - [MACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-mace)
 - [TACE 蒸馏](https://github.com/aboys-cb/NepTrain/tree/master/examples/distillation-tace)
 
+## 本地 smoke 验证
+
+无需 GPU、Slurm 或 DFT 程序，可以先运行：
+
+```bash
+neptrain smoke --profile recovery --workflow --output ./outputs/workflow-smoke
+```
+
+`--workflow` 使用正式 `active_learning_v3` 适配器检查 9 个固定场景：无辅助测试、测试路径不存在、空测试文件、测试重叠、测试误差超限、测试预测异常、MD 失败恢复、覆盖完成后继续累计达标轮数，以及有效标签不足。训练、MD 和预测使用确定性的本地替身，标注使用 Toy Teacher；它检查流程契约，不代表真实模型精度或集群运行验证。该组场景固定每代最多选 8 帧，`--max-selected` 只控制基础 smoke 和旧迭代 smoke。
+
+命令输出一个 JSON，`workflow.passed` 和 `workflow.checks` 给出检查结果；详细记录位于 `workflow/workflow-smoke-report.json`，各场景目录保留 ledger、`science.json`、`result.json` 和 `notifications.txt`。通知仅生成文本，不向飞书发送。重复运行请更换输出目录，或显式使用 `--force` 替换这个 smoke 目录。
+
+原有 `--iterations N` 保留为旧 Toy 迭代器的确定性与恢复检查，可与 `--workflow` 同时使用；单独通过旧迭代 smoke 不代表新版收敛流程已被覆盖。
+
 ## 创建项目
 
 ```bash
@@ -256,7 +270,7 @@ workflow:
 ```
 
 这套判据只使用“本轮 FPS 选出的最远结构、DFT 标注之后、并入训练集之前”的旧模型
-预测，避免拿训练过同一批结构的模型证明自己收敛。默认要求至少 50 个有效标签；整批
+预测，避免拿训练过同一批结构的模型证明自己收敛。上例要求至少 50 个有效标签（省略 `min_selected` 时为 1，空标签不计入连续达标）；整批
 Energy/Force/Virial 的 R²、每个元素的 Force R²、每个实际温压条件的 Force R² 都要
 过线，同时三倍参考标准差之外的残差比例不能超过 `max_outlier_fraction`。对常量切片，
 完全一致记为 R²=1，否则记为 0，避免未定义值被误判为通过。`acquisition_max_rmse`
@@ -268,9 +282,11 @@ Energy/Force/Virial 的 R²、每个元素的 Force R²、每个实际温压条�
 体系的固定阈值：上例是通用起点，声子、弹性或高精度热力学任务仍应使用面向目标性质
 的独立验证集。能量和 virial 的 RMSE 单位为 `eV/atom`，力为 `eV/Å`。
 
-未配置 `workflow.convergence` 且没有独立验证的流程仍会停在
-`coverage_exhausted`：它只表示当前描述符和采样路径已找不到覆盖缺口，不等价于
-模型已经通过物理精度验证。
+`workflow.convergence.min_selected` 不能大于 `sampling.selection.max_selected`（选样上限省略时为 100）。配置校验会拒绝这种无法满足的收敛要求，并提示提高选样上限或降低最低标签数。
+
+未配置 `workflow.convergence` 时，不会自动判定精度收敛，即使辅助测试误差很小也一样。
+`coverage_exhausted` 只表示当前采样路径没有可调度任务；`budget_exhausted` 表示采样代数预算用尽。
+两者都不是成功。若生产覆盖已达标但采样精度或连续达标轮数不足，会继续安排生产条件采样，直到判据通过或预算用尽。
 
 这里的“一代”严格绑定一个模型哈希。新建流程使用 `active_learning_v3`，采样代按
 `train → validate → explore → select → label → evaluate → update` 推进：先用上一代
@@ -282,7 +298,7 @@ scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交�
 
 采样判据通过后，本代仍会先合并最后一批 DFT 标签，但不会把已看过这些标签的模型
 用于收敛判断。Controller 随后创建一个 `finalization` 代，只执行
-`train → validate`：在最终完整训练集上训练并验收最终模型，不再运行 MD、FPS 或 DFT。
+`train → validate`：在最终完整训练集上训练最终模型并检查产物与来源一致性，不再运行 MD、FPS 或 DFT。
 `complete` 只由这个终代产生。为保证最后一个采样代也能自动完成，准备 workflow 时会
 在 `max_model_generations` 个采样预算之外预留一个终代；若采样预算用尽仍未通过，预留
 代不会被误用作普通采样。
@@ -411,8 +427,7 @@ stress 会按 `-stress × volume` 转为 virial，TACE 直接输出的 virial �
 `neptrain label` 或 workflow 启动标注。
 
 这一路径在调度上完全替代 DFT，但报告会保留 `teacher_model` 来源，避免把蒸馏
-标签误称为 DFT 标签。若配置独立 `evaluation.validation_path`，最终验收仍以该
-参考集为准。
+标签误称为 DFT 标签。`evaluation.validation_path` 仅提供辅助测试报告，不决定流程是否继续或收敛。
 
 ## 准备和运行
 
@@ -480,7 +495,7 @@ neptrain workflow restart fe-workflow \
 `diagnose`。CLI 不对这个有歧义的名称做猜测或静默转换，`--dry-run` 会列出实际
 复用和重算的阶段。
 
-默认状态页优先显示当前代次、采样温度路径、实际 MD 进度和历代验证精度。例如：
+默认状态页优先显示当前代次、采样温度路径、实际 MD 进度和新增标签的训练前预测精度。例如：
 
 ```text
 NepTrain · Fe-spin
@@ -491,7 +506,7 @@ NepTrain · Fe-spin
 采样进度：
 300 K ✓ → 500 K ● 3.2/10 ps（2/4 条轨迹完成）→ 700 K ○
 
-验证集精度：
+新增 DFT 预测精度（训练前）：
 代    状态    E/meV·atom⁻¹  F/meV·Å⁻¹    V/meV·atom⁻¹  M/meV/μB    验收
 G1    完成    18.0           210           41.0           168          通过
 G2    完成    14.2 ↓21%      176 ↓16%      35.0 ↓15%      149 ↓11%     通过
@@ -499,9 +514,8 @@ G3    采样中  -             -             -             -            等待
 ```
 
 ps 进度来自 MD 已写出的实际 step 和模板中的有效 timestep，不使用墙钟时间估算；
-远端文件暂时不可见时会明确显示“ps 暂不可读”。未配置独立验证集时，状态页不把
-训练误差冒充为泛化精度；若配置了 `workflow.convergence`，这里改为显示旧模型对
-本轮新增 DFT 标签的训练前误差，否则显示“暂无可比较数据”。
+远端文件暂时不可见时会明确显示“ps 暂不可读”。精度表始终优先显示采样模型对本轮新增标签的训练前误差。
+辅助测试单独标注“仅供参考”；重叠和预测失败会提示。收敛判断同时说明标签数、精度、连续达标或生产覆盖方面还缺少什么证据。
 
 `--jobs` 按“代次 + 阶段 + attempt”压缩同一批任务。即使同时运行 20 个 MD 或
 100 个 DFT 标注任务，也只显示每批的完成、运行、等待和失败计数；逐任务结构仍
@@ -535,16 +549,17 @@ workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 
 - `budget_exhausted`：模型代数预算耗尽，先 `workflow extend`，不是成功。
 - `stalled`：当前执行不能通过普通 `resume` 继续；检查原因后可用
   `workflow restart --from ...` 明确选择重算位置，或者修改策略后新建 workflow。
-- `complete`：完整 stage 链和（若配置）独立 validation 已验收。
+- `complete`：采样精度和生产覆盖判据已通过，并完成最终训练与模型检查。
 
 `workflow.max_model_generations` 是采样代预算，不包含自动预留的最终训练代，也不是
-成功条件。配置 `evaluation` 时，最终训练代还必须通过独立 validation 才能完成。
-预算用尽但仍未收敛时状态为 `budget_exhausted`，连续两轮没有
-新覆盖或模型改进时状态为 `stalled`，都不会伪装成 `complete`。
+成功条件。辅助测试不阻止最终训练代完成。预算用尽但仍未收敛时状态为 `budget_exhausted`，
+没有可调度采样任务时为 `coverage_exhausted`，都不会伪装成 `complete`。
 
-`evaluation` 可以整块省略。此时 workflow 仍可采样、标注、重训和记录场景证据，
-但 `validation_accepted` 保持为空，流程不会伪造 validation passed，也不会把
-该模型标成已完成独立验证。
+`training.test_path` 和整个 `evaluation` 都可省略。前者供训练后端输出测试误差；后者的
+`validation_path` 用于辅助测试，`max_rmse` 只是可选参考阈值，不会回填到采样收敛阈值。
+辅助测试缺失、与训练集重叠、误差超限或预测失败，都不参与重训、模型启用、额外采样和收敛决策。
+重叠帧数、参考阈值结果和告警会保留；未提供测试、预测失败或存在重叠时，`validation_accepted` 保持为空。
+这两个可选数据集未配置、文件为空（包括仅含空白字符）或路径不存在时，跳过对应测试；已配置但不可用时提示，不阻塞准备、训练、任务打包或恢复。主训练数据、模型产物和新增标签仍必须有效；非空测试文件仍进行格式与标签校验。
 
 默认停止 Controller，并取消当前 process 或 Slurm 作业：
 
@@ -583,7 +598,7 @@ generations/0001/
 训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；
 `calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 Matplotlib
 从 `loss.out` 自动生成 `training-convergence.png` 和可审计的
-`training-report.json`。配置独立验证集时，validate 还会生成按验收阈值归一化的
+`training-report.json`。配置辅助测试集和参考阈值时，validate 还会生成按参考阈值归一化的
 `evaluation-metrics.png` 与 `evaluation-report.json`；图中 1× 线就是配置阈值。
 同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction parity 图
 `evaluation-parity.png`，spin 模型会增加 magnetic-force 面板。对应报告记录

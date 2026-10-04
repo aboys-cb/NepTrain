@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import fcntl
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -26,6 +27,7 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from .content_addressing import canonical_sha256, file_sha256
+from .scientific_data import optional_dataset_issue
 from .generation_policy import stage_implementation, stage_sequence_for_kind
 from .iteration import GenerationPlan, StageContext, StageOutcome
 from .persistence import atomic_write_json
@@ -674,14 +676,8 @@ def build_stage_task(
         and resolved_stage_input.get("generation_kind", "legacy") == "legacy"
     ):
         path_fields.clear()
-    evaluation = portable_config.get("evaluation", {})
     if implementation_stage == "evaluate":
-        validation_field = (
-            "evaluation.validation_path"
-            if evaluation.get("validation_path")
-            else "training.test_path"
-        )
-        path_fields.add(validation_field)
+        path_fields.add("evaluation.validation_path")
     all_path_fields = {
         dotted
         for fields in _STAGE_CONFIG_PATH_FIELDS.values()
@@ -708,6 +704,12 @@ def build_stage_task(
         ):
             continue
         source = _resolve_path(value, workflow_root)
+        if dotted in {"training.test_path", "evaluation.validation_path"}:
+            issue = optional_dataset_issue(source, role=dotted)
+            if issue:
+                logging.getLogger(__name__).warning(issue)
+                _delete_dotted(portable_config, dotted)
+                continue
         suffix = source.suffix if source.is_file() else ""
         destination = inputs / "config" / dotted.replace(".", "/")
         if suffix:

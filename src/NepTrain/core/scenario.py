@@ -529,9 +529,8 @@ class ScenarioLadder:
                         )
                     )
 
-        # If the complete frontier still misses the global validation target,
-        # run cheap additional production probes instead of pretending success.
-        if not candidates and state.get("validation_accepted") is False:
+        # Continue collecting independent sampling evidence after coverage is complete.
+        if not candidates and state.get("acquisition_pending") is True:
             for structure in structures:
                 for temperature in self.production_temperatures:
                     identifier = _scenario_id(
@@ -804,7 +803,6 @@ class ScenarioLadder:
         state["no_progress_rounds"] = (
             0
             if progress_made
-            or validation_accepted is True
             or not novelty_converged
             else int(state.get("no_progress_rounds", 0)) + 1
         )

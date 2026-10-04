@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -11,6 +12,7 @@ import tempfile
 from typing import Any, Mapping
 
 from .content_addressing import canonical_sha256, file_sha256
+from .scientific_data import optional_dataset_issue
 from .generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
     generation_stage_sequence,
@@ -259,6 +261,14 @@ class WorkflowWorkspace:
             if value in {None, "", "auto"}:
                 return
             source = Path(value)
+            if (section, key) in {
+                ("training", "test_path"), ("evaluation", "validation_path")
+            }:
+                issue = optional_dataset_issue(source, role=f"{section}.{key}")
+                if issue:
+                    logging.getLogger(__name__).warning(issue)
+                    snapshot[section].pop(key, None)
+                    return
             if not source.is_file():
                 return
             target = self.inputs_dir / f"{relative}{source.suffix}"

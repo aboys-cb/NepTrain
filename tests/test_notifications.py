@@ -291,3 +291,77 @@ def test_worker_does_not_block_controller_and_deduplicates(tmp_path: Path):
         workspace.notification_state.read_text(encoding="utf-8")
     )
     assert state["events"][event.event_id]["state"] == "delivered"
+
+
+def test_notification_prioritizes_acquisition_and_explains_test_warning():
+    event = _generation_event(
+        "Fe",
+        5,
+        {"generation": 2, "max_selected": 10},
+        {
+            "kind": "acquisition",
+            "stage_sequence": [
+                "train",
+                "validate",
+                "explore",
+                "select",
+                "label",
+                "evaluate",
+                "update",
+            ],
+            "complete": True,
+            "accepted": True,
+            "stages": {
+                "evaluate": {
+                    "metrics": {
+                        "prediction_metric_basis": "per_atom_v1",
+                        "current_model_force_rmse": 0.08,
+                    }
+                },
+                "validate": {
+                    "metrics": {
+                        "prediction_metric_basis": "per_atom_v1",
+                        "force_rmse": 0.5,
+                        "validation_warnings": ["辅助测试重叠，仅供参考"],
+                    }
+                },
+                "update": {
+                    "metrics": {
+                        "convergence_reasons": ["连续达标 1/2 代，仍需采样确认。"]
+                    }
+                },
+            },
+        },
+    )
+    assert "新增 DFT 预测 RMSE（训练前）" in event.text
+    assert "F=80 meV/Å" in event.text
+    assert "F=500 meV/Å" not in event.text
+    assert "提示：辅助测试重叠，仅供参考" in event.text
+    assert "继续原因：连续达标 1/2 代" in event.text
+
+
+def test_v3_notification_reports_merged_training_count():
+    event = _generation_event(
+        "Fe",
+        8,
+        {"generation": 1, "max_selected": 8},
+        {
+            "kind": "acquisition",
+            "complete": True,
+            "accepted": True,
+            "stage_sequence": [
+                "train",
+                "validate",
+                "explore",
+                "select",
+                "label",
+                "evaluate",
+                "update",
+            ],
+            "stages": {
+                "train": {"metrics": {"training_count": 4}},
+                "update": {"metrics": {"training_count": 12, "added_count": 8}},
+            },
+        },
+    )
+    assert "训练集：4 → 12（+8）" in event.text

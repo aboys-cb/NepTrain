@@ -220,7 +220,8 @@ def init_project(
                 path.chmod(0o755)
     print(
         f"Created {project}. Add train.xyz, nep.in and route structures; "
-        "optionally configure evaluation, then run "
+        "set workflow.convergence thresholds for automatic convergence "
+        "(evaluation is optional and diagnostic only), then run "
         "`neptrain doctor --project project.yaml`."
     )
     return project

@@ -8,7 +8,7 @@
 
 ```text
 初始数据 → Student 训练 → GPUMD 采样 → FPS → VASP 标注
-        → 合并数据 → Student 重训 → 验收
+        → 训练前精度评估 → 合并数据 → 决定继续采样或最终训练
 ```
 
 本例使用 Al，VASP 负责新结构的真实标注。仓库不能分发 VASP 或 POTCAR；你需要
@@ -41,7 +41,7 @@ python ../prepare_al_seed.py --output-dir .
 | 文件 | 用途 |
 |---|---|
 | `train.xyz` | 24 个带 energy/forces/virial 的初始训练结构 |
-| `validation.xyz` | 4 个独立的教程验收结构 |
+| `validation.xyz` | 4 个教程辅助测试结构 |
 | `structures/al.xyz` | GPUMD 的起始结构 |
 
 这些标签来自 ASE EMT，只用于验证 workflow 机械过程。正式计算必须把
@@ -179,13 +179,17 @@ neptrain workflow stop vasp-tutorial-workflow
 
 | 位置 | 内容 |
 |---|---|
-| `generations/0001/md/` | GPUMD 轨迹和健康报告 |
+| `generations/0001/explore/` | GPUMD 轨迹和健康报告 |
 | `generations/0001/select/` | FPS 选择结果和选择报告 |
 | `generations/0001/label/selected-labels.xyz` | VASP 新标签 |
 | `generations/0001/label/label-provenance.json` | VASP 输入和资源来源 |
-| `generations/0001/dataset/` | 合并后的训练集 |
-| `generations/0001/retrain/` | 重训模型和训练曲线 PNG |
-| `generations/0001/evaluate/` | 验收结果和评估图 PNG |
+| `generations/0001/update/` | 合并后的训练集 |
+| `generations/0001/train/` | 本代采样模型和训练曲线 PNG |
+| `generations/0001/evaluate/` | 新增标签的训练前预测误差 |
+
+`evaluation` 只输出辅助测试，不阻止流程继续；采样精度阈值在 `workflow.convergence` 中。
+示例阈值仅供教程使用。只有精度、生产覆盖和连续达标要求都满足，才会进入最终训练。
+辅助测试报告位于 `generations/0001/validate/`。
 
 本例把 `max_model_generations` 设为 `1`。状态最后出现 `budget_exhausted` 表示
 教程设定的一代预算已经用完，不等于 Slurm 或 VASP 失败。真正失败会在 stage/job

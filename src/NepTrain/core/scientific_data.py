@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 from ase import Atoms
@@ -27,6 +28,23 @@ LABEL_MATCH_ATOL = 1e-6
 
 class ScientificDataError(ValueError):
     """Raised when scientific input or output violates the data contract."""
+
+
+def optional_dataset_issue(path: Path | None, *, role: str) -> str | None:
+    """Explain why an optional dataset should be skipped, without reading all frames."""
+    if path is None:
+        reason = "未配置路径"
+    else:
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(8192):
+                    if chunk.strip():
+                        return None
+            reason = "文件为空"
+        except OSError as error:
+            reason = f"文件不可用（{error}）"
+    location = f"，路径：{path}" if path is not None else ""
+    return f"{role}已跳过：{reason}{location}；不阻止主流程。"
 
 
 def _canonical_float64(value: object) -> bytes:

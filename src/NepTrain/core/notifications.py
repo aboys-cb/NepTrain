@@ -233,11 +233,26 @@ def _generation_event(
     training = science["training"]
     validation_quality = science["quality"]["validation_rmse"]
     acquisition_quality = science["quality"]["acquisition_rmse"]
-    has_validation = any(
-        value is not None for value in validation_quality.values()
+    has_acquisition = any(value is not None for value in acquisition_quality.values())
+    quality = acquisition_quality if has_acquisition else validation_quality
+    quality_label = (
+        "新增 DFT 预测 RMSE（训练前）"
+        if has_acquisition
+        else "辅助测试 RMSE（仅供参考）"
     )
-    quality = validation_quality if has_validation else acquisition_quality
-    quality_label = "验证 RMSE" if has_validation else "新增 DFT 预测 RMSE（训练前）"
+    decision_lines = [
+        *(
+            f"提示：{warning}"
+            for warning in science["quality"].get("validation_warnings", [])
+        ),
+        *(
+            f"继续原因：{reason}"
+            for reason in science["quality"].get("convergence_reasons", [])
+        ),
+    ]
+    if science["quality"].get("finalization_pending"):
+        decision_lines.append("下一步：采样精度与生产覆盖已通过，进入最终训练。")
+
     stages = record.get("stages", {})
     label_metrics = (
         stages.get("label", {}).get("metrics", {})
@@ -255,12 +270,9 @@ def _generation_event(
             "🎯 [NepTrain] 最终模型已就绪",
             *_workflow_identity(workflow_id, workflow_path),
             f"最终代：G{generation}（计划上限 G{total_generations}）",
-            (
-                "最终训练集："
-                f"{_number(training.get('after_count'))} 个结构"
-            ),
-            "结果：最终模型已验收",
-            "说明：本代仅执行收尾训练与验证，不再运行 MD、FPS 或 DFT",
+            ("最终训练集：" f"{_number(training.get('after_count'))} 个结构"),
+            "结果：采样判据已通过，最终模型训练完成",
+            "说明：本代仅执行收尾训练与模型检查，不再运行 MD、FPS 或 DFT；辅助测试不参与收敛判断",
         ]
         model = training.get("active_model_sha256")
         if model:
@@ -276,7 +288,7 @@ def _generation_event(
             )
         return NotificationEvent(
             f"generation:{generation}:accepted",
-            "\n".join(lines),
+            "\n".join([*lines, *decision_lines]),
         )
     lines = [
         f"{icon} [NepTrain] G{generation}/{total_generations} 完成",
@@ -316,7 +328,7 @@ def _generation_event(
         lines.insert(-1, f"模型：{str(model)[:12]}")
     return NotificationEvent(
         f"generation:{generation}:accepted",
-        "\n".join(lines),
+        "\n".join([*lines, *decision_lines]),
     )
 
 
@@ -382,7 +394,12 @@ def _terminal_event(
     if state != "complete":
         lines.append(f"原因：{detail}")
     if state != "complete":
-        lines.append("已完成的科学结果和失败证据均保留，可检查后 resume")
+        advice = {
+            "budget_exhausted": "采样预算已用尽；检查精度与覆盖缺口后用 workflow extend 增加预算。",
+            "coverage_exhausted": "当前采样路径已无新任务，但尚未证明收敛；检查采样条件和 workflow.convergence。",
+            "stalled": "检查停滞原因；需要重算时先用 workflow restart --dry-run 预览影响范围。",
+        }.get(state, "已完成结果和失败证据均保留；排除日志中的故障后可用 workflow resume 继续。")
+        lines.append(advice)
     event_id = (
         "workflow:complete"
         if state == "complete"

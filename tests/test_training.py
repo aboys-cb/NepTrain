@@ -325,3 +325,28 @@ def test_training_rejects_model_that_nepadapters_cannot_load(tmp_path: Path, mon
             ),
             "torchnep",
         )
+
+
+@pytest.mark.parametrize("contents", [None, "", " \n\t"])
+def test_gpumd_skips_unavailable_test_and_stale_copy(tmp_path, monkeypatch, caplog, contents):
+    train_file = tmp_path / "train.xyz"
+    write(train_file, Atoms("Fe", cell=[4, 4, 4], pbc=True), format="extxyz")
+    config = tmp_path / "nep.in"
+    config.write_text("cutoff 6 4\n")
+    optional = tmp_path / "optional.xyz"
+    if contents is not None:
+        optional.write_text(contents)
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "test.xyz").write_text("stale test from previous run")
+
+    def fake_run(command, *, stdout, stderr, cwd, check):
+        assert not (Path(cwd) / "test.xyz").exists()
+        (Path(cwd) / "nep.txt").write_text("nep4 1 Fe\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("NepTrain.core.training.subprocess.run", fake_run)
+    monkeypatch.setitem(sys.modules, "nep_adapters", _ordinary_model_adapter())
+    result = train(TrainingRequest(config, train_file, output, test_file=optional), "gpumd")
+    assert result.best_model.is_file()
+    assert "训练测试集已跳过" in caplog.text

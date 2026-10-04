@@ -113,6 +113,7 @@ def test_acquisition_convergence_requires_every_attempt_and_a_streak():
         "consecutive_generations": 2,
     }
     diagnostic = {
+        "evaluated_count": 1,
         "current_model_energy_rmse": 0.002,
         "current_model_force_rmse": 0.08,
         "current_model_virial_rmse": 0.02,
@@ -645,8 +646,20 @@ def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
     )
 
 
-def test_finalization_does_not_complete_when_independent_validation_fails(
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        "overlap",
+        "high_error",
+        "nonfinite",
+        "prediction_error",
+        "no_thresholds",
+        "omitted",
+    ],
+)
+def test_finalization_test_is_diagnostic_only(
     tmp_path,
+    test_case,
 ):
     teacher = ToyTeacher("ordinary")
     merged = tmp_path / "merged.xyz"
@@ -670,7 +683,14 @@ def test_finalization_does_not_complete_when_independent_validation_fails(
         model.write_text("final\n", encoding="utf-8")
         return TrainingResult(backend, model, None, None)
 
+    if test_case == "overlap":
+        validation.write_bytes(merged.read_bytes())
+
     def failing_predict(_model, frames, _backend):
+        if test_case == "prediction_error":
+            raise RuntimeError("test predictor unavailable")
+        if test_case == "nonfinite":
+            return PredictionEvaluation({"energy_rmse": float("nan")})
         force = np.concatenate([frame.get_forces() for frame in frames])
         return PredictionEvaluation(
             {"energy_rmse": 0.2, "force_rmse": 0.5},
@@ -691,6 +711,10 @@ def test_finalization_does_not_complete_when_independent_validation_fails(
         "md": {"spin": False},
         "workflow": {},
     }
+    if test_case == "omitted":
+        config.pop("evaluation")
+    elif test_case == "no_thresholds":
+        config["evaluation"].pop("max_rmse")
     train_adapter = WorkflowIterationAdapter(
         config,
         initial_training=None,
@@ -736,8 +760,18 @@ def test_finalization_does_not_complete_when_independent_validation_fails(
         ),
     )
 
-    assert outcome.metrics["accepted"] is False
-    assert outcome.metrics["workflow_converged"] is False
+    assert outcome.metrics["accepted"] is True
+    assert outcome.metrics["workflow_converged"] is True
+    assert outcome.metrics["validation_accepted"] is (
+        False if test_case == "high_error" else None
+    )
+    assert bool(outcome.metrics["validation_warnings"]) is (
+        test_case not in {"omitted", "no_thresholds"}
+    )
+    if test_case == "overlap":
+        assert outcome.metrics["validation_overlap_count"] == 1
+        assert outcome.metrics["validation_independent"] is False
+    assert outcome.artifacts["activated_model"].read_text().strip() == "final"
 
 
 def test_descriptor_backend_receives_every_frame_in_bounded_batches(tmp_path):
@@ -1465,7 +1499,16 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
                 "mforce_rmse": 0.5,
             },
         },
-        "workflow": {},
+        "workflow": {
+            "convergence": {
+                "acquisition_max_rmse": {
+                    "energy_rmse": 0.5,
+                    "force_rmse": 0.5,
+                    "virial_rmse": 0.5,
+                    "mforce_rmse": 0.5,
+                }
+            }
+        },
     }
     config["sampling"]["selection"]["novelty"] = {
         "selection_threshold": 0.0,
@@ -1514,7 +1557,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     md_attempts = json.loads(summary.artifacts["md_attempts"].read_text())
     assert all(item["completed"] for item in md_attempts["attempts"])
     assert len([call for call in calls if call[0] == "train"]) == 2
-    assert len([call for call in calls if call[0] == "predict"]) == 6
+    assert len([call for call in calls if call[0] == "predict"]) == 5
     assert calls[0] == ("train", "torchnep", "cuda")
     assert training_requests[0].config_file == config_file
     assert training_requests[1].config_file.name == "torchnep-finetune.in"
@@ -1563,10 +1606,13 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     overlap_adapter = WorkflowIterationAdapter(
         overlap_config, initial_training=initial, runtime=runtime
     )
-    with pytest.raises(WorkflowIterationError, match="overlaps"):
-        GenerationController(
-            tmp_path / "overlap-workflow", "overlap"
-        ).run_generation(plan, overlap_adapter)
+    overlap_result = GenerationController(
+        tmp_path / "overlap-workflow", "overlap"
+    ).run_generation(plan, overlap_adapter)
+    assert overlap_result.accepted
+    assert overlap_result.metrics["evaluate"]["validation_overlap_count"] == 3
+    assert overlap_result.metrics["evaluate"]["validation_accepted"] is None
+    assert overlap_result.metrics["evaluate"]["validation_warnings"]
 
     unsafe_config = {
         **config,
@@ -1575,10 +1621,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
             "max_rmse": {},
         },
     }
-    with pytest.raises(WorkflowIterationError, match="mforce_rmse"):
-        WorkflowIterationAdapter(
-            unsafe_config, initial_training=initial, runtime=runtime
-        )
+    WorkflowIterationAdapter(unsafe_config, initial_training=initial, runtime=runtime)
 
     fallback_config = {
         **config,
@@ -1592,12 +1635,14 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
             if key != "validation_path"
         },
     }
-    with pytest.raises(
-        WorkflowIterationError, match="evaluation.validation_path"
-    ):
-        WorkflowIterationAdapter(
-            fallback_config, initial_training=initial, runtime=runtime
-        )
+    adapter = WorkflowIterationAdapter(
+        fallback_config, initial_training=initial, runtime=runtime
+    )
+    assert adapter.validation is None
+    evaluation, diagnostic = adapter._validation_diagnostic(initial, initial)
+    assert evaluation is None
+    assert diagnostic["validation_warnings"]
+    assert diagnostic["evaluated_count"] == 0
     assert all(request.test_file is None for request in training_requests)
 
 
@@ -2311,6 +2356,8 @@ def test_candidate_model_must_pass_activation_before_the_next_round(
             if model.read_text(encoding="utf-8").strip() == "candidate"
             else 2.0
         )
+        if not np.allclose(_frames[0].positions, labeled_frames[0].positions):
+            value = 100.0  # Optional test fails even for a sound new-label candidate.
         return PredictionEvaluation(
             {"energy_rmse": value, "force_rmse": value}
         )
@@ -2325,6 +2372,11 @@ def test_candidate_model_must_pass_activation_before_the_next_round(
                 template=config_file,
             ),
             "labeling": {"backend": "toy"},
+            "workflow": {
+                "convergence": {
+                    "acquisition_max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0}
+                }
+            },
             "evaluation": {
                 "validation_path": str(validation),
                 "max_rmse": {"energy_rmse": 1.0, "force_rmse": 1.0},
@@ -2412,6 +2464,8 @@ def test_candidate_model_must_pass_activation_before_the_next_round(
         )
     )
 
+    assert outcome.metrics["validation_accepted"] is False
+    assert outcome.metrics["validation_warnings"]
     assert outcome.metrics["accepted"] is True
     assert (
         outcome.metrics["candidate_activation_accepted"]
@@ -2752,3 +2806,14 @@ def test_workflow_label_routes_production_dft_through_label_interface(
         "origin": None,
         "labeled_count": 2,
     }
+
+
+def test_empty_acquisition_cannot_advance_convergence_streak():
+    result = _acquisition_convergence_status(
+        {"evaluated_count": 0, "current_model_force_rmse": 0.0},
+        {"acquisition_max_rmse": {"force_rmse": 0.1}, "consecutive_generations": 2},
+        {"acquisition_convergence_streak": 1},
+    )
+    assert result["acquisition_converged"] is False
+    assert result["acquisition_convergence_streak"] == 0
+    assert "证据不足" in result["convergence_reasons"][0]

@@ -739,6 +739,14 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 raise ConfigError(
                     "workflow.convergence.min_selected must be a positive integer"
                 )
+            max_selected = int(selection.get("max_selected", 100))
+            if min_selected > max_selected:
+                raise ConfigError(
+                    f"workflow.convergence.min_selected ({min_selected}) exceeds "
+                    f"sampling.selection.max_selected ({max_selected}); "
+                    "convergence is impossible: increase max_selected or lower "
+                    "min_selected"
+                )
             consecutive = convergence.get("consecutive_generations", 1)
             if (
                 isinstance(consecutive, bool)
@@ -788,19 +796,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
                         "route's production_ready replica count"
                     )
     if evaluation:
-        if not evaluation.get("validation_path"):
-            raise ConfigError(
-                "evaluation.validation_path is required when evaluation is configured"
-            )
         thresholds = dict(evaluation.get("max_rmse") or {})
-        required = {"energy_rmse", "force_rmse"}
-        if md.get("spin", False):
-            required.add("mforce_rmse")
-        missing = sorted(required - set(thresholds))
-        if missing:
-            raise ConfigError(
-                "evaluation.max_rmse is missing " + ", ".join(missing)
-            )
         if any(float(value) <= 0 for value in thresholds.values()):
             raise ConfigError("evaluation.max_rmse values must be positive")
 

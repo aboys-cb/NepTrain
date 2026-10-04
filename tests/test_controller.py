@@ -2721,7 +2721,7 @@ def test_controller_reports_exhausted_sampling_coverage(
         raise AssertionError("controller did not stop at exhausted coverage")
 
     assert controller.state["current"] is None
-    assert "independent validation" in controller.state["reason"]
+    assert "acquisition evidence" in controller.state["reason"]
     assert [stage for stage, _ in launches] == ["train"]
 
 
@@ -4948,7 +4948,35 @@ def test_internal_controller_failure_preserves_live_handle_for_resume(
     assert controller.state["current"]["handle"]["execution_id"] == "701999"
 
 
-def test_detached_controller_completes_a_real_multi_process_workflow(tmp_path):
+@pytest.mark.parametrize("slow_cleanup", [False, True])
+def test_detached_controller_completes_a_real_multi_process_workflow(
+    tmp_path, monkeypatch, slow_cleanup
+):
+    if slow_cleanup:
+        # Keep the actual child controller in its finalizer after it publishes
+        # completion, so the terminal-state/lock-release race is deterministic.
+        bootstrap = _write(
+            tmp_path / "slow_cleanup_controller.py",
+            """
+import time
+from NepTrain.core import notifications
+from NepTrain.cli.cli import main
+
+class SlowCleanupNotifier:
+    def observe(self, **kwargs):
+        pass
+
+    def close(self):
+        time.sleep(0.5)
+
+notifications.build_workflow_notifier = lambda *args: SlowCleanupNotifier()
+main()
+""",
+        )
+        monkeypatch.setattr(
+            "NepTrain.core.controller._controller_command",
+            lambda: [sys.executable, str(bootstrap)],
+        )
     config, initial = _controller_inputs(tmp_path)
     worker = _write(
         tmp_path / "portable_dummy_worker.py",
@@ -5038,13 +5066,17 @@ result = {
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         status = workflow_status(preparation.output_dir)
-        if status.state == "complete":
+        # Completion is persisted before notifier cleanup and lock release.
+        if status.state == "complete" and not controller_running(preparation.output_dir):
             break
         if status.state in {"failed", "rejected"}:
             raise AssertionError(status.reason)
         time.sleep(0.1)
     else:
-        raise AssertionError("detached controller did not complete")
+        raise AssertionError(
+            f"detached controller did not finish and release its lock: "
+            f"state={status.state}, running={controller_running(preparation.output_dir)}"
+        )
 
     assert not controller_running(preparation.output_dir)
     assert (preparation.output_dir / "results/nep.txt").is_file()
@@ -5215,3 +5247,56 @@ def test_start_controller_accepts_first_tick_state(tmp_path, monkeypatch):
     monkeypatch.setattr(controller_module.subprocess, "Popen", fake_popen)
 
     assert start_controller(preparation.output_dir) == 4321
+
+
+@pytest.mark.parametrize("stage,section,key", [
+    ("train", "training", "test_path"),
+    ("evaluate", "evaluation", "validation_path"),
+])
+@pytest.mark.parametrize("contents", [None, "", " \n\t"])
+def test_stage_bundle_skips_unavailable_optional_dataset(
+    tmp_path, caplog, stage, section, key, contents
+):
+    initial = _write_labeled(tmp_path / "initial.xyz")
+    optional = tmp_path / "optional.xyz"
+    if contents is not None:
+        optional.write_text(contents)
+    config = {section: {key: str(optional)}}
+    task = build_stage_task(
+        tmp_path / "tasks", workflow_root=tmp_path, workflow_id="optional",
+        generation=1, stage=stage, attempt=1,
+        target=ExecutionTarget("local", "process"), plan=_plan(),
+        config=config, initial_training=initial,
+        context=StageContext(
+            generation=1, generation_dir=tmp_path / "generation", plan=_plan(),
+            artifacts={}, previous_artifacts={},
+        ),
+    )
+    descriptor = json.loads(task.descriptor.read_text())
+    assert key not in descriptor["config"][section]
+    assert "已跳过" in caplog.text
+
+
+@pytest.mark.parametrize("role", ["training_test", "evaluation_validation"])
+@pytest.mark.parametrize("contents", [None, "", " \n\t"])
+def test_controller_and_status_allow_optional_snapshot_to_disappear(
+    tmp_path, role, contents, caplog
+):
+    from NepTrain.core.config import load_config, save_config
+
+    source, initial = _controller_inputs(tmp_path)
+    config, _ = load_config(source)
+    config["training"]["test_path"] = str(tmp_path / "validation.xyz")
+    save_config(config, source)
+    prepared = prepare_workflow(source, initial, tmp_path / "workflow")
+    manifest = json.loads(prepared.manifest.read_text())
+    record = next(row for row in manifest["dependencies"] if row["role"] == role)
+    optional = Path(record["path"])
+    if contents is None:
+        optional.unlink()
+    else:
+        optional.write_text(contents)
+    controller = PersistentController(prepared.output_dir)
+    assert controller.workflow_id == prepared.workflow_id
+    assert workflow_status(prepared.output_dir).workflow_id == prepared.workflow_id
+    assert "已跳过" in caplog.text
