@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 
 import matplotlib
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 
 from .content_addressing import file_sha256
@@ -468,6 +469,7 @@ def _parity_sample(
 
 def _parity_figure(
     series: Mapping[str, ParitySeries],
+    title: str,
 ) -> tuple[Figure, dict[str, dict[str, Any]]]:
     prepared: list[
         tuple[str, ParitySeries, np.ndarray, np.ndarray, np.ndarray]
@@ -479,7 +481,7 @@ def _parity_figure(
         )
         reference = values.reference[finite]
         predicted = values.predicted[finite]
-        if len(reference) < 2:
+        if len(reference) < 1:
             continue
         selected = _parity_sample(reference, predicted)
         rmse = float(
@@ -491,6 +493,8 @@ def _parity_figure(
             "finite_pairs": int(len(reference)),
             "plotted_pairs": int(len(selected)),
             "rmse": rmse,
+            "reference_range": [float(reference.min()), float(reference.max())],
+            "predicted_range": [float(predicted.min()), float(predicted.max())],
             "sampling": (
                 "all"
                 if len(selected) == len(reference)
@@ -501,9 +505,7 @@ def _parity_figure(
             (name, values, reference, predicted, selected)
         )
     if not prepared:
-        raise ValueError(
-            "no parity series contains at least two finite pairs"
-        )
+        raise ValueError("no parity series contains finite pairs")
 
     columns = 1 if len(prepared) == 1 else 2
     rows = math.ceil(len(prepared) / columns)
@@ -516,7 +518,7 @@ def _parity_figure(
             figure.subplots(rows, columns, squeeze=False)
         )
         figure.suptitle(
-            "Validation parity: reference versus candidate",
+            title,
             fontsize=16,
             fontweight="bold",
         )
@@ -525,6 +527,12 @@ def _parity_figure(
             "force": "Force components",
             "virial": "Virial components",
             "mforce": "Magnetic-force components",
+        }
+        colors = {
+            "energy": "#65ad65",
+            "force": "#9476b8",
+            "virial": "#e8a35a",
+            "mforce": "#5266bd",
         }
         for axis, (
             name,
@@ -546,7 +554,7 @@ def _parity_figure(
                 y,
                 s=9,
                 alpha=0.35,
-                color="#0072B2",
+                color=colors.get(name, "#0072B2"),
                 edgecolors="none",
                 rasterized=len(selected) > 5_000,
             )
@@ -562,19 +570,25 @@ def _parity_figure(
             axis.set_aspect("equal", adjustable="box")
             unit = f" ({values.unit})" if values.unit else ""
             axis.set_xlabel(f"Reference{unit}")
-            axis.set_ylabel(f"Candidate prediction{unit}")
+            axis.set_ylabel(f"Prediction{unit}")
             axis.set_title(
                 display_names.get(name, name),
                 loc="left",
                 pad=10,
             )
             panel = panels[name]
+            metric_scale = 1000 if values.unit.startswith("eV") else 1
+            metric_unit = (
+                values.unit.replace("eV", "meV", 1)
+                if metric_scale == 1000
+                else values.unit
+            )
             axis.text(
                 0.03,
                 0.97,
                 (
                     f"n={panel['finite_pairs']:,}\n"
-                    f"RMSE={panel['rmse']:.4g}"
+                    f"RMSE={panel['rmse'] * metric_scale:.4g} {metric_unit}"
                 ),
                 transform=axis.transAxes,
                 ha="left",
@@ -587,7 +601,29 @@ def _parity_figure(
                     "pad": 3,
                 },
             )
-            axis.grid(True, which="major")
+            residual = np.abs(predicted - reference) * metric_scale
+            inset = axis.inset_axes([0.61, 0.10, 0.34, 0.28])
+            limit = float(np.quantile(residual, 0.99)) * 1.05
+            limit = max(limit, 1e-12)
+            counts, edges = np.histogram(residual, bins=30, range=(0, limit))
+            density = counts / max(float(counts.max()), 1.0)
+            inset.stairs(
+                density, edges, fill=True, color=colors.get(name, "#0072B2"), alpha=0.65
+            )
+            inset.set_xlim(0, limit)
+            inset.set_yticks([])
+            inset.set_xlabel(f"Absolute error ({metric_unit})", fontsize=7, labelpad=2)
+            inset.xaxis.set_major_locator(MaxNLocator(3))
+            inset.tick_params(axis="x", labelsize=7)
+            inset.grid(False)
+            panel["error_histogram"] = {
+                "range": [0.0, limit],
+                "unit": metric_unit,
+                "counts": counts.tolist(),
+                "edges": edges.tolist(),
+                "outside_range": int(np.sum(residual > limit)),
+            }
+            axis.grid(False)
             axis.spines["top"].set_visible(False)
             axis.spines["right"].set_visible(False)
         for axis in axes.flat[len(prepared):]:
@@ -601,21 +637,24 @@ def build_parity_report(
     series: Mapping[str, ParitySeries],
     source: Mapping[str, Any] | None = None,
     suffix: str = "",
+    stem: str = "evaluation-parity",
+    title: str = "Auxiliary test: reference versus prediction",
 ) -> ReportArtifacts:
-    """Plot reference/prediction agreement for independent validation data."""
+    """Plot reference/prediction agreement without conflating dataset roles."""
 
-    report_path = output_dir / f"evaluation-parity-report{suffix}.json"
-    chart_path = output_dir / f"evaluation-parity{suffix}.png"
+    report_path = output_dir / f"{stem}-report{suffix}.json"
+    chart_path = output_dir / f"{stem}{suffix}.png"
     report: dict[str, Any] = {
         "version": 1,
         "kind": "evaluation_parity",
+        "title": title,
         "renderer": f"matplotlib-{matplotlib.__version__}",
         "status": "unavailable",
         "chart": None,
         "source": dict(source or {}),
     }
     try:
-        figure, panels = _parity_figure(series)
+        figure, panels = _parity_figure(series, title)
     except ValueError as error:
         report["reason"] = str(error)
         return ReportArtifacts(_write_json(report_path, report), None)
@@ -628,10 +667,192 @@ def build_parity_report(
     return ReportArtifacts(_write_json(report_path, report), chart_path)
 
 
+def build_training_parity_reports(
+    output_dir: Path,
+    *,
+    outputs: Mapping[str, Path],
+    backend: str,
+    model: Path | None,
+) -> dict[str, Path]:
+    """Reuse NEP prediction files: predicted columns precede reference columns."""
+    artifacts = {}
+    for split in ("train", "test"):
+        if split == "test" and not any(
+            f"{name}_test.out" in outputs
+            for name in ("energy", "force", "virial", "mforce")
+        ):
+            continue
+        series = {}
+        sources = {}
+        warnings = []
+        for name, width, unit in (
+            ("energy", 1, "eV/atom"),
+            ("force", 3, "eV/Å"),
+            ("virial", 6, "eV/atom"),
+            ("mforce", 3, "eV/μB"),
+        ):
+            path = outputs.get(f"{name}_{split}.out")
+            if path is None:
+                continue
+            try:
+                values = np.loadtxt(path, ndmin=2)
+                if values.shape[1] != width * 2:
+                    raise ValueError(
+                        f"expected {width * 2} columns, got {values.shape[1]}"
+                    )
+                predicted, reference = values[:, :width], values[:, width:]
+                if name == "virial":
+                    # NEP uses -1e6 for a missing virial reference.
+                    reference = np.where(reference == -1e6, np.nan, reference)
+                series[name] = ParitySeries(reference, predicted, unit)
+                sources[path.name] = file_sha256(path)
+            except (OSError, ValueError) as error:
+                warnings.append(f"{path.name}: {error}")
+        role = "final-epoch model" if backend == "torchnep" else "trainer output"
+        report = build_parity_report(
+            output_dir,
+            series=series,
+            stem=f"training-parity-{split}",
+            title=f"{'Training' if split == 'train' else 'Test'} set · {role}",
+            source={
+                "dataset_role": split,
+                "backend": backend,
+                "prediction_model_role": role,
+                "prediction_model_sha256": (
+                    file_sha256(model)
+                    if model is not None and model.is_file()
+                    else None
+                ),
+                "files": sources,
+                "column_order": "prediction_then_reference",
+                "warnings": warnings,
+            },
+        )
+        artifacts[report.report.name] = report.report
+        if report.chart is not None:
+            artifacts[report.chart.name] = report.chart
+    return artifacts
+
+
+def build_selection_pca_report(
+    output_dir: Path,
+    *,
+    descriptors: np.ndarray,
+    selected_indices: Sequence[int],
+    candidate_ids: Sequence[str],
+    source: Mapping[str, Any] | None = None,
+    stem: str = "selection-pca",
+) -> ReportArtifacts:
+    """Visualize eligible candidates in a shared PCA basis, without changing FPS."""
+    report_path = output_dir / f"{stem}-report.json"
+    chart_path = output_dir / f"{stem}.png"
+    points = np.asarray(descriptors, dtype=np.float64)
+    selected = np.asarray(selected_indices, dtype=int)
+    report = {
+        "version": 1,
+        "kind": "selection_pca",
+        "status": "unavailable",
+        "chart": None,
+        "source": dict(source or {}),
+        "candidate_ids": list(candidate_ids),
+        "selected_indices": selected.tolist(),
+        "preprocessing": "centered reduced candidate descriptors; no feature rescaling",
+        "scope": (source or {}).get(
+            "candidate_scope",
+            "eligible candidate pool after training-overlap removal and deduplication",
+        ),
+    }
+    if len(points) == 0:
+        report["reason"] = "no eligible candidate structures"
+        return ReportArtifacts(_write_json(report_path, report), None)
+    if (
+        points.ndim != 2
+        or len(points) != len(candidate_ids)
+        or points.shape[1] == 0
+        or not np.isfinite(points).all()
+    ):
+        raise ValueError("PCA requires finite descriptor rows matching candidate_ids")
+    if selected.ndim != 1 or np.any(selected < 0) or np.any(selected >= len(points)):
+        raise ValueError("selected indices are outside the candidate pool")
+    # Bound the PCA fit cost and plot density; every selected structure is still projected and shown.
+    fit_indices = np.linspace(0, len(points) - 1, min(len(points), 20_000), dtype=int)
+    fit = points[fit_indices]
+    center = fit.mean(axis=0)
+    centered = fit - center
+    _, singular, vectors = np.linalg.svd(centered, full_matrices=False)
+    components = np.zeros((2, points.shape[1]))
+    count = min(2, len(vectors))
+    components[:count] = vectors[:count]
+    for vector in components:
+        if vector[np.argmax(np.abs(vector))] < 0:
+            vector *= -1
+    coordinates = (points - center) @ components.T
+    variance = singular**2
+    total = float(variance.sum())
+    ratios = np.zeros(2)
+    if total > 0:
+        ratios[:count] = variance[:count] / total
+    with matplotlib.rc_context(_MATPLOTLIB_STYLE):
+        figure = Figure(figsize=(8, 6.2), layout="constrained")
+        axis = figure.subplots()
+        axis.scatter(
+            coordinates[fit_indices, 0],
+            coordinates[fit_indices, 1],
+            s=25,
+            color="#1f77b4",
+            alpha=0.45,
+            label="All candidate structures",
+        )
+        axis.scatter(
+            coordinates[selected, 0],
+            coordinates[selected, 1],
+            s=9,
+            color="#ff7f0e",
+            label="Selected structures",
+            zorder=3,
+        )
+        axis.set_xlabel(f"PC1 ({ratios[0]:.1%} variance)")
+        axis.set_ylabel(f"PC2 ({ratios[1]:.1%} variance)")
+        axis.set_title(
+            f"Selection coverage · {len(selected)} / {len(points)} structures",
+            loc="left",
+        )
+        if len(fit_indices) < len(points):
+            axis.text(
+                0.99,
+                0.01,
+                f"Background / PCA fit: {len(fit_indices):,} evenly spaced candidates",
+                transform=axis.transAxes,
+                ha="right",
+                fontsize=8,
+            )
+        axis.grid(False)
+        axis.legend(loc="best", frameon=True)
+    _save_figure(figure, chart_path)
+    report.update(
+        status="ready",
+        chart=chart_path.name,
+        candidate_count=len(points),
+        selected_count=len(selected),
+        coordinates=coordinates.tolist(),
+        components=components.tolist(),
+        center=center.tolist(),
+        explained_variance_ratio=ratios.tolist(),
+        fit_indices=fit_indices.tolist(),
+        rank=int(
+            np.sum(singular > (singular[0] * max(centered.shape) * np.finfo(float).eps))
+        ),
+        note="PCA is a display projection, not the group-normalized FPS distance or a convergence criterion",
+    )
+    return ReportArtifacts(_write_json(report_path, report), chart_path)
+
+
 __all__ = [
     "ParitySeries",
     "ReportArtifacts",
     "build_evaluation_report",
     "build_parity_report",
     "build_training_report",
+    "build_training_parity_reports",
+    "build_selection_pca_report",
 ]

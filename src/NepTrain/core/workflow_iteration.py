@@ -50,6 +50,7 @@ from .reporting import (
     ParitySeries,
     build_evaluation_report,
     build_parity_report,
+    build_selection_pca_report,
 )
 from .persistence import atomic_write_json
 from .scenario import ScenarioLadder
@@ -1934,15 +1935,24 @@ class WorkflowIterationAdapter:
                     "resolved_completion_coverage_threshold": 0.0,
                 },
             )
+            pca = build_selection_pca_report(
+                context.work_dir,
+                descriptors=np.empty((0, 0)),
+                selected_indices=[],
+                candidate_ids=[],
+                source={
+                    "generation": context.generation,
+                    "model_sha256": pool_manifest.model_sha256,
+                },
+            )
             return StageOutcome(
                 artifacts={
+                    "selection_pca_report": pca.report,
                     "selected_input": selected_path,
                     "selection_result": result_path,
                 },
                 metrics={
-                    "candidate_count_before_deduplication": len(
-                        all_candidates
-                    ),
+                    "candidate_count_before_deduplication": len(all_candidates),
                     "candidate_count_after_deduplication": 0,
                     "duplicate_candidate_count": 0,
                     "selected_count": 0,
@@ -1954,9 +1964,7 @@ class WorkflowIterationAdapter:
                     "batch_ready": False,
                     "batch_kind": "coverage_complete",
                     "sampling_model_sha256": pool_manifest.model_sha256,
-                    "route_fingerprints": dict(
-                        pool_manifest.route_fingerprints
-                    ),
+                    "route_fingerprints": dict(pool_manifest.route_fingerprints),
                     "failed_md_attempt_count": failed_count,
                     "selection_novelty_threshold": 0.0,
                     "completion_coverage_threshold": 0.0,
@@ -2122,8 +2130,28 @@ class WorkflowIterationAdapter:
                 ),
             },
         )
+        pca = build_selection_pca_report(
+            context.work_dir,
+            descriptors=candidate_descriptors,
+            selected_indices=result.selected_indices,
+            candidate_ids=candidate_ids,
+            source={
+                "generation": context.generation,
+                "model_sha256": pool_manifest.model_sha256,
+                "descriptor_reduction": descriptor_reduction,
+                "descriptor_elements": list(elements),
+                "candidate_count_before_filtering": len(all_candidates),
+            },
+        )
+        artifacts = {
+            "selected_input": selected_path,
+            "selection_result": result_path,
+            "selection_pca_report": pca.report,
+        }
+        if pca.chart is not None:
+            artifacts["selection_pca"] = pca.chart
         return StageOutcome(
-            artifacts={"selected_input": selected_path, "selection_result": result_path},
+            artifacts=artifacts,
             metrics={
                 "candidate_count_before_deduplication": len(all_candidates),
                 "candidate_count_after_deduplication": len(candidates),
@@ -2135,9 +2163,7 @@ class WorkflowIterationAdapter:
                 "batch_ready": bool(selected),
                 "batch_kind": batch_kind,
                 "sampling_model_sha256": pool_manifest.model_sha256,
-                "route_fingerprints": dict(
-                    pool_manifest.route_fingerprints
-                ),
+                "route_fingerprints": dict(pool_manifest.route_fingerprints),
                 "failed_md_attempt_count": failed_count,
                 "selection_novelty_threshold": selection_threshold,
                 "completion_coverage_threshold": completion_threshold,
@@ -2145,8 +2171,7 @@ class WorkflowIterationAdapter:
                 "descriptor_reduction": descriptor_reduction,
                 "descriptor_elements": list(elements),
                 "novel_selected_count": sum(
-                    value > selection_threshold
-                    for value in result.selected_novelty
+                    value > selection_threshold for value in result.selected_novelty
                 ),
                 "counts_by_stratum": dict(result.counts_by_stratum),
                 "remaining_novelty_by_condition": dict(
@@ -2457,8 +2482,19 @@ class WorkflowIterationAdapter:
             output = atomic_write_json(
                 context.work_dir / "acquisition-signals.json", signals
             )
+            parity = build_parity_report(
+                context.work_dir,
+                series={},
+                stem="acquisition-parity",
+                title="New labels · before training",
+                source={"dataset_role": "acquisition", "evaluated_count": 0},
+            )
             return StageOutcome(
-                artifacts={"acquisition_signals": output}, metrics=signals
+                artifacts={
+                    "acquisition_signals": output,
+                    "acquisition_parity_report": parity.report,
+                },
+                metrics=signals,
             )
         _, spin_count = validate_spin_dataset(frames, require_mforce=True)
         evaluation = self.runtime.predict(
@@ -2548,9 +2584,26 @@ class WorkflowIterationAdapter:
         output = atomic_write_json(
             context.work_dir / "acquisition-signals.json", signals
         )
-        return StageOutcome(
-            artifacts={"acquisition_signals": output}, metrics=signals
+        parity = build_parity_report(
+            context.work_dir,
+            series=evaluation.comparisons,
+            stem="acquisition-parity",
+            title="New labels · before training",
+            source={
+                "dataset_role": "acquisition",
+                "generation": context.generation,
+                "model_sha256": file_sha256(context.artifacts["model"]),
+                "labels_sha256": file_sha256(context.artifacts["labeled"]),
+                "evaluated_count": len(frames),
+            },
         )
+        artifacts = {
+            "acquisition_signals": output,
+            "acquisition_parity_report": parity.report,
+        }
+        if parity.chart is not None:
+            artifacts["acquisition_parity"] = parity.chart
+        return StageOutcome(artifacts=artifacts, metrics=signals)
 
     def _merge(self, context: StageContext) -> StageOutcome:
         original = _read_frames(context.artifacts["training_input"])

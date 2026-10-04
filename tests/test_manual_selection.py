@@ -92,3 +92,9 @@ def test_manual_selection_uses_shared_policy_and_writes_provenance(
     assert persisted["descriptor"]["kind"] == "soap"
     assert persisted["descriptor"]["reduction"] == "global_mean"
     assert persisted["output"] == str(output_path.resolve())
+    pca = json.loads(Path(persisted["pca_report"]).read_text())
+    assert pca["candidate_count"] == 3
+    assert {pca["candidate_ids"][i] for i in pca["selected_indices"]} == set(
+        report["selected_ids"]
+    )
+    assert Path(persisted["pca_chart"]).read_bytes().startswith(b"\x89PNG")

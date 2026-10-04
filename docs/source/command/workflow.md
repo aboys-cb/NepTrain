@@ -462,6 +462,7 @@ train → explore → select → label → evaluate → update
 ```bash
 neptrain workflow status workflow
 neptrain workflow status workflow --jobs
+neptrain workflow status workflow --details
 neptrain workflow resume workflow
 neptrain workflow restart workflow --generation 3 --from label --dry-run
 neptrain workflow stop workflow
@@ -497,31 +498,28 @@ neptrain workflow restart workflow \
 `diagnose`。CLI 不对这个有歧义的名称做猜测或静默转换，`--dry-run` 会列出实际
 复用和重算的阶段。
 
-默认状态页优先显示当前代次、采样温度路径、实际 MD 进度和新增标签的训练前预测精度。例如：
+默认状态页显示当前代次、阶段进展、数据集增长、最近三次采样评估和已有图片路径；未开始的未来代次及无数据的磁力列不展开。以下是采样部分的输出示意：
 
 ```text
 NepTrain · Fe-spin
 路径：/work/neptrain/Fe-spin
 状态：运行中 | 第 3/6 代 | 采样中
-更新：14:32:08（8 秒前）
+控制器心跳：14:32:08（8 秒前）（不代表计算进度更新）
 
 采样进度：
-300 K ✓ → 500 K ● 3.2/10 ps（2/4 条轨迹完成）→ 700 K ○
-
-新增 DFT 预测精度（训练前）：
-代    状态    E/meV·atom⁻¹  F/meV·Å⁻¹    V/meV·atom⁻¹  M/meV/μB    验收
-G1    完成    18.0           210           41.0           168          通过
-G2    完成    14.2 ↓21%      176 ↓16%      35.0 ↓15%      149 ↓11%     通过
-G3    采样中  -             -             -             -            等待
+  default | P=0（模板压力单位）
+    300 K 轨迹完成 | 轨迹正常 2/2 | 目标：长程
+    500 K 执行中 | 执行完成 0/4 | 运行 3 | 排队 1 | 已读轨迹 1–9/10 ps（3/4 可读） | 目标：短试跑
+    700 K ○ 未开始
 ```
 
-ps 进度来自 MD 已写出的实际 step 和模板中的有效 timestep，不使用墙钟时间估算；
-远端文件暂时不可见时会明确显示“ps 暂不可读”。精度表始终优先显示采样模型对本轮新增标签的训练前误差。
-辅助测试单独标注“仅供参考”；重叠和预测失败会提示。收敛判断同时说明标签数、精度、连续达标或生产覆盖方面还缺少什么证据。
+控制器心跳与任务检查时间分别标注；Job 状态是控制器最近一次检查的缓存，status 不额外查询调度器。ps 来自本机可读轨迹或日志以及模板 timestep，不使用墙钟时间估算。并行轨迹显示可读进度范围和读取数量；文件暂不可见时说明时间不可读，不将缺失值当作零，也不以最快一条代表整批。执行结束、轨迹正常、已记录等级和生产覆盖分别展示；仅尝试过某温度不能显示为完成，生产覆盖注明证据所属模型。
 
-`--jobs` 按“代次 + 阶段 + attempt”压缩同一批任务。即使同时运行 20 个 MD 或
-100 个 DFT 标注任务，也只显示每批的完成、运行、等待和失败计数；逐任务结构仍
-完整保留在 `--json` 输出中。
+精度主表使用新增结构的训练前预测误差，E/V 为 meV/atom、F 为 meV/Å、M 为 meV/μB。不同代次的评估结构不同，不打印升降百分比来暗示模型提升。最近评估的判据表列出当前值、配置阈值、最差元素与温压条件、异常残差比例、有效标签数和连续达标次数；生产覆盖缺口保留在收敛原因中。训练期间若能读取 loss.out，则显示最新有限训练记录及日志更新时间。
+
+`--details` 展开所有已有评估和可选辅助 test（仅供参考，统一使用 meV 单位）；默认保留最新提示，但不展开 test 精度。图片路径直接显示在状态页；已完成阶段没有有效绘图数据时说明未出图原因。`--json` 保留完整机器可读数据，不要求普通用户阅读报告 JSON。
+
+`--jobs` 按“代次 + 阶段 + attempt + 执行目标”压缩同一批任务，显示执行完成、运行、等待和失败计数。历史失败可能已由后续重试恢复；逐任务结构和检查时间保留在 `--json` 中。
 
 `workflow status --json` 的 stdout 使用
 `neptrain.workflow-status.v1`；run/resume、restart、stop 和 extend 分别使用稳定的
@@ -596,15 +594,15 @@ generations/0001/
 旧 `active_learning_v3` workflow 保留 `validate/`，`adaptive_v2` workflow 仍使用原来的 `evaluate/diagnose/dataset` 目录；这些目录不会
 自动迁移。一个 generation 内只使用其 ledger 已记录的那套 stage sequence。
 
-训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；
-`calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 Matplotlib
-从 `loss.out` 自动生成 `training-convergence.png` 和可审计的
-`training-report.json`。配置辅助测试集和参考阈值时，train 还会生成按参考阈值归一化的
-`evaluation-metrics.png` 与 `evaluation-report.json`；图中 1× 线就是配置阈值。
-同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction parity 图
-`evaluation-parity.png`，spin 模型会增加 magnetic-force 面板。对应报告记录
-validation/model hash、总点数、实际绘制点数和 RMSE；大数组只对显示点做确定性
-抽样，RMSE 仍使用全部有限数据。
+训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录；`calculation` 软链指向真实执行目录，便于直接排查。各阶段自动出图：
+
+`train/training-convergence.png`：训练 loss 曲线。`train/training-parity-train.png`：训练集参考值与预测值的对角线图；训练器提供 test 输出时另有 `training-parity-test.png`。读取训练器的 `energy/force/virial/mforce_{train,test}.out`，不额外运行预测。TorchNEP 原生输出对应最后一个 epoch，图标题和报告会明确标注；它不一定是流程启用的 best 模型。
+
+`evaluate/acquisition-parity.png`：本代采样模型对新标注结构的预测与参考值对比，这些结构尚未加入该模型的训练集。直接复用 evaluate 的预测结果。对角线图按可用数据展示 Energy、Force、Virial 和 magnetic force，包含理想对角线、RMSE 与绝对误差分布；能量和 virial 使用每原子单位。大数组只对显示点做确定性抽样，RMSE 仍使用全部有限数据。
+
+`select/selection-pca.png`：蓝色表示排除训练集重叠、去重后的候选结构，橙色叠加本轮选中结构。使用筛选时已有的结构描述符，在同一个 PCA 基底中投影到 PC1/PC2，坐标轴标注解释方差。超过 20,000 个候选时，均匀抽样拟合 PCA 和绘制蓝色背景，全部选中结构仍会显示；报告保留全部候选的坐标和结构 ID。PCA 只用于显示，不改变 FPS 距离、筛选结果或收敛判断。独立 `neptrain select` 同样生成 `<输出文件名>.selection-pca.png`，背景为该命令过滤、去重后的候选池。
+
+配置可选辅助测试集时，train 另有 `evaluation-parity.png`；配置参考阈值时还有 `evaluation-metrics.png`。这些辅助诊断不影响收敛，也不要求 test 必须存在。每张图都有对应 JSON 报告，记录来源、模型哈希（可用时）、点数和统计量；没有有效绘图数据时只输出注明原因的报告。
 
 内部 job 也只保留一层输入和一层输出。job 名称已经包含代数、阶段、route、
 attempt 和任务指纹，因此输出目录不再重复这些信息：

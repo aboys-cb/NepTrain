@@ -17,7 +17,7 @@ from ase.data import atomic_numbers
 from ase.io import read as ase_read
 import numpy as np
 
-from .reporting import build_training_report
+from .reporting import build_training_report, build_training_parity_reports
 from .scientific_data import optional_dataset_issue
 from .spin import validate_spin_dataset
 
@@ -330,4 +330,12 @@ def train(request: TrainingRequest, backend: str) -> TrainingResult:
     outputs[report.report.name] = report.report
     if report.chart is not None:
         outputs[report.chart.name] = report.chart
+    outputs.update(
+        build_training_parity_reports(
+            request.output_dir,
+            outputs=result.outputs,
+            backend=backend,
+            model=result.final_model if backend == "torchnep" else result.best_model,
+        )
+    )
     return replace(result, outputs=outputs)

@@ -535,9 +535,10 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     assert "NepTrain · controller-smoke" in output
     assert f"路径：{preparation.output_dir}" in output
     assert "状态：待启动 | 第 1/3 代 | 训练" in output
-    assert "300 K ○ → 500 K ○" in output
-    assert "新增 DFT 预测精度（训练前）：" in output
+    assert "300 K ○ 未开始" in output and "500 K ○ 未开始" in output
+    assert "暂无新增结构的训练前预测结果" in output
     assert "G1" in output
+    assert "G2" not in output
     assert "未开始" in output
     assert "执行批次：" not in output
 
@@ -589,7 +590,7 @@ Step Temp PotEng
     status = workflow_status(preparation.output_dir)
 
     cells = status.sampling_routes[0]["temperatures"]
-    assert cells[0]["state"] == "complete"
+    assert cells[0]["state"] == "pending"
     assert cells[1]["state"] == "active"
     assert cells[1]["current_ps"] == pytest.approx(3.2)
     assert cells[1]["target_ps"] == pytest.approx(10.0)
@@ -597,7 +598,8 @@ Step Temp PotEng
         SimpleNamespace(project=str(preparation.output_dir), json=False, jobs=False)
     )
     output_text = capsys.readouterr().out
-    assert "300 K ✓ → 500 K ● 3.2/10 ps" in output_text
+    assert "300 K ○ 未开始" in output_text
+    assert "3.2/10 ps" in output_text
     run_status_command(
         SimpleNamespace(project=str(preparation.output_dir), json=True, jobs=False)
     )
@@ -667,7 +669,7 @@ def test_status_shows_pretraining_acquisition_error_for_convergence(capsys):
     _print_precision(status)
 
     output = capsys.readouterr().out
-    assert "新增 DFT 预测精度（训练前）：" in output
+    assert "新增结构预测精度（训练前 RMSE）：" in output
     assert "2.5" in output
     assert "80" in output
     assert "25" in output
@@ -1286,8 +1288,8 @@ def test_status_explains_sampling_decision_and_optional_test(tmp_path, capsys):
     )
     _print_workflow_status(replace(status, generations=(science,)), show_jobs=False)
     output = capsys.readouterr().out
-    assert "新增 DFT 预测精度（训练前）" in output
-    assert "辅助测试（仅供参考" in output
+    assert "新增结构预测精度（训练前 RMSE）" in output
+    assert "辅助测试（仅供参考" not in output
     assert "231 帧重叠" in output
     assert "尚未收敛" in output
     assert "连续达标 1/2 代" in output
@@ -1437,3 +1439,293 @@ def test_problem_status_shows_current_generation_and_recovery(tmp_path, capsys, 
         "本代计算与报告：" + str(prepared.output_dir / "generations/0003") not in text
     )
     assert "下一步：neptrain workflow resume workflow" in text
+
+
+def test_sampling_view_does_not_infer_success_from_attempt_or_scheduler(tmp_path):
+    from NepTrain.core.workflow import _sampling_progress
+    from NepTrain.cli.cli import _sampling_cell
+
+    config = {
+        "sampling": {
+            "routes": [{"id": "r", "conditions": {"temperature_path": [300, 600]}}]
+        }
+    }
+    historical = (
+        {
+            "scenarios": {
+                "attempted_temperatures_by_route": {"r": [300]},
+                "routes": [
+                    {
+                        "route_id": "r",
+                        "attempts": [
+                            {"attempt_id": "a", "temperature": 300, "steps": 10000}
+                        ],
+                        "completed": {"a": False},
+                    }
+                ],
+            }
+        },
+    )
+    result = _sampling_progress(config, {}, historical, base_dir=tmp_path)
+    assert result[0]["temperatures"][0]["state"] == "failed"
+    assert result[0]["temperatures"][1]["state"] == "pending"
+    legacy = ({"scenarios": {"attempted_temperatures_by_route": {"r": [300]}}},)
+    assert (
+        _sampling_progress(config, {}, legacy, base_dir=tmp_path)[0]["temperatures"][0][
+            "state"
+        ]
+        == "attempted"
+    )
+    task = {
+        "route_id": "r",
+        "temperature": 300,
+        "steps": 10000,
+        "collected_bundle": "bundle",
+    }
+    live = _sampling_progress(
+        config,
+        {"current": {"stage": "explore", "tasks": [task]}},
+        (),
+        base_dir=tmp_path,
+    )[0]["temperatures"][0]
+    assert live["state"] == "collected" and live["current_ps"] is None
+    assert "待科学阶段确认" in _sampling_cell(live)
+
+
+def test_sampling_view_shows_range_and_partial_readability(tmp_path):
+    from NepTrain.core.workflow import _sampling_progress
+    from NepTrain.cli.cli import _sampling_cell
+
+    tasks = []
+    for index, step in enumerate((1000, 9000, None)):
+        bundle = tmp_path / str(index)
+        if step is not None:
+            _write(bundle / "output/log.lammps", f"Step Temp\n{step} 300\n")
+        tasks.append(
+            {
+                "route_id": "r",
+                "temperature": 300,
+                "steps": 10000,
+                "bundle": str(bundle),
+                "handle": {"execution_id": str(index)},
+                "observed_state": "RUNNING" if step else "PENDING",
+            }
+        )
+    config = {
+        "sampling": {"routes": [{"id": "r", "conditions": {"temperature_path": [300]}}]}
+    }
+    result = _sampling_progress(
+        config, {"current": {"stage": "explore", "tasks": tasks}}, (), base_dir=tmp_path
+    )
+    cell = result[0]["temperatures"][0]
+    assert cell["current_ps"] == 1 and cell["current_ps_max"] == 9
+    assert cell["waiting"] == 1 and cell["readable"] == 2
+    assert "1–9/10 ps（2/3 可读）" in _sampling_cell(cell)
+
+
+@pytest.mark.parametrize(
+    "state,label", [("failed", "评估失败"), ("paused", "评估已暂停")]
+)
+def test_precision_respects_workflow_state_and_has_no_cross_dataset_deltas(
+    capsys, state, label
+):
+    from copy import deepcopy
+
+    generation = {
+        "generation": 1,
+        "state": "accepted",
+        "quality": {
+            "acquisition_rmse": {"force_rmse": 0.2, "mforce_rmse": None},
+            "acquisition_count": 20,
+        },
+    }
+    generations = []
+    for index in range(1, 6):
+        item = deepcopy(generation)
+        item["generation"] = index
+        item["quality"]["acquisition_rmse"]["force_rmse"] /= index
+        generations.append(item)
+    generations[-1]["state"] = "in_progress"
+    _print_precision(
+        SimpleNamespace(
+            precision_basis="acquisition",
+            generations=generations,
+            generation=5,
+            stage="evaluate",
+            state=state,
+        )
+    )
+    text = capsys.readouterr().out
+    assert label in text
+    assert "G1" not in text and "G2" not in text and "G3" in text
+    assert "↓" not in text and "M/meV" not in text
+
+
+def test_status_details_and_convergence_show_thresholds_and_worst_group(
+    tmp_path, capsys
+):
+    from dataclasses import replace
+    from NepTrain.cli.cli import _print_workflow_status
+
+    config, initial = _inputs(tmp_path)
+    status = workflow_status(
+        prepare_workflow(config, initial, tmp_path / "workflow").output_dir
+    )
+    record = {
+        "kind": "acquisition",
+        "stage_sequence": ["train", "explore", "select", "label", "evaluate", "update"],
+        "complete": True,
+        "accepted": True,
+        "stages": {
+            "train": {
+                "metrics": {
+                    "training_count": 100,
+                    "prediction_metric_basis": "per_atom_v1",
+                    "force_rmse": 0.15,
+                }
+            },
+            "evaluate": {
+                "metrics": {
+                    "prediction_metric_basis": "per_atom_v1",
+                    "evaluated_count": 20,
+                    "current_model_force_rmse": 0.08,
+                    "current_model_force_r2": 0.96,
+                    "element_force_r2": {"Ta": 0.87, "C": 0.97},
+                    "condition_force_r2": {"R=r|T=1500|P=0": 0.88},
+                }
+            },
+            "update": {
+                "metrics": {
+                    "training_count": 120,
+                    "added_count": 20,
+                    "generation_disposition": "continue",
+                    "acquisition_convergence_streak": 0,
+                    "acquisition_convergence_required": 2,
+                }
+            },
+        },
+    }
+    science = _generation_science({"generation": 1, "max_selected": 20}, record)
+    status = replace(
+        status,
+        generations=(science,),
+        convergence_policy={
+            "acquisition_max_rmse": {"force_rmse": 0.1},
+            "acquisition_min_r2": {"force_r2": 0.95},
+            "group_min_force_r2": 0.9,
+            "min_selected": 10,
+            "consecutive_generations": 2,
+        },
+    )
+    _print_workflow_status(status, show_jobs=False)
+    normal = capsys.readouterr().out
+    assert "≤100 meV/Å" in normal and "最差元素 Ta" in normal and "0.87" in normal
+    assert "R=r|T=1500|P=0" in normal and "连续达标代数" in normal
+    assert "训练集：100 → 120（新增 20）" in normal
+    assert "辅助测试（仅供参考" not in normal
+    _print_workflow_status(status, show_jobs=False, details=True)
+    detail = capsys.readouterr().out
+    assert "辅助测试（仅供参考" in detail and "force_rmse=150" in detail
+
+
+def test_status_publishes_only_committed_report_and_sampling_evidence(tmp_path):
+    from NepTrain.core.workflow import _scientific_progress
+
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    manifest = json.loads(preparation.manifest.read_text())
+    root = preparation.output_dir / "generations/0001/select"
+    chart = _write(root / "selection-pca.png")
+    report = _write(
+        root / "selection-pca-report.json",
+        json.dumps({"status": "ready", "chart": chart.name}),
+    )
+    plan = _write(
+        root / "scenario-plan.json",
+        json.dumps({"routes": [{"route_id": "r", "attempts": [], "completed": {}}]}),
+    )
+
+    def artifact(path):
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    record = {
+        "stages": {
+            "select": {
+                "artifacts": {
+                    "selection_pca_report": artifact(report),
+                    "scenario_plan": artifact(plan),
+                }
+            }
+        }
+    }
+    summary = _scientific_progress(
+        preparation, manifest, ledger={"generations": {"1": record}}
+    )[0]
+    assert summary["reports"][0]["chart"] == str(chart)
+    assert summary["scenarios"]["routes"][0]["route_id"] == "r"
+    report.write_text('{"status":"ready","chart":"fake.png"}')
+    assert (
+        _scientific_progress(
+            preparation, manifest, ledger={"generations": {"1": record}}
+        )[0]["reports"]
+        == []
+    )
+
+
+def test_training_status_reads_latest_complete_finite_loss_row(tmp_path):
+    from NepTrain.core.workflow import _training_progress
+
+    bundle = tmp_path / "task"
+    _write(
+        bundle / ".output-building-1/loss.out",
+        "# header\n10 0.2 0.1\n20 0.1 0.05\n30 nan\n40\n",
+    )
+    progress = _training_progress(
+        {"current": {"stage": "train", "bundle": str(bundle)}},
+        {"training": {"backend": "torchnep"}},
+    )
+    assert progress["step"] == 20 and progress["loss"] == 0.1
+    assert progress["updated_at"]
+
+
+def test_status_shows_plot_paths_and_explains_missing_plot_without_json(
+    capsys, tmp_path
+):
+    from NepTrain.cli.cli import _print_reports
+
+    root = tmp_path / "generations/0003"
+    status = SimpleNamespace(
+        generations=(
+            {
+                "generation": 3,
+                "reports": [
+                    {
+                        "report": str(root / "select/selection-pca-report.json"),
+                        "chart": str(root / "select/selection-pca.png"),
+                        "status": "ready",
+                    },
+                    {
+                        "report": str(root / "evaluate/acquisition-parity-report.json"),
+                        "chart": None,
+                        "status": "unavailable",
+                        "reason": "no parity series contains finite pairs",
+                    },
+                    {
+                        "report": str(root / "train/evaluation-parity-report.json"),
+                        "chart": str(root / "train/evaluation-parity.png"),
+                        "status": "ready",
+                    },
+                ],
+            },
+        )
+    )
+    _print_reports(status)
+    text = capsys.readouterr().out
+    assert str(root / "select/selection-pca.png") in text
+    assert "没有有效的新标签预测数据" in text
+    assert ".json" not in text and "evaluation-parity.png" not in text
+    _print_reports(status, details=True)
+    assert "evaluation-parity.png" in capsys.readouterr().out

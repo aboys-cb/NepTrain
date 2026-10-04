@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from NepTrain.core.content_addressing import file_sha256
 from NepTrain.core.iteration import (
     GenerationController,
     GenerationPlan,
@@ -572,6 +573,12 @@ def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
     }
     assert "model_training_set" in summary.artifacts
     assert "training_set" in summary.artifacts
+    parity = json.loads(summary.artifacts["acquisition_parity_report"].read_text())
+    assert parity["source"]["dataset_role"] == "acquisition"
+    assert parity["source"]["model_sha256"] == file_sha256(summary.artifacts["model"])
+    assert parity["panels"]["force"]["rmse"] == 0
+    assert summary.artifacts["acquisition_parity"].is_file()
+    assert summary.artifacts["selection_pca"].is_file()
 
 
 @pytest.mark.parametrize(
@@ -1864,6 +1871,13 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     selected = ase_read(outcome.artifacts["selected_input"], index=":")
 
     assert outcome.metrics["candidate_count_after_deduplication"] == 2
+    pca = json.loads(outcome.artifacts["selection_pca_report"].read_text())
+    assert pca["candidate_count"] == 2
+    assert pca["selected_count"] == 2
+    selection = json.loads(outcome.artifacts["selection_result"].read_text())
+    assert [pca["candidate_ids"][i] for i in pca["selected_indices"]] == selection[
+        "selected_ids"
+    ]
     assert outcome.metrics["duplicate_candidate_count"] == 1
     assert outcome.metrics["selected_count"] == 2
     assert outcome.metrics["configured_max_selected"] == 20

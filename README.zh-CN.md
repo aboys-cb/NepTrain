@@ -325,6 +325,7 @@ neptrain workflow run workflow
 ```bash
 neptrain workflow status workflow
 neptrain workflow status workflow --jobs
+neptrain workflow status workflow --details
 neptrain workflow resume workflow
 neptrain workflow stop workflow
 neptrain workflow extend workflow 15
@@ -592,11 +593,14 @@ workflow/
 新流程每代目录直接是 `train/`、`explore/`、`select/`、`label/`、
 `evaluate/` 和 `update/`。既有 `active_learning_v3` workflow 保留 `validate/`，`adaptive_v2` workflow 保留原来的
 `evaluate/diagnose/dataset` 路径，不自动迁移。训练输出、loss 和模型发布到对应阶段
-目录，`calculation` 软链指向真实执行目录。训练阶段会用 Matplotlib 发布
-`training-convergence.png` 和 `training-report.json`；配置可选辅助测试集时，
-train 阶段还会发布按阈值归一化的 `evaluation-metrics.png`，以及 Energy、
-Force、Virial（spin 模型另含 magnetic force）的 reference/prediction parity 图
-`evaluation-parity.png`。每张图都有对应的 JSON 报告记录数据来源、点数和 RMSE。
+目录，`calculation` 软链指向真实执行目录。各阶段自动生成 PNG 和对应 JSON 报告：
+
+- `train/`：`training-convergence.png` 和 `training-parity-train.png`；训练器提供 test 输出时另有 `training-parity-test.png`。TorchNEP 原生 parity 对应最后一个 epoch，图中明确标注，可能与流程启用的 best 模型不同。
+- `evaluate/`：`acquisition-parity.png`，对比采样模型预测与本轮新标签，包含对角线、RMSE 和误差分布。
+- `select/`：`selection-pca.png`，蓝色候选、橙色选中结构，共用 PC1/PC2 坐标。超过 20,000 个候选时抽样拟合和显示背景，仍展示全部选中结构。只用于显示，不改变筛选或收敛。
+
+配置可选辅助测试集时，train 还会发布 `evaluation-parity.png`；配置参考阈值时另有
+`evaluation-metrics.png`。无有效绘图数据时只生成说明原因的 JSON 报告，不要求 test 必须存在。
 
 开发阶段的确定性工作流 smoke：
 

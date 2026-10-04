@@ -26,7 +26,7 @@ acceptance; it does not duplicate the scientific calculation logic.
 - Local process, local Slurm, and SSH + Slurm execution targets.
 - Content-addressed task bundles, atomic publication, hash validation, and
   resumable workflow state.
-- PNG training-convergence and evaluation reports generated with Matplotlib.
+- Automatic training and new-label evaluation parity plots (diagonal, RMSE, error distributions), training loss curves, and selection PCA coverage plots with selected structures highlighted. Each plot includes a JSON provenance report.
 
 ## Installation
 

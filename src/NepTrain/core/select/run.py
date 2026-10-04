@@ -23,7 +23,7 @@ from ..nep.calculator import DescriptorCalculator
 from ..scientific_data import STRUCTURE_ID_VERSION, structure_id
 from ..md.health import is_structure_reasonable
 from ..persistence import atomic_write_json
-
+from ..reporting import build_selection_pca_report
 
 class SelectionError(RuntimeError):
     """Raised when a manual selection cannot produce a valid result."""
@@ -262,10 +262,24 @@ def run_select(args) -> dict[str, Any]:
         "descriptor": descriptor_record,
         "output": str(output),
     }
+    pca = build_selection_pca_report(
+        output.parent,
+        descriptors=candidate_descriptors,
+        selected_indices=result.selected_indices,
+        candidate_ids=identifiers,
+        stem=f"{output.stem}.selection-pca",
+        source={
+            "descriptor": descriptor_record,
+            "candidate_scope": "manual candidates after physical filtering and deduplication",
+        },
+    )
+    report["pca_report"] = str(pca.report)
+    report["pca_chart"] = str(pca.chart) if pca.chart is not None else None
     atomic_write_json(report_path, report)
     print(
         f"Selected {len(selected)} of {read_count} structures -> {output}\n"
-        f"Selection report -> {report_path}"
+        f"Selection report -> {report_path}\n"
+        f"Selection PCA -> {pca.chart or pca.report}"
     )
     return report
 

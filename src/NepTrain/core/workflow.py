@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import shlex
@@ -19,6 +20,7 @@ import uuid
 from .content_addressing import canonical_sha256, file_sha256
 from .scientific_data import optional_dataset_issue
 from .generation_policy import (
+    stage_sequence_for_kind,
     ACTIVE_LEARNING_GENERATION_PROTOCOL,
     ACTIVE_LEARNING_V3_PROTOCOL,
     ADAPTIVE_GENERATION_PROTOCOL,
@@ -88,6 +90,8 @@ class WorkflowStatus:
     sampling_routes: tuple[Mapping[str, Any], ...]
     precision_basis: str | None
     convergence_configured: bool | None = None
+    convergence_policy: Mapping[str, Any] | None = None
+    training_progress: Mapping[str, Any] | None = None
 
 
 _STAGES = (
@@ -1190,6 +1194,7 @@ def _generation_science(
         "kind": None if record is None else record.get("kind", "legacy"),
         "state": state,
         "completed_stages": tuple(stage for stage in sequence if stage in stages),
+        "stage_sequence": sequence,
         "plan": {
             "max_selected": int(plan["max_selected"]),
             "selection_novelty_threshold": float(
@@ -1237,6 +1242,11 @@ def _generation_science(
             "active_model_sha256": evaluate.get("active_model_sha256"),
         },
         "quality": {
+            "acquisition_count": diagnose.get("evaluated_count"),
+            "element_force_r2": dict(diagnose.get("element_force_r2", {})),
+            "condition_force_r2": dict(diagnose.get("condition_force_r2", {})),
+            "outlier_fraction": dict(diagnose.get("outlier_fraction", {})),
+            "attempt_metrics": dict(diagnose.get("attempt_metrics", {})),
             "acquisition_rmse": acquisition_rmse,
             "acquisition_r2": acquisition_r2,
             "validation_rmse": validation_rmse,
@@ -1292,10 +1302,68 @@ def _scientific_progress(
     if ledger is not None:
         assert isinstance(ledger, Mapping)
         generations = ledger.get("generations", {})
-    return tuple(
-        _generation_science(plan, generations.get(str(plan["generation"])))
-        for plan in plans
-    )
+    summaries = []
+    for plan in plans:
+        record = generations.get(str(plan["generation"]))
+        summary = _generation_science(plan, record)
+        if record is None:
+            protocol = manifest.get("generation_protocol", LEGACY_GENERATION_PROTOCOL)
+            summary["stage_sequence"] = stage_sequence_for_kind(
+                "legacy" if protocol == LEGACY_GENERATION_PROTOCOL else "acquisition",
+                protocol,
+            )
+        summary["reports"] = []
+        for stage in (record or {}).get("stages", {}).values():
+            for name, artifact in stage.get("artifacts", {}).items():
+                if not isinstance(artifact, Mapping):
+                    continue
+                path = Path(str(artifact.get("path", "")))
+                if name not in {"scenario_plan", "scenario_maturity"} and not (
+                    path.name.endswith("-report.json")
+                    and any(
+                        token in path.name
+                        for token in ("parity", "selection-pca", "training-report")
+                    )
+                ):
+                    continue
+                try:
+                    path.resolve().relative_to(preparation.output_dir.resolve())
+                    if not path.is_file() or file_sha256(path) != artifact.get(
+                        "sha256"
+                    ):
+                        continue
+                    if name == "scenario_plan":
+                        summary["scenarios"]["routes"] = _read_json(
+                            path, role=name
+                        ).get("routes", [])
+                    elif name == "scenario_maturity":
+                        summary["scenarios"]["maturity"] = _read_json(
+                            path, role=name
+                        ).get("routes", {})
+                    elif path.name.endswith("-report.json") and any(
+                        token in path.name
+                        for token in ("parity", "selection-pca", "training-report")
+                    ):
+                        report = _read_json(path, role=name)
+                        chart = path.parent / str(report.get("chart") or "")
+                        summary["reports"].append(
+                            {
+                                "report": str(path),
+                                "status": report.get("status"),
+                                "chart": (
+                                    str(chart)
+                                    if report.get("chart") and chart.is_file()
+                                    else None
+                                ),
+                                "reason": report.get("reason"),
+                            }
+                        )
+                except (OSError, ValueError, WorkflowError):
+                    # The ledger integrity check owns damage reporting. Status
+                    # must still explain a damaged workflow without a traceback.
+                    continue
+        summaries.append(summary)
+    return tuple(summaries)
 
 
 def _md_timestep_ps(
@@ -1453,7 +1521,16 @@ def _sampling_task_state(task: Mapping[str, Any]) -> str:
         return "complete"
     if observed in {"failed", "cancelled", "skipped"}:
         return "failed"
-    return "running"
+    if observed in {
+        "pending",
+        "submitted",
+        "submitting",
+        "launching",
+        "queued",
+        "not_submitted",
+    }:
+        return "waiting"
+    return "running" if observed == "running" else "unknown"
 
 
 def _sampling_progress(
@@ -1472,22 +1549,23 @@ def _sampling_progress(
         if isinstance(route, Mapping)
     ]
     backend = str(config.get("md", {}).get("backend", "lammps"))
-    completed_by_route: dict[str, set[float]] = {}
+    latest_routes = {}
+    maturities = {}
+    attempted_by_route: dict[str, set[float]] = {}
     for generation in generations:
-        by_route = generation.get("scenarios", {}).get(
+        scenarios = generation.get("scenarios", {})
+        for route in scenarios.get("routes", []):
+            latest_routes[str(route["route_id"])] = route
+        maturities.update(scenarios.get("maturity", {}))
+        for route_id, temperatures in scenarios.get(
             "attempted_temperatures_by_route", {}
-        )
-        if not isinstance(by_route, Mapping):
-            continue
-        if not by_route and len(route_ids) == 1:
-            by_route = {
-                route_ids[0]: generation.get("scenarios", {}).get(
-                    "attempted_temperatures", ()
-                )
-            }
-        for route_id, values in by_route.items():
-            completed_by_route.setdefault(str(route_id), set()).update(
-                float(value) for value in values
+        ).items():
+            attempted_by_route.setdefault(route_id, set()).update(
+                map(float, temperatures)
+            )
+        if not scenarios.get("attempted_temperatures_by_route") and len(route_ids) == 1:
+            attempted_by_route.setdefault(route_ids[0], set()).update(
+                map(float, scenarios.get("attempted_temperatures", ()))
             )
     current = controller.get("current")
     current_tasks = (
@@ -1511,9 +1589,7 @@ def _sampling_progress(
         task["state"] = _sampling_task_state(raw)
         task["steps"] = steps
         output = _active_md_output(raw)
-        if task["state"] == "complete":
-            task["current_ps"] = "target"
-        elif output is None:
+        if output is None:
             task["current_ps"] = None
         elif backend == "gpumd":
             task["current_ps"] = _gpumd_time_ps(output)
@@ -1536,32 +1612,57 @@ def _sampling_progress(
             backend=backend,
             base_dir=base_dir,
         )
-        scheduled_indices = [
-            index
-            for index, temperature in enumerate(temperatures)
-            if tasks_by_condition.get((route_id, temperature))
-        ]
-        furthest_scheduled = max(scheduled_indices, default=-1)
         cells = []
-        for temperature_index, temperature in enumerate(temperatures):
+        historical = latest_routes.get(route_id, {})
+        route_maturity = maturities.get(route_id, {})
+        for temperature in temperatures:
             tasks = tasks_by_condition.get((route_id, temperature), [])
+            live = bool(tasks)
+            if not live:
+                tasks = [
+                    {
+                        **attempt,
+                        "state": (
+                            "complete"
+                            if historical.get("completed", {}).get(
+                                attempt["attempt_id"]
+                            )
+                            is True
+                            else "failed"
+                        ),
+                    }
+                    for attempt in historical.get("attempts", [])
+                    if float(attempt["temperature"]) == temperature
+                ]
             states = [str(task["state"]) for task in tasks]
             completed = states.count("complete")
             failed = states.count("failed")
-            if tasks and completed == len(tasks):
-                state = "complete"
-            elif tasks and any(
-                value in {"running", "waiting"} for value in states
-            ):
-                state = "active"
+            if live:
+                state = (
+                    "active"
+                    if any(
+                        value in {"running", "waiting", "unknown"} for value in states
+                    )
+                    else "collected" if not failed else "failed"
+                )
             elif tasks:
-                state = "failed"
-            elif temperature in completed_by_route.get(route_id, set()):
-                state = "complete"
-            elif temperature_index < furthest_scheduled:
-                state = "complete"
+                state = "complete" if completed == len(tasks) else "failed"
+            elif temperature in attempted_by_route.get(route_id, set()):
+                state = "attempted"
             else:
                 state = "pending"
+            levels = {}
+            for scenario in (
+                route_maturity.get("history", {}).get("scenarios", {}).values()
+            ):
+                if float(scenario["temperature"]) == temperature:
+                    level = scenario["maturity"]
+                    levels[level] = levels.get(level, 0) + 1
+            coverage = (
+                route_maturity.get("production_status", {})
+                .get("by_temperature", {})
+                .get(f"{temperature:g}")
+            )
             target_ps_values = [
                 task["steps"] * timestep_ps
                 for task in tasks
@@ -1570,9 +1671,7 @@ def _sampling_progress(
             current_ps_values = []
             for task in tasks:
                 value = task.get("current_ps")
-                if value == "target" and timestep_ps is not None:
-                    current_ps_values.append(task["steps"] * timestep_ps)
-                elif isinstance(value, int | float):
+                if isinstance(value, int | float):
                     current_ps_values.append(float(value))
                 elif task.get("last_step") is not None and timestep_ps is not None:
                     current_ps_values.append(
@@ -1585,20 +1684,72 @@ def _sampling_progress(
                     "completed": completed,
                     "failed": failed,
                     "total": len(tasks),
-                    "current_ps": max(current_ps_values, default=None),
+                    "current_ps": min(current_ps_values, default=None),
+                    "current_ps_max": max(current_ps_values, default=None),
                     "target_ps": max(target_ps_values, default=None),
+                    "target_ps_min": min(target_ps_values, default=None),
+                    "readable": len(current_ps_values),
+                    "live": live,
+                    "waiting": states.count("waiting"),
+                    "running": states.count("running"),
+                    "unknown": states.count("unknown"),
+                    "target_levels": sorted(
+                        {task.get("target_level", "unknown") for task in tasks}
+                    ),
+                    "maturities": levels,
+                    "production_coverage": coverage,
+                    "production_model_sha256": route_maturity.get("history", {}).get(
+                        "last_model_id"
+                    ),
                 }
             )
         summaries.append(
             {
                 "route_id": route_id,
+                "pressure": raw_route.get("conditions", {}).get("pressure", 0),
                 "temperatures": tuple(cells),
-                "failed": sum(
-                    cell["failed"] for cell in cells
-                ),
+                "failed": sum(cell["failed"] for cell in cells),
             }
         )
     return tuple(summaries)
+
+
+def _training_progress(
+    controller: Mapping[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    current = controller.get("current")
+    if not isinstance(current, Mapping) or current.get("stage") not in {
+        "train",
+        "retrain",
+    }:
+        return None
+    output = _active_md_output(current)
+    if output is None:
+        return None
+    path = output / "loss.out"
+    text = _tail_text(path)
+    if text is None:
+        return None
+    for line in reversed(text.splitlines()):
+        try:
+            values = [float(value) for value in line.split()]
+        except ValueError:
+            continue
+        if len(values) >= 2 and all(math.isfinite(value) for value in values):
+            try:
+                updated = datetime.fromtimestamp(
+                    path.stat().st_mtime, timezone.utc
+                ).isoformat()
+            except OSError:
+                updated = None
+            return {
+                "step": values[0],
+                "loss": values[1],
+                "backend": config.get("training", {}).get("backend"),
+                "path": str(path),
+                "updated_at": updated,
+            }
+    return None
 
 
 def workflow_status(output_dir: str | Path) -> WorkflowStatus:
@@ -1680,14 +1831,15 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                     "stage": item.get("stage"),
                     "attempt": f"attempt-{item.get('attempt', 1)}",
                     "script": (
-                        f"{task_record.get('target', '-')}/"
-                        f"{item.get('stage', '-')}"
+                        f"{task_record.get('target', '-')}/" f"{item.get('stage', '-')}"
                     ),
                     "job_id": handle.get("execution_id"),
                     "bundle": task_record.get("bundle") or handle.get("bundle"),
                     "dependency": None,
                     "state": execution_state,
                     "current": False,
+                    "observed_at": task_record.get("observed_at"),
+                    "target": task_record.get("target"),
                     "detail": task_record.get("failure")
                     or task_record.get("detail")
                     or item.get("failure")
@@ -1738,8 +1890,9 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                     "dependency": None,
                     "state": observed,
                     "current": True,
-                    "detail": task_record.get("detail")
-                    or cancellation.get("detail"),
+                    "observed_at": task_record.get("observed_at"),
+                    "target": task_record.get("target"),
+                    "detail": task_record.get("detail") or cancellation.get("detail"),
                 }
             )
 
@@ -1904,6 +2057,8 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             base_dir=workspace.root,
         ),
         precision_basis="acquisition",
+        convergence_policy=dict(config.get("workflow", {}).get("convergence", {})),
+        training_progress=_training_progress(controller, config),
     )
 
 

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -56,6 +57,7 @@ def test_gpumd_training_adapter_prepares_inputs_and_collects_outputs(
         stdout.flush()
         (directory / "nep.txt").write_text("nep4 2 O Fe\n", encoding="utf-8")
         (directory / "nep.restart").write_bytes(b"checkpoint")
+        (directory / "energy_train.out").write_text("1.02 1.0\n1.52 1.5\n")
         (directory / "loss.out").write_text(
             "0 4 0.1 0.2 2 3 4 2.5 3.5 4.5\n"
             "10 2 0.1 0.2 1 2 3 1.5 2.5 3.5\n",
@@ -92,7 +94,15 @@ def test_gpumd_training_adapter_prepares_inputs_and_collects_outputs(
         "output.log",
         "training-convergence.png",
         "training-report.json",
+        "training-parity-train-report.json",
+        "energy_train.out",
+        "training-parity-train.png",
     }
+    parity = json.loads(result.outputs["training-parity-train-report.json"].read_text())
+    assert parity["panels"]["energy"]["rmse"] == pytest.approx(0.02)
+    assert (
+        result.outputs["training-parity-train.png"].read_bytes().startswith(b"\x89PNG")
+    )
 
 
 def test_gpumd_restart_overrides_only_restart_owned_config(
@@ -281,6 +291,7 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
         "output.log",
         "training-convergence.png",
         "training-report.json",
+        "training-parity-train-report.json",
     }
     assert captured["finetune_from"] == str(finetune)
     assert captured["resume_from"] is None
