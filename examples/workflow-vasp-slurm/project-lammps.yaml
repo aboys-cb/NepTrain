@@ -21,7 +21,7 @@ sampling:
         - ./structures
       template_path: ./lammps-npt.in
       conditions:
-        pressure: 0  # GPUMD: GPa; unused by the fixed-volume NVT template
+        pressure: 0  # LAMMPS NPT, units metal: bar
         temperature_path:
           - 300
       progression:

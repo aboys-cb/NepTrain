@@ -21,7 +21,7 @@ sampling:
         - ./structures
       template_path: ./gpumd-npt.in
       conditions:
-        pressure: 0  # GPUMD: GPa; unused by the fixed-volume NVT template
+        pressure: 0  # GPUMD NPT: GPa
         temperature_path:
           - 300
       progression:

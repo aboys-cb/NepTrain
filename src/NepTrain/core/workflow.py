@@ -373,6 +373,25 @@ def _validate_labeled_dataset_for_preparation(
         )
 
 
+def _optional_labeled_dataset_issue(
+    path: Path | None, *, role: str, expect_spin: bool
+) -> str | None:
+    """Explain why optional labels should be skipped without blocking preparation."""
+    issue = optional_dataset_issue(path, role=role)
+    if issue:
+        return issue
+    try:
+        _validate_labeled_dataset_for_preparation(
+            path, role=role, expect_spin=expect_spin
+        )
+    except Exception as error:
+        return (
+            f"{role}已跳过：数据无法读取或标签无效，路径：{path}；"
+            f"{type(error).__name__}: {error}；不阻止主流程。"
+        )
+    return None
+
+
 def _validate_vasp_preparation(
     config: Mapping[str, Any],
     *,
@@ -589,14 +608,13 @@ def prepare_workflow(
         raw_path = config.get(section, {}).get(key)
         if raw_path:
             path = Path(str(raw_path))
-            issue = optional_dataset_issue(path, role=role)
+            issue = _optional_labeled_dataset_issue(
+                path, role=role, expect_spin=expect_spin
+            )
             if issue:
                 logging.getLogger(__name__).warning(issue)
                 config[section].pop(key, None)
                 continue
-            _validate_labeled_dataset_for_preparation(
-                path, role=role, expect_spin=expect_spin,
-            )
     labeling_target_name = config["execution"]["stage_targets"]["labeling"]
     labeling_target = config["execution"]["targets"][labeling_target_name]
     labeling_backend = config["labeling"]["backend"]

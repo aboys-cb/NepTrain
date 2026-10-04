@@ -99,6 +99,10 @@ def test_v4_publication_reads_test_metrics_from_train(tmp_path: Path):
     assert not (generation_dir / "md").exists()
     summary = (workspace.results_dir / "summary.md").read_text(encoding="utf-8")
     assert "Energy RMSE (eV/atom)：0.01" in summary
+    assert "Energy RMSE (eV/atom)：9.0" in summary
+    assert summary.index("Energy RMSE (eV/atom)：9.0") < summary.index("辅助测试")
+    assert "当前模型：" in summary and "最终模型：" not in summary
+    assert "尚未确认流程收敛" in summary
 
 
 def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: Path):
@@ -121,7 +125,7 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
     assert json.loads((workspace.results_dir / "nep.txt").read_text()) == "evaluate"
     assert (workspace.results_dir / "train.xyz").read_text() == "merge\n"
     assert json.loads((workspace.results_dir / "metrics.json").read_text()) == "evaluate"
-    assert "最新验收代：1" in (workspace.results_dir / "summary.md").read_text()
+    assert "最新完成代：1" in (workspace.results_dir / "summary.md").read_text()
     accepted = (workspace.results_dir / "current").resolve()
     assert accepted.stat().st_mode & 0o070 == 0o070
 
@@ -304,3 +308,69 @@ def test_snapshot_drops_unavailable_optional_paths(tmp_path, contents):
     assert initial_copy.read_text() == "required data"
     assert "test_path" not in snapshot["training"]
     assert "validation_path" not in snapshot["evaluation"]
+
+
+@pytest.mark.parametrize(
+    "kind,decision,expected",
+    [
+        (
+            "acquisition",
+            {
+                "workflow_converged": False,
+                "production_ready": False,
+                "acquisition_convergence_streak": 1,
+                "acquisition_convergence_required": 2,
+                "convergence_reasons": ["有效新标签不足"],
+            },
+            "尚未确认流程收敛",
+        ),
+        (
+            "acquisition",
+            {"workflow_converged": False, "finalization_pending": True},
+            "等待最终训练",
+        ),
+        ("finalization", {"workflow_converged": True}, "已收敛"),
+    ],
+)
+def test_result_summary_distinguishes_current_model_from_converged_model(
+    kind, decision, expected
+):
+    activation = {
+        "evaluation_configured": True,
+        "validation_accepted": False,
+        "energy_rmse": 9.0,
+        "validation_warnings": ["测试集重叠，仅供参考"],
+    }
+    metrics = {
+        "train": activation,
+        "evaluate": {"current_model_force_rmse": 0.08},
+        "update": decision,
+    }
+    if kind == "finalization":
+        activation.update(decision)
+    summary = WorkflowWorkspace._summary_markdown(
+        {
+            "generation": 2,
+            "kind": kind,
+            "stage_sequence": (
+                list(ACTIVE_LEARNING_ACQUISITION_STAGES)
+                if kind == "acquisition"
+                else ["train"]
+            ),
+            "metrics": metrics,
+        }
+    )
+    assert expected in summary
+    assert "最新验收代" not in summary
+    assert "辅助测试（仅供参考，不参与收敛）" in summary
+    assert "测试集重叠，仅供参考" in summary
+    if kind == "finalization":
+        assert "最终模型：" in summary
+        assert "本代只做最终训练，不采样" in summary
+    else:
+        assert "当前模型：" in summary and "最终模型：" not in summary
+        assert "Force RMSE (eV/Å)：0.08" in summary
+    if "convergence_reasons" in decision:
+        assert "有效新标签不足" in summary
+        assert "连续达标：1/2 代" in summary
+        assert "生产采样覆盖：未满足" in summary

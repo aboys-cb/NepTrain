@@ -359,30 +359,72 @@ class WorkflowWorkspace:
             "kind": summary.get("kind"),
             "stage_sequence": summary.get("stage_sequence"),
         }
+        metrics = summary["metrics"]
         validation_stage = stage_for_role(record, "validate")
-        evaluation = summary["metrics"].get(validation_stage or "evaluate", {})
-        lines = ["# NepTrain workflow 结果", ""]
-        if evaluation.get("evaluation_configured") is False:
-            lines.extend(
-                [
-                    f"- 最新完成代：{generation}",
-                    "- 独立 evaluation：未配置",
-                ]
-            )
+        evaluation = metrics.get(validation_stage or "evaluate", {})
+        acquisition_stage = stage_for_role(record, "evaluate")
+        acquisition = metrics.get(acquisition_stage, {})
+        update_stage = stage_for_role(record, "update")
+        decision = (
+            metrics.get(update_stage, {})
+            if record["kind"] == "acquisition"
+            else evaluation
+        )
+        converged = decision.get("workflow_converged") is True
+        if converged:
+            state = "已收敛"
+        elif decision.get("finalization_pending"):
+            state = "采样判据已通过，等待最终训练；尚未确认流程收敛"
         else:
-            lines.extend(
-                [
-                    f"- 最新验收代：{generation}",
-                    f"- Energy RMSE (eV/atom)：{evaluation.get('energy_rmse', 'n/a')}",
-                    f"- Force RMSE (eV/Å)：{evaluation.get('force_rmse', 'n/a')}",
-                    f"- Virial RMSE (eV/atom)：{evaluation.get('virial_rmse', 'n/a')}",
-                ]
-            )
+            state = "尚未确认流程收敛"
+        lines = [
+            "# NepTrain workflow 结果",
+            "",
+            f"- 最新完成代：{generation}",
+            f"- 收敛状态：{state}",
+        ]
+        for reason in decision.get("convergence_reasons", []):
+            lines.append(f"- 收敛说明：{reason}")
+        if decision.get("production_ready") is not None:
+            coverage = "已满足" if decision["production_ready"] else "未满足"
+            lines.append(f"- 生产采样覆盖：{coverage}")
+        streak = decision.get("acquisition_convergence_streak")
+        required = decision.get("acquisition_convergence_required")
+        if streak is not None and required is not None:
+            lines.append(f"- 新增结构精度连续达标：{streak}/{required} 代")
+
+        labels = (
+            ("energy_rmse", "Energy RMSE (eV/atom)"),
+            ("force_rmse", "Force RMSE (eV/Å)"),
+            ("virial_rmse", "Virial RMSE (eV/atom)"),
+            ("mforce_rmse", "Magnetic-force RMSE (eV/μB)"),
+        )
+        lines.extend(["", "## 新增标注结构的预测精度（训练前）", ""])
+        if record["kind"] == "finalization":
+            lines.append("本代只做最终训练，不采样；采样验收证据见上一采样代报告。")
+        else:
+            available = [
+                f"- {label}：{acquisition['current_model_' + key]}"
+                for key, label in labels
+                if acquisition.get("current_model_" + key) is not None
+            ]
+            lines.extend(available or ["暂无有效预测误差，不能据此确认精度达标。"])
+
+        lines.extend(["", "## 辅助测试（仅供参考，不参与收敛）", ""])
+        available = [
+            f"- {label}：{evaluation[key]}"
+            for key, label in labels
+            if evaluation.get(key) is not None
+        ]
+        lines.extend(available or ["未配置或未获得有效测试误差。"])
+        for warning in evaluation.get("validation_warnings", []):
+            lines.append(f"- 提示：{warning}")
+        prefix = "最终" if converged else "当前"
         lines.extend(
             [
                 "",
-                "最终模型：`nep.txt`",
-                "最终训练集：`train.xyz`",
+                f"{prefix}模型：`nep.txt`",
+                f"{prefix}模型使用的训练集：`train.xyz`",
                 "完整指标：`metrics.json`",
                 "",
             ]

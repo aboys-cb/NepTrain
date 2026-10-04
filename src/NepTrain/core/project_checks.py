@@ -5,11 +5,11 @@ from typing import Any, Mapping
 
 from .scientific_data import optional_dataset_issue
 from .workflow import (
+    _optional_labeled_dataset_issue,
     _resolved_config,
     _sampling_frames,
     _validate_labeled_dataset_for_preparation,
 )
-
 
 def check_project_inputs(
     config: Mapping[str, Any], base_dir: Path
@@ -21,17 +21,18 @@ def check_project_inputs(
 
     def dataset(value, role, *, optional=False):
         path = Path(value) if value else None
+        if optional:
+            issue = _optional_labeled_dataset_issue(path, role=role, expect_spin=spin)
+            checks.append(("WARN", issue) if issue else ("OK", f"{role}：{path}"))
+            return
         issue = optional_dataset_issue(path, role=role)
         if issue:
-            if optional:
-                checks.append(("WARN", issue))
-            else:
-                checks.append(
-                    (
-                        "FAIL",
-                        f"{role}：{path or '未配置'}；补齐带标签的 extxyz 数据或修正路径。",
-                    )
+            checks.append(
+                (
+                    "FAIL",
+                    f"{role}：{path or '未配置'}；补齐带标签的 extxyz 数据或修正路径。",
                 )
+            )
             return
         try:
             _validate_labeled_dataset_for_preparation(path, role=role, expect_spin=spin)

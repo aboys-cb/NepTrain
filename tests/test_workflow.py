@@ -1322,7 +1322,9 @@ def test_finalization_precision_has_no_waiting_acquisition_row(capsys, state, ex
     assert "验收" not in text
 
 
-@pytest.mark.parametrize("contents", [None, "", " \n\t"])
+@pytest.mark.parametrize(
+    "contents", [None, "", " \n\t", "not extxyz\n", "1\n\nFe 0\n", "1\n\nFe 0 0 0\n"]
+)
 def test_preparation_skips_unavailable_optional_datasets(tmp_path, caplog, contents):
     from NepTrain.core.config import load_config, save_config
 
@@ -1334,6 +1336,19 @@ def test_preparation_skips_unavailable_optional_datasets(tmp_path, caplog, conte
     config["training"]["test_path"] = str(optional)
     config["evaluation"]["validation_path"] = str(optional)
     save_config(config, source)
+    from NepTrain.core.project_checks import check_project_inputs
+
+    checks = check_project_inputs(config, source.parent)
+    optional_checks = [
+        (level, detail)
+        for level, detail in checks
+        if "training.test_path" in detail or "evaluation.validation_path" in detail
+    ]
+    assert len(optional_checks) == 2
+    assert all(
+        level == "WARN" and "已跳过" in detail for level, detail in optional_checks
+    )
+    assert not any(level == "FAIL" for level, _ in checks)
     prepared = prepare_workflow(source, initial, tmp_path / "workflow")
     portable, _ = load_config(prepared.config_file)
     assert "test_path" not in portable["training"]
@@ -1363,3 +1378,62 @@ def test_prepare_and_extend_print_human_actions_and_total_budget(tmp_path, capsy
     assert "3 → 5（增加 2 代）" in text
     assert "下一步：neptrain workflow run" in text
     assert workflow_status(output).convergence_configured is False
+
+
+@pytest.mark.parametrize("configured_file_exists", [True, False])
+@pytest.mark.parametrize("explicit_output", [True, False])
+def test_explicit_initial_training_takes_priority(
+    tmp_path, capsys, configured_file_exists, explicit_output
+):
+    from ase.io import read
+
+    source, initial = _inputs(tmp_path)
+    alternative = tmp_path / "chosen training.xyz"
+    alternative.write_bytes(initial.read_bytes() * 2)
+    if not configured_file_exists:
+        initial.unlink()
+    output = tmp_path / ("chosen output" if explicit_output else "controller-smoke")
+    run_project_command(
+        SimpleNamespace(
+            project=str(source),
+            initial_training=str(alternative),
+            output=str(output) if explicit_output else None,
+            workflow_id=None,
+            prepare_only=True,
+            foreground=False,
+            poll_interval=None,
+            json=False,
+        )
+    )
+    prepared = output / "inputs" / "initial-train.xyz"
+    assert prepared.read_bytes() == alternative.read_bytes()
+    assert len(read(prepared, index=":")) == 2
+    assert "已准备，尚未启动" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state", ["failed", "rejected", "stalled", "damaged"])
+def test_problem_status_shows_current_generation_and_recovery(tmp_path, capsys, state):
+    from dataclasses import replace
+    from NepTrain.cli.cli import _print_workflow_status
+
+    source, initial = _inputs(tmp_path)
+    prepared = prepare_workflow(source, initial, tmp_path / "workflow")
+    status = workflow_status(prepared.output_dir)
+    assert len(status.generations) == 3
+    _print_workflow_status(
+        replace(
+            status,
+            state=state,
+            generation=1,
+            stage="train",
+            reason="training command exited 1",
+            next_action="neptrain workflow resume workflow",
+        )
+    )
+    text = capsys.readouterr().out
+    assert "training command exited 1" in text
+    assert f"本代计算与报告：{prepared.output_dir / 'generations/0001'}" in text
+    assert (
+        "本代计算与报告：" + str(prepared.output_dir / "generations/0003") not in text
+    )
+    assert "下一步：neptrain workflow resume workflow" in text

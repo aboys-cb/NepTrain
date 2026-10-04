@@ -451,8 +451,8 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
             print(f"异常：{total_failed} 条采样轨迹失败，失败证据已保留")
 
     _print_precision(status)
-    for generation in status.generations:
-        quality = generation["quality"]
+    for generation_record in status.generations:
+        quality = generation_record["quality"]
         test_metrics = quality.get("validation_rmse", {})
         if status.precision_basis != "validation" and any(
             value is not None for value in test_metrics.values()
@@ -463,10 +463,10 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
                 if value is not None
             )
             print(
-                f"G{generation['generation']} 辅助测试（仅供参考，E/V: eV/atom，F: eV/Å，M: eV/μB）：{values}"
+                f"G{generation_record['generation']} 辅助测试（仅供参考，E/V: eV/atom，F: eV/Å，M: eV/μB）：{values}"
             )
         for warning in quality.get("validation_warnings", []):
-            print(f"提示 G{generation['generation']}：{warning}")
+            print(f"提示 G{generation_record['generation']}：{warning}")
     decisions = [
         generation
         for generation in status.generations
@@ -610,7 +610,7 @@ def run_project_command(args):
                         f"invalid project configuration: {error}"
                     ) from error
                 value = config.get("training", {}).get("initial_path")
-                if value:
+                if value and not initial_training:
                     path = Path(value).expanduser()
                     initial_training = str(
                         (project.parent / path).resolve()
