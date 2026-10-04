@@ -4,12 +4,12 @@
 
 # Distill a NEP student from a MACE teacher
 
-This tutorial labels three Al structures with a pinned MACE-MP-0 checkpoint,
+This tutorial labels 12 displaced Al structures with a pinned MACE-MP-0 checkpoint,
 trains a TorchNEP student, and can then run one complete workflow generation:
 
 ```text
 candidates → MACE teacher → energy/forces/virial
-           → TorchNEP student → GPUMD sampling → relabeling and retraining
+           → TorchNEP student → GPUMD sampling → relabeling, pre-training evaluation, and data update
 ```
 
 ## 1. Enter the example and create the environment
@@ -19,7 +19,7 @@ cd examples/distillation-mace
 python -m pip install -e '../..[mace,torchnep]'
 ```
 
-Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-npt.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Install a PyTorch build suitable for your driver first, then verify:
 
@@ -51,7 +51,7 @@ label provenance.
 python make_candidates.py
 ```
 
-`candidates.xyz` contains three fcc Al cells with different lattice scaling:
+`candidates.xyz` contains 12 strained and displaced fcc Al cells with different lattice scaling:
 
 ```bash
 python - <<'PY'
@@ -125,8 +125,8 @@ neptrain doctor --project project.yaml
 ```
 
 The project uses local process targets and is intended for an already allocated
-GPU node. `nep-workflow.in` trains for 500 epochs and `gpumd-nve.in` runs a
-very short NVE sample.
+GPU node. `nep-workflow.in` trains for 500 epochs and `gpumd-npt.in` runs a
+very short NPT sample.
 
 ```bash
 neptrain workflow run project.yaml --prepare-only
@@ -145,13 +145,12 @@ neptrain workflow run project.yaml --foreground
 | Location | Contents |
 |---|---|
 | `generations/0001/train/` | Initial student and PNG convergence plot |
-| `generations/0001/md/` | GPUMD trajectories and health report |
+| `generations/0001/explore/` | GPUMD trajectories and health report |
 | `generations/0001/select/` | FPS selection result |
 | `generations/0001/label/selected-labels.xyz` | New MACE labels |
 | `generations/0001/label/label-provenance.json` | Runner, model name, and SHA256 |
-| `generations/0001/dataset/` | Merged training set |
-| `generations/0001/retrain/` | Retrained student |
-| `generations/0001/evaluate/` | Evaluation result |
+| `generations/0001/update/` | Merged training set |
+| `generations/0001/evaluate/` | Pre-training prediction error on new labels |
 
 `budget_exhausted` means the one-generation tutorial budget was consumed; it
 does not mean the workflow failed.
@@ -161,7 +160,7 @@ does not mean the workflow failed.
 - Choose a checkpoint whose elements, theoretical level, and license match the
   target system.
 - Cover the intended thermodynamic and structural space, not three scaled cells.
-- Prepare an independent validation set and physically meaningful thresholds.
+- Set system-specific `workflow.convergence` thresholds for prediction errors on new labels before training on them. An independent test set is optional and diagnostic only.
 - Increase student capacity, training epochs, and workflow generations.
 - Replace local targets with cluster-appropriate Slurm targets.
 - Never mix teacher labels with different energy references or theory levels.
@@ -177,3 +176,14 @@ does not mean the workflow failed.
 | Spin input is rejected | MACE runner does not produce `mforce` | Use a teacher backend that supports magnetic-force labels |
 
 See [MACE Foundation Models](https://mace-docs.readthedocs.io/en/latest/guide/foundation_models.html).
+
+## Workflow version and expected outcome
+
+All new preparations use `active_learning_v4`:
+`train → explore → select → label → evaluate → update`.
+`train` also checks model lineage, activates the model, and optionally reports test errors; `evaluate` compares the
+sampling model with newly obtained labels before training on them. The thresholds in
+`project.yaml` demonstrate configuration, not accepted model accuracy. With one sampling
+generation, expect `budget_exhausted`; this is not a backend failure. A following generation
+trains the updated data, and final training requires accuracy plus production coverage.
+NPT uses isotropic `npt_scr` at 0 GPa, a rough 100 GPa elastic modulus, and 100/1000-step coupling parameters. The tiny cell and short run are interface checks, not equilibrium sampling.

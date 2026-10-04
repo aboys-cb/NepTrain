@@ -39,6 +39,7 @@ from NepTrain.core.iteration import (
 )
 from NepTrain.core.generation_policy import (
     ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    ACTIVE_LEARNING_V3_PROTOCOL,
     ADAPTIVE_GENERATION_PROTOCOL,
 )
 
@@ -182,6 +183,7 @@ def test_workflow_prepares_controller_plans_and_readable_workspace(tmp_path: Pat
     assert workspace.tasks_dir.is_dir()
     manifest = json.loads(result.manifest.read_text())
     assert manifest["version"] == 7
+    assert manifest["generation_protocol"] == ACTIVE_LEARNING_GENERATION_PROTOCOL
     assert manifest["structure_id_version"] == "neptrain.structure-id.v3"
     assert len(manifest["instance_id"]) == 32
     assert manifest["orchestration"] == "controller"
@@ -227,8 +229,9 @@ def test_convergence_workflow_reserves_one_train_only_finalization_plan(tmp_path
     assert len(result.plans) == 4
 
 
-def test_existing_adaptive_v2_preparation_remains_idempotent(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("saved_protocol", [ADAPTIVE_GENERATION_PROTOCOL, ACTIVE_LEARNING_V3_PROTOCOL])
+def test_existing_preparation_keeps_saved_protocol(
+    tmp_path, monkeypatch, saved_protocol
 ):
     config, initial = _inputs(tmp_path)
     config.write_text(
@@ -253,12 +256,12 @@ def test_existing_adaptive_v2_preparation_remains_idempotent(
     monkeypatch.setattr(
         workflow_module,
         "ACTIVE_LEARNING_GENERATION_PROTOCOL",
-        ADAPTIVE_GENERATION_PROTOCOL,
+        saved_protocol,
     )
-    output = tmp_path / "adaptive-v2"
+    output = tmp_path / saved_protocol
     first = prepare_workflow(config, initial, output)
     first_manifest = json.loads(first.manifest.read_text(encoding="utf-8"))
-    assert first_manifest["generation_protocol"] == ADAPTIVE_GENERATION_PROTOCOL
+    assert first_manifest["generation_protocol"] == saved_protocol
 
     monkeypatch.setattr(
         workflow_module,
@@ -368,7 +371,7 @@ def test_prepare_only_cli_does_not_start_controller(tmp_path: Path, capsys):
     config, _ = _inputs(tmp_path)
     output = tmp_path / "project"
     run_project_command(
-        SimpleNamespace(
+        SimpleNamespace(json=True,
             project=str(config),
             initial_training=str(tmp_path / "initial.xyz"),
             output=str(output),
@@ -401,7 +404,7 @@ def test_project_run_uses_the_same_control_schema_as_directory_run(
 
     monkeypatch.setattr("NepTrain.core.controller.start_controller", fake_start)
     run_project_command(
-        SimpleNamespace(
+        SimpleNamespace(json=True,
             project=str(config),
             initial_training=str(tmp_path / "initial.xyz"),
             output=str(output),
@@ -1019,7 +1022,7 @@ def test_run_starts_existing_prepared_workflow_directory(
 
     monkeypatch.setattr("NepTrain.core.workflow.start_workflow", fake_start)
     run_project_command(
-        SimpleNamespace(
+        SimpleNamespace(json=True,
             project=str(preparation.output_dir),
             initial_training=None,
             output=None,
@@ -1073,7 +1076,7 @@ def test_resume_command_uses_existing_workflow_interface(
         return expected
 
     monkeypatch.setattr("NepTrain.core.workflow.resume_workflow", fake_resume)
-    run_resume_command(SimpleNamespace(project=str(preparation.output_dir)))
+    run_resume_command(SimpleNamespace(json=True, project=str(preparation.output_dir)))
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["protocol"] == "neptrain.workflow-control.v1"
@@ -1115,7 +1118,7 @@ def test_restart_command_exposes_explicit_stage_and_task_scope(
 
     monkeypatch.setattr("NepTrain.core.workflow.restart_workflow", fake_restart)
     run_restart_command(
-        SimpleNamespace(
+        SimpleNamespace(json=True,
             project=str(preparation.output_dir),
             generation=3,
             from_stage="label",
@@ -1261,7 +1264,7 @@ def test_coverage_exhausted_status_is_not_reported_as_prepared(tmp_path):
     status = workflow_status(preparation.output_dir)
     assert status.state == "coverage_exhausted"
     assert "convergence is not established" in status.reason
-    assert status.next_action is None
+    assert "workflow.convergence" in status.next_action
 
 
 def test_status_explains_sampling_decision_and_optional_test(tmp_path, capsys):
@@ -1341,3 +1344,22 @@ def test_preparation_skips_unavailable_optional_datasets(tmp_path, caplog, conte
     }
     assert "训练测试集已跳过" in caplog.text
     assert "辅助测试集已跳过" in caplog.text
+
+
+def test_prepare_and_extend_print_human_actions_and_total_budget(tmp_path, capsys):
+    from NepTrain.cli.cli import run_extend_command
+    source, initial = _inputs(tmp_path)
+    output = tmp_path / "new user workflow"
+    run_project_command(SimpleNamespace(
+        project=str(source), initial_training=str(initial), output=str(output),
+        workflow_id=None, prepare_only=True, foreground=False, poll_interval=None,
+        json=False,
+    ))
+    text = capsys.readouterr().out
+    assert "已准备，尚未启动" in text and "下一步：neptrain workflow run" in text
+    assert not text.startswith("{")
+    run_extend_command(SimpleNamespace(project=str(output), generations=5, json=False))
+    text = capsys.readouterr().out
+    assert "3 → 5（增加 2 代）" in text
+    assert "下一步：neptrain workflow run" in text
+    assert workflow_status(output).convergence_configured is False

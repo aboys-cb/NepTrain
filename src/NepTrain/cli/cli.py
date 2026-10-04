@@ -421,6 +421,8 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
     print(f"路径：{status.project_path}")
     print(f"状态：{state} | {location}")
     print(f"更新：{_updated_text(status.updated_at)}")
+    if getattr(status, "convergence_configured", None) is False:
+        print("收敛：未启用自动收敛；完成采样覆盖或用尽预算不代表精度达标。")
     if status.state in {
         "degraded",
         "paused",
@@ -500,8 +502,65 @@ def _print_workflow_status(status, *, show_jobs: bool = True):
         )
         if notification.get("last_error"):
             print(f"通知错误：{notification['last_error']}")
+    if status.state in {"failed", "rejected", "stalled", "damaged"}:
+        root = Path(status.project_path)
+        print(f"日志：{root / 'logs'}")
+        if generation:
+            print(f"本代计算与报告：{root / 'generations' / f'{generation:04d}'}")
+        failed_jobs = [job for job in status.jobs if str(job["state"]).upper() in {"FAILED", "SKIPPED"}]
+        for job in failed_jobs[-3:]:
+            if job.get("detail"):
+                print(f"  {job.get('stage', '')} / Job {job.get('job_id')}: {job['detail']}")
+            if job.get("bundle"):
+                print(f"  任务目录（stdout.log / output）：{job['bundle']}")
+        if status.state in {"failed", "rejected"}:
+            print("先修复日志中的原因，再执行恢复；resume 会重试未完成阶段。")
+            print("若需更改固定的结构、模板或策略，请修改原始项目并用新的 --output 目录运行。")
+    result_root = Path(status.project_path) / "results"
+    available_results = [result_root / name for name in ("nep.txt", "train.xyz")
+                         if (result_root / name).is_file()]
+    if available_results:
+        print("结果（流程已完成）：" if status.state == "complete" else "当前结果（尚未确认流程收敛）：")
+        for path in available_results:
+            print(f"  {path}")
+        print(f"逐代报告：{Path(status.project_path) / 'generations'}")
     if status.next_action and status.state not in {"running", "waiting", "degraded"}:
         print(f"下一步：{status.next_action}")
+
+
+def _print_workflow_control(payload, *, json_output=False):
+    if json_output:
+        _print_json(payload)
+        return
+    action = payload.get("action", "")
+    labels = {"prepare": "已准备，尚未启动", "start": "已启动", "resume": "已恢复",
+              "restart": "已重新启动", "restart_preview": "重算预览（未执行）",
+              "repair": "已修复", "noop": "无需重复执行", "stop": "已停止"}
+    name = payload.get("workflow_id") or Path(payload.get("project", "workflow")).name
+    print(f"NepTrain · {name}")
+    if action:
+        print(f"操作：{labels.get(action, action)}")
+    root = payload.get("project")
+    if root:
+        print(f"路径：{root}")
+    if "total_model_generations" in payload:
+        print(f"采样代预算：{payload['previous_model_generations']} → "
+              f"{payload['total_model_generations']}（增加 {payload['added_generations']} 代）")
+    for key, label in (("reused_stages", "保留阶段"), ("restarted_stages", "重算阶段")):
+        if key in payload:
+            print(f"{label}：{', '.join(payload[key]) or '无'}")
+    if "retried_tasks" in payload:
+        print(f"任务：保留 {payload.get('preserved_tasks', 0)}，重试 {payload['retried_tasks']}")
+    if isinstance(payload.get("current_execution"), dict):
+        execution = payload["current_execution"]
+        print(f"当前任务：{execution.get('action', '-')}；{execution.get('detail', '')}")
+    if "controller_exit_code" in payload:
+        print(f"Controller 退出码：{payload['controller_exit_code']}")
+    if root:
+        print(f"查看状态：neptrain workflow status {shlex.quote(root)} --jobs")
+        print(f"日志目录：{Path(root) / 'logs'}")
+    if payload.get("next_action"):
+        print(f"下一步：{payload['next_action']}")
 
 
 def run_project_command(args):
@@ -603,7 +662,8 @@ def run_project_command(args):
                     payload["controller_pid"] = controller_result
     except WorkflowError:
         raise
-    _print_json(payload)
+    _print_workflow_control(payload, json_output=getattr(args, "json", False))
+    return payload.get("controller_exit_code", 0)
 
 
 def run_status_command(args):
@@ -633,7 +693,7 @@ def run_resume_command(args):
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     payload = _workflow_resume_payload(result)
-    _print_json(payload)
+    _print_workflow_control(payload, json_output=getattr(args, "json", False))
 
 
 def run_restart_command(args):
@@ -662,7 +722,7 @@ def run_restart_command(args):
         payload.pop("controller_pid")
     if result.controller_exit_code is None:
         payload.pop("controller_exit_code")
-    _print_json(payload)
+    _print_workflow_control(payload, json_output=getattr(args, "json", False))
 
 
 def _workflow_resume_payload(result):
@@ -684,19 +744,31 @@ def _workflow_resume_payload(result):
 
 
 def run_extend_command(args):
-    from NepTrain.core.workflow import WorkflowError, extend_workflow
+    from NepTrain.core.workflow import WorkflowError, extend_workflow, workflow_status
+    from NepTrain.core.workflow_workspace import WorkflowWorkspace
+    from NepTrain.core.config import load_config
 
     try:
+        workspace = WorkflowWorkspace.locate(args.project)
+        previous_config, _ = load_config(workspace.project_file)
+        previous_total = int(previous_config["workflow"]["max_model_generations"])
         preparation = extend_workflow(args.project, args.generations)
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
-    _print_json(
+    from NepTrain.core.config import load_config
+    config, _ = load_config(preparation.config_file)
+    total = int(config["workflow"]["max_model_generations"])
+    _print_workflow_control(
         {
             "protocol": "neptrain.workflow-extend.v1",
             "workflow_id": preparation.workflow_id,
-            "total_model_generations": len(preparation.plans),
+            "total_model_generations": total,
+            "previous_model_generations": previous_total,
+            "added_generations": total - previous_total,
             "project": str(preparation.output_dir),
-        }
+            "next_action": workflow_status(preparation.output_dir).next_action,
+        },
+        json_output=getattr(args, "json", False),
     )
 
 
@@ -709,11 +781,13 @@ def run_stop_command(args):
         )
     except ControllerError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
-    _print_json(
+    _print_workflow_control(
         {
             "protocol": "neptrain.workflow-stop.v1",
             **result,
-        }
+            "action": "stop",
+        },
+        json_output=getattr(args, "json", False),
     )
 
 
@@ -1064,6 +1138,13 @@ def run_doctor(args):
 
     model_info = None
     if config is not None:
+        from NepTrain.core.project_checks import check_project_inputs
+
+        print("项目输入检查（FAIL 必须修复，WARN 为提示）：")
+        for level, detail in check_project_inputs(config, project.parent):
+            print(f"{level} {detail}")
+            if level == "FAIL":
+                failures.append(detail)
         from NepTrain.core.execution import ExecutionTarget
 
         checked_config = {
@@ -1081,9 +1162,10 @@ def run_doctor(args):
         try:
             resource_contract = _doctor_resource_contract(config, project)
         except (KeyError, OSError, RuntimeError, ValueError) as error:
-            raise SystemExit(
-                f"NepTrain: error: invalid labeling resource contract: {error}"
-            ) from error
+            resource_contract = None
+            failures.append("labeling resource contract")
+            print(f"FAIL 标注资源清单：{error}")
+            print("  补齐资源清单中的元素、文件路径和真实 SHA256；参见对应后端示例。")
         labeling = config.get("labeling", {})
         labeling_backend = str(labeling.get("backend", "vasp"))
         if labeling_backend == "model":
@@ -1114,23 +1196,29 @@ def run_doctor(args):
                     setup_path = Path(setup_text)
             target = ExecutionTarget.from_mapping(str(name), value)
             resolved_targets[str(name)] = target
-            tools, packages, roles = _doctor_target_requirements(
-                checked_config,
-                str(name),
-                target,
-                base_dir=project.parent,
-            )
-            probe = _doctor_target_probe(
-                target,
-                tools,
-                packages,
-                setup_path,
-            )
-            completed = _doctor_run_probe(
-                target,
-                probe,
-                timeout_message="probe timed out after 30s",
-            )
+            try:
+                tools, packages, roles = _doctor_target_requirements(
+                    checked_config,
+                    str(name),
+                    target,
+                    base_dir=project.parent,
+                )
+                probe = _doctor_target_probe(
+                    target,
+                    tools,
+                    packages,
+                    setup_path,
+                )
+                completed = _doctor_run_probe(
+                    target,
+                    probe,
+                    timeout_message="probe timed out after 30s",
+                )
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                failures.append(f"execution target {name}")
+                print(f"FAIL execution target {name}: {error}")
+                print("  检查该 target 的 setup_script、command、host 和标注输入；修复后重跑 doctor。")
+                continue
             available = completed.returncode == 0
             location = target.host or "local"
             role_text = ",".join(roles) if roles else "unused"
@@ -1277,6 +1365,7 @@ def run_doctor(args):
                 failures.append("Feishu webhook")
                 print(f"  {result.detail}")
     if failures:
+        print(f"检查结束：{len(failures)} 项必须修复；按上面的路径和提示处理后重跑 doctor。")
         raise SystemExit("Doctor failed: " + ", ".join(failures))
     print("Doctor completed successfully.")
 
@@ -1388,7 +1477,7 @@ def build_smoke(subparsers):
     parser.add_argument(
         "--workflow",
         action="store_true",
-        help="Also run the fixed v3 decision/recovery suite with deterministic backend doubles (no real MD or DFT).",
+        help="Also run the fixed active-learning decision/recovery suite with deterministic backend doubles (no real MD or DFT).",
     )
     parser.add_argument("--force", action="store_true")
 
@@ -2134,6 +2223,7 @@ def build_workflow_commands(subparsers):
         ),
     )
     run.set_defaults(func=run_project_command)
+    run.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
     run.add_argument("project", help="Project YAML or prepared workflow directory.")
     run.add_argument("--initial-training")
     run.add_argument("--output")
@@ -2158,6 +2248,7 @@ def build_workflow_commands(subparsers):
         "resume", help="Start or restart an existing workflow controller."
     )
     resume.set_defaults(func=run_resume_command)
+    resume.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
     resume.add_argument("project")
 
     restart = actions.add_parser(
@@ -2165,6 +2256,7 @@ def build_workflow_commands(subparsers):
         help="Restart the latest unfinished generation from an explicit stage.",
     )
     restart.set_defaults(func=run_restart_command)
+    restart.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
     restart.add_argument("project")
     restart.add_argument("--generation", type=int, required=True)
     restart.add_argument(
@@ -2194,13 +2286,16 @@ def build_workflow_commands(subparsers):
         "extend", help="Increase the maximum model-generation budget."
     )
     extend.set_defaults(func=run_extend_command)
+    extend.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
     extend.add_argument("project")
-    extend.add_argument("generations", type=int)
+    extend.add_argument("generations", type=int, metavar="TOTAL_GENERATIONS",
+                        help="New total sampling-generation budget, not the number to add (e.g. 10 -> 15 adds 5).")
 
     stop = actions.add_parser(
         "stop", help="Stop the controller and cancel its current compute jobs."
     )
     stop.set_defaults(func=run_stop_command)
+    stop.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
     stop.add_argument("project")
     cancellation = stop.add_mutually_exclusive_group()
     cancellation.set_defaults(cancel_jobs=True)
@@ -2312,6 +2407,7 @@ def main():
             ExecutionError,
             IterationError,
             ManualTaskError,
+            OSError,
         )
         scientific_error_names = {
             "LabelingError",

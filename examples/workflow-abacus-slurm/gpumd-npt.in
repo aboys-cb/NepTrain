@@ -1,0 +1,10 @@
+# NepTrain template; run through project.yaml, not directly with GPUMD.
+# Short interface check, not an equilibrated trajectory.
+# Pressure and the rough elastic modulus are in GPa; coupling constants are in steps.
+# https://gpumd.org/gpumd/input_parameters/ensemble_standard.html
+potential {{ model_file }}
+velocity {{ temperature }} seed {{ seed }}
+ensemble npt_scr {{ temperature }} {{ temperature }} 100 {{ pressure }} 100 1000
+time_step 0.5
+dump_exyz 1 0 1
+run {{ steps }}

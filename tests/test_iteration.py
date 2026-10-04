@@ -38,6 +38,9 @@ from NepTrain.core.generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
     ACTIVE_LEARNING_FINALIZATION_STAGES,
     ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    ACTIVE_LEARNING_V3_PROTOCOL,
+    ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
     ADAPTIVE_GENERATION_PROTOCOL,
     generation_stage_sequence,
     stage_for_role,
@@ -246,7 +249,7 @@ def test_adaptive_generation_finalizes_in_a_train_evaluate_only_generation(
     ]
 
 
-def test_active_learning_v3_uses_unambiguous_public_stage_names(tmp_path):
+def test_active_learning_v4_has_no_separate_validation_stage(tmp_path):
     calls = []
 
     class Adapter:
@@ -267,13 +270,13 @@ def test_active_learning_v3_uses_unambiguous_public_stage_names(tmp_path):
                     "accepted": True,
                     "generation_disposition": "finalize",
                 }
-            elif context.generation_kind == "finalization" and stage == "validate":
+            elif context.generation_kind == "finalization" and stage == "train":
                 metrics = {"accepted": True, "workflow_converged": True}
             return StageOutcome({f"g{context.generation}_{stage}": path}, metrics)
 
     controller = GenerationController(
-        tmp_path / "active-learning-v3",
-        "active-learning-v3",
+        tmp_path / "active-learning-v4",
+        "active-learning-v4",
         generation_protocol=ACTIVE_LEARNING_GENERATION_PROTOCOL,
     )
     adapter = Adapter()
@@ -327,7 +330,7 @@ def test_active_learning_v3_dispatches_evaluate_separately_from_validate():
                 artifacts={},
                 previous_artifacts={},
                 generation_kind="acquisition",
-                stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+                stage_sequence=ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
             ),
         )
 
@@ -353,8 +356,13 @@ def test_stage_roles_disambiguate_v2_and_v3_evaluate():
     }
     v3 = {
         "kind": "acquisition",
-        "stage_sequence": list(ACTIVE_LEARNING_ACQUISITION_STAGES),
+        "stage_sequence": list(ACTIVE_LEARNING_V3_ACQUISITION_STAGES),
     }
+
+    v4 = {"kind": "acquisition", "stage_sequence": list(ACTIVE_LEARNING_ACQUISITION_STAGES)}
+    assert stage_for_role(v4, "validate") == "train"
+    assert stage_for_role(v4, "evaluate") == "evaluate"
+    assert stage_for_role(v4, "update") == "update"
 
     assert stage_for_role(v2, "validate") == "evaluate"
     assert stage_for_role(v2, "evaluate") == "diagnose"
@@ -436,6 +444,12 @@ def test_rejected_finalization_reopens_from_train(tmp_path):
             ),
             "diagnose",
             "merge",
+        ),
+        (
+            ACTIVE_LEARNING_V3_PROTOCOL,
+            ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
+            "evaluate",
+            "update",
         ),
         (
             ACTIVE_LEARNING_GENERATION_PROTOCOL,
@@ -564,7 +578,8 @@ def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
     ("stage_sequence", "validation_stage"),
     [
         (("train", "evaluate"), "evaluate"),
-        (ACTIVE_LEARNING_FINALIZATION_STAGES, "validate"),
+        (ACTIVE_LEARNING_V3_FINALIZATION_STAGES, "validate"),
+        (ACTIVE_LEARNING_FINALIZATION_STAGES, "train"),
     ],
 )
 def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
@@ -623,7 +638,7 @@ def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
             stage_sequence=stage_sequence,
         ),
     )
-    evaluate = adapter.run_stage(
+    evaluate = train if validation_stage == "train" else adapter.run_stage(
         validation_stage,
         StageContext(
             generation=2,
@@ -657,9 +672,11 @@ def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
         "omitted",
     ],
 )
+@pytest.mark.parametrize("stage_sequence", [("train", "evaluate"), ACTIVE_LEARNING_FINALIZATION_STAGES])
 def test_finalization_test_is_diagnostic_only(
     tmp_path,
     test_case,
+    stage_sequence,
 ):
     teacher = ToyTeacher("ordinary")
     merged = tmp_path / "merged.xyz"
@@ -736,7 +753,7 @@ def test_finalization_test_is_diagnostic_only(
             },
             stage_dir=tmp_path / "train",
             generation_kind="finalization",
-            stage_sequence=("train", "evaluate"),
+            stage_sequence=stage_sequence,
         ),
     )
     evaluate_adapter = WorkflowIterationAdapter(
@@ -746,7 +763,7 @@ def test_finalization_test_is_diagnostic_only(
         active_generation_kind="finalization",
         runtime=WorkflowRuntime(train=fake_train, predict=failing_predict),
     )
-    outcome = evaluate_adapter.run_stage(
+    outcome = train if stage_sequence == ACTIVE_LEARNING_FINALIZATION_STAGES else evaluate_adapter.run_stage(
         "evaluate",
         StageContext(
             generation=2,
@@ -756,7 +773,7 @@ def test_finalization_test_is_diagnostic_only(
             previous_artifacts={},
             stage_dir=tmp_path / "evaluate",
             generation_kind="finalization",
-            stage_sequence=("train", "evaluate"),
+            stage_sequence=stage_sequence,
         ),
     )
 
@@ -2817,3 +2834,38 @@ def test_empty_acquisition_cannot_advance_convergence_streak():
     assert result["acquisition_converged"] is False
     assert result["acquisition_convergence_streak"] == 0
     assert "证据不足" in result["convergence_reasons"][0]
+
+
+@pytest.mark.parametrize("model_state", ["missing", "empty"])
+def test_v4_training_rejects_unusable_model_before_activation(tmp_path, model_state):
+    initial = tmp_path / "initial.xyz"
+    config = tmp_path / "nep.in"
+    config.write_text("type 1 Fe\n")
+    teacher = ToyTeacher("ordinary")
+    ase_write(initial, [teacher.label(toy_candidate_frames("ordinary", 77, 1)[0])], format="extxyz")
+
+    def train(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model = request.output_dir / "nep.txt"
+        if model_state == "empty":
+            model.touch()
+        return TrainingResult(backend, model, None, None)
+
+    adapter = WorkflowIterationAdapter(
+        {"training": {"config_path": str(config)}},
+        initial_training=initial,
+        active_stage="train",
+        active_generation_kind="acquisition",
+        active_stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+        runtime=WorkflowRuntime(train=train),
+    )
+    with pytest.raises(WorkflowIterationError, match="missing or empty"):
+        adapter.run_stage("train", StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation",
+            plan=GenerationPlan(1, 77, 1),
+            artifacts={}, previous_artifacts={},
+            generation_kind="acquisition",
+            stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+        ))
+    assert not (tmp_path / "generation" / "active-model-lineage.json").exists()

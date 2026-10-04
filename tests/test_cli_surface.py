@@ -431,6 +431,11 @@ def test_doctor_reads_backends_and_route_targets_from_project(
     capsys,
 ):
     project = _manual_project(tmp_path)
+    from NepTrain.core.dft.toy import ToyTeacher
+    frame = ToyTeacher("ordinary").label(Atoms("Fe", cell=[4, 4, 4], pbc=True))
+    for name in ("train.xyz", "a.xyz", "b.xyz"):
+        ase_write(tmp_path / name, frame, format="extxyz")
+    (tmp_path / "nep.in").write_text("type 1 Fe\n")
     yaml = YAML()
     with project.open(encoding="utf-8") as handle:
         value = yaml.load(handle)
@@ -706,17 +711,17 @@ def test_doctor_and_execution_select_vasp_from_incar(tmp_path, incar, executable
 
 
 @pytest.mark.parametrize("profile", ["ordinary", "recovery"])
-def test_workflow_smoke_exercises_production_v3_decisions(tmp_path, profile):
+def test_workflow_smoke_exercises_production_v4_decisions(tmp_path, profile):
     completed = _help(
         "smoke", "--workflow", "--profile", profile, "--output", str(tmp_path / "smoke")
     )
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(completed.stdout)
     report = payload["workflow"]
-    assert report["generation_protocol"] == "active_learning_v3"
+    assert report["generation_protocol"] == "active_learning_v4"
     assert report["backend_mode"] == "deterministic_doubles"
     assert report["passed"] and all(report["checks"].values())
-    assert len(report["cases"]) == 9
+    assert len(report["cases"]) == 10
     assert report["cases"]["no_test"]["generations_completed"] == 5
     assert report["cases"]["md_recovery"]["generations_completed"] == 6
     assert report["cases"]["long_streak"]["generations_completed"] == 7
@@ -726,3 +731,42 @@ def test_workflow_smoke_exercises_production_v3_decisions(tmp_path, profile):
     assert (
         "训练集：4 → 12（+8）" in (workflow / "no_test/notifications.txt").read_text()
     )
+
+
+def test_repeated_init_reports_actionable_error_without_traceback(tmp_path):
+    assert _help("workflow", "init", "--profile", "local", "--directory", str(tmp_path)).returncode == 0
+    result = _help("workflow", "init", "--directory", str(tmp_path))
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert "doctor --project" in result.stderr and "覆盖" in result.stderr
+
+
+def test_doctor_collects_missing_inputs_before_resource_failure(tmp_path):
+    _help("workflow", "init", "--profile", "local", "--directory", str(tmp_path))
+    result = _help("doctor", "--project", str(tmp_path / "project.yaml"))
+    assert result.returncode != 0
+    for field in ("training.initial_path", "training.config_path", ".structures", "标注资源清单"):
+        assert field in result.stdout
+    assert "未启用自动收敛" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("command", ["run", "resume", "restart", "extend", "stop"])
+def test_workflow_controls_offer_explicit_json(command):
+    result = _help("workflow", command, "--help")
+    assert result.returncode == 0 and "--json" in result.stdout
+    if command == "extend":
+        assert "TOTAL_GENERATIONS" in result.stdout and "not the number to add" in " ".join(result.stdout.split())
+
+
+def test_workflow_control_human_summary_keeps_restart_details(capsys):
+    from NepTrain.cli.cli import _print_workflow_control
+    value = {"workflow_id": "case", "action": "restart_preview", "project": "/tmp/a b",
+             "reused_stages": ["train", "explore"], "restarted_stages": ["label"],
+             "preserved_tasks": 4, "retried_tasks": 1}
+    _print_workflow_control(value)
+    out = capsys.readouterr().out
+    assert "重算预览（未执行）" in out and "保留 4，重试 1" in out
+    assert "'/tmp/a b'" in out and not out.startswith("{")
+    _print_workflow_control(value, json_output=True)
+    assert json.loads(capsys.readouterr().out) == value

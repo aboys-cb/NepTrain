@@ -11,6 +11,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = (
     ROOT / "README.md",
+    ROOT / "README.zh-CN.md",
+    *sorted((ROOT / "examples").glob("*/README*.md")),
     ROOT / "docs/source/command/manual.md",
     ROOT / "docs/source/command/workflow.md",
 )

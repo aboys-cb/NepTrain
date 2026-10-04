@@ -24,29 +24,21 @@ cd examples/workflow-vasp-slurm
 python -m pip install -e '../..[torchnep]'
 ```
 
-Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-npt.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Training nodes must run `neptrain` and TorchNEP, MD nodes must run `gpumd`, and
 labeling nodes must run `vasp_std`. Record the conda/module setup for each node
 type and put it in `env-training.sh`, `env-gpumd.sh`, and `env-vasp.sh`.
 
-## 2. Generate tutorial seed data
+## 2. Generate unlabeled seed structures
 
 ```bash
 python ../prepare_al_seed.py --output-dir .
 ```
 
-The script creates:
-
-| File | Purpose |
-|---|---|
-| `train.xyz` | 24 seed structures with energy, forces, and virial |
-| `validation.xyz` | 4 optional tutorial test structures |
-| `structures/al.xyz` | Initial structure for GPUMD |
-
-These labels come from ASE EMT and only validate workflow mechanics. For
-production, replace both datasets with data consistent with your VASP setup.
-Never mix different theoretical levels in one training set.
+This generates `seed-train.xyz` (24 frames), `seed-validation.xyz` (4 optional test frames),
+and `structures/al.xyz`. It creates no energy, force, virial, or EMT labels. Step 6 labels the
+seeds with the same backend, inputs, and resource manifest used by the workflow.
 
 ## 3. Pin the POTCAR
 
@@ -107,15 +99,11 @@ no output:
 grep -R "REPLACE" project.yaml env-*.sh vasp-resources.json
 ```
 
-## 5. Run preflight checks
+## 5. Check the runtime prerequisites
 
-```bash
-neptrain doctor --project project.yaml
-```
-
-This checks the schema-v8 project, Slurm commands, setup scripts, and POTCAR
-path and SHA256 on compute nodes. It cannot replace one real VASP run, which
-must validate the license, MPI setup, and executable.
+Finish replacing resource paths, hashes, partitions, and setup commands before submitting
+any job. The full `doctor --project` input check runs after the seed labeling below;
+`train.xyz` does not exist yet. The next single-structure calculation tests the actual backend.
 
 ## 6. Label one structure first
 
@@ -143,6 +131,15 @@ PY
 ```
 
 If it fails, inspect `neptrain task logs <run_directory>` before proceeding.
+
+Once the single-structure check passes, label the seeds with the same settings. Only the training set is required; an absent optional test set produces a warning and is skipped.
+
+```bash
+neptrain label seed-train.xyz --backend vasp --project project.yaml --target vasp --wait --output train.xyz
+# Optional / 可选：
+neptrain label seed-validation.xyz --backend vasp --project project.yaml --target vasp --wait --output validation.xyz
+neptrain doctor --project project.yaml
+```
 
 ## 7. Prepare and start the workflow
 
@@ -174,7 +171,7 @@ neptrain workflow stop vasp-tutorial-workflow
 
 `evaluation` is diagnostic only and does not block progression. Acquisition accuracy thresholds live in
 `workflow.convergence`; the example values are for the tutorial only. Final training requires accuracy,
-production coverage, and the configured passing streak. Optional test reports are in `generations/0001/validate/`.
+production coverage, and the configured passing streak. Optional test reports are in `generations/0001/train/`.
 
 The example sets `max_model_generations: 1`. A final `budget_exhausted` state
 means the tutorial used its one-generation budget; it is not a Slurm or VASP
@@ -182,10 +179,10 @@ failure. Real failures appear in stage/job state and logs.
 
 ## 9. Convert it to a production project
 
-- Replace EMT data with labels from the same VASP theoretical level.
+- Expand seed coverage while preserving the same VASP theoretical level.
 - Add every target element to the resource manifest.
 - Review `ENCUT`, pseudopotentials, k points, electronic convergence, and spin.
-- Replace the 10–80-step NVE path with validated NVE/NVT/NPT sampling.
+- Replace the 10–80-step NPT path with validated NPT sampling.
 - Increase data volume, validation coverage, training size, and generations.
 - Tune `structures_per_job`, `max_concurrent`, and Slurm resources.
 
@@ -198,3 +195,21 @@ failure. Real failures appear in stage/job state and logs.
 | `execution target ... FAIL` | Placeholder setup or partition remains | Remove every `REPLACE` value |
 | VASP exits immediately | Module, license, or MPI launcher mismatch | Inspect task/stage logs |
 | NaN trajectory | Unstable initial student or MD settings | Inspect `trajectory-health.json`; reduce timestep/temperature and improve seed data |
+
+## NPT settings and validation limits
+
+`gpumd-npt.in` uses isotropic `npt_scr`, target pressure 0 GPa, a rough elastic-modulus
+parameter of 100 GPa, and thermostat/barostat coupling parameters of 100/1000 steps.
+These are tutorial settings, not fitted material constants. The four-atom cell and 10–80
+steps test file and stage handling; they cannot establish equilibration or a production model.
+See the [GPUMD ensemble syntax](https://gpumd.org/gpumd/input_parameters/ensemble_standard.html).
+The one-generation budget normally ends as `budget_exhausted`, not `complete`.
+
+## Use ordinary LAMMPS NPT instead
+
+`project-lammps.yaml`, `lammps-npt.in`, and `env-lammps.sh` reuse the same VASP data and
+resources. Configure LAMMPS/NEPAdapters in the setup script and the partitions/paths in this
+alternative YAML, then use `doctor --project project-lammps.yaml` and
+`workflow run project-lammps.yaml --prepare-only`. Its output is
+`vasp-lammps-tutorial-workflow`. Pressure is in **bar** with LAMMPS `units metal`; the
+framework substitutes the template value without converting it from GPUMD units.

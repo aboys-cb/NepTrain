@@ -16,11 +16,12 @@ md:
 
 sampling:
   routes:
-    - id: aluminum-nve
+    - id: aluminum-npt
       structures:
         - ./candidates.xyz
-      template_path: ./gpumd-nve.in
+      template_path: ./gpumd-npt.in
       conditions:
+        pressure: 0  # GPUMD: GPa
         temperature_path:
           - 50
       progression:
@@ -51,6 +52,13 @@ labeling:
 workflow:
   id: tace-distillation-workflow
   max_model_generations: 1
+  # Tutorial thresholds only; this one-generation run does not establish accuracy.
+  convergence:
+    acquisition_max_rmse:
+      energy_rmse: 0.2  # eV/atom
+      force_rmse: 0.5  # eV/Angstrom
+    min_selected: 1
+    consecutive_generations: 1
   seed: 20260728
 
 execution:

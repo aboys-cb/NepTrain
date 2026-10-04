@@ -56,6 +56,8 @@ from NepTrain.core.iteration import GenerationPlan, StageContext, StageOutcome
 from NepTrain.core.generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
     ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    ACTIVE_LEARNING_V3_PROTOCOL,
+    ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
 )
 from NepTrain.core.scientific_data import (
     INPUT_STRUCTURE_ID_KEY,
@@ -973,11 +975,11 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
         artifacts=current,
         previous_artifacts={},
         generation_kind="acquisition",
-        stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+        stage_sequence=ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
         stage_input={
             "generation_kind": "acquisition",
-            "generation_protocol": ACTIVE_LEARNING_GENERATION_PROTOCOL,
-            "stage_sequence": list(ACTIVE_LEARNING_ACQUISITION_STAGES),
+            "generation_protocol": ACTIVE_LEARNING_V3_PROTOCOL,
+            "stage_sequence": list(ACTIVE_LEARNING_V3_ACQUISITION_STAGES),
         },
     )
     v3_descriptors = {}
@@ -1000,7 +1002,7 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
     assert set(v3_descriptors["validate"]["artifacts"]) == set(current)
     assert tuple(
         v3_descriptors["validate"]["stage_input"]["stage_sequence"]
-    ) == ACTIVE_LEARNING_ACQUISITION_STAGES
+    ) == ACTIVE_LEARNING_V3_ACQUISITION_STAGES
     assert set(v3_descriptors["evaluate"]["artifacts"]) == {
         "labeled",
         "model",
@@ -1071,6 +1073,33 @@ def test_remote_stage_bundle_carries_only_activated_model_across_generations(
         "activated_checkpoint",
         "active_model_lineage",
     }
+
+    # New training bundles own activation and therefore carry diagnostic inputs.
+    train_task = build_stage_task(
+        tmp_path / "v4-train-tasks",
+        workflow_root=tmp_path,
+        workflow_id="activation-v4",
+        generation=1,
+        stage="train",
+        attempt=1,
+        target=ExecutionTarget("local", "process"),
+        plan=_plan(),
+        config=config,
+        initial_training=initial,
+        context=StageContext(
+            generation=1,
+            generation_dir=tmp_path / "generation-v4",
+            plan=_plan(),
+            artifacts={},
+            previous_artifacts={},
+            generation_kind="acquisition",
+            stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
+            stage_input={"generation_kind": "acquisition"},
+        ),
+    )
+    descriptor = json.loads(train_task.descriptor.read_text())
+    diagnostic_path = descriptor["config"]["evaluation"]["validation_path"]
+    assert (train_task.bundle / diagnostic_path).read_bytes() == validation.read_bytes()
 
 
 def test_adaptive_followup_train_bundle_keeps_training_config(tmp_path):
@@ -1498,7 +1527,8 @@ def test_controller_uses_reserved_plan_only_after_acquisition_requests_finalizat
     assert next_work[1:] == ("train", "finalization-context")
 
 
-def test_controller_completes_v3_from_finalization_validate_metrics(tmp_path):
+@pytest.mark.parametrize("activation_stage", ["train", "validate"])
+def test_controller_completes_from_saved_finalization_metrics(tmp_path, activation_stage):
     config, initial = _controller_inputs(tmp_path)
     config.write_text(
         config.read_text(encoding="utf-8").replace(
@@ -1546,9 +1576,9 @@ def test_controller_completes_v3_from_finalization_validate_metrics(tmp_path):
                     "2": {
                         "plan_sha256": plans[1].sha256,
                         "kind": "finalization",
-                        "stage_sequence": ["train", "validate"],
+                        "stage_sequence": ["train"] if activation_stage == "train" else ["train", "validate"],
                         "stages": {
-                            "validate": {
+                            activation_stage: {
                                 "artifacts": {},
                                 "metrics": {
                                     "accepted": True,
@@ -1790,6 +1820,7 @@ def test_notification_failure_never_changes_controller_result(
     assert "intentional notification failure" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_group_submission_checks_stop_between_parallel_launch_batches(
     tmp_path: Path,
 ):
@@ -1862,6 +1893,7 @@ def test_group_submission_checks_stop_between_parallel_launch_batches(
     assert len([item for item in launches if item[0] == "label"]) == 4
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
     tmp_path: Path,
 ):
@@ -1940,6 +1972,7 @@ def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
     ), bulk_collections
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_remote_batch_collection_uses_one_compact_archive(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
@@ -2053,6 +2086,7 @@ def test_remote_batch_collection_uses_one_compact_archive(tmp_path):
         assert outcome.metrics["labeled_count"] == 1
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -2086,6 +2120,7 @@ def test_controller_routes_every_stage_without_scheduler_dependencies(tmp_path):
     assert "scripts" not in manifest
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_status_audits_and_resume_repairs_committed_result_projection(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -2364,14 +2399,14 @@ def test_controller_restart_can_reopen_latest_rejected_generation(tmp_path):
     )
 
 
-def test_controller_restart_v3_evaluate_does_not_rewind_validate(tmp_path):
+def test_controller_restart_v4_evaluate_does_not_rewind_training(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     controller = PersistentController(preparation.output_dir)
     plan = controller.plans[0]
     workspace = WorkflowWorkspace.locate(preparation.output_dir)
     ledger = json.loads(workspace.ledger.read_text(encoding="utf-8"))
-    completed = ACTIVE_LEARNING_ACQUISITION_STAGES[:5]
+    completed = ACTIVE_LEARNING_ACQUISITION_STAGES[:4]
     ledger["generations"]["1"] = {
         "plan_sha256": plan.sha256,
         "kind": "acquisition",
@@ -2407,6 +2442,7 @@ def test_controller_restart_v3_evaluate_does_not_rewind_validate(tmp_path):
     assert set(ledger["generations"]["1"]["stages"]) == set(completed)
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_resume_refuses_irrecoverable_committed_artifact_damage(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -2443,6 +2479,7 @@ def test_resume_refuses_irrecoverable_committed_artifact_damage(tmp_path):
     assert workflow_status(preparation.output_dir).state == "damaged"
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_missing_scientific_ledger_is_not_treated_as_a_fresh_workflow(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -2545,6 +2582,7 @@ def test_controller_publishes_flat_md_calculation_link(tmp_path):
     assert not (output / "md").exists()
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
     tmp_path,
 ):
@@ -2632,6 +2670,7 @@ def test_controller_submits_every_unlocked_route_attempt_as_one_md_wave(
     assert tracker["maximum"] == 2
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
@@ -2697,6 +2736,7 @@ def test_controller_splits_dft_labels_and_limits_concurrency(tmp_path):
     assert not (dft_root / "calculations").exists()
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_reports_exhausted_sampling_coverage(
     tmp_path, monkeypatch
 ):
@@ -2725,6 +2765,7 @@ def test_controller_reports_exhausted_sampling_coverage(
     assert [stage for stage, _ in launches] == ["train"]
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_label_oom_is_not_retried_and_does_not_stop_sibling_tasks(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
@@ -2809,6 +2850,7 @@ def test_label_oom_is_not_retried_and_does_not_stop_sibling_tasks(tmp_path):
     assert any(job["state"] == "SKIPPED" for job in status.jobs)
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_failed_labels_are_skipped_without_blocking_successful_siblings(
     tmp_path,
 ):
@@ -2906,6 +2948,7 @@ def test_failed_labels_are_skipped_without_blocking_successful_siblings(
     assert [job["state"] for job in status.jobs].count("SKIPPED") == 2
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_stalls_when_every_label_fails(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
@@ -2987,6 +3030,7 @@ def test_controller_stalls_when_every_label_fails(tmp_path):
     assert [job["state"] for job in status.jobs].count("SKIPPED") == 3
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_invalid_collected_label_is_skipped_without_blocking_siblings(
     tmp_path,
 ):
@@ -3064,6 +3108,7 @@ def test_invalid_collected_label_is_skipped_without_blocking_siblings(
     assert label["tasks"][0]["retryable"] is False
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_label_submission_rejection_fails_before_submitting_siblings(
     tmp_path,
 ):
@@ -3146,6 +3191,7 @@ def test_permanent_single_stage_collection_error_is_terminal(tmp_path):
     )
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_stalls_when_md_wave_has_no_safe_candidate_frames(
     tmp_path,
 ):
@@ -3190,6 +3236,7 @@ def test_controller_stalls_when_md_wave_has_no_safe_candidate_frames(
     )
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_group_merge_failure_can_retry_collected_results(
     tmp_path,
     monkeypatch,
@@ -3278,6 +3325,7 @@ def test_controller_waits_and_reuses_task_after_submission_throttle(tmp_path):
     assert launches == [("train", "gpu")]
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_md_wave_retry_preserves_completed_attempts(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     text = config.read_text(encoding="utf-8")
@@ -3392,6 +3440,7 @@ class EvaluationStateExecutor(ImmediateExecutor):
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_does_not_report_unconverged_work_as_complete(
     tmp_path, metrics, expected_state
 ):
@@ -3435,6 +3484,7 @@ class SameSchedulerIdExecutor(ImmediateExecutor):
         )
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_controller_namespaces_equal_slurm_job_ids_by_target(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -4375,6 +4425,7 @@ def test_stop_prepared_workflow_is_an_idempotent_no_op(tmp_path):
     assert "workflow run" in status.next_action
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_stop_complete_workflow_does_not_rewrite_it_as_paused(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -4499,6 +4550,7 @@ def test_stop_workflow_preserves_current_until_cancellation_is_terminal(
     assert stop_event["current_execution"]["action"] == "cancelling"
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_group_stop_preserves_completed_labels_and_skips_cancelled_shard(
     tmp_path,
 ):
@@ -4612,6 +4664,7 @@ def test_group_stop_preserves_completed_labels_and_skips_cancelled_shard(
     assert label["metrics"]["failed_frame_indices"] == [2]
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_group_stop_retries_all_labels_when_none_were_collected(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
@@ -4739,6 +4792,7 @@ def test_controller_retry_creates_a_new_traceable_attempt(tmp_path):
     assert state["history"][0]["failure"] == "intentional failure"
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_selection_oom_automatically_advances_memory_ladder(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     text = config.read_text(encoding="utf-8").replace(
@@ -4949,6 +5003,7 @@ def test_internal_controller_failure_preserves_live_handle_for_resume(
 
 
 @pytest.mark.parametrize("slow_cleanup", [False, True])
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_detached_controller_completes_a_real_multi_process_workflow(
     tmp_path, monkeypatch, slow_cleanup
 ):
@@ -5086,6 +5141,7 @@ result = {
     assert len(state["history"]) == 8
 
 
+@pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_stopped_controller_resumes_an_inflight_process(tmp_path):
     config, initial = _controller_inputs(tmp_path)
     worker = _write(

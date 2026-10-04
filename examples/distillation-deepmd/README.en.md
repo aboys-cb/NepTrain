@@ -9,7 +9,7 @@ student smoke training, and then runs one complete workflow generation:
 
 ```text
 candidates → DPA-3 teacher → energy/forces/virial
-           → TorchNEP student → GPUMD sampling → relabeling and retraining
+           → TorchNEP student → GPUMD sampling → relabeling, pre-training evaluation, and data update
 ```
 
 The main path uses DeePMD-kit's built-in `DPA-3.2-5M` with the `OMol25` head.
@@ -23,7 +23,7 @@ cd examples/distillation-deepmd
 python -m pip install -e '../..[deepmd,torchnep]'
 ```
 
-Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nvt.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Verify the commands and CUDA runtime:
 
@@ -135,9 +135,7 @@ command -v gpumd
 neptrain doctor --project project.yaml
 ```
 
-The three-atom test uses `gpumd-nve.in`. It initializes velocities at 50 K but
-does not apply a thermostat, avoiding strong thermostat coupling in a tiny
-system. `nep-workflow.in` trains for 500 epochs before this short MD run.
+The three-atom example uses `gpumd-nvt.in`: a fixed vacuum box and a 50 K Nosé–Hoover thermostat. It has no barostat. The 0.1 fs timestep and 2–16 steps only check the interface; they do not establish a thermal distribution. `nep-workflow.in` trains for 500 epochs.
 
 ```bash
 neptrain workflow run project.yaml --prepare-only
@@ -156,16 +154,15 @@ neptrain workflow run project.yaml --foreground
 | Location | Contents |
 |---|---|
 | `generations/0001/train/` | Initial student and PNG convergence plot |
-| `generations/0001/md/` | GPUMD trajectory and `trajectory-health.json` |
+| `generations/0001/explore/` | GPUMD trajectory and `trajectory-health.json` |
 | `generations/0001/select/` | FPS-selected candidates |
 | `generations/0001/label/selected-labels.xyz` | New DPA-3 labels |
 | `generations/0001/label/label-provenance.json` | Runner, head, model name, and SHA256 |
-| `generations/0001/dataset/` | Merged student training set |
-| `generations/0001/retrain/` | Retrained student |
-| `generations/0001/evaluate/` | Evaluation and activation artifacts |
+| `generations/0001/update/` | Merged student training set |
+| `generations/0001/evaluate/` | Pre-training prediction error on new labels |
 
 `budget_exhausted` means the one-generation tutorial budget was consumed, not
-that the workflow failed. All eight stages should complete; teacher or MD
+that the workflow failed. The configured sampling stages should complete; teacher or MD
 failures are shown on their respective stage.
 
 ## 8. Switch to DPA-4
@@ -206,9 +203,19 @@ not claim validation against a public DPA-4 checkpoint.
 | `head ... not found` | The model does not contain that branch | Run `dp --pt show ... model-branch` |
 | `cannot access a CUDA device` | The process has no GPU allocation | Check Slurm GPU resources and PyTorch CUDA |
 | `returned non-finite labels` | Teacher inference failed | Test the same model and structure with `dp test` or ASE |
-| GPUMD produces NaN | Student or MD settings are unstable | Inspect the health report; keep the tutorial NVE before changing ensembles |
+| GPUMD produces NaN | Student or MD settings are unstable | Inspect the health report; keep the tutorial NVT before changing ensembles |
 | Spin input is rejected | Runner does not produce `mforce` | Use a teacher backend that supports magnetic-force labels |
 
 References: [built-in model downloads](https://docs.deepmodeling.com/projects/deepmd/en/latest/model/pretrained.html),
 [DPA-3 distillation tutorial](https://docs.deepmodeling.com/projects/deepmd/en/latest/getting-started/dpa3_cyclohexane_distillation.html),
 and [DPA-4 documentation](https://docs.deepmodeling.com/projects/deepmd/en/latest/model/dpa4.html).
+
+## Workflow version and expected outcome
+
+All new preparations use `active_learning_v4`:
+`train → explore → select → label → evaluate → update`.
+`train` also checks model lineage, activates the model, and optionally reports test errors; `evaluate` compares the
+sampling model with newly obtained labels before training on them. The thresholds in
+`project.yaml` demonstrate configuration, not accepted model accuracy. With one sampling
+generation, expect `budget_exhausted`; this is not a backend failure. A following generation
+trains the updated data, and final training requires accuracy plus production coverage.

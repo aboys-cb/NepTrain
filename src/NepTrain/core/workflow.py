@@ -20,6 +20,7 @@ from .content_addressing import canonical_sha256, file_sha256
 from .scientific_data import optional_dataset_issue
 from .generation_policy import (
     ACTIVE_LEARNING_GENERATION_PROTOCOL,
+    ACTIVE_LEARNING_V3_PROTOCOL,
     ADAPTIVE_GENERATION_PROTOCOL,
     LEGACY_GENERATION_PROTOCOL,
 )
@@ -86,6 +87,7 @@ class WorkflowStatus:
     updated_at: str | None
     sampling_routes: tuple[Mapping[str, Any], ...]
     precision_basis: str | None
+    convergence_configured: bool | None = None
 
 
 _STAGES = (
@@ -178,6 +180,7 @@ def _normalise_manifest(
         LEGACY_GENERATION_PROTOCOL,
         ADAPTIVE_GENERATION_PROTOCOL,
         ACTIVE_LEARNING_GENERATION_PROTOCOL,
+        ACTIVE_LEARNING_V3_PROTOCOL,
     }:
         raise WorkflowError(
             f"workflow manifest has unsupported generation protocol: "
@@ -638,11 +641,8 @@ def prepare_workflow(
         sampling_frames=sampling_frames,
     )
     settings = config.get("workflow", {})
-    generation_protocol = (
-        ACTIVE_LEARNING_GENERATION_PROTOCOL
-        if settings.get("convergence")
-        else LEGACY_GENERATION_PROTOCOL
-    )
+    # Missing accuracy thresholds disable automatic convergence, not the v3 flow.
+    generation_protocol = ACTIVE_LEARNING_GENERATION_PROTOCOL
     if (
         (output / "workflow-manifest.json").is_file()
         or (output / ".neptrain" / "layout.json").is_file()
@@ -1666,6 +1666,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                         f"{item.get('stage', '-')}"
                     ),
                     "job_id": handle.get("execution_id"),
+                    "bundle": task_record.get("bundle") or handle.get("bundle"),
                     "dependency": None,
                     "state": execution_state,
                     "current": False,
@@ -1715,6 +1716,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                         f"{current.get('stage', '-')}"
                     ),
                     "job_id": handle.get("execution_id"),
+                    "bundle": task_record.get("bundle") or handle.get("bundle"),
                     "dependency": None,
                     "state": observed,
                     "current": True,
@@ -1760,9 +1762,19 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
                 "reason", "no sampling tasks remain; convergence is not established"
             )
         )
+        next_action = (
+            "检查 workflow.convergence 和采样覆盖；修改结构、采样策略或收敛条件后，"
+            "用原始项目 YAML 和新的 --output 目录创建流程，保留当前证据。"
+        )
     elif controller_state == "stalled":
         state = "stalled"
         reason = str(controller.get("reason", "workflow made no progress"))
+        next_action = (
+            f"先查看 {workflow_path}/logs 和最新一代计算日志；修复原因后用 "
+            f"neptrain workflow restart {workflow_path} --generation "
+            f"{progress.generation or progress.completed_generations or 1} "
+            "--from <失败阶段> --dry-run 检查重算范围。"
+        )
     elif progress.state == "rejected" or controller_state == "rejected":
         state = "rejected"
         reason = str(controller.get("reason", progress.reason))
@@ -1850,6 +1862,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
 
     return WorkflowStatus(
         workflow_id=preparation.workflow_id,
+        convergence_configured=bool(config.get("workflow", {}).get("convergence")),
         project_path=str(preparation.output_dir),
         state=state,
         completed_generations=progress.completed_generations,

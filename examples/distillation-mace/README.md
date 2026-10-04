@@ -4,12 +4,12 @@
 
 # 用 MACE Teacher 蒸馏一个 NEP Student
 
-这个教程先用固定的 MACE-MP-0 checkpoint 标注三个 Al 晶体结构，再训练
+这个教程先用固定的 MACE-MP-0 checkpoint 标注12 个带局域位移的 Al 晶体结构，再训练
 TorchNEP Student，最后可选跑一代完整 workflow：
 
 ```text
 候选结构 → MACE Teacher → energy/forces/virial
-         → TorchNEP Student → GPUMD 采样 → 再标注与重训
+         → TorchNEP Student → GPUMD 采样 → 再标注、训练前评估与更新数据
 ```
 
 ## 1. 进入示例并创建环境
@@ -20,7 +20,7 @@ python -m pip install -e '../..[mace,torchnep]'
 ```
 
 从当前源码安装，确保 NepTrain 与附带的占位符模板匹配；MD 计算节点也应使用同一
-源码版本。`gpumd-nve.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
+源码版本。`gpumd-npt.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
 
 先按机器驱动安装合适的 PyTorch，再安装上面的 extra。确认环境：
 
@@ -50,7 +50,7 @@ NepTrain 将本地 checkpoint 的真实 SHA256 写入标签 provenance。
 python make_candidates.py
 ```
 
-`candidates.xyz` 包含三个不同晶格缩放的 fcc Al 结构：
+`candidates.xyz` 包含12 个不同晶格缩放与局域位移的 fcc Al 结构：
 
 ```bash
 python - <<'PY'
@@ -85,7 +85,7 @@ neptrain label candidates.xyz \
 python inspect_labels.py
 ```
 
-最后一行应以 `OK:` 开头。三个 frame 必须共享一个 Teacher SHA256，并同时具有
+最后一行应以 `OK:` 开头。12 个 frame 必须共享一个 Teacher SHA256，并同时具有
 有限的 energy、forces 和 `(3, 3)` virial。
 
 ## 5. 训练 Student 冒烟模型
@@ -124,7 +124,7 @@ neptrain doctor --project project.yaml
 ```
 
 `project.yaml` 使用本地 process target，适合在已经分配 GPU 的节点运行。
-`nep-workflow.in` 使用 500 个 epoch，`gpumd-nve.in` 做极短的 NVE 采样。
+`nep-workflow.in` 使用 500 个 epoch，`gpumd-npt.in` 做极短的 NPT 采样。
 
 ```bash
 neptrain workflow run project.yaml --prepare-only
@@ -143,13 +143,12 @@ neptrain workflow run project.yaml --foreground
 | 位置 | 内容 |
 |---|---|
 | `generations/0001/train/` | 初始 Student 和训练曲线 PNG |
-| `generations/0001/md/` | GPUMD 轨迹和健康报告 |
+| `generations/0001/explore/` | GPUMD 轨迹和健康报告 |
 | `generations/0001/select/` | FPS 选择结果 |
 | `generations/0001/label/selected-labels.xyz` | MACE 新标签 |
 | `generations/0001/label/label-provenance.json` | runner、模型名和 SHA256 |
-| `generations/0001/dataset/` | 合并后的训练集 |
-| `generations/0001/retrain/` | 重训 Student |
-| `generations/0001/evaluate/` | 激活结果 |
+| `generations/0001/update/` | 合并后的训练集 |
+| `generations/0001/evaluate/` | 新标签的训练前预测误差 |
 
 本例 `max_model_generations: 1`，所以末尾 `budget_exhausted` 表示教程预算用完，
 不代表任务失败。
@@ -157,8 +156,8 @@ neptrain workflow run project.yaml --foreground
 ## 8. 正式使用前
 
 - 根据目标体系选择与元素范围、理论水平和许可证匹配的 MACE checkpoint。
-- 使用覆盖目标温压和结构空间的候选集，不要只用三个缩放晶胞。
-- 准备独立验证集，并设置有物理意义的验收阈值。
+- 使用覆盖目标温压和结构空间的候选集，不要只用本例的 12 个微扰晶胞。
+- 按目标体系设置 `workflow.convergence`，以新增结构的训练前误差判断收敛；独立测试集可选，仅供辅助诊断。
 - 扩大 Student 网络、训练 epoch 和 workflow 代数。
 - 把本地 target 换成适合集群的 Slurm target。
 - 不要混合来自不同能量基准或理论水平的 Teacher 标签。
@@ -174,3 +173,13 @@ neptrain workflow run project.yaml --foreground
 | 输入含 `spin` 被拒绝 | MACE runner 不生成 `mforce` | 使用支持磁力标签的 Teacher |
 
 参考：[MACE Foundation Models](https://mace-docs.readthedocs.io/en/latest/guide/foundation_models.html)。
+
+## 流程版本与预期结果
+
+新建流程统一使用 `active_learning_v4`：
+`train → explore → select → label → evaluate → update`。
+`train` 同时检查模型来源、启用模型并可选输出测试误差；`evaluate` 用新标签评估采样模型的训练前预测。
+`project.yaml` 中的阈值仅演示配置，不代表模型已经达到该精度。一代采样预算通常以
+`budget_exhausted` 结束，属于预期结果，不是后端失败。更新的数据由下一代训练；只有精度和
+生产覆盖均满足条件才进入最终训练。
+NPT 使用 0 GPa 的各向同性 `npt_scr`，粗略弹性模量为 100 GPa，温压耦合参数为 100/1000 步；小晶胞和短轨迹只验证接口，不代表平衡采样。

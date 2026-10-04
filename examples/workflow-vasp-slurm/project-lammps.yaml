@@ -10,16 +10,16 @@ training:
   use_compile: false
 
 md:
-  backend: gpumd
+  backend: lammps
   inference_backend: auto
   spin: false
 
 sampling:
   routes:
-    - id: aluminum-npt
+    - id: aluminum-lammps-npt
       structures:
         - ./structures
-      template_path: ./gpumd-npt.in
+      template_path: ./lammps-npt.in
       conditions:
         pressure: 0  # GPUMD: GPa; unused by the fixed-volume NVT template
         temperature_path:
@@ -57,7 +57,7 @@ evaluation:
     force_rmse: 0.5
 
 workflow:
-  id: vasp-tutorial-workflow
+  id: vasp-lammps-tutorial-workflow
   max_model_generations: 1
   # Tutorial values only; choose accuracy targets for your own system.
   convergence:
@@ -87,7 +87,7 @@ execution:
       partition: REPLACE_GPU_PARTITION
       time: 00:10:00
       gpus_per_node: 1
-      setup_script: ./env-gpumd.sh
+      setup_script: ./env-lammps.sh
     vasp:
       executor: slurm
       partition: REPLACE_CPU_PARTITION
@@ -99,3 +99,5 @@ execution:
         NEPTRAIN_VASP_COMMAND: srun vasp_std
     local:
       executor: process
+
+# LAMMPS units metal: pressure is in bar, not GPUMD GPa.

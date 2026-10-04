@@ -65,7 +65,7 @@ def test_workspace_keeps_old_stage_directories_and_adds_v3_names(tmp_path: Path)
     assert workspace.stage_dir(1, "update").name == "update"
 
 
-def test_v3_publication_reads_validation_metrics_from_validate(tmp_path: Path):
+def test_v4_publication_reads_test_metrics_from_train(tmp_path: Path):
     class Adapter:
         def run_stage(self, stage, context):
             path = context.work_dir / f"{stage}.txt"
@@ -74,7 +74,6 @@ def test_v3_publication_reads_validation_metrics_from_validate(tmp_path: Path):
             metrics = {}
             if stage == "train":
                 artifacts["model_training_set"] = path
-            elif stage == "validate":
                 artifacts.update(activated_model=path, signals=path)
                 metrics = {
                     "energy_rmse": 0.01,
@@ -87,10 +86,10 @@ def test_v3_publication_reads_validation_metrics_from_validate(tmp_path: Path):
                 metrics = {"accepted": True}
             return StageOutcome(artifacts, metrics)
 
-    workspace = WorkflowWorkspace.create(tmp_path / "v3-publication")
+    workspace = WorkflowWorkspace.create(tmp_path / "v4-publication")
     controller = GenerationController(
         workspace.root,
-        "v3-publication",
+        "v4-publication",
         generation_protocol=ACTIVE_LEARNING_GENERATION_PROTOCOL,
     )
     controller.run_generation(GenerationPlan(1, 7, 2), Adapter())

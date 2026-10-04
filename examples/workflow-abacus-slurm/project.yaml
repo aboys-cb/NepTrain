@@ -3,7 +3,6 @@ schema_version: 8
 training:
   backend: torchnep
   initial_path: ./train.xyz
-  test_path: ./validation.xyz
   config_path: ./nep.in
   device: cuda
   torch_backend: bmm
@@ -17,11 +16,12 @@ md:
 
 sampling:
   routes:
-    - id: aluminum-nve
+    - id: aluminum-npt
       structures:
         - ./structures
-      template_path: ./gpumd-nve.in
+      template_path: ./gpumd-npt.in
       conditions:
+        pressure: 0  # GPUMD: GPa; unused by the fixed-volume NVT template
         temperature_path:
           - 300
       progression:

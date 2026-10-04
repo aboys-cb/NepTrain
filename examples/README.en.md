@@ -25,7 +25,25 @@ Recommended learning order:
 4. Replace the tutorial data, short MD run, and smoke `nep.in` with production
    settings.
 
-These examples validate the software path; they do not produce a potential
-ready for publication or production simulation. The VASP and ABACUS seed data
-come from ASE EMT and must be replaced with first-principles data at the same
-theoretical level as the production labels.
+These examples teach the software path; they do not supply production-ready potentials.
+
+## Coverage and limits
+
+| Configuration | System and sampling | What it teaches |
+|---|---|---|
+| VASP `project.yaml` | Periodic Al, GPUMD NPT | Slurm targets, pinned POTCAR, same-backend seed labels |
+| VASP `project-lammps.yaml` | Periodic Al, LAMMPS NPT | MD backend replacement; pressure in bar |
+| ABACUS `project.yaml` | Periodic Al, GPUMD NPT | Plane waves, pinned UPF, backend replacement |
+| MACE / TACE | Periodic Al, GPUMD NPT | Teacher invocation, hashes, and provenance |
+| DeepMD / DPA | Single water molecule in vacuum, GPUMD NVT | Multiple elements, model head, fixed-volume molecular labels |
+| [DeltaSpin](workflow-vasp-deltaspin/README.en.md) | Periodic Fe, LAMMPS spin NPT, two routes | Vector moments, mforce, and independent route coverage |
+
+Every YAML targets the new workflow; test data are optional. DFT seeds are unlabeled until
+processed with the same backend and inputs used later. No EMT/DFT mixing is part of the tutorial.
+GPUMD pressure is in GPa; LAMMPS metal pressure is in bar, with no automatic conversion.
+The isolated molecule remains NVT. Short trajectories verify interfaces, not equilibration.
+Temperature, coupling parameters, timesteps, and acceptance thresholds need system-specific validation.
+
+These cases do not establish scientific acceptance for alloy defects, phase transitions, or large
+magnetic training campaigns. Local tests cover YAML, generators, template rendering, and stage contracts;
+real backend runs require configured software and resources as described in each tutorial.

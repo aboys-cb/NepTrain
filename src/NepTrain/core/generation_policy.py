@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-
 LEGACY_GENERATION_PROTOCOL = "legacy_v1"
 ADAPTIVE_GENERATION_PROTOCOL = "adaptive_v2"
-ACTIVE_LEARNING_GENERATION_PROTOCOL = "active_learning_v3"
+ACTIVE_LEARNING_V3_PROTOCOL = "active_learning_v3"
+ACTIVE_LEARNING_GENERATION_PROTOCOL = "active_learning_v4"
 
 LEGACY_STAGES = (
     "train",
@@ -29,7 +29,7 @@ ACQUISITION_STAGES = (
     "merge",
 )
 FINALIZATION_STAGES = ("train", "evaluate")
-ACTIVE_LEARNING_ACQUISITION_STAGES = (
+ACTIVE_LEARNING_V3_ACQUISITION_STAGES = (
     "train",
     "validate",
     "explore",
@@ -38,16 +38,27 @@ ACTIVE_LEARNING_ACQUISITION_STAGES = (
     "evaluate",
     "update",
 )
-ACTIVE_LEARNING_FINALIZATION_STAGES = ("train", "validate")
+ACTIVE_LEARNING_V3_FINALIZATION_STAGES = ("train", "validate")
+ACTIVE_LEARNING_ACQUISITION_STAGES = (
+    "train",
+    "explore",
+    "select",
+    "label",
+    "evaluate",
+    "update",
+)
+ACTIVE_LEARNING_FINALIZATION_STAGES = ("train",)
 
 _KIND_SEQUENCES = {
     "legacy": (LEGACY_STAGES,),
     "acquisition": (
         ACQUISITION_STAGES,
+        ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
         ACTIVE_LEARNING_ACQUISITION_STAGES,
     ),
     "finalization": (
         FINALIZATION_STAGES,
+        ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
         ACTIVE_LEARNING_FINALIZATION_STAGES,
     ),
 }
@@ -73,7 +84,9 @@ def stage_implementation(
     """Return the existing scientific implementation for one public stage."""
 
     if stage_sequence in {
+        ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
         ACTIVE_LEARNING_ACQUISITION_STAGES,
+        ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
         ACTIVE_LEARNING_FINALIZATION_STAGES,
     }:
         return {
@@ -89,10 +102,21 @@ def stage_for_role(record: Mapping[str, Any], role: str) -> str | None:
 
     sequence = generation_stage_sequence(record)
     if sequence in {
+        ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
         ACTIVE_LEARNING_ACQUISITION_STAGES,
+        ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
         ACTIVE_LEARNING_FINALIZATION_STAGES,
     }:
-        candidate = role
+        candidate = (
+            "train"
+            if role == "validate"
+            and sequence
+            in {
+                ACTIVE_LEARNING_ACQUISITION_STAGES,
+                ACTIVE_LEARNING_FINALIZATION_STAGES,
+            }
+            else role
+        )
     else:
         candidate = {
             "validate": "evaluate",
@@ -133,6 +157,7 @@ def resolve_generation_kind(
         return "legacy"
     if protocol not in {
         ADAPTIVE_GENERATION_PROTOCOL,
+        ACTIVE_LEARNING_V3_PROTOCOL,
         ACTIVE_LEARNING_GENERATION_PROTOCOL,
     }:
         raise ValueError(f"unsupported generation protocol: {protocol}")
@@ -154,6 +179,11 @@ def stage_sequence_for_kind(
             "acquisition": ACQUISITION_STAGES,
             "finalization": FINALIZATION_STAGES,
         }
+    elif protocol == ACTIVE_LEARNING_V3_PROTOCOL:
+        sequences = {
+            "acquisition": ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
+            "finalization": ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
+        }
     elif protocol == ACTIVE_LEARNING_GENERATION_PROTOCOL:
         sequences = {
             "acquisition": ACTIVE_LEARNING_ACQUISITION_STAGES,
@@ -172,6 +202,9 @@ __all__ = [
     "ACTIVE_LEARNING_ACQUISITION_STAGES",
     "ACTIVE_LEARNING_FINALIZATION_STAGES",
     "ACTIVE_LEARNING_GENERATION_PROTOCOL",
+    "ACTIVE_LEARNING_V3_PROTOCOL",
+    "ACTIVE_LEARNING_V3_ACQUISITION_STAGES",
+    "ACTIVE_LEARNING_V3_FINALIZATION_STAGES",
     "ADAPTIVE_GENERATION_PROTOCOL",
     "FINALIZATION_STAGES",
     "LEGACY_GENERATION_PROTOCOL",

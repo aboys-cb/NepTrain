@@ -1,4 +1,4 @@
-"""Create a small EMT-labeled Al seed set for workflow mechanics tutorials."""
+"""Generate unlabeled Al seeds; label them with the workflow's DFT backend."""
 
 from __future__ import annotations
 
@@ -7,42 +7,41 @@ from pathlib import Path
 
 import numpy as np
 from ase.build import bulk
-from ase.calculators.emt import EMT
-from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import write
-from ase.stress import voigt_6_to_full_3x3_stress
 
 
-def _labeled_frame(scale: float, displacement: float):
+def _frame(scale: float, displacement: float):
     atoms = bulk("Al", "fcc", a=4.05, cubic=True)
     atoms.set_cell(atoms.cell * scale, scale_atoms=True)
     atoms.positions[0, 0] += displacement
-    atoms.calc = EMT()
-    energy = float(atoms.get_potential_energy())
-    forces = np.asarray(atoms.get_forces(), dtype=np.float64)
-    stress = voigt_6_to_full_3x3_stress(atoms.get_stress())
-    virial = -stress * atoms.get_volume()
-    atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
-    atoms.info["virial"] = virial
-    atoms.info["Config_type"] = "tutorial-emt-seed"
+    atoms.info["Config_type"] = "tutorial-al-seed"
     return atoms
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default=".")
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     root = Path(args.output_dir).expanduser().resolve()
-    structures = root / "structures"
-    structures.mkdir(parents=True, exist_ok=True)
-
+    targets = [
+        root / "seed-train.xyz",
+        root / "seed-validation.xyz",
+        root / "structures/al.xyz",
+    ]
+    existing = [str(path) for path in targets if path.exists()]
+    if existing and not args.force:
+        parser.error(
+            "files already exist (use --force to regenerate): " + ", ".join(existing)
+        )
+    targets[-1].parent.mkdir(parents=True, exist_ok=True)
     train = [
-        _labeled_frame(scale, displacement)
+        _frame(scale, displacement)
         for scale in np.linspace(0.97, 1.03, 12)
         for displacement in (-0.015, 0.015)
     ]
     validation = [
-        _labeled_frame(scale, displacement)
+        _frame(scale, displacement)
         for scale, displacement in (
             (0.975, 0.0),
             (0.9925, 0.01),
@@ -50,19 +49,13 @@ def main() -> None:
             (1.025, 0.0),
         )
     ]
-    start = bulk("Al", "fcc", a=4.05, cubic=True)
-    start.info["Config_type"] = "tutorial-al-start"
-
-    write(root / "train.xyz", train, format="extxyz")
-    write(root / "validation.xyz", validation, format="extxyz")
-    write(structures / "al.xyz", start, format="extxyz")
-    print(f"Wrote {len(train)} training frames to {root / 'train.xyz'}")
+    for path, frames in zip(targets, (train, validation, [_frame(1.0, 0.0)])):
+        write(path, frames, format="extxyz")
+        print(f"Wrote {len(frames)} unlabeled frames to {path}")
     print(
-        f"Wrote {len(validation)} validation frames to "
-        f"{root / 'validation.xyz'}"
+        "Label seed-train.xyz with the same DFT inputs and resources used by project.yaml."
     )
-    print(f"Wrote the MD start structure to {structures / 'al.xyz'}")
-    print("These EMT labels are for workflow mechanics only, not production.")
+    print("No train.xyz or validation.xyz was created; no EMT/DFT labels are mixed.")
 
 
 if __name__ == "__main__":

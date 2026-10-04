@@ -8,7 +8,7 @@ NepTrain 是 NEP 模型生命周期的统一命令行工具。它既能独立运
 标注和采样，也能把同一套步骤组合成可恢复的主动学习 workflow。
 
 ```text
-train → validate → explore → select → label → evaluate → update
+train → explore → select → label → evaluate → update
 ```
 
 手动命令和自动 workflow 使用相同的训练、MD、Label Adapter 和执行 target；
@@ -291,12 +291,16 @@ neptrain workflow init \
 cd fe-project
 ```
 
-补齐 `train.xyz`、`validation.xyz`、`nep.in`、`structures/`、标注输入和环境脚本，
+补齐必需的 `train.xyz`、`nep.in`、`structures/`、标注输入、资源清单和环境脚本，
 然后检查：
 
 ```bash
 neptrain doctor --project project.yaml
 ```
+
+`training.test_path` 与 `evaluation.validation_path` 可省略、为空或不存在，不阻塞主流程。
+新项目统一使用新版流程；未配置 `workflow.convergence` 时不自动判断精度收敛。生成的 YAML 末尾有带单位的配置示例。
+`doctor` 会汇总必须修复的输入/环境问题和可选提示，修复后再准备。
 
 先准备而不提交：
 
@@ -323,8 +327,11 @@ neptrain workflow status workflow
 neptrain workflow status workflow --jobs
 neptrain workflow resume workflow
 neptrain workflow stop workflow
-neptrain workflow extend workflow 5
+neptrain workflow extend workflow 15
 ```
+
+上述控制命令默认输出可读摘要；脚本解析请加 `--json`。`extend workflow 15` 表示把采样总代数改成 15，
+不是再增加 15 代；随后按输出提示启动或恢复。
 
 `stop` 默认同时停止 workflow Controller，并取消当前排队或运行的计算任务。取消记录
 会写入 workflow 历史；以后恢复时会为该阶段创建新的可追踪 attempt。
@@ -469,11 +476,13 @@ smoke、short 或 long 采样证据；只有最终 production 认证重新绑定
 健康轨迹进入下一档时长。若本轮没有结构超过阈值，workflow 会跳过 DFT 和重训，
 直接推进采样阶梯。需要固定策略时，可同时配置
 `selection_threshold` 和 `completion_threshold`。
-完整阶梯耗尽后，独立验证通过才会报告 `complete`；没有独立验证时会停在
-`coverage_exhausted`，不会把“采样未发现新结构”冒充为“模型精度已经验证”。
+采样覆盖完成后，还需要新增标注结构的训练前预测误差满足
+`workflow.convergence`，有效标签数和连续达标代数达到要求，再完成最终训练，
+才会报告 `complete`。没有配置收敛条件或新标签证据不足时，不能仅凭覆盖完成宣称精度收敛。
+可选测试集只提供辅助误差，不参与上述判定。
 
-`workflow.max_model_generations` 是最大模型代数预算。生产温度、最长时长、replica、轨迹诊断和
-validation 全部通过后会提前完成；预算耗尽或连续无进展会分别报告
+`workflow.max_model_generations` 是采样代数预算，最终训练另行预留。生产温度、最长时长、replica、轨迹诊断和
+新增结构精度满足要求后会进入最终训练；预算耗尽或连续无进展会分别报告
 `budget_exhausted` 或 `stalled`，不会误报为 `complete`。
 
 LAMMPS plugin 由 `execution.targets.*.setup_script` 加载，例如在
@@ -580,19 +589,19 @@ workflow/
 需要重新开始时创建新的 workflow 目录，它会得到新的随机 instance id，不会复用
 旧 task/result。
 
-新流程每代目录直接是 `train/`、`validate/`、`explore/`、`select/`、`label/`、
-`evaluate/` 和 `update/`。既有 `adaptive_v2` workflow 保留原来的
+新流程每代目录直接是 `train/`、`explore/`、`select/`、`label/`、
+`evaluate/` 和 `update/`。既有 `active_learning_v3` workflow 保留 `validate/`，`adaptive_v2` workflow 保留原来的
 `evaluate/diagnose/dataset` 路径，不自动迁移。训练输出、loss 和模型发布到对应阶段
 目录，`calculation` 软链指向真实执行目录。训练阶段会用 Matplotlib 发布
-`training-convergence.png` 和 `training-report.json`；配置独立验证集时，
-validate 阶段还会发布按阈值归一化的 `evaluation-metrics.png`，以及 Energy、
+`training-convergence.png` 和 `training-report.json`；配置可选辅助测试集时，
+train 阶段还会发布按阈值归一化的 `evaluation-metrics.png`，以及 Energy、
 Force、Virial（spin 模型另含 magnetic force）的 reference/prediction parity 图
 `evaluation-parity.png`。每张图都有对应的 JSON 报告记录数据来源、点数和 RMSE。
 
 开发阶段的确定性工作流 smoke：
 
 ```bash
-neptrain smoke --profile ordinary
-neptrain smoke --profile spin --force
-neptrain smoke --profile recovery --force
+neptrain smoke --profile ordinary --workflow
+neptrain smoke --profile spin --workflow --force
+neptrain smoke --profile recovery --workflow --force
 ```

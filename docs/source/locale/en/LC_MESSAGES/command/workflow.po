@@ -560,8 +560,8 @@ msgstr ""
 "model's candidate pool."
 
 #: ../../source/command/workflow.md:253 e19f2550ee5d446e8e0c0650a61bddcc
-msgid "采样判据通过后，本代仍会先合并最后一批 DFT 标签，但不会把已看过这些标签的模型 用于收敛判断。Controller 随后创建一个 `finalization` 代，只执行 `train → validate`：在最终完整训练集上训练最终模型并检查产物与来源一致性，不再运行 MD、FPS 或 DFT。 `complete` 只由这个终代产生。为保证最后一个采样代也能自动完成，准备 workflow 时会 在 `max_model_generations` 个采样预算之外预留一个终代；若采样预算用尽仍未通过，预留 代不会被误用作普通采样。"
-msgstr "After the sampling criteria pass, merge the final labels and create a finalization generation running `train → validate`. It trains on the complete dataset and checks model outputs and provenance without MD, FPS, or DFT. New workflows reach `complete` only through finalization. One finalization slot is reserved beyond `max_model_generations`; it is never reused for sampling when the budget is exhausted."
+msgid "采样判据通过后，本代仍会先合并最后一批 DFT 标签，但不会把已看过这些标签的模型 用于收敛判断。Controller 随后创建一个 `finalization` 代，只执行 `train`：在最终完整训练集上训练最终模型并检查产物与来源一致性，不再运行 MD、FPS 或 DFT。 `complete` 只由这个终代产生。为保证最后一个采样代也能自动完成，准备 workflow 时会 在 `max_model_generations` 个采样预算之外预留一个终代；若采样预算用尽仍未通过，预留 代不会被误用作普通采样。"
+msgstr "After the sampling criteria pass, merge the final labels and create a finalization generation running `train`. It trains on the complete dataset and checks model outputs and provenance without MD, FPS, or DFT. New workflows reach `complete` only through finalization. One finalization slot is reserved beyond `max_model_generations`; it is never reused for sampling when the budget is exhausted."
 
 #: ../../source/command/workflow.md:260 3d4f445f2ac6437999c9bf8d17e1fd93
 msgid ""
@@ -823,12 +823,12 @@ msgstr "Prepare and run"
 #: ../../source/command/workflow.md:389 d78f54d8c37d417db550dfb7d35431df
 msgid ""
 "neptrain workflow run project.yaml --prepare-only\n"
-"neptrain workflow run fe-workflow\n"
+"neptrain workflow run workflow\n"
 msgstr ""
 
 #: ../../source/command/workflow.md:394 6754ee66ce7a4a3c8dda368311b647a7
 msgid ""
-"第一条命令只创建不可变输入快照，返回的 `next_action` 可以直接复制执行。 不需要人工检查快照时，也可以直接运行 `neptrain "
+"第一条命令只创建不可变输入快照，输出的“下一步”命令可以直接复制执行。 不需要人工检查快照时，也可以直接运行 `neptrain "
 "workflow run project.yaml`，一次完成创建和启动。"
 msgstr ""
 "The first command creates only an immutable input snapshot, and its "
@@ -871,11 +871,11 @@ msgstr "Status and recovery"
 
 #: ../../source/command/workflow.md:413 3feb3d8a6a634147afa4f1fa3d69aae3
 msgid ""
-"neptrain workflow status fe-workflow\n"
-"neptrain workflow status fe-workflow --jobs\n"
-"neptrain workflow resume fe-workflow\n"
-"neptrain workflow stop fe-workflow\n"
-"neptrain workflow extend fe-workflow 5\n"
+"neptrain workflow status workflow\n"
+"neptrain workflow status workflow --jobs\n"
+"neptrain workflow resume workflow\n"
+"neptrain workflow stop workflow\n"
+"neptrain workflow extend workflow 15\n"
 msgstr ""
 
 #: ../../source/command/workflow.md:421 d2bf485c67a044d89f20335c4226eaad
@@ -1009,7 +1009,7 @@ msgstr ""
 "jobs:"
 
 #: ../../source/command/workflow.md:488 ea48e2ec410743bc97c95aad3a6cfe73
-msgid "neptrain workflow stop fe-workflow\n"
+msgid "neptrain workflow stop workflow\n"
 msgstr ""
 
 #: ../../source/command/workflow.md:492 1bda64bf3cc84fea85b97b6ed65a000c
@@ -1019,7 +1019,7 @@ msgstr ""
 "continue:"
 
 #: ../../source/command/workflow.md:494 c09d60bb83e74e4ab4669213b3499979
-msgid "neptrain workflow stop fe-workflow --keep-jobs\n"
+msgid "neptrain workflow stop workflow --keep-jobs\n"
 msgstr ""
 
 #: ../../source/command/workflow.md:498 6abcac7f34af4a4f9a00dbda805a6d67
@@ -1055,8 +1055,8 @@ msgid ""
 msgstr ""
 
 #: ../../source/command/workflow.md:518 315453b79f634e1c82e1d9f702e23733
-msgid "训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录； `calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 Matplotlib 从 `loss.out` 自动生成 `training-convergence.png` 和可审计的 `training-report.json`。配置辅助测试集和参考阈值时，validate 还会生成按参考阈值归一化的 `evaluation-metrics.png` 与 `evaluation-report.json`；图中 1× 线就是配置阈值。 同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction parity 图 `evaluation-parity.png`，spin 模型会增加 magnetic-force 面板。对应报告记录 validation/model hash、总点数、实际绘制点数和 RMSE；大数组只对显示点做确定性 抽样，RMSE 仍使用全部有限数据。"
-msgstr "Models, losses, and stdout/stderr are published in stage directories; `calculation` points to the execution directory. Training produces `training-convergence.png` and `training-report.json` from `loss.out`. With optional test data and reference thresholds, validate produces `evaluation-metrics.png` and `evaluation-report.json`; 1× is the reference threshold. Prediction comparisons produce `evaluation-parity.png` for energy, force, and virial, plus magnetic forces for spin models. Reports retain provenance, counts, displayed points, and RMSE. Display sampling is deterministic; RMSE uses all finite data."
+msgid "训练模型、loss 和 stdout/stderr 等关键产物会发布到对应阶段目录； `calculation` 软链指向真实执行目录，便于直接排查。训练完成后会用 Matplotlib 从 `loss.out` 自动生成 `training-convergence.png` 和可审计的 `training-report.json`。配置辅助测试集和参考阈值时，train 还会生成按参考阈值归一化的 `evaluation-metrics.png` 与 `evaluation-report.json`；图中 1× 线就是配置阈值。 同一轮预测还会生成 Energy、Force、Virial 的 reference/prediction parity 图 `evaluation-parity.png`，spin 模型会增加 magnetic-force 面板。对应报告记录 validation/model hash、总点数、实际绘制点数和 RMSE；大数组只对显示点做确定性 抽样，RMSE 仍使用全部有限数据。"
+msgstr "Models, losses, and stdout/stderr are published in stage directories; `calculation` points to the execution directory. Training produces `training-convergence.png` and `training-report.json` from `loss.out`. With optional test data and reference thresholds, train produces `evaluation-metrics.png` and `evaluation-report.json`; 1× is the reference threshold. Prediction comparisons produce `evaluation-parity.png` for energy, force, and virial, plus magnetic forces for spin models. Reports retain provenance, counts, displayed points, and RMSE. Display sampling is deterministic; RMSE uses all finite data."
 
 #: ../../source/command/workflow.md:528 bc76ff358ecb461cba312c64f49c9c1d
 msgid "内部 job 也只保留一层输入和一层输出。job 名称已经包含代数、阶段、route、 attempt 和任务指纹，因此输出目录不再重复这些信息："
@@ -1204,8 +1204,8 @@ msgstr "Local smoke checks"
 msgid "无需 GPU、Slurm 或 DFT 程序，可以先运行："
 msgstr "Run this first without a GPU, Slurm, or a DFT executable:"
 
-msgid "`--workflow` 使用正式 `active_learning_v3` 适配器检查 9 个固定场景：无辅助测试、测试路径不存在、空测试文件、测试重叠、测试误差超限、测试预测异常、MD 失败恢复、覆盖完成后继续累计达标轮数，以及有效标签不足。训练、MD 和预测使用确定性的本地替身，标注使用 Toy Teacher；它检查流程契约，不代表真实模型精度或集群运行验证。该组场景固定每代最多选 8 帧，`--max-selected` 只控制基础 smoke 和旧迭代 smoke。"
-msgstr "`--workflow` exercises the production `active_learning_v3` adapter in nine fixed scenarios: absent optional tests, missing test paths, empty test files, test overlap, excessive test error, test prediction failures, MD recovery, additional passing generations after production coverage, and insufficient labels. Training, MD, and prediction use deterministic local doubles; labeling uses Toy Teacher. These are workflow contract checks, not model accuracy or cluster validation. The suite fixes the selection cap at eight frames per generation; `--max-selected` controls only the base and legacy iteration smoke."
+msgid "`--workflow` 使用正式 `active_learning_v4` 适配器检查 10 个固定场景：未启用自动收敛、无辅助测试、测试路径不存在、空测试文件、测试重叠、测试误差超限、测试预测异常、MD 失败恢复、覆盖完成后继续累计达标轮数，以及有效标签不足。训练、MD 和预测使用确定性的本地替身，标注使用 Toy Teacher；它检查流程契约，不代表真实模型精度或集群运行验证。该组场景固定每代最多选 8 帧，`--max-selected` 只控制基础 smoke 和旧迭代 smoke。"
+msgstr "`--workflow` exercises the production `active_learning_v4` adapter in ten fixed scenarios: disabled automatic convergence, absent optional tests, missing test paths, empty test files, test overlap, excessive test error, test prediction failures, MD recovery, additional passing generations after production coverage, and insufficient labels. Training, MD, and prediction use deterministic local doubles; labeling uses Toy Teacher. These are workflow contract checks, not model accuracy or cluster validation. The suite fixes the selection cap at eight frames per generation; `--max-selected` controls only the base and legacy iteration smoke."
 
 msgid "命令输出一个 JSON，`workflow.passed` 和 `workflow.checks` 给出检查结果；详细记录位于 `workflow/workflow-smoke-report.json`，各场景目录保留 ledger、`science.json`、`result.json` 和 `notifications.txt`。通知仅生成文本，不向飞书发送。重复运行请更换输出目录，或显式使用 `--force` 替换这个 smoke 目录。"
 msgstr "The command emits one JSON document with `workflow.passed` and `workflow.checks`. Details are saved in `workflow/workflow-smoke-report.json`; each scenario retains its ledger, `science.json`, `result.json`, and `notifications.txt`. Notifications are rendered as text only and never sent to Feishu. Use a new output directory for another run, or explicitly pass `--force` to replace the smoke directory."
@@ -1215,3 +1215,66 @@ msgstr "Existing `--iterations N` checks determinism and recovery in the legacy 
 
 msgid "`workflow.convergence.min_selected` 不能大于 `sampling.selection.max_selected`（选样上限省略时为 100）。配置校验会拒绝这种无法满足的收敛要求，并提示提高选样上限或降低最低标签数。"
 msgstr "`workflow.convergence.min_selected` must not exceed `sampling.selection.max_selected` (default 100). Configuration validation rejects this impossible convergence requirement and suggests raising the selection cap or lowering the minimum label count."
+
+msgid "新手检查清单"
+msgstr "First-run checklist"
+
+msgid "`workflow init` 生成的是待填写的项目。先补齐训练集、训练输入、route 结构、标注资源和环境，再运行 `doctor --project project.yaml`。重复 init 会提示已有文件；不要为继续使用项目而加 `--force`，该选项会覆盖生成的配置、模板、资源清单和环境脚本。"
+msgstr "`workflow init` creates a project to fill in. Supply training data and inputs, route structures, labeling resources, and runtime setup before running `doctor --project project.yaml`. Repeated initialization reports existing files. Do not use `--force` merely to continue an existing project: it overwrites generated configuration, templates, resource manifests, and environment scripts."
+
+msgid "`doctor` 将独立问题汇总为 `FAIL`（必须修复）、`WARN`（提示）和 `OK`。缺少 test 或未启用自动收敛只提示。初始种子尚未标注时，先按对应案例完成独立标注，再检查整个项目。环境检查成功不代表 DFT、训练或 MD 已实际通过。"
+msgstr "`doctor` collects independent checks as `FAIL` (must fix), `WARN` (informational), and `OK`. Missing test data or disabled automatic convergence only produce warnings. If seed structures are not yet labeled, follow the example to label them before checking the whole project. Passing environment checks does not mean DFT, training, or MD has actually run successfully."
+
+msgid "新项目统一使用 `active_learning_v4`，不再因为缺少 `workflow.convergence` 而切到旧流程。未设置阈值时，状态明确提示“未启用自动收敛”。已有工作目录继续使用其保存的阶段协议，不能通过删除或编辑内部记录迁移。"
+msgstr "New projects always use `active_learning_v4`; omitting `workflow.convergence` no longer selects the legacy flow. Status explicitly reports disabled automatic convergence when thresholds are absent. Existing workspaces retain their saved stage protocol; deleting or editing internal records is not a migration method."
+
+msgid "命令输出与恢复"
+msgstr "Command output and recovery"
+
+msgid "`workflow run/resume/restart/stop/extend` 默认输出可读摘要；自动化脚本请显式加 `--json`，保持一个完整 JSON 文档。`status` 完成时列出实际存在的模型和训练集路径；尚未收敛时显示的是当前结果，不应视为验收通过。"
+msgstr "`workflow run/resume/restart/stop/extend` print readable summaries by default. Automation scripts must request `--json` to obtain one complete JSON document. Completed status lists the model and dataset paths that exist. Before convergence, these are current results, not accepted final models."
+
+msgid "`workflow extend workflow 15` 将采样总预算设为 15；原预算为 12 时只增加 3 代，不是增加 15 代。最终训练预留代不算采样预算。命令会显示变更前后预算，并根据当前状态给出 run 或 resume 等下一步提示。"
+msgstr "`workflow extend workflow 15` sets the total sampling budget to 15. From a budget of 12, it adds three generations, not fifteen. A reserved final-training generation is not part of the sampling budget. Output shows old and new budgets and the next action, such as run or resume, according to the current state."
+
+msgid "失败时先查看状态给出的日志、任务目录和失败原因；修复环境或后端问题后再 resume。若需要更改已经固定的结构、模板或采样策略，应修改原始项目 YAML 并选择新的输出目录；保留旧目录的科学证据。stalled 或 coverage_exhausted 不意味着无限重试可以解决问题，需先检查阈值、标签证据和采样覆盖。"
+msgstr "On failure, first inspect the logs, task directory, and reason shown by status. Resume after fixing runtime or backend problems. Changes to snapshotted structures, templates, or sampling strategies require editing the original project YAML and choosing a new output directory while retaining old evidence. A stalled or coverage-exhausted workflow needs a review of thresholds, label evidence, and sampling coverage, rather than unlimited retries."
+
+msgid "LAMMPS 运行期间，NepTrain 会按 `sampling.candidate_pool.health` 中的体积比和 最大原子力阈值生成官方 `fix halt` 检查；检查间隔不超过 100 步，也不会大于 当前 dump 间隔。触发后 LAMMPS 使用 soft halt 保留已经写出的完整帧，NepTrain 会读取 halt 的 fix ID 和停止步数，将结果记为 `trajectory_halt`，而不是因为进程 退出码为 0 就误判为完成。只有一个 `run {{ steps }}` 的既有自定义模板会自动插入 检查；包含多个主 `run` 的模板应在合适位置显式写一行 `{{ halt_commands }}`。 元素相关最小距离、mforce 和 spin 幅值仍由统一的轨迹健康检查在回收后判断，避免在 LAMMPS 输入中复制一套不等价的物理算法。把相应 health 阈值设为 `null` 可以关闭 该项检查。"
+msgstr "While LAMMPS runs, NepTrain generates native `fix halt` checks from the volume-ratio and maximum atomic-force thresholds in `sampling.candidate_pool.health`. Checks run at intervals no larger than 100 steps or the dump interval. A soft halt preserves complete frames already written. NepTrain reads the halt fix ID and stopping step and records `trajectory_halt`, rather than treating exit code 0 as completion. Existing custom templates with a single `run {{ steps }}` receive these checks automatically; templates with multiple main `run` commands should place `{{ halt_commands }}` explicitly. Element-dependent minimum distances, mforce, and spin magnitudes are checked by the shared trajectory-health logic after collection. Set a health threshold to `null` to disable that check."
+
+msgid "这里的“一代”严格绑定一个模型哈希。新建流程使用 `active_learning_v4`，采样代按 `train → explore → select → label → evaluate → update` 推进：先用上一代 合并后的完整训练集得到新模型，再让这个模型驱动本代 MD。Controller 会枚举该模型下所有已解锁 scenario attempt，并把它们作为独立 process/Slurm 任务一次性提交；全部进入终态后 再合并候选并执行 FPS。不同 route 可通过 `execution.sampling_route_targets` 送到不同平台。所有候选必须由同一个模型产生；候选池 manifest 和每个 extxyz 帧都会记录 `sampling_model_sha256`。旧模型轨迹不能混入新模型候选池。"
+msgstr "A generation is bound to exactly one model hash. New workflows use `active_learning_v4` with `train → explore → select → label → evaluate → update`: train a new model on the previous generation's merged dataset, then use it for this generation's MD. The Controller submits all unlocked scenario attempts for that model as independent process/Slurm tasks, waits for terminal states, and then merges candidates and runs FPS. Route-specific targets are configured through `execution.sampling_route_targets`. Every candidate must come from the same model; the pool manifest and each extxyz frame record `sampling_model_sha256`. Trajectories from older models cannot enter the current candidate pool."
+
+msgid "输出目录默认使用 `workflow.id`。所有新建流程均按新版阶段顺序推进："
+msgstr "The output directory defaults to `workflow.id`. All newly prepared workflows use the current stage sequence:"
+
+msgid "训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。 既有 `adaptive_v2` 目录继续保留原来的 `evaluate/diagnose/merge` stage 和路径； 新版本按 manifest 中已经固化的 protocol 读取，不会重命名或混写旧目录。"
+msgstr "Training, MD, and labeling stages use the same adapters and execution targets as standalone commands. Existing `adaptive_v2` directories retain their original `evaluate/diagnose/merge` stages and paths. The manifest fixes the protocol; newer versions read it without renaming or mixing existing directories."
+
+msgid "`resume` 延续 Controller 当前记录的执行意图，不回退已经提交到 ledger 的科学阶段。 需要明确重算本代某个阶段时使用 `restart`。先用 `--dry-run` 查看复用和重算范围， 确认后去掉该选项执行："
+msgstr "`resume` continues the Controller's recorded execution intent without rolling back scientific stages committed to the ledger. Use `restart` to recompute a specific stage in the current generation. Inspect the reuse and recomputation plan with `--dry-run`, then remove that option to execute:"
+
+msgid "# 保留已经成功的 DFT shard，只重试失败或未完成的 shard\nneptrain workflow restart workflow \\\n  --generation 3 --from label --tasks failed --dry-run\nneptrain workflow restart workflow \\\n  --generation 3 --from label --tasks failed\n\n# 放弃本代已有的选择结果，从 select 开始全部重算\nneptrain workflow restart workflow \\\n  --generation 3 --from select --tasks all\n"
+msgstr "# Keep successful DFT shards and retry failed or unfinished shards\nneptrain workflow restart workflow \\\n  --generation 3 --from label --tasks failed --dry-run\nneptrain workflow restart workflow \\\n  --generation 3 --from label --tasks failed\n\n# Discard the current generation's selection and recompute from select\nneptrain workflow restart workflow \\\n  --generation 3 --from select --tasks all\n"
+
+msgid "`restart` 只操作最新且尚未完成的代次。指定阶段之前的 artifact 保持权威；该阶段 及其下游的已提交记录转入 `recovery_attempts`，当前执行转入 history，不会删除 失败证据。若 current 是 `label` 或 `explore` task group，`--tasks failed` 保留 已收集且校验通过的 shard，只为失败或未完成 shard 创建新 attempt；`--tasks all` 则重建整组任务。仍有 scheduler 作业未终止时 restart 会拒绝执行，必须先 stop 并 完成状态核对，避免重复提交。"
+msgstr "`restart` only operates on the latest unfinished generation. Earlier artifacts remain authoritative; committed records for the selected stage and downstream stages move to `recovery_attempts`, and current execution moves to history without deleting failure evidence. For a current `label` or `explore` task group, `--tasks failed` preserves collected and verified shards and creates new attempts only for failed or unfinished shards. `--tasks all` rebuilds the entire group. Restart refuses to proceed while scheduler jobs remain active; stop and verify their state first to avoid duplicate submissions."
+
+msgid "`--from` 使用该 generation 的 ledger 中实际记录的 stage 名。新 `active_learning_v4` 中 `evaluate` 表示“对新增标签评估旧模型”；旧 `adaptive_v2` 中 `evaluate` 仍表示“采样前模型验证”，新增标签评估仍叫 `diagnose`。CLI 不对这个有歧义的名称做猜测或静默转换，`--dry-run` 会列出实际 复用和重算的阶段。"
+msgstr "`--from` takes the stage name actually recorded in that generation's ledger. In `active_learning_v4`, `evaluate` assesses the existing model against new labels. In `adaptive_v2`, `evaluate` still means model validation before sampling, and new-label assessment is named `diagnose`. The CLI does not guess or silently translate this ambiguous name; `--dry-run` lists the actual stages to reuse and recompute."
+
+msgid "`workflow status --json` 的 stdout 使用 `neptrain.workflow-status.v1`；run/resume、restart、stop 和 extend 分别使用稳定的 `workflow-control.v1`、`workflow-restart.v1`、`workflow-stop.v1` 和 `workflow-extend.v1`。诊断不混入 JSON stdout。`workflow-control.v1` 始终包含 `workflow_id`、`project`、 `manifest` 和 `action`；`action` 明确区分 `prepare`、`start`、`resume`、 `repair` 与 `noop`，不再另写一份重复的 `started` 布尔状态。"
+msgstr "`workflow status --json` writes `neptrain.workflow-status.v1` to stdout. The run/resume, restart, stop, and extend commands use stable `workflow-control.v1`, `workflow-restart.v1`, `workflow-stop.v1`, and `workflow-extend.v1` contracts. Diagnostics never mix with JSON stdout. `workflow-control.v1` always includes `workflow_id`, `project`, `manifest`, and `action`. The action distinguishes `prepare`, `start`, `resume`, `repair`, and `noop`; there is no redundant `started` boolean."
+
+msgid "`stalled`：当前执行不能通过普通 `resume` 继续；检查原因后可用 `workflow restart --from ...` 明确选择重算位置，或者修改策略后新建 workflow。"
+msgstr "`stalled`: ordinary `resume` cannot continue the current execution. Inspect the cause, then use `workflow restart --from ...` to select a recomputation point, or revise the policy and create a new workflow."
+
+msgid "旧 `adaptive_v2` workflow 仍使用原来的 `evaluate/diagnose/dataset` 目录；这些目录不会 自动迁移。一个 generation 内只使用其 ledger 已记录的那套 stage sequence。"
+msgstr "Existing `adaptive_v2` workflows retain their original `evaluate/diagnose/dataset` directories without automatic migration. Each generation uses only the stage sequence already recorded in its ledger."
+
+msgid "训练、MD 和 labeling stage 使用与独立命令相同的 Adapter 和 execution target。 `train` 完成时检查模型产物和来源、启用模型，并生成可选的辅助测试报告。 新流程不再单独运行 `validate`。既有 `active_learning_v3` 目录仍保留其 `validate` 阶段， `adaptive_v2` 目录继续保留原来的 `evaluate/diagnose/merge` stage 和路径； 新版本按 manifest 中已经固化的 protocol 读取，不会重命名或混写旧目录。"
+msgstr "Training, MD, and labeling stages use the same adapters and execution targets as standalone commands. Training checks model artifacts and provenance, activates the model, and generates optional test diagnostics. New workflows have no separate `validate` stage. Existing `active_learning_v3` directories retain `validate`, and `adaptive_v2` directories retain their original `evaluate/diagnose/merge` stages and paths. The manifest fixes the protocol; newer versions read it without renaming or mixing existing directories."
+
+msgid "旧 `active_learning_v3` workflow 保留 `validate/`，`adaptive_v2` workflow 仍使用原来的 `evaluate/diagnose/dataset` 目录；这些目录不会 自动迁移。一个 generation 内只使用其 ledger 已记录的那套 stage sequence。"
+msgstr "Existing `active_learning_v3` workflows retain `validate/`, and `adaptive_v2` workflows retain their original `evaluate/diagnose/dataset` directories without automatic migration. Each generation uses only the stage sequence already recorded in its ledger."

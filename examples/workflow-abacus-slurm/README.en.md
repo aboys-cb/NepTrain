@@ -22,22 +22,21 @@ cd examples/workflow-abacus-slurm
 python -m pip install -e '../..[torchnep]'
 ```
 
-Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-npt.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Training nodes need TorchNEP, MD nodes need GPUMD, and labeling nodes need
 ABACUS. Put their conda/module setup in `env-training.sh`, `env-gpumd.sh`, and
 `env-abacus.sh`.
 
-## 2. Generate tutorial seed data
+## 2. Generate unlabeled seed structures
 
 ```bash
 python ../prepare_al_seed.py --output-dir .
 ```
 
-This creates `train.xyz`, `validation.xyz`, and `structures/al.xyz`. The first
-two use ASE EMT labels only to exercise workflow mechanics. Replace them with
-first-principles data consistent with your ABACUS pseudopotentials,
-functional, basis, and k-point setup before production use.
+This generates `seed-train.xyz` (24 frames), `seed-validation.xyz` (4 optional test frames),
+and `structures/al.xyz`. It creates no energy, force, virial, or EMT labels. Step 6 labels the
+seeds with the same backend, inputs, and resource manifest used by the workflow.
 
 ## 3. Pin ABACUS resources
 
@@ -97,15 +96,11 @@ Continue only when this command has no output:
 grep -R "REPLACE" project.yaml env-*.sh abacus-resources.json
 ```
 
-## 5. Run preflight checks
+## 5. Check the runtime prerequisites
 
-```bash
-neptrain doctor --project project.yaml
-```
-
-This checks the schema, Slurm target, setup scripts, and UPF path and SHA256 on
-compute nodes. It does not run an ABACUS calculation or validate the MPI/runtime
-combination.
+Finish replacing resource paths, hashes, partitions, and setup commands before submitting
+any job. The full `doctor --project` input check runs after the seed labeling below;
+`train.xyz` does not exist yet. The next single-structure calculation tests the actual backend.
 
 ## 6. Label one structure first
 
@@ -132,6 +127,15 @@ PY
 
 On failure, inspect `neptrain task logs <run_directory>`. Do not start the
 workflow until standalone labeling succeeds.
+
+Once the single-structure check passes, label the seeds with the same settings. Only the training set is required; an absent optional test set produces a warning and is skipped.
+
+```bash
+neptrain label seed-train.xyz --backend abacus --project project.yaml --target abacus --wait --output train.xyz
+# Optional / 可选：
+neptrain label seed-validation.xyz --backend abacus --project project.yaml --target abacus --wait --output validation.xyz
+neptrain doctor --project project.yaml
+```
 
 ## 7. Prepare and start the workflow
 
@@ -161,7 +165,7 @@ neptrain workflow stop abacus-tutorial-workflow
 
 `evaluation` is diagnostic only and does not block progression. Acquisition accuracy thresholds live in
 `workflow.convergence`; the example values are for the tutorial only. Final training requires accuracy,
-production coverage, and the configured passing streak. Optional test reports are in `generations/0001/validate/`.
+production coverage, and the configured passing streak. Optional test reports are in `generations/0001/train/`.
 
 A final `budget_exhausted` state means the example used its one-generation
 budget. Determine real failures from stage/job states and logs.
@@ -171,7 +175,7 @@ budget. Determine real failures from stage/job states and logs.
 - Replace EMT data with labels from the same ABACUS theoretical level.
 - Pin UPF files for every element and ORB files for LCAO.
 - Review `ecutwfc`, k points, smearing, magnetism, and SCF convergence.
-- Replace the 10–80-step NVE path with validated sampling.
+- Replace the 10–80-step NPT path with validated sampling.
 - Increase data volume, validation coverage, training size, and generations.
 - Tune Slurm resources and labeling concurrency.
 
@@ -185,3 +189,12 @@ budget. Determine real failures from stage/job states and logs.
 | `execution target ... FAIL` | Placeholder setup or partition remains | Remove every `REPLACE` value |
 | ABACUS exits immediately | Module, MPI launcher, or INPUT mismatch | Inspect task/stage logs |
 | NaN trajectory | Unstable student or MD settings | Inspect the health report; reduce timestep/temperature and improve seed data |
+
+## NPT settings and validation limits
+
+`gpumd-npt.in` uses isotropic `npt_scr`, target pressure 0 GPa, a rough elastic-modulus
+parameter of 100 GPa, and thermostat/barostat coupling parameters of 100/1000 steps.
+These are tutorial settings, not fitted material constants. The four-atom cell and 10–80
+steps test file and stage handling; they cannot establish equilibration or a production model.
+See the [GPUMD ensemble syntax](https://gpumd.org/gpumd/input_parameters/ensemble_standard.html).
+The one-generation budget normally ends as `budget_exhausted`, not `complete`.

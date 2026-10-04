@@ -27,3 +27,22 @@ examples/distillation-tace/labeled.xyz
 examples/distillation-tace/student-nep.txt
 examples/distillation-tace/student-train/
 examples/distillation-tace/tace-distillation-workflow/
+
+# Generated tutorial inputs, models, and runs (keep templates and manifests tracked).
+examples/*/seed-*.xyz
+examples/*/train.xyz
+examples/*/validation.xyz
+examples/*/candidates.xyz
+examples/*/labeled.xyz
+examples/*/check.xyz
+examples/*/*-check.xyz
+examples/*/structures/
+examples/*/vasp-resources.json
+examples/*/abacus-resources.json
+examples/*/.teacher-cache/
+examples/*/*.model
+examples/*/*.pt
+examples/*/*.part
+examples/*/student-nep.txt
+examples/*/student-train/
+examples/*/*-workflow/

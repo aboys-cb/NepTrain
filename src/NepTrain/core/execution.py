@@ -28,7 +28,12 @@ from ase.io import write as ase_write
 
 from .content_addressing import canonical_sha256, file_sha256
 from .scientific_data import optional_dataset_issue
-from .generation_policy import stage_implementation, stage_sequence_for_kind
+from .generation_policy import (
+    ACTIVE_LEARNING_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_FINALIZATION_STAGES,
+    stage_implementation,
+    stage_sequence_for_kind,
+)
 from .iteration import GenerationPlan, StageContext, StageOutcome
 from .persistence import atomic_write_json
 from .sampling_route import load_sampling_routes
@@ -676,7 +681,13 @@ def build_stage_task(
         and resolved_stage_input.get("generation_kind", "legacy") == "legacy"
     ):
         path_fields.clear()
-    if implementation_stage == "evaluate":
+    if implementation_stage == "evaluate" or (
+        stage == "train"
+        and context.stage_sequence in {
+            ACTIVE_LEARNING_ACQUISITION_STAGES,
+            ACTIVE_LEARNING_FINALIZATION_STAGES,
+        }
+    ):
         path_fields.add("evaluation.validation_path")
     all_path_fields = {
         dotted

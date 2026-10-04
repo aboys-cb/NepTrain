@@ -15,6 +15,7 @@ from .content_addressing import canonical_sha256, file_sha256
 from .scientific_data import optional_dataset_issue
 from .generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
     generation_stage_sequence,
     stage_for_role,
 )
@@ -242,7 +243,10 @@ class WorkflowWorkspace:
             raise ValueError(f"unknown workflow stage: {stage}") from error
         if (
             stage == "explore"
-            and stage_sequence == ACTIVE_LEARNING_ACQUISITION_STAGES
+            and stage_sequence in {
+                ACTIVE_LEARNING_ACQUISITION_STAGES,
+                ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
+            }
         ):
             relative = "explore"
         return self.generation_dir(generation) / relative

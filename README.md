@@ -10,7 +10,7 @@ selection, and labeling as standalone tasks, or compose the same steps into a
 resumable active-learning workflow.
 
 ```text
-train → validate → explore → select → label → evaluate → update
+train → explore → select → label → evaluate → update
 ```
 
 Standalone commands and automated workflows use the same scientific adapters
@@ -71,7 +71,7 @@ Use the deterministic toy workflow to check the NepTrain installation without
 submitting DFT or Slurm jobs:
 
 ```bash
-neptrain smoke --profile ordinary
+neptrain smoke --profile ordinary --workflow
 ```
 
 For a real project, validate every configured execution target before
@@ -81,7 +81,7 @@ submission:
 neptrain doctor --project project.yaml
 ```
 
-`doctor` reads the project backends, stage targets, setup scripts, and target
+`doctor` collects missing required data, training inputs, route structures, and resource errors before reporting the summary. Optional tests and disabled automatic convergence produce warnings. It also reads the project backends, stage targets, setup scripts, and target
 environment. It checks the actual GPUMD/TorchNEP, LAMMPS/GPUMD,
 VASP/ABACUS, or MACE/DeepMD/TACE runtime required by each target.
 
@@ -166,18 +166,22 @@ execution targets:
 ```bash
 neptrain doctor --project project.yaml
 neptrain workflow run project.yaml --prepare-only
-neptrain workflow run fe-workflow
+neptrain workflow run workflow
 ```
+
+New projects always use the current active-learning flow. Without `workflow.convergence`, automatic accuracy convergence is disabled; add system-specific thresholds using the commented example generated in `project.yaml`.
 
 Inspect and control it with:
 
 ```bash
-neptrain workflow status fe-workflow --jobs
-neptrain workflow resume fe-workflow
-neptrain workflow restart fe-workflow --generation 3 --from label --dry-run
-neptrain workflow stop fe-workflow
-neptrain workflow extend fe-workflow 5
+neptrain workflow status workflow --jobs
+neptrain workflow resume workflow
+neptrain workflow restart workflow --generation 3 --from label --dry-run
+neptrain workflow stop workflow
+neptrain workflow extend workflow 15
 ```
+
+Workflow control commands default to readable summaries; use `--json` for scripts. `extend workflow 15` sets the total sampling budget to 15; it does not add 15 generations. Follow the printed next action to start or resume.
 
 Human-readable workflow status focuses on the active generation, a compact
 temperature path with observable MD progress in ps, and a per-generation RMSE

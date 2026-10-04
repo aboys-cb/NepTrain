@@ -1,0 +1,17 @@
+# Short spin-model training for interface checks; not a converged Fe potential.
+version 4
+type 1 Fe
+cutoff 3.5 3.5
+n_max 2 2
+basis_size 2 2
+l_max 2 1 0
+neuron 16
+spin_mode 1
+spin_dof_type Fe
+lambda_m 1.0
+epoch 500
+batch 4
+lr 0.001
+lambda_e 1.0
+lambda_f 1.0
+lambda_v 0.1

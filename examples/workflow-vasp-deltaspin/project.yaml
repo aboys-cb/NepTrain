@@ -1,0 +1,86 @@
+schema_version: 8
+training:
+  backend: torchnep
+  initial_path: ./train.xyz
+  config_path: ./nep.in
+  device: cuda
+md:
+  backend: lammps
+  inference_backend: auto
+  spin: true
+sampling:
+  routes:
+    - id: fm
+      structures:
+        - ./structures/fm.xyz
+      template_path: ./lammps-spin-npt.in
+      conditions:
+        temperature_path:
+          - 50
+          - 100
+        pressure: 0
+      progression:
+        steps:
+          smoke_passed: 10
+          short_stable: 20
+          long_stable: 40
+          production_ready: 80
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 1
+          production_ready: 1
+    - id: canted
+      structures:
+        - ./structures/canted.xyz
+      template_path: ./lammps-spin-npt.in
+      conditions:
+        temperature_path:
+          - 50
+          - 100
+        pressure: 0
+      progression:
+        steps:
+          smoke_passed: 10
+          short_stable: 20
+          long_stable: 40
+          production_ready: 80
+        replicas:
+          smoke_passed: 1
+          short_stable: 1
+          long_stable: 1
+          production_ready: 1
+  selection:
+    max_selected: 4
+    novelty: auto
+labeling:
+  backend: vasp
+  input_path: ./INCAR
+  resource_path: /REPLACE/WITH/YOUR/potpaw_PBE
+  potcar_manifest_path: ./vasp-resources.json
+  kpoint_mode: auto
+  structures_per_job: 1
+  max_concurrent: 1
+workflow:
+  id: fe-deltaspin-workflow
+  max_model_generations: 1
+  seed: 20260727
+  convergence:
+    acquisition_max_rmse:
+      energy_rmse: 0.2
+      force_rmse: 0.5
+      mforce_rmse: 0.1
+    min_selected: 1
+    consecutive_generations: 1
+execution:
+  stage_targets:
+    training: local
+    sampling: local
+    labeling: local
+    analysis: local
+  targets:
+    local:
+      executor: process
+
+# LAMMPS metal pressure: bar. RMSE: eV/atom, eV/Angstrom, eV/mu_B.
+# Tutorial thresholds and short trajectories are not scientific acceptance criteria.

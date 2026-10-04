@@ -1,0 +1,19 @@
+clear
+units metal
+atom_style {{ atom_style }}
+boundary p p p
+read_data {{ structure_file }}
+
+pair_style {{ pair_style }}
+pair_coeff * * {{ model_file }} {{ elements }}
+
+timestep {{ timestep_ps }}
+velocity all create {{ temperature }} {{ seed }} mom yes rot yes dist gaussian
+fix integrator all npt{{ fix_suffix }} temp {{ temperature }} {{ temperature }} 0.1 iso {{ pressure }} {{ pressure }} 1.0
+
+thermo 100
+thermo_style custom step temp pe ke etotal press
+dump trajectory all custom {{ dump_interval }} {{ trajectory_file }} id type x y z fx fy fz
+dump_modify trajectory sort id format float %.17g
+{{ halt_commands }}
+run {{ steps }}

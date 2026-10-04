@@ -4,12 +4,12 @@
 
 # Distill a NEP student from a TACE teacher
 
-This tutorial labels three Al crystals with a pinned `TACE-OAM-7M` model,
+This tutorial labels 12 displaced Al crystals with a pinned `TACE-OAM-7M` model,
 trains a TorchNEP student, and can then run one complete workflow generation:
 
 ```text
 candidates → TACE teacher → energy/forces/virial
-           → TorchNEP student → GPUMD sampling → relabeling and retraining
+           → TorchNEP student → GPUMD sampling → relabeling, pre-training evaluation, and data update
 ```
 
 ## 1. Enter the example and install the environment
@@ -26,7 +26,7 @@ pip install \
 export TACE_USE_CUE=1
 ```
 
-Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-nve.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
+Install from this checkout so NepTrain matches the supplied placeholder templates. Use the same source revision on MD worker nodes. The `gpumd-npt.in` file is rendered by NepTrain; do not pass it directly to GPUMD.
 
 Verify that both commands come from the same environment:
 
@@ -58,7 +58,7 @@ same local model content in label provenance.
 python make_candidates.py
 ```
 
-`candidates.xyz` contains three fcc Al cells with different lattice scaling:
+`candidates.xyz` contains 12 strained and displaced fcc Al cells with different lattice scaling:
 
 ```bash
 python - <<'PY'
@@ -142,13 +142,12 @@ tutorial budget was consumed; it is not a failure.
 | Location | Contents |
 |---|---|
 | `generations/0001/train/` | Initial student and PNG convergence plot |
-| `generations/0001/md/` | GPUMD trajectory and health report |
+| `generations/0001/explore/` | GPUMD trajectory and health report |
 | `generations/0001/select/` | FPS selection result |
 | `generations/0001/label/selected-labels.xyz` | New TACE labels |
 | `generations/0001/label/label-provenance.json` | Runner, model name, and SHA256 |
-| `generations/0001/dataset/` | Merged training set |
-| `generations/0001/retrain/` | Retrained student |
-| `generations/0001/evaluate/` | Activation result |
+| `generations/0001/update/` | Merged training set |
+| `generations/0001/evaluate/` | Pre-training prediction error on new labels |
 
 ## 8. Spin-teacher boundary
 
@@ -162,7 +161,7 @@ Missing magnetic-force output fails explicitly and is never replaced by zeros.
 
 - Match the checkpoint elements, theory level, and license to the target.
 - Do not mix teacher labels from different fidelities or energy references.
-- Use an independent validation set and physically meaningful thresholds.
+- Set system-specific `workflow.convergence` thresholds for prediction errors on new labels before training on them. An independent test set is optional and diagnostic only.
 - Increase student capacity, epochs, candidate coverage, and workflow budget.
 - Smoke-test the exact checkpoint on the deployment GPU before using Slurm.
 
@@ -178,3 +177,14 @@ Missing magnetic-force output fails explicitly and is never replaced by zeros.
 
 See the [TACE repository](https://github.com/xvzemin/tace) and
 [TACE inference documentation](https://tace.readthedocs.io/en/latest/guide/scripts.html).
+
+## Workflow version and expected outcome
+
+All new preparations use `active_learning_v4`:
+`train → explore → select → label → evaluate → update`.
+`train` also checks model lineage, activates the model, and optionally reports test errors; `evaluate` compares the
+sampling model with newly obtained labels before training on them. The thresholds in
+`project.yaml` demonstrate configuration, not accepted model accuracy. With one sampling
+generation, expect `budget_exhausted`; this is not a backend failure. A following generation
+trains the updated data, and final training requires accuracy plus production coverage.
+NPT uses isotropic `npt_scr` at 0 GPa, a rough 100 GPa elastic modulus, and 100/1000-step coupling parameters. The tiny cell and short run are interface checks, not equilibrium sampling.

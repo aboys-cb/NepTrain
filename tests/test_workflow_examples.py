@@ -17,7 +17,7 @@ from NepTrain.core.workflow import _md_timestep_ps
 
 ROOT = Path(__file__).parents[1]
 GPUMD_EXAMPLES = sorted(
-    path.parent.name for path in (ROOT / "examples").glob("*/gpumd-nve.in")
+    path.parent.name for path in (ROOT / "examples").glob("*/gpumd-n*.in")
 )
 
 
@@ -49,13 +49,13 @@ def test_distillation_workflow_examples_are_schema_valid(example, runner):
     "example",
     GPUMD_EXAMPLES,
 )
-def test_workflow_examples_use_placeholder_nve_template(
+def test_workflow_examples_use_requested_ensemble_template(
     example,
     tmp_path,
 ):
     root = ROOT / "examples" / example
     run_input = RunInput(tmp_path / "nep.txt")
-    run_input.read_run(root / "gpumd-nve.in")
+    run_input.read_run(next(root.glob("gpumd-n*.in")))
     run_input.configure(
         temperature=75.0,
         pressure=0.0,
@@ -69,7 +69,7 @@ def test_workflow_examples_use_placeholder_nve_template(
     text = output.read_text(encoding="utf-8")
     assert "{{" not in text
     assert "potential nep.txt\n" in text
-    assert "ensemble nve\n" in text
+    assert ("ensemble nvt_nhc 75.0 75.0 100\n" if example == "distillation-deepmd" else "ensemble npt_scr 75.0 75.0 100 0.0 100 1000\n") in text
     assert "velocity 75.0 seed 42\n" in text
     assert "run 4\n" in text
 
@@ -120,7 +120,9 @@ def test_gpumd_examples_prepare_and_recover_every_sampling_stage(
         assert commands == [
             ["potential", "nep.txt"],
             ["velocity", str(expected["temperature"]), "seed", str(expected["seed"])],
-            ["ensemble", "nve"],
+            (["ensemble", "nvt_nhc", str(expected["temperature"]), str(expected["temperature"]), "100"]
+             if example == "distillation-deepmd" else
+             ["ensemble", "npt_scr", str(expected["temperature"]), str(expected["temperature"]), "100", "0.0", "100", "1000"]),
             ["time_step", str(timestep_fs)],
             ["dump_exyz", "1", "0", "1"],
             ["run", str(expected["steps"])],
@@ -179,11 +181,11 @@ def test_dft_workflow_examples_are_schema_valid(example, backend, target):
     assert warnings == []
     assert config["labeling"]["backend"] == backend
     assert config["execution"]["stage_targets"]["labeling"] == target
-    assert config["training"]["test_path"] == "./validation.xyz"
+    assert "test_path" not in config["training"]
     assert config["workflow"]["max_model_generations"] == 1
 
 
-def test_al_tutorial_seed_contains_complete_training_labels(tmp_path):
+def test_al_tutorial_seed_requires_consistent_dft_labeling(tmp_path):
     subprocess.run(
         [
             sys.executable,
@@ -196,15 +198,17 @@ def test_al_tutorial_seed_contains_complete_training_labels(tmp_path):
         text=True,
     )
 
-    train = ase_read(tmp_path / "train.xyz", index=":")
-    validation = ase_read(tmp_path / "validation.xyz", index=":")
+    train = ase_read(tmp_path / "seed-train.xyz", index=":")
+    validation = ase_read(tmp_path / "seed-validation.xyz", index=":")
     start = ase_read(tmp_path / "structures" / "al.xyz")
     assert len(train) == 24
     assert len(validation) == 4
     assert len(start) == 4
     for frame in [*train, *validation]:
-        assert frame.get_forces().shape == (4, 3)
-        assert frame.info["virial"].shape == (3, 3)
+        assert frame.calc is None
+        assert "virial" not in frame.info
+    assert not (tmp_path / "train.xyz").exists()
+    assert not (tmp_path / "validation.xyz").exists()
 
 
 @pytest.mark.parametrize(("backend", "text", "expected"), [
@@ -217,3 +221,73 @@ def test_workflow_progress_understands_explicit_timing_placeholders(tmp_path, ba
     path = tmp_path / "md.in"
     path.write_text(text)
     assert _md_timestep_ps({"template_path": path.name}, backend=backend, base_dir=tmp_path) == pytest.approx(expected)
+
+
+EXAMPLE_PROJECTS = sorted((ROOT / "examples").glob("*/project*.yaml"))
+
+
+@pytest.mark.parametrize("project", EXAMPLE_PROJECTS, ids=lambda path: f"{path.parent.name}/{path.name}")
+def test_every_example_prepares_v3_with_explicit_convergence(project, tmp_path):
+    """Exercise real preparation with toy labels, never claim real DFT validation."""
+    import json
+    from NepTrain.core.config import save_config
+    from NepTrain.core.dft.toy import ToyTeacher
+    from NepTrain.core.workflow import prepare_workflow
+
+    root = project.parent
+    for path in root.iterdir():
+        if path.is_file():
+            shutil.copy2(path, tmp_path / path.name)
+    generator = tmp_path / "make_candidates.py"
+    command = ([sys.executable, str(generator)] if generator.exists() else
+               [sys.executable, str(ROOT / "examples/prepare_al_seed.py"), "--output-dir", str(tmp_path)])
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    config, _ = load_config(tmp_path / project.name)
+    assert config["workflow"]["convergence"]
+    seed = tmp_path / ("candidates.xyz" if (tmp_path / "candidates.xyz").exists() else "seed-train.xyz")
+    teacher = ToyTeacher("spin" if config["md"]["spin"] else "ordinary")
+    frames = [teacher.label(frame) for frame in ase_read(seed, index=":")]
+    initial = tmp_path / config["training"]["initial_path"]
+    ase_write(initial, frames, format="extxyz")
+    # Data and resource stand-ins isolate preparation from licensed runtimes.
+    config["labeling"] = {"backend": "toy"}
+    config["execution"]["targets"] = {
+        name: {"executor": "process"} for name in config["execution"]["targets"]
+    }
+    save_config(config, tmp_path / project.name)
+    prepared = prepare_workflow(tmp_path / project.name, initial, tmp_path / "prepared")
+    manifest = json.loads(prepared.manifest.read_text())
+    assert manifest["generation_protocol"] == "active_learning_v4"
+    assert manifest["sampling_generation_budget"] == 1
+    assert len(prepared.plans) == 2
+
+
+@pytest.mark.parametrize("spin", [False, True])
+def test_shipped_lammps_npt_templates_render_units_and_spin(spin):
+    from NepTrain.core.md.lammps import render_template
+    path = ROOT / "examples" / (
+        "workflow-vasp-deltaspin/lammps-spin-npt.in" if spin else
+        "workflow-vasp-slurm/lammps-npt.in"
+    )
+    text = render_template(path.read_text(), {
+        "atom_style": "spin" if spin else "atomic", "structure_file": "model.data",
+        "pair_style": "nep/cpu", "model_file": "nep.txt", "elements": "Fe" if spin else "Al",
+        "temperature": 300, "spin_temperature": 300, "pressure": 123,
+        "timestep_ps": 0.001, "seed": 17, "fix_suffix": "",
+        "dump_interval": 1, "trajectory_file": "dump.lammpstrj", "steps": 10,
+        "halt_commands": "",
+    })
+    assert "{{" not in text
+    assert "units metal" in text and "iso 123 123 1.0" in text
+    assert ("dynspin/glsd/npt" in text) == spin
+
+
+def test_fe_seed_has_spin_targets_but_no_fabricated_labels(tmp_path):
+    subprocess.run([sys.executable, str(ROOT / "examples/workflow-vasp-deltaspin/make_candidates.py"),
+                    "--output-dir", str(tmp_path)], check=True, capture_output=True)
+    frames = ase_read(tmp_path / "seed-train.xyz", index=":")
+    assert len(frames) == 12
+    for frame in frames:
+        assert frame.arrays["spin"].shape == (16, 3)
+        np.testing.assert_allclose(np.linalg.norm(frame.arrays["spin"], axis=1), 2.2)
+        assert "mforce" not in frame.arrays and frame.calc is None

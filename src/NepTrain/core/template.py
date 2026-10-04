@@ -6,6 +6,7 @@ from importlib.resources import files
 import json
 from pathlib import Path
 import shutil
+import shlex
 
 from ruamel.yaml import YAML
 
@@ -123,9 +124,13 @@ def init_project(
     root = Path(destination).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     project = root / "project.yaml"
-    if project.exists() and not force:
+    generated = ["project.yaml", "lammps.in", "INCAR" if dft_backend == "vasp" else "INPUT"]
+    existing = [name for name in generated if (root / name).exists()]
+    if existing and not force:
         raise FileExistsError(
-            f"{project} already exists; use --force to replace generated templates"
+            f"项目文件已存在：{', '.join(existing)}（{root}）。"
+            f"继续使用请运行 neptrain doctor --project {shlex.quote(str(project))}。"
+            "需要重新生成时先备份；--force 会覆盖配置、模板和环境脚本，并重建资源清单。"
         )
     yaml = YAML()
     yaml.indent(mapping=2, sequence=4, offset=2)
@@ -138,6 +143,18 @@ def init_project(
                 dft_backend=dft_backend,
             ),
             handle,
+        )
+    with project.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n# 新项目使用 active_learning_v4；未配置 convergence 时不自动判定收敛。\n"
+            "# 在上面的 workflow 下添加 convergence。以下仅示范语法，阈值须按目标体系确定：\n"
+            "#   convergence:\n"
+            "#     acquisition_max_rmse:\n"
+            "#       energy_rmse: 0.01  # eV/atom\n"
+            "#       force_rmse: 0.1    # eV/Angstrom\n"
+            + ("#       mforce_rmse: 0.05  # eV/mu_B\n" if spin else "")
+            + "#     min_selected: 10    # 不得超过 sampling.selection.max_selected\n"
+            "#     consecutive_generations: 2\n"
         )
     (root / "structures").mkdir(exist_ok=True)
     if force:
@@ -218,12 +235,11 @@ def init_project(
             if not path.exists() or force:
                 path.write_text(content, encoding="utf-8")
                 path.chmod(0o755)
-    print(
-        f"Created {project}. Add train.xyz, nep.in and route structures; "
-        "set workflow.convergence thresholds for automatic convergence "
-        "(evaluation is optional and diagnostic only), then run "
-        "`neptrain doctor --project project.yaml`."
-    )
+    print(f"已创建项目：{project}")
+    print("待补齐：带标签的 train.xyz、nep.in、structures/ 中的结构、资源清单及运行环境。")
+    print("收敛：未启用自动收敛；project.yaml 末尾有带单位的配置示例。")
+    print("可选：training.test_path 和 evaluation.validation_path 可省略。")
+    print(f"下一步：neptrain doctor --project {shlex.quote(str(project))}")
     return project
 
 

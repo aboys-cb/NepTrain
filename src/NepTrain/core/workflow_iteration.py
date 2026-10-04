@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import os
 from pathlib import Path
@@ -34,7 +34,11 @@ from .fps import (
     adaptive_novelty_threshold,
     hierarchical_farthest_point_sampling,
 )
-from .generation_policy import stage_implementation
+from .generation_policy import (
+    ACTIVE_LEARNING_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_FINALIZATION_STAGES,
+    stage_implementation,
+)
 from .labeling import LabelRequest, LabelResult, label
 from .iteration import (
     StageContext,
@@ -595,7 +599,8 @@ class WorkflowIterationAdapter:
             else None
         )
         requires_validation = (
-            implementation_stage is None or implementation_stage == "evaluate"
+            implementation_stage is None
+            or implementation_stage in {"train", "evaluate"}
         )
         self.validation = (
             self._path(validation_value)
@@ -800,6 +805,8 @@ class WorkflowIterationAdapter:
             role="training",
             warm_start=warm_start,
         )
+        if not result.best_model.is_file() or result.best_model.stat().st_size == 0:
+            raise WorkflowIterationError("trained candidate model is missing or empty")
         candidate_sha256 = file_sha256(result.best_model)
         lineage = {
             "version": 2,
@@ -831,7 +838,7 @@ class WorkflowIterationAdapter:
                 for name, path in result.outputs.items()
             }
         )
-        return StageOutcome(
+        outcome = StageOutcome(
             artifacts=artifacts,
             metrics={
                 "backend": result.backend,
@@ -842,6 +849,19 @@ class WorkflowIterationAdapter:
                 "generation_kind": context.generation_kind,
             },
         )
+
+        if context.stage_sequence in {
+            ACTIVE_LEARNING_ACQUISITION_STAGES,
+            ACTIVE_LEARNING_FINALIZATION_STAGES,
+        }:
+            activation = self._activate_trained_model(
+                replace(context, artifacts={**context.artifacts, **outcome.artifacts})
+            )
+            return StageOutcome(
+                artifacts={**outcome.artifacts, **activation.artifacts},
+                metrics={**outcome.metrics, **activation.metrics},
+            )
+        return outcome
 
     def _validation_diagnostic(
         self, model: Path, training: Path
@@ -906,10 +926,12 @@ class WorkflowIterationAdapter:
             )
             return None, payload
 
-    def _adaptive_evaluate(self, context: StageContext) -> StageOutcome:
-        """Qualify the generation model before it can drive acquisition."""
+    def _activate_trained_model(self, context: StageContext) -> StageOutcome:
+        """Check and publish a trained model, with optional test diagnostics."""
 
         candidate = context.artifacts["candidate_model"]
+        if not candidate.is_file() or candidate.stat().st_size == 0:
+            raise WorkflowIterationError("trained candidate model is missing or empty")
         candidate_sha256 = file_sha256(candidate)
         training_input = context.artifacts["model_training_set"]
         lineage = json.loads(
@@ -921,7 +943,7 @@ class WorkflowIterationAdapter:
             != file_sha256(training_input)
         ):
             raise WorkflowIterationError(
-                "adaptive evaluate received inconsistent model lineage"
+                "trained model has inconsistent lineage"
             )
 
         options = self.config.get("evaluation", {})
@@ -931,8 +953,6 @@ class WorkflowIterationAdapter:
         validation_accepted = validation["validation_accepted"]
         evaluated_count = validation["evaluated_count"]
         spin_count = validation["spin_frame_count"]
-        if not candidate.is_file() or candidate.stat().st_size == 0:
-            raise WorkflowIterationError("trained candidate model is missing or empty")
         accepted = True
         active_lineage = {
             **lineage,
@@ -1030,10 +1050,10 @@ class WorkflowIterationAdapter:
         return self._adaptive_train(context)
 
     def _acquisition_evaluate(self, context: StageContext) -> StageOutcome:
-        return self._adaptive_evaluate(context)
+        return self._activate_trained_model(context)
 
     def _finalization_evaluate(self, context: StageContext) -> StageOutcome:
-        return self._adaptive_evaluate(context)
+        return self._activate_trained_model(context)
 
     def _acquisition_explore(self, context: StageContext) -> StageOutcome:
         return self._explore(context)

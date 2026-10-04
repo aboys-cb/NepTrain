@@ -186,6 +186,8 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
         if case == "empty_test":
             test_file.write_text(" \n\t", encoding="utf-8")
         config["evaluation"] = {"validation_path": str(test_file)}
+    if case == "no_convergence":
+        config["workflow"].pop("convergence")
     validate_config(config)
     atomic_write_json(root / "config.json", config)
     stage_calls = []
@@ -213,7 +215,7 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
     notifications = []
     sciences = []
     training_counts_match = []
-    budget = 4 if case == "insufficient_labels" else 8
+    budget = 4 if case in {"insufficient_labels", "no_convergence"} else 8
     for generation in range(1, budget + 2):
         plan = GenerationPlan(generation, seed + generation, 8)
         summary = controller.run_generation(plan, adapter)
@@ -226,7 +228,7 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
         training_counts_match.append(
             science["training"]["after_count"] == actual_training_count
         )
-        decision = summary.metrics.get("update", summary.metrics.get("validate", {}))
+        decision = summary.metrics.get("update", summary.metrics.get("train", {}))
         rows.append(
             {
                 "generation": generation,
@@ -239,14 +241,14 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
                 "disposition": decision.get("generation_disposition"),
                 "converged": decision.get("workflow_converged"),
                 "reasons": decision.get("convergence_reasons", []),
-                "warnings": summary.metrics.get("validate", {}).get(
+                "warnings": summary.metrics.get("train", {}).get(
                     "validation_warnings", []
                 ),
                 "maturity": decision.get("scenario_counts_by_maturity", {}),
-                "test_overlap_count": summary.metrics.get("validate", {}).get(
+                "test_overlap_count": summary.metrics.get("train", {}).get(
                     "validation_overlap_count"
                 ),
-                "validation_accepted": summary.metrics.get("validate", {}).get(
+                "validation_accepted": summary.metrics.get("train", {}).get(
                     "validation_accepted"
                 ),
             }
@@ -294,6 +296,7 @@ def run_workflow_smoke(
         case: _run_case(root / case, case, profile, seed)
         for case in (
             "no_test",
+            "no_convergence",
             "missing_test",
             "empty_test",
             "overlap_test",
@@ -314,11 +317,16 @@ def run_workflow_smoke(
     streak = cases["long_streak"]["generations"]
     recovery = cases["md_recovery"]["generations"]
     checks = {
+        "no_thresholds_never_claim_convergence": all(
+            row["kind"] == "acquisition" and not row["converged"]
+            and row["streak"] == 0 and row["reasons"]
+            for row in cases["no_convergence"]["generations"]
+        ),
         "training_counts_match_artifacts": all(
             case["training_counts_match_artifacts"] for case in cases.values()
         ),
         "expected_completion": all(
-            case["converged"] == (name != "insufficient_labels")
+            case["converged"] == (name not in {"insufficient_labels", "no_convergence"})
             for name, case in cases.items()
         ),
         "optional_test_does_not_change_decisions": all(
@@ -352,10 +360,14 @@ def run_workflow_smoke(
             row["selected"] == 4 and row["streak"] == 0 and row["reasons"]
             for row in cases["insufficient_labels"]["generations"]
         ),
+        "no_standalone_validate": all(
+            "validate" not in row["stages"]
+            for case in cases.values() for row in case["generations"]
+        ),
         "finalization_has_no_sampling": all(
-            case["generations"][-1]["stages"] == ["train", "validate"]
+            case["generations"][-1]["stages"] == ["train"]
             for name, case in cases.items()
-            if name != "insufficient_labels"
+            if name not in {"insufficient_labels", "no_convergence"}
         ),
     }
     report = {

@@ -13,6 +13,8 @@ def main() -> None:
             "labeled.xyz does not exist; run the labeling command first"
         )
     frames = read(path, index=":")
+    from NepTrain.core.scientific_data import validate_labeled_frames
+    validate_labeled_frames(frames)
     print("frame  energy(eV)  max|force|(eV/A)  virial  label_engine")
     for index, frame in enumerate(frames):
         forces = np.asarray(frame.get_forces())

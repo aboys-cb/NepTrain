@@ -9,7 +9,7 @@
 
 ```text
 候选结构 → DPA-3 Teacher → energy/forces/virial
-         → TorchNEP Student → GPUMD 采样 → 再标注与重训
+         → TorchNEP Student → GPUMD 采样 → 再标注、训练前评估与更新数据
 ```
 
 主教程使用 DeePMD-kit 官方内置的 `DPA-3.2-5M` 和 `OMol25` head。DPA-4
@@ -25,7 +25,7 @@ python -m pip install -e '../..[deepmd,torchnep]'
 ```
 
 从当前源码安装，确保 NepTrain 与附带的占位符模板匹配；MD 计算节点也应使用同一
-源码版本。`gpumd-nve.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
+源码版本。`gpumd-nvt.in` 由 NepTrain 渲染后运行，不要直接交给 GPUMD。
 
 确认命令可见：
 
@@ -138,10 +138,7 @@ command -v gpumd
 neptrain doctor --project project.yaml
 ```
 
-本例为三个原子的测试体系提供 `gpumd-nve.in`。NVE 仍按 50 K 初始化速度，但不
-使用 thermostat；这样可以避免把极小体系的强恒温耦合发散误判为 Student 势函数
-问题。`nep-workflow.in` 使用 500 个 epoch，比独立的 10-epoch 语法冒烟更适合
-执行这段短 MD。
+本例使用 `gpumd-nvt.in`：固定真空盒，50 K Nosé–Hoover 恒温，不使用压强耦合。0.1 fs 步长和 2–16 步只验证接口，不能证明达到热平衡。`nep-workflow.in` 使用 500 个 epoch。
 
 先准备，再启动：
 
@@ -162,12 +159,11 @@ neptrain workflow run project.yaml --foreground
 | 位置 | 内容 |
 |---|---|
 | `generations/0001/train/` | 初始 Student 和训练曲线 PNG |
-| `generations/0001/md/` | GPUMD 轨迹与 `trajectory-health.json` |
+| `generations/0001/explore/` | GPUMD 轨迹与 `trajectory-health.json` |
 | `generations/0001/select/` | FPS 选中的候选 |
 | `generations/0001/label/selected-labels.xyz` | DPA-3 新标签 |
 | `generations/0001/label/label-provenance.json` | runner、head、模型名和 SHA256 |
-| `generations/0001/dataset/` | 合并后的 Student 训练集 |
-| `generations/0001/retrain/` | 重训 Student |
+| `generations/0001/update/` | 合并后的 Student 训练集 |
 | `generations/0001/evaluate/` | 激活结果与评估产物 |
 
 示例只允许一代。最后显示 `budget_exhausted` 表示一代教程预算用完，不是
@@ -211,9 +207,18 @@ checkpoint 的端到端验证。
 | `head ... not found` | 模型没有该 branch | 用 `dp --pt show ... model-branch` 查看 |
 | `cannot access a CUDA device` | 当前进程没拿到 GPU | 检查 Slurm GPU 资源和 PyTorch CUDA |
 | `returned non-finite labels` | Teacher 推理结果异常 | 先用同一模型/结构运行 `dp test` 或 ASE |
-| GPUMD 输出 NaN | Student 或 MD 参数不稳定 | 看健康报告；本例不要把 NVE 改成强耦合 NVT |
+| GPUMD 输出 NaN | Student 或 MD 参数不稳定 | 看健康报告；本例不要把 NVT 改成强耦合 NVT |
 | 输入含 `spin` 被拒绝 | runner 不生成 `mforce` | 使用真正支持磁力标签的 Teacher backend |
 
 参考：[DeePMD-kit 内置模型下载](https://docs.deepmodeling.com/projects/deepmd/en/latest/model/pretrained.html)、
 [官方 DPA-3 蒸馏教程](https://docs.deepmodeling.com/projects/deepmd/en/latest/getting-started/dpa3_cyclohexane_distillation.html)、
 [DPA-4 文档](https://docs.deepmodeling.com/projects/deepmd/en/latest/model/dpa4.html)。
+
+## 流程版本与预期结果
+
+新建流程统一使用 `active_learning_v4`：
+`train → explore → select → label → evaluate → update`。
+`train` 同时检查模型来源、启用模型并可选输出测试误差；`evaluate` 用新标签评估采样模型的训练前预测。
+`project.yaml` 中的阈值仅演示配置，不代表模型已经达到该精度。一代采样预算通常以
+`budget_exhausted` 结束，属于预期结果，不是后端失败。更新的数据由下一代训练；只有精度和
+生产覆盖均满足条件才进入最终训练。
