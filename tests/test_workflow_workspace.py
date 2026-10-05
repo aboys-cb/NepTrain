@@ -98,11 +98,11 @@ def test_v4_publication_reads_test_metrics_from_train(tmp_path: Path):
     assert (generation_dir / "explore").is_dir()
     assert not (generation_dir / "md").exists()
     summary = (workspace.results_dir / "summary.md").read_text(encoding="utf-8")
-    assert "Energy RMSE (eV/atom)：0.01" in summary
-    assert "Energy RMSE (eV/atom)：9.0" in summary
-    assert summary.index("Energy RMSE (eV/atom)：9.0") < summary.index("辅助测试")
-    assert "当前模型：" in summary and "最终模型：" not in summary
-    assert "尚未确认流程收敛" in summary
+    assert "Energy RMSE (eV/atom): 0.01" in summary
+    assert "Energy RMSE (eV/atom): 9.0" in summary
+    assert summary.index("Energy RMSE (eV/atom): 9.0") < summary.index("Optional test")
+    assert "Current model: " in summary and "Final model: " not in summary
+    assert "Convergence not yet established" in summary
 
 
 def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: Path):
@@ -125,7 +125,10 @@ def test_workspace_hides_machine_state_and_publishes_accepted_results(tmp_path: 
     assert json.loads((workspace.results_dir / "nep.txt").read_text()) == "evaluate"
     assert (workspace.results_dir / "train.xyz").read_text() == "merge\n"
     assert json.loads((workspace.results_dir / "metrics.json").read_text()) == "evaluate"
-    assert "最新完成代：1" in (workspace.results_dir / "summary.md").read_text()
+    assert (
+        "Latest completed generation: 1"
+        in (workspace.results_dir / "summary.md").read_text()
+    )
     accepted = (workspace.results_dir / "current").resolve()
     assert accepted.stat().st_mode & 0o070 == 0o070
 
@@ -320,16 +323,16 @@ def test_snapshot_drops_unavailable_optional_paths(tmp_path, contents):
                 "production_ready": False,
                 "acquisition_convergence_streak": 1,
                 "acquisition_convergence_required": 2,
-                "convergence_reasons": ["有效新标签不足"],
+                "convergence_reasons": ["Insufficient new labels"],
             },
-            "尚未确认流程收敛",
+            "Convergence not yet established",
         ),
         (
             "acquisition",
             {"workflow_converged": False, "finalization_pending": True},
-            "等待最终训练",
+            "awaiting final training",
         ),
-        ("finalization", {"workflow_converged": True}, "已收敛"),
+        ("finalization", {"workflow_converged": True}, "Converged"),
     ],
 )
 def test_result_summary_distinguishes_current_model_from_converged_model(
@@ -339,7 +342,7 @@ def test_result_summary_distinguishes_current_model_from_converged_model(
         "evaluation_configured": True,
         "validation_accepted": False,
         "energy_rmse": 9.0,
-        "validation_warnings": ["测试集重叠，仅供参考"],
+        "validation_warnings": ["Test overlaps the training set; diagnostic only"],
     }
     metrics = {
         "train": activation,
@@ -361,16 +364,18 @@ def test_result_summary_distinguishes_current_model_from_converged_model(
         }
     )
     assert expected in summary
-    assert "最新验收代" not in summary
-    assert "辅助测试（仅供参考，不参与收敛）" in summary
-    assert "测试集重叠，仅供参考" in summary
+    assert "Latest accepted generation" not in summary
+    assert "Optional test (diagnostic only; does not determine convergence)" in summary
+    assert "Test overlaps the training set; diagnostic only" in summary
     if kind == "finalization":
-        assert "最终模型：" in summary
-        assert "本代只做最终训练，不采样" in summary
+        assert "Final model: " in summary
+        assert (
+            "This generation performs final training only, with no sampling" in summary
+        )
     else:
-        assert "当前模型：" in summary and "最终模型：" not in summary
-        assert "Force RMSE (eV/Å)：0.08" in summary
+        assert "Current model: " in summary and "Final model: " not in summary
+        assert "Force RMSE (eV/Å): 0.08" in summary
     if "convergence_reasons" in decision:
-        assert "有效新标签不足" in summary
-        assert "连续达标：1/2 代" in summary
-        assert "生产采样覆盖：未满足" in summary
+        assert "Insufficient new labels" in summary
+        assert "Consecutive passing generations: 1/2" in summary
+        assert "Production coverage: Not met" in summary

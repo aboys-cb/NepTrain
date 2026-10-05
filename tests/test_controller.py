@@ -1738,7 +1738,7 @@ def test_external_signal_stop_is_reported(tmp_path, monkeypatch):
     assert state["state"] == "stopped"
     assert "external signal" in state["reason"]
     assert "SIGTERM" in state["reason"]
-    assert any("external signal" in text or "外部终止信号" in text for _, text in events)
+    assert any("external signal" in text for _, text in events)
 
 
 def test_transient_controller_fault_is_retried_in_place(tmp_path, monkeypatch):
@@ -5330,7 +5330,7 @@ def test_stage_bundle_skips_unavailable_optional_dataset(
     )
     descriptor = json.loads(task.descriptor.read_text())
     assert key not in descriptor["config"][section]
-    assert "已跳过" in caplog.text
+    assert "skipped" in caplog.text
 
 
 @pytest.mark.parametrize("role", ["training_test", "evaluation_validation"])
@@ -5355,4 +5355,4 @@ def test_controller_and_status_allow_optional_snapshot_to_disappear(
     controller = PersistentController(prepared.output_dir)
     assert controller.workflow_id == prepared.workflow_id
     assert workflow_status(prepared.output_dir).workflow_id == prepared.workflow_id
-    assert "已跳过" in caplog.text
+    assert "skipped" in caplog.text

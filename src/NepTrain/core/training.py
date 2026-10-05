@@ -310,7 +310,7 @@ def train(request: TrainingRequest, backend: str) -> TrainingResult:
         raise TrainingError(f"training config does not exist: {request.config_file}")
     expects_spin, elements = _validate_training_data(request.train_file)
     if request.test_file is not None:
-        issue = optional_dataset_issue(request.test_file, role="训练测试集")
+        issue = optional_dataset_issue(request.test_file, role="Training test dataset")
         if issue:
             logging.getLogger(__name__).warning(issue)
             request = replace(request, test_file=None)

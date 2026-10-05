@@ -504,15 +504,15 @@ neptrain workflow restart workflow \
 
 ```text
 NepTrain · Fe-spin
-路径：/work/neptrain/Fe-spin
-状态：运行中 | 第 3/6 代 | 采样中
-控制器心跳：14:32:08（8 秒前）（不代表计算进度更新）
+Path: /work/neptrain/Fe-spin
+Status: Running | Generation 3/6 | Sampling
+Controller heartbeat: 14:32:08 (8s ago) (not a job progress timestamp)
 
-采样进度：
-  default | P=0（模板压力单位）
-    300 K 轨迹完成 | 轨迹正常 2/2 | 目标：长程
-    500 K 执行中 | 执行完成 0/4 | 运行 3 | 排队 1 | 已读轨迹 1–9/10 ps（3/4 可读） | 目标：短试跑
-    700 K ○ 未开始
+Sampling progress:
+  default | P=0 (template pressure units)
+    300 K Trajectories complete | Healthy trajectories 2/2 | Target: Long
+    500 K In progress | Finished 0/4 | Running 3 | Queued 1 | Trajectory progress 1–9/10 ps (3/4 readable) | Target: Smoke
+    700 K ○ Not started
 ```
 
 控制器心跳与任务检查时间分别标注；Job 状态是控制器最近一次检查的缓存，status 不额外查询调度器。ps 来自本机可读轨迹或日志以及模板 timestep，不使用墙钟时间估算。并行轨迹显示可读进度范围和读取数量；文件暂不可见时说明时间不可读，不将缺失值当作零，也不以最快一条代表整批。执行结束、轨迹正常、已记录等级和生产覆盖分别展示；仅尝试过某温度不能显示为完成，生产覆盖注明证据所属模型。
@@ -659,7 +659,7 @@ ledger 缺失、publication 唯一副本损坏或 artifact 路径逃出 workflow
 
 `doctor` 将独立问题汇总为 `FAIL`（必须修复）、`WARN`（提示）和 `OK`。缺少 test 或未启用自动收敛只提示。初始种子尚未标注时，先按对应案例完成独立标注，再检查整个项目。环境检查成功不代表 DFT、训练或 MD 已实际通过。
 
-新项目统一使用 `active_learning_v4`，不再因为缺少 `workflow.convergence` 而切到旧流程。未设置阈值时，状态明确提示“未启用自动收敛”。已有工作目录继续使用其保存的阶段协议，不能通过删除或编辑内部记录迁移。
+新项目统一使用 `active_learning_v4`，不再因为缺少 `workflow.convergence` 而切到旧流程。未设置阈值时，状态明确提示`Convergence checks are disabled`（未启用收敛检查）。已有工作目录继续使用其保存的阶段协议，不能通过删除或编辑内部记录迁移。
 
 ## 命令输出与恢复
 

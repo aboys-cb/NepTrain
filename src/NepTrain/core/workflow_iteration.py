@@ -319,7 +319,7 @@ def _acquisition_convergence_status(
             "acquisition_converged": False,
             "acquisition_convergence_streak": 0,
             "convergence_reasons": [
-                "未配置 workflow.convergence，采样覆盖完成也不代表精度收敛。"
+                "Convergence checks are disabled: workflow.convergence is not configured. Sampling coverage alone does not establish accuracy."
             ],
         }
     thresholds = dict(policy.get("acquisition_max_rmse", {}))
@@ -383,20 +383,28 @@ def _acquisition_convergence_status(
     reasons = []
     if not enough_evidence:
         reasons.append(
-            f"本轮有效新标签 {int(diagnostic.get('evaluated_count', 0))}/{min_selected}，证据不足。"
+            f"Insufficient evidence: evaluated {int(diagnostic.get('evaluated_count', 0))}/{min_selected} required new labels."
         )
     if not aggregate_rmse_accepted:
-        reasons.append("新增结构的训练前 RMSE 未达到配置阈值或缺少指标。")
+        reasons.append("New-label RMSE exceeds a configured limit or is unavailable.")
     if not aggregate_r2_accepted:
-        reasons.append("新增结构的训练前 R² 未达到配置阈值或缺少指标。")
+        reasons.append("New-label R² is below a configured minimum or is unavailable.")
     if not attempts_accepted:
-        reasons.append("部分采样轨迹的训练前 RMSE 未达到配置阈值。")
+        reasons.append(
+            "At least one trajectory has new-label RMSE above a configured limit or missing metrics."
+        )
     if not groups_accepted:
-        reasons.append("元素或温压条件分组的力 R² 未达标或缺少证据。")
+        reasons.append(
+            "Force R² by element or temperature-pressure condition is below the required minimum or lacks evidence."
+        )
     if not outliers_accepted:
-        reasons.append("异常残差比例未达标或缺少证据。")
+        reasons.append(
+            "The outlier fraction exceeds the configured limit or is unavailable."
+        )
     if acquisition_accepted and streak < required:
-        reasons.append(f"本轮精度达标，连续达标 {streak}/{required} 代，仍需采样确认。")
+        reasons.append(
+            f"Accuracy criteria met this round; consecutive passing generations: {streak}/{required}. More sampling is needed."
+        )
     return {
         "acquisition_convergence_configured": True,
         "acquisition_metrics": metrics,
@@ -881,7 +889,9 @@ class WorkflowIterationAdapter:
         if not self.evaluation_configured:
             return None, payload
         warnings = payload["validation_warnings"]
-        issue = optional_dataset_issue(self.validation, role="辅助测试集")
+        issue = optional_dataset_issue(
+            self.validation, role="Optional evaluation dataset"
+        )
         if issue:
             warnings.append(issue)
             return None, payload
@@ -898,7 +908,7 @@ class WorkflowIterationAdapter:
             )
             if overlap:
                 warnings.append(
-                    f"辅助测试集有 {overlap}/{len(frames)} 帧与训练集重叠；误差仅供参考，不影响采样和收敛。"
+                    f"Optional test overlap: {overlap}/{len(frames)} structures are also in the training set. These errors are diagnostic only and do not affect sampling or convergence."
                 )
             options = self.config.get("evaluation", {})
             evaluation = self.runtime.predict(
@@ -907,7 +917,7 @@ class WorkflowIterationAdapter:
             metrics = {name: float(value) for name, value in evaluation.metrics.items()}
             if not metrics or not all(np.isfinite(value) for value in metrics.values()):
                 warnings.append(
-                    "辅助测试产生空或非有限误差，未判定验证通过；流程仍由采样证据决定。"
+                    "Optional test metrics are empty or non-finite; no test result is available. Sampling evidence still determines workflow decisions."
                 )
                 return None, payload
             payload.update(metrics)
@@ -918,12 +928,12 @@ class WorkflowIterationAdapter:
                 payload["validation_accepted"] = passed if not overlap else None
                 if not passed:
                     warnings.append(
-                        "辅助测试误差未达到参考阈值；不阻止模型启用、采样或流程收敛。"
+                        "Optional test errors exceed the reference limits. This does not block model activation, sampling, or convergence."
                     )
             return evaluation, payload
         except Exception as error:
             warnings.append(
-                f"辅助测试未完成：{type(error).__name__}: {error}；不影响采样判据。"
+                f"Optional test could not finish: {type(error).__name__}: {error}. Sampling criteria are unaffected."
             )
             return None, payload
 
@@ -2708,9 +2718,9 @@ class WorkflowIterationAdapter:
                 for temperature, coverage in status["by_temperature"].items():
                     if coverage["coverage"] < status["minimum_coverage"]:
                         convergence["convergence_reasons"].append(
-                            f"{route_id} / {temperature} K：当前模型生产覆盖 "
-                            f"{coverage['coverage']:.0%}，要求 ≥{status['minimum_coverage']:.0%}；"
-                            f"每个场景需 {status['minimum_successful_replicas']} 个成功副本。"
+                            f"{route_id} / {temperature} K: production coverage for the current model is "
+                            f"{coverage['coverage']:.0%}; required ≥{status['minimum_coverage']:.0%}. "
+                            f"Successful replicas required per scenario: {status['minimum_successful_replicas']}."
                         )
         history.update(convergence)
         history.update(
@@ -3248,9 +3258,9 @@ class WorkflowIterationAdapter:
                 for temperature, coverage in status["by_temperature"].items():
                     if coverage["coverage"] < status["minimum_coverage"]:
                         convergence["convergence_reasons"].append(
-                            f"{route_id} / {temperature} K：当前模型生产覆盖 "
-                            f"{coverage['coverage']:.0%}，要求 ≥{status['minimum_coverage']:.0%}；"
-                            f"每个场景需 {status['minimum_successful_replicas']} 个成功副本。"
+                            f"{route_id} / {temperature} K: production coverage for the current model is "
+                            f"{coverage['coverage']:.0%}; required ≥{status['minimum_coverage']:.0%}. "
+                            f"Successful replicas required per scenario: {status['minimum_successful_replicas']}."
                         )
         history.update(convergence)
         history["workflow_converged"] = workflow_converged

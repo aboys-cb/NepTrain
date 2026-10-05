@@ -729,7 +729,8 @@ def test_workflow_smoke_exercises_production_v4_decisions(tmp_path, profile):
     workflow = tmp_path / "smoke/workflow"
     assert json.loads((workflow / "workflow-smoke-report.json").read_text()) == report
     assert (
-        "训练集：4 → 12（+8）" in (workflow / "no_test/notifications.txt").read_text()
+        "Training set: 4 → 12 (+8)"
+        in (workflow / "no_test/notifications.txt").read_text()
     )
 
 
@@ -738,16 +739,21 @@ def test_repeated_init_reports_actionable_error_without_traceback(tmp_path):
     result = _help("workflow", "init", "--directory", str(tmp_path))
     assert result.returncode == 2
     assert "Traceback" not in result.stderr
-    assert "doctor --project" in result.stderr and "覆盖" in result.stderr
+    assert "doctor --project" in result.stderr and "overwrites" in result.stderr
 
 
 def test_doctor_collects_missing_inputs_before_resource_failure(tmp_path):
     _help("workflow", "init", "--profile", "local", "--directory", str(tmp_path))
     result = _help("doctor", "--project", str(tmp_path / "project.yaml"))
     assert result.returncode != 0
-    for field in ("training.initial_path", "training.config_path", ".structures", "标注资源清单"):
+    for field in (
+        "training.initial_path",
+        "training.config_path",
+        ".structures",
+        "Labeling resource manifest",
+    ):
         assert field in result.stdout
-    assert "未启用自动收敛" in result.stdout
+    assert "Convergence checks are disabled" in result.stdout
     assert "Traceback" not in result.stderr
 
 
@@ -766,7 +772,9 @@ def test_workflow_control_human_summary_keeps_restart_details(capsys):
              "preserved_tasks": 4, "retried_tasks": 1}
     _print_workflow_control(value)
     out = capsys.readouterr().out
-    assert "重算预览（未执行）" in out and "保留 4，重试 1" in out
+    assert (
+        "Restart preview (no changes made)" in out and "preserved 4, retried 1" in out
+    )
     assert "'/tmp/a b'" in out and not out.startswith("{")
     _print_workflow_control(value, json_output=True)
     assert json.loads(capsys.readouterr().out) == value

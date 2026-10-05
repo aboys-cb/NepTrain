@@ -2260,14 +2260,14 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
 
             if resume_after_interruption:
                 detail = (
-                    f"上一次控制器没有正常收尾就结束了（状态 {previous_state}"
+                    f"The previous controller exited without a clean shutdown (state: {previous_state}"
                     + (
-                        f"，最后心跳 {previous_heartbeat}"
+                        f"; last heartbeat: {previous_heartbeat}"
                         if previous_heartbeat
                         else ""
                     )
-                    + (f"，原因 {previous_reason}" if previous_reason else "")
-                    + "）。本次启动已接管并继续，账本与已提交的作业保持不变。"
+                    + (f"; reason: {previous_reason}" if previous_reason else "")
+                    + "). This controller has taken over; the ledger and submitted jobs are preserved."
                 )
                 report_controller_event(
                     "controller-restarted:"
@@ -2369,8 +2369,8 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                     ControllerTick(
                         "stalled",
                         detail=(
-                            f"控制器收到外部终止信号 {name}（不是 workflow stop 命令），"
-                            "流程未失败、账本保持不变，resume 即可继续。"
+                            f"The controller received external signal {name}, not a workflow stop request. "
+                            "The workflow is paused and its ledger is intact. Run workflow resume to continue."
                         ),
                     ),
                 )

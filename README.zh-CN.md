@@ -15,6 +15,9 @@ train → explore → select → label → evaluate → update
 workflow 只负责计划、状态推进和验收，不复制科学计算逻辑。Label Adapter 可以
 是 VASP、ABACUS，也可以是已经微调并用于替代 DFT 的等变 Teacher 模型。
 
+CLI 输出、帮助、通知及自动生成的项目和报告文案统一使用英文；README 和文档
+保留中英文。用户填写的名称、路径和外部程序原始消息保持原样。
+
 第一次使用可直接选择完整教程：
 
 - [VASP + Slurm workflow](examples/workflow-vasp-slurm/README.md)

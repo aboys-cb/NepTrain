@@ -6,6 +6,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from NepTrain.core.notifications import (
     NotificationEvent,
     WorkflowNotificationWorker,
@@ -80,8 +82,8 @@ def test_doctor_probe_identifies_the_project(tmp_path: Path):
 
     assert result.ok
     text = json.loads(pool.requests[0][2]["body"])["content"]["text"]
-    assert "任务：Fe-spin" in text
-    assert f"路径：{project.resolve()}" in text
+    assert "Workflow: Fe-spin" in text
+    assert f"Path: {project.resolve()}" in text
 
 
 def test_generation_report_contains_scientific_progress():
@@ -145,17 +147,17 @@ def test_generation_report_contains_scientific_progress():
 
     assert event.event_id == "generation:2:accepted"
     assert "G2/4" in event.text
-    assert "任务：Fe" in event.text
-    assert "路径：/work/Fe-run" in event.text
-    assert "40 候选" in event.text
-    assert "1 批失败" in event.text
-    assert "部分成功并已接受" in event.text
+    assert "Workflow: Fe" in event.text
+    assert "Path: /work/Fe-run" in event.text
+    assert "40 candidates" in event.text
+    assert "failed batches: 1" in event.text
+    assert "Generation completed with partial results" in event.text
     assert "E=10 meV/atom" in event.text
     assert "F=200 meV/Å" in event.text
     assert "M=150 meV/μB" in event.text
     assert "meV/spin unit" not in event.text
-    assert "温度：300/500 K" in event.text
-    assert "最长时长：400 steps" in event.text
+    assert "Temperature: 300/500 K" in event.text
+    assert "Longest run: 400 steps" in event.text
 
 
 def test_finalization_notification_does_not_claim_sampling_or_labeling():
@@ -184,12 +186,12 @@ def test_finalization_notification_does_not_claim_sampling_or_labeling():
         },
     )
 
-    assert "最终模型已就绪" in event.text
-    assert "最终代：G3（计划上限 G4）" in event.text
-    assert "最终训练集：120 个结构" in event.text
-    assert "不再运行 MD、FPS 或 DFT" in event.text
-    assert "采样：" not in event.text
-    assert "标注：" not in event.text
+    assert "Final model ready" in event.text
+    assert "Final generation: G3 (planned limit: G4)" in event.text
+    assert "Final training set: 120 structures" in event.text
+    assert "no MD, selection, or labeling" in event.text
+    assert "Sampling: " not in event.text
+    assert "Labeling: " not in event.text
 
 
 def test_finalization_notification_omits_empty_quality_placeholders():
@@ -229,8 +231,8 @@ def test_complete_terminal_report_uses_actual_completed_generation():
 
     event = _terminal_event("Fe", 17, state, tick)
 
-    assert "工作流已收敛并完成" in event.text
-    assert "结束位置：G15（计划上限 G17）" in event.text
+    assert "Workflow converged and complete" in event.text
+    assert "Finished at: G15 (planned limit: G17)" in event.text
     assert "17/17" not in event.text
     assert "workflow converged" not in event.text
 
@@ -253,8 +255,8 @@ def test_terminal_report_is_stable_per_attempt():
     )
 
     assert event.event_id == "terminal:failed:3:label:2"
-    assert "任务：Fe" in event.text
-    assert "路径：/work/Fe-run" in event.text
+    assert "Workflow: Fe" in event.text
+    assert "Path: /work/Fe-run" in event.text
     assert "OUT_OF_MEMORY" in event.text
     assert "resume" in event.text
 
@@ -322,22 +324,28 @@ def test_notification_prioritizes_acquisition_and_explains_test_warning():
                     "metrics": {
                         "prediction_metric_basis": "per_atom_v1",
                         "force_rmse": 0.5,
-                        "validation_warnings": ["辅助测试重叠，仅供参考"],
+                        "validation_warnings": [
+                            "Optional test overlaps the training set; diagnostic only"
+                        ],
                     }
                 },
                 "update": {
                     "metrics": {
-                        "convergence_reasons": ["连续达标 1/2 代，仍需采样确认。"]
+                        "convergence_reasons": [
+                            "Consecutive passing generations: 1/2. More sampling is needed."
+                        ]
                     }
                 },
             },
         },
     )
-    assert "新增 DFT 预测 RMSE（训练前）" in event.text
+    assert "Prediction RMSE on new structures (before training on them)" in event.text
     assert "F=80 meV/Å" in event.text
     assert "F=500 meV/Å" not in event.text
-    assert "提示：辅助测试重叠，仅供参考" in event.text
-    assert "继续原因：连续达标 1/2 代" in event.text
+    assert (
+        "Note: Optional test overlaps the training set; diagnostic only" in event.text
+    )
+    assert "Convergence: Consecutive passing generations: 1/2" in event.text
 
 
 def test_v3_notification_reports_merged_training_count():
@@ -364,4 +372,41 @@ def test_v3_notification_reports_merged_training_count():
             },
         },
     )
-    assert "训练集：4 → 12（+8）" in event.text
+    assert "Training set: 4 → 12 (+8)" in event.text
+
+
+@pytest.mark.parametrize("kind", ["acquisition", "finalization"])
+@pytest.mark.parametrize("mforce", [None, 0.0, 0.15])
+def test_notification_shows_magnetic_force_only_when_available(kind, mforce):
+    final = kind == "finalization"
+    prefix = "" if final else "current_model_"
+    event = _generation_event(
+        "Fe",
+        3,
+        {"generation": 1, "max_selected": 10},
+        {
+            "kind": kind,
+            "stage_sequence": (
+                ["train"]
+                if final
+                else ["train", "explore", "select", "label", "evaluate", "update"]
+            ),
+            "complete": True,
+            "accepted": True,
+            "stages": {
+                "train" if final else "evaluate": {
+                    "metrics": {
+                        "prediction_metric_basis": "per_atom_v1",
+                        prefix + "force_rmse": 0.1,
+                        prefix + "mforce_rmse": mforce,
+                    }
+                }
+            },
+        },
+    )
+    assert "F=100 meV/Å" in event.text
+    if mforce is None:
+        assert "M=" not in event.text
+        assert "μB" not in event.text
+    else:
+        assert f"M={mforce * 1000:g} meV/μB" in event.text

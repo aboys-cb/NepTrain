@@ -128,10 +128,10 @@ def doctor_probe(
         settings,
         "\n".join(
             (
-                "🩺 [NepTrain] Doctor 通知链路验证",
+                "🩺 [NepTrain] Notification check",
                 *identity,
-                "结果：签名校验与消息投递成功",
-                "说明：这不是工作流进度消息",
+                "Result: Notification delivered successfully.",
+                "This is a connectivity check from doctor, not a workflow update.",
             )
         ),
         pool=pool,
@@ -142,9 +142,9 @@ def _workflow_identity(
     workflow_id: str,
     workflow_path: Path | str | None,
 ) -> tuple[str, ...]:
-    lines = [f"任务：{workflow_id}"]
+    lines = [f"Workflow: {workflow_id}"]
     if workflow_path is not None:
-        lines.append(f"路径：{Path(workflow_path).resolve()}")
+        lines.append(f"Path: {Path(workflow_path).resolve()}")
     return tuple(lines)
 
 
@@ -202,12 +202,12 @@ def _sampling_range(record: Mapping[str, Any]) -> str | None:
         else:
             values = (
                 f"{temperatures[0]:g}–{temperatures[-1]:g}"
-                f"（{len(temperatures)} 个温度点）"
+                f" ({len(temperatures)} temperatures)"
             )
-        parts.append(f"温度：{values} K")
+        parts.append(f"Temperature: {values} K")
     if steps:
-        parts.append(f"最长时长：{max(steps):,} steps")
-    return "；".join(parts) or None
+        parts.append(f"Longest run: {max(steps):,} steps")
+    return "; ".join(parts) or None
 
 
 def _plan_mapping(plan: Any) -> Mapping[str, Any]:
@@ -236,22 +236,34 @@ def _generation_event(
     has_acquisition = any(value is not None for value in acquisition_quality.values())
     quality = acquisition_quality if has_acquisition else validation_quality
     quality_label = (
-        "新增 DFT 预测 RMSE（训练前）"
+        "Prediction RMSE on new structures (before training on them)"
         if has_acquisition
-        else "辅助测试 RMSE（仅供参考）"
+        else "Optional test RMSE (diagnostic only)"
     )
+    quality_text = (
+        f"{quality_label}: "
+        f"E={_metric(quality.get('energy_rmse'), scale=1000, unit='meV/atom')}, "
+        f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}, "
+        f"V={_metric(quality.get('virial_rmse'), scale=1000, unit='meV/atom')}"
+    )
+    if quality.get("mforce_rmse") is not None:
+        quality_text += (
+            f", M={_metric(quality['mforce_rmse'], scale=1000, unit='meV/μB')}"
+        )
     decision_lines = [
         *(
-            f"提示：{warning}"
+            f"Note: {warning}"
             for warning in science["quality"].get("validation_warnings", [])
         ),
         *(
-            f"继续原因：{reason}"
+            f"Convergence: {reason}"
             for reason in science["quality"].get("convergence_reasons", [])
         ),
     ]
     if science["quality"].get("finalization_pending"):
-        decision_lines.append("下一步：采样精度与生产覆盖已通过，进入最终训练。")
+        decision_lines.append(
+            "Next: Accuracy and production coverage requirements met; proceeding to final training."
+        )
 
     stages = record.get("stages", {})
     label_metrics = (
@@ -263,69 +275,65 @@ def _generation_event(
     failed_sources = int(sampling.get("failed_source_count", 0) or 0)
     partial = failed_labels > 0 or failed_sources > 0
     icon = "⚠️" if partial else "✅"
-    outcome = "部分成功并已接受" if partial else "本轮已接受"
+    outcome = (
+        "Generation completed with partial results; review the failures above."
+        if partial
+        else "Generation completed. Convergence is assessed separately."
+    )
     if generation_kind == "finalization":
         final_quality = any(value is not None for value in quality.values())
         lines = [
-            "🎯 [NepTrain] 最终模型已就绪",
+            "🎯 [NepTrain] Final model ready",
             *_workflow_identity(workflow_id, workflow_path),
-            f"最终代：G{generation}（计划上限 G{total_generations}）",
-            ("最终训练集：" f"{_number(training.get('after_count'))} 个结构"),
-            "结果：采样判据已通过，最终模型训练完成",
-            "说明：本代仅执行收尾训练与模型检查，不再运行 MD、FPS 或 DFT；辅助测试不参与收敛判断",
+            f"Final generation: G{generation} (planned limit: G{total_generations})",
+            (
+                "Final training set: "
+                f"{_number(training.get('after_count'))} structures"
+            ),
+            "Result: Sampling criteria met and final training complete.",
+            "This generation ran final training and model checks only, with no MD, selection, or labeling. Optional tests do not determine convergence.",
         ]
         model = training.get("active_model_sha256")
         if model:
-            lines.insert(-2, f"模型：{str(model)[:12]}")
+            lines.insert(-2, f"Model: {str(model)[:12]}")
         if final_quality:
-            lines.insert(
-                -2,
-                f"{quality_label}："
-                f"E={_metric(quality.get('energy_rmse'), scale=1000, unit='meV/atom')}，"
-                f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}，"
-                f"V={_metric(quality.get('virial_rmse'), scale=1000, unit='meV/atom')}，"
-                f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/μB')}",
-            )
+            lines.insert(-2, quality_text)
         return NotificationEvent(
             f"generation:{generation}:accepted",
             "\n".join([*lines, *decision_lines]),
         )
     lines = [
-        f"{icon} [NepTrain] G{generation}/{total_generations} 完成",
+        f"{icon} [NepTrain] G{generation}/{total_generations} complete",
         *_workflow_identity(workflow_id, workflow_path),
         (
-            "采样："
-            f"{_number(sampling.get('candidate_count'))} 候选 → "
-            f"{_number(sampling.get('candidate_count_after_deduplication'))} 去重 → "
-            f"{_number(sampling.get('selected_count'))} 选中"
+            "Sampling: "
+            f"{_number(sampling.get('candidate_count'))} candidates → "
+            f"{_number(sampling.get('candidate_count_after_deduplication'))} after deduplication → "
+            f"{_number(sampling.get('selected_count'))} selected"
         ),
         (
-            f"标注：{_number(sampling.get('labeled_count'))} 成功"
-            + (f"，{failed_labels} 批失败" if failed_labels else "")
+            f"Labeling: {_number(sampling.get('labeled_count'))} structures labeled"
+            + (f"; failed batches: {failed_labels}" if failed_labels else "")
         ),
-        f"{quality_label}："
-        f"E={_metric(quality.get('energy_rmse'), scale=1000, unit='meV/atom')}，"
-        f"F={_metric(quality.get('force_rmse'), scale=1000, unit='meV/Å')}，"
-        f"V={_metric(quality.get('virial_rmse'), scale=1000, unit='meV/atom')}，"
-        f"M={_metric(quality.get('mforce_rmse'), scale=1000, unit='meV/μB')}",
-        f"结论：{outcome}",
+        quality_text,
+        f"Outcome: {outcome}",
     ]
     training_line = (
-        "训练集："
+        "Training set: "
         f"{_number(training.get('before_count'))} → "
         f"{_number(training.get('after_count'))}"
     )
     if training.get("added_count") is not None:
-        training_line += f"（+{_number(training.get('added_count'))}）"
+        training_line += f" (+{_number(training.get('added_count'))})"
     lines.insert(3, training_line)
     if failed_sources:
-        lines.insert(2, f"采样异常：{failed_sources} 个 source 失败")
+        lines.insert(2, f"Failed sampling sources: {failed_sources}")
     sampling_range = _sampling_range(record)
     if sampling_range:
-        lines.insert(2, f"采样范围：{sampling_range}")
+        lines.insert(2, f"Sampling range: {sampling_range}")
     model = training.get("active_model_sha256")
     if model:
-        lines.insert(-1, f"模型：{str(model)[:12]}")
+        lines.insert(-1, f"Model: {str(model)[:12]}")
     return NotificationEvent(
         f"generation:{generation}:accepted",
         "\n".join([*lines, *decision_lines]),
@@ -368,12 +376,12 @@ def _terminal_event(
         "coverage_exhausted": "⚠️",
     }
     labels = {
-        "complete": "工作流已收敛并完成",
-        "failed": "流程失败",
-        "rejected": "评估未通过",
-        "stalled": "流程停滞",
-        "budget_exhausted": "轮次预算耗尽",
-        "coverage_exhausted": "采样覆盖耗尽",
+        "complete": "Workflow converged and complete",
+        "failed": "Workflow failed",
+        "rejected": "Acceptance criteria not met",
+        "stalled": "Workflow stalled",
+        "budget_exhausted": "Sampling budget exhausted",
+        "coverage_exhausted": "Sampling coverage exhausted",
     }
     lines = [
         f"{icons.get(state, 'ℹ️')} [NepTrain] {labels.get(state, state)}",
@@ -381,24 +389,29 @@ def _terminal_event(
     ]
     if state == "complete":
         if generation is None:
-            lines.append(f"结束位置：计划上限 G{total_generations}")
+            lines.append(f"Planned limit: G{total_generations}")
         else:
             lines.append(
-                f"结束位置：G{generation}（计划上限 G{total_generations}）"
+                f"Finished at: G{generation} (planned limit: G{total_generations})"
             )
-        lines.append("状态：最终结果已保存，流程正常结束")
+        lines.append("Status: Final results saved; workflow finished successfully.")
     else:
-        lines.append(f"进度：{generation or total_generations}/{total_generations}")
+        lines.append(
+            f"Generation: {generation or total_generations}/{total_generations}"
+        )
     if stage:
-        lines.append(f"位置：G{generation or '-'} / {stage}")
+        lines.append(f"Stopped at: G{generation or '-'} / {stage}")
     if state != "complete":
-        lines.append(f"原因：{detail}")
+        lines.append(f"Reason: {detail}")
     if state != "complete":
         advice = {
-            "budget_exhausted": "采样预算已用尽；检查精度与覆盖缺口后用 workflow extend 增加预算。",
-            "coverage_exhausted": "当前采样路径已无新任务，但尚未证明收敛；检查采样条件和 workflow.convergence。",
-            "stalled": "检查停滞原因；需要重算时先用 workflow restart --dry-run 预览影响范围。",
-        }.get(state, "已完成结果和失败证据均保留；排除日志中的故障后可用 workflow resume 继续。")
+            "budget_exhausted": "Review the remaining accuracy and coverage requirements, then use neptrain workflow extend to increase the sampling budget.",
+            "coverage_exhausted": "No sampling tasks remain, but convergence is not established. Review the sampling conditions and workflow.convergence.",
+            "stalled": "Review the reason for the stall. Use neptrain workflow restart --dry-run to preview which stages would be rerun.",
+        }.get(
+            state,
+            "Completed results and failure diagnostics are retained. Resolve the error in the logs, then use neptrain workflow resume to continue.",
+        )
         lines.append(advice)
     event_id = (
         "workflow:complete"

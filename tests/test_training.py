@@ -360,4 +360,4 @@ def test_gpumd_skips_unavailable_test_and_stale_copy(tmp_path, monkeypatch, capl
     monkeypatch.setitem(sys.modules, "nep_adapters", _ordinary_model_adapter())
     result = train(TrainingRequest(config, train_file, output, test_file=optional), "gpumd")
     assert result.best_model.is_file()
-    assert "训练测试集已跳过" in caplog.text
+    assert "Training test dataset skipped" in caplog.text

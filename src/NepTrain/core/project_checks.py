@@ -23,33 +23,36 @@ def check_project_inputs(
         path = Path(value) if value else None
         if optional:
             issue = _optional_labeled_dataset_issue(path, role=role, expect_spin=spin)
-            checks.append(("WARN", issue) if issue else ("OK", f"{role}：{path}"))
+            checks.append(("WARN", issue) if issue else ("OK", f"{role}: {path}"))
             return
         issue = optional_dataset_issue(path, role=role)
         if issue:
             checks.append(
                 (
                     "FAIL",
-                    f"{role}：{path or '未配置'}；补齐带标签的 extxyz 数据或修正路径。",
+                    f"{role}: {path or 'not configured'}; provide a labeled extxyz dataset or correct the path.",
                 )
             )
             return
         try:
             _validate_labeled_dataset_for_preparation(path, role=role, expect_spin=spin)
         except Exception as error:
-            checks.append(("FAIL", f"{role}：{path}；{error}"))
+            checks.append(("FAIL", f"{role}: {path}; {error}"))
         else:
-            checks.append(("OK", f"{role}：{path}"))
+            checks.append(("OK", f"{role}: {path}"))
 
     def required_file(value, role):
         path = Path(value) if value else None
         issue = optional_dataset_issue(path, role=role)
         if issue:
             checks.append(
-                ("FAIL", f"{role}：{path or '未配置'}；创建文件或修正配置路径。")
+                (
+                    "FAIL",
+                    f"{role}: {path or 'not configured'}; create the file or correct the configured path.",
+                )
             )
         else:
-            checks.append(("OK", f"{role}：{path}"))
+            checks.append(("OK", f"{role}: {path}"))
 
     training = resolved.get("training", {})
     initial = training.get("initial_path")
@@ -66,10 +69,13 @@ def check_project_inputs(
             frames = _sampling_frames({"sampling": {"routes": [route]}})
         except Exception as error:
             checks.append(
-                ("FAIL", f"{role}.structures：{error}；在配置目录放入可读取的结构。")
+                (
+                    "FAIL",
+                    f"{role}.structures: {error}; provide readable structures at the configured path.",
+                )
             )
         else:
-            checks.append(("OK", f"{role}.structures：{len(frames)} 帧"))
+            checks.append(("OK", f"{role}.structures: {len(frames)} structures"))
     labeling = resolved.get("labeling", {})
     if labeling.get("backend") in {"vasp", "abacus"}:
         required_file(labeling.get("input_path"), "labeling.input_path")
@@ -78,14 +84,14 @@ def check_project_inputs(
             checks.append(
                 (
                     "FAIL",
-                    f"execution.targets.{name} 仍有 REPLACE；填写真实分区、资源路径和环境。",
+                    f"execution.targets.{name} still contains REPLACE; set the actual partition, resource paths, and environment.",
                 )
             )
     if not config.get("workflow", {}).get("convergence"):
         checks.append(
             (
                 "WARN",
-                "未启用自动收敛：流程使用 active_learning_v4；预算耗尽或覆盖耗尽不等于精度达标。",
+                "Convergence checks are disabled (active_learning_v4). Budget or coverage exhaustion does not establish accuracy.",
             )
         )
     return checks

@@ -533,14 +533,14 @@ def test_status_cli_is_scientific_and_controller_focused(tmp_path: Path, capsys)
     )
     output = capsys.readouterr().out
     assert "NepTrain · controller-smoke" in output
-    assert f"路径：{preparation.output_dir}" in output
-    assert "状态：待启动 | 第 1/3 代 | 训练" in output
-    assert "300 K ○ 未开始" in output and "500 K ○ 未开始" in output
-    assert "暂无新增结构的训练前预测结果" in output
+    assert f"Path: {preparation.output_dir}" in output
+    assert "Status: Ready to start | Generation 1/3 | Training" in output
+    assert "300 K ○ Not started" in output and "500 K ○ Not started" in output
+    assert "No predictions available yet" in output
     assert "G1" in output
     assert "G2" not in output
-    assert "未开始" in output
-    assert "执行批次：" not in output
+    assert "Not started" in output
+    assert "Job batches:" not in output
 
 
 def test_status_reports_live_md_temperature_and_real_ps(tmp_path: Path, capsys):
@@ -598,7 +598,7 @@ Step Temp PotEng
         SimpleNamespace(project=str(preparation.output_dir), json=False, jobs=False)
     )
     output_text = capsys.readouterr().out
-    assert "300 K ○ 未开始" in output_text
+    assert "300 K ○ Not started" in output_text
     assert "3.2/10 ps" in output_text
     run_status_command(
         SimpleNamespace(project=str(preparation.output_dir), json=True, jobs=False)
@@ -638,9 +638,9 @@ def test_status_precision_table_shows_generation_deltas(capsys):
     _print_precision(status)
 
     output = capsys.readouterr().out
-    assert "辅助测试精度（仅供参考）：" in output
-    assert "F/meV·Å⁻¹" in output
-    assert "M/meV/μB" in output
+    assert "Optional test RMSE (diagnostic only):" in output
+    assert "Force" in output and "meV/Å" in output
+    assert "Magnetic force" in output and "meV/μB" in output
     assert "160 ↓20%" in output
 
 
@@ -669,11 +669,11 @@ def test_status_shows_pretraining_acquisition_error_for_convergence(capsys):
     _print_precision(status)
 
     output = capsys.readouterr().out
-    assert "新增结构预测精度（训练前 RMSE）：" in output
+    assert "Prediction RMSE on new structures (before training on them):" in output
     assert "2.5" in output
     assert "80" in output
     assert "25" in output
-    assert "通过" in output
+    assert "Met" in output
 
 
 def test_status_does_not_present_training_error_as_validation(capsys):
@@ -686,7 +686,10 @@ def test_status_does_not_present_training_error_as_validation(capsys):
 
     _print_precision(status)
 
-    assert "精度变化：暂无新增结构的训练前预测结果" in capsys.readouterr().out
+    assert (
+        "New structure evaluation: No predictions available yet"
+        in capsys.readouterr().out
+    )
 
 
 def test_jobs_are_compacted_by_generation_stage_and_attempt(capsys):
@@ -716,9 +719,9 @@ def test_jobs_are_compacted_by_generation_stage_and_attempt(capsys):
     _print_job_batches(jobs)
 
     output = capsys.readouterr().out
-    assert "G3 采样 attempt-1：20 个任务 | 完成 12 | 运行 8" in output
-    assert "Job 1000–1019" in output
-    assert "G3 标注 attempt-1：100 个任务 | 完成 80 | 等待 20" in output
+    assert "G3 Sampling attempt-1: Jobs: 20 | Complete 12 | Running 8" in output
+    assert "Job IDs: 1000–1019" in output
+    assert "G3 Labeling attempt-1: Jobs: 100 | Complete 80 | Waiting 20" in output
     assert len(output.splitlines()) == 4
 
 
@@ -1278,26 +1281,62 @@ def test_status_explains_sampling_decision_and_optional_test(tmp_path, capsys):
     status = workflow_status(preparation.output_dir)
     science = _generation_science(
         {"generation": 1, "max_selected": 10},
-        {"kind": "acquisition", "stage_sequence": ["train", "validate", "explore", "select", "label", "evaluate", "update"],
-         "complete": True, "accepted": True, "stages": {
-             "evaluate": {"metrics": {"prediction_metric_basis": "per_atom_v1", "current_model_force_rmse": 0.08}},
-             "validate": {"metrics": {"prediction_metric_basis": "per_atom_v1", "force_rmse": 0.5,
-                                      "validation_warnings": ["辅助测试有 231 帧重叠"]}},
-             "update": {"metrics": {"generation_disposition": "continue", "convergence_reasons": ["连续达标 1/2 代，仍需采样确认。"]}},
-         }},
+        {
+            "kind": "acquisition",
+            "stage_sequence": [
+                "train",
+                "validate",
+                "explore",
+                "select",
+                "label",
+                "evaluate",
+                "update",
+            ],
+            "complete": True,
+            "accepted": True,
+            "stages": {
+                "evaluate": {
+                    "metrics": {
+                        "prediction_metric_basis": "per_atom_v1",
+                        "current_model_force_rmse": 0.08,
+                    }
+                },
+                "validate": {
+                    "metrics": {
+                        "prediction_metric_basis": "per_atom_v1",
+                        "force_rmse": 0.5,
+                        "validation_warnings": [
+                            "Optional test: 231 overlapping structures"
+                        ],
+                    }
+                },
+                "update": {
+                    "metrics": {
+                        "generation_disposition": "continue",
+                        "convergence_reasons": [
+                            "Consecutive passing generations: 1/2. More sampling is needed."
+                        ],
+                    }
+                },
+            },
+        },
     )
     _print_workflow_status(replace(status, generations=(science,)), show_jobs=False)
     output = capsys.readouterr().out
-    assert "新增结构预测精度（训练前 RMSE）" in output
-    assert "辅助测试（仅供参考" not in output
-    assert "231 帧重叠" in output
-    assert "尚未收敛" in output
-    assert "连续达标 1/2 代" in output
+    assert "Prediction RMSE on new structures (before training on them)" in output
+    assert "Optional test (diagnostic only" not in output
+    assert "231 overlapping structures" in output
+    assert "Not yet established" in output
+    assert "Consecutive passing generations: 1/2" in output
 
 
 @pytest.mark.parametrize(
     "state,expected",
-    [("accepted", "完成"), ("in_progress", "训练中"), ("rejected", "未通过")],
+    [
+        ("accepted", "Complete"),
+        ("in_progress", "Training: Running"),
+        ("rejected", "Not met"),
+    ],
 )
 def test_finalization_precision_has_no_waiting_acquisition_row(capsys, state, expected):
     generation = {
@@ -1319,9 +1358,9 @@ def test_finalization_precision_has_no_waiting_acquisition_row(capsys, state, ex
         )
     )
     text = capsys.readouterr().out
-    assert f"G5 最终训练：{expected}（本代不采样）" in text
-    assert "等待" not in text
-    assert "验收" not in text
+    assert f"G5 Final training: {expected} (no sampling)" in text
+    assert "Waiting" not in text
+    assert "acceptance" not in text
 
 
 @pytest.mark.parametrize(
@@ -1348,7 +1387,7 @@ def test_preparation_skips_unavailable_optional_datasets(tmp_path, caplog, conte
     ]
     assert len(optional_checks) == 2
     assert all(
-        level == "WARN" and "已跳过" in detail for level, detail in optional_checks
+        level == "WARN" and "skipped" in detail for level, detail in optional_checks
     )
     assert not any(level == "FAIL" for level, _ in checks)
     prepared = prepare_workflow(source, initial, tmp_path / "workflow")
@@ -1359,8 +1398,8 @@ def test_preparation_skips_unavailable_optional_datasets(tmp_path, caplog, conte
     assert not {"training_test", "evaluation_validation"} & {
         record["role"] for record in manifest["dependencies"]
     }
-    assert "训练测试集已跳过" in caplog.text
-    assert "辅助测试集已跳过" in caplog.text
+    assert "Training test dataset skipped" in caplog.text
+    assert "Optional evaluation dataset skipped" in caplog.text
 
 
 def test_prepare_and_extend_print_human_actions_and_total_budget(tmp_path, capsys):
@@ -1373,12 +1412,12 @@ def test_prepare_and_extend_print_human_actions_and_total_budget(tmp_path, capsy
         json=False,
     ))
     text = capsys.readouterr().out
-    assert "已准备，尚未启动" in text and "下一步：neptrain workflow run" in text
+    assert "Prepared; not started" in text and "Next: neptrain workflow run" in text
     assert not text.startswith("{")
     run_extend_command(SimpleNamespace(project=str(output), generations=5, json=False))
     text = capsys.readouterr().out
-    assert "3 → 5（增加 2 代）" in text
-    assert "下一步：neptrain workflow run" in text
+    assert "3 → 5 (+2)" in text
+    assert "Next: neptrain workflow run" in text
     assert workflow_status(output).convergence_configured is False
 
 
@@ -1410,7 +1449,7 @@ def test_explicit_initial_training_takes_priority(
     prepared = output / "inputs" / "initial-train.xyz"
     assert prepared.read_bytes() == alternative.read_bytes()
     assert len(read(prepared, index=":")) == 2
-    assert "已准备，尚未启动" in capsys.readouterr().out
+    assert "Prepared; not started" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("state", ["failed", "rejected", "stalled", "damaged"])
@@ -1434,11 +1473,11 @@ def test_problem_status_shows_current_generation_and_recovery(tmp_path, capsys, 
     )
     text = capsys.readouterr().out
     assert "training command exited 1" in text
-    assert f"本代计算与报告：{prepared.output_dir / 'generations/0001'}" in text
+    assert f"Generation files: {prepared.output_dir / 'generations/0001'}" in text
     assert (
-        "本代计算与报告：" + str(prepared.output_dir / "generations/0003") not in text
+        "Generation files: " + str(prepared.output_dir / "generations/0003") not in text
     )
-    assert "下一步：neptrain workflow resume workflow" in text
+    assert "Next: neptrain workflow resume workflow" in text
 
 
 def test_sampling_view_does_not_infer_success_from_attempt_or_scheduler(tmp_path):
@@ -1489,7 +1528,7 @@ def test_sampling_view_does_not_infer_success_from_attempt_or_scheduler(tmp_path
         base_dir=tmp_path,
     )[0]["temperatures"][0]
     assert live["state"] == "collected" and live["current_ps"] is None
-    assert "待科学阶段确认" in _sampling_cell(live)
+    assert "trajectory checks pending" in _sampling_cell(live)
 
 
 def test_sampling_view_shows_range_and_partial_readability(tmp_path):
@@ -1520,11 +1559,11 @@ def test_sampling_view_shows_range_and_partial_readability(tmp_path):
     cell = result[0]["temperatures"][0]
     assert cell["current_ps"] == 1 and cell["current_ps_max"] == 9
     assert cell["waiting"] == 1 and cell["readable"] == 2
-    assert "1–9/10 ps（2/3 可读）" in _sampling_cell(cell)
+    assert "1–9/10 ps (2/3 readable)" in _sampling_cell(cell)
 
 
 @pytest.mark.parametrize(
-    "state,label", [("failed", "评估失败"), ("paused", "评估已暂停")]
+    "state,label", [("failed", "Evaluation: Failed"), ("paused", "Evaluation: Paused")]
 )
 def test_precision_respects_workflow_state_and_has_no_cross_dataset_deltas(
     capsys, state, label
@@ -1558,11 +1597,12 @@ def test_precision_respects_workflow_state_and_has_no_cross_dataset_deltas(
     text = capsys.readouterr().out
     assert label in text
     assert "G1" not in text and "G2" not in text and "G3" in text
-    assert "↓" not in text and "M/meV" not in text
+    assert "↓" not in text and "Magnetic force" not in text
 
 
+@pytest.mark.parametrize("test_mforce", [None, 0.0, 0.15])
 def test_status_details_and_convergence_show_thresholds_and_worst_group(
-    tmp_path, capsys
+    tmp_path, capsys, test_mforce
 ):
     from dataclasses import replace
     from NepTrain.cli.cli import _print_workflow_status
@@ -1582,6 +1622,7 @@ def test_status_details_and_convergence_show_thresholds_and_worst_group(
                     "training_count": 100,
                     "prediction_metric_basis": "per_atom_v1",
                     "force_rmse": 0.15,
+                    "mforce_rmse": test_mforce,
                 }
             },
             "evaluate": {
@@ -1619,13 +1660,19 @@ def test_status_details_and_convergence_show_thresholds_and_worst_group(
     )
     _print_workflow_status(status, show_jobs=False)
     normal = capsys.readouterr().out
-    assert "≤100 meV/Å" in normal and "最差元素 Ta" in normal and "0.87" in normal
-    assert "R=r|T=1500|P=0" in normal and "连续达标代数" in normal
-    assert "训练集：100 → 120（新增 20）" in normal
-    assert "辅助测试（仅供参考" not in normal
+    assert "≤100 meV/Å" in normal and "Worst element Ta" in normal and "0.87" in normal
+    assert "R=r|T=1500|P=0" in normal and "Consecutive passing generations" in normal
+    assert "Training set: 100 → 120 (+20)" in normal
+    assert "Optional test (diagnostic only" not in normal
     _print_workflow_status(status, show_jobs=False, details=True)
     detail = capsys.readouterr().out
-    assert "辅助测试（仅供参考" in detail and "force_rmse=150" in detail
+    assert "Optional test (diagnostic only" in detail
+    assert "Force RMSE=150 meV/Å" in detail
+    assert "Magnetic force" not in normal and "μB" not in normal
+    if test_mforce is None:
+        assert "Magnetic force" not in detail and "μB" not in detail
+    else:
+        assert f"Magnetic force RMSE={test_mforce * 1000:g} meV/μB" in detail
 
 
 def test_status_publishes_only_committed_report_and_sampling_evidence(tmp_path):
@@ -1725,7 +1772,7 @@ def test_status_shows_plot_paths_and_explains_missing_plot_without_json(
     _print_reports(status)
     text = capsys.readouterr().out
     assert str(root / "select/selection-pca.png") in text
-    assert "没有有效的新标签预测数据" in text
+    assert "No valid predictions for new labels" in text
     assert ".json" not in text and "evaluation-parity.png" not in text
     _print_reports(status, details=True)
     assert "evaluation-parity.png" in capsys.readouterr().out

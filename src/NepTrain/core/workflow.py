@@ -390,8 +390,8 @@ def _optional_labeled_dataset_issue(
         )
     except Exception as error:
         return (
-            f"{role}已跳过：数据无法读取或标签无效，路径：{path}；"
-            f"{type(error).__name__}: {error}；不阻止主流程。"
+            f"{role} skipped: unreadable data or invalid labels; path: {path}; "
+            f"{type(error).__name__}: {error}. The workflow can continue."
         )
     return None
 
@@ -606,8 +606,8 @@ def prepare_workflow(
         expect_spin=expect_spin,
     )
     for section, key, role in (
-        ("training", "test_path", "训练测试集"),
-        ("evaluation", "validation_path", "辅助测试集"),
+        ("training", "test_path", "Training test dataset"),
+        ("evaluation", "validation_path", "Optional evaluation dataset"),
     ):
         raw_path = config.get(section, {}).get(key)
         if raw_path:
@@ -1934,17 +1934,17 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             )
         )
         next_action = (
-            "检查 workflow.convergence 和采样覆盖；修改结构、采样策略或收敛条件后，"
-            "用原始项目 YAML 和新的 --output 目录创建流程，保留当前证据。"
+            "Review workflow.convergence and sampling coverage. To change structures, sampling policy, or convergence criteria, "
+            "edit the source project YAML and start with a new --output directory to preserve this run."
         )
     elif controller_state == "stalled":
         state = "stalled"
         reason = str(controller.get("reason", "workflow made no progress"))
         next_action = (
-            f"先查看 {workflow_path}/logs 和最新一代计算日志；修复原因后用 "
+            f"Inspect {workflow_path}/logs and the latest generation logs. After fixing the issue, preview the restart scope with "
             f"neptrain workflow restart {workflow_path} --generation "
             f"{progress.generation or progress.completed_generations or 1} "
-            "--from <失败阶段> --dry-run 检查重算范围。"
+            "--from <failed-stage> --dry-run."
         )
     elif progress.state == "rejected" or controller_state == "rejected":
         state = "rejected"

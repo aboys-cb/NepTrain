@@ -22,16 +22,8 @@ msgstr ""
 msgid "独立步骤"
 msgstr "Standalone steps"
 
-#: ../../source/command/manual.md:3 761e092d74ef47959dc9c3ce145ffbf0
-msgid ""
-"NepTrain 的训练、MD 和标注命令既可在本机运行，也可通过 `project.yaml` 中的 "
-"target 提交到 Slurm。上传、提交、等待和收集进度写到 stderr；最终结果默认是 适"
-"合人阅读的摘要。"
-msgstr ""
-"NepTrain training, MD, and labeling commands can run locally or submit to a "
-"Slurm target defined in `project.yaml`. Upload, submission, waiting, and "
-"collection progress goes to stderr; the final result is a human-readable "
-"summary by default."
+msgid "NepTrain 的训练、MD 和标注命令既可在本机运行，也可通过 `project.yaml` 中的 target 提交到 Slurm。上传、提交、等待和收集进度写到 stderr；最终结果默认是 适合人阅读的摘要。CLI 输出、帮助、通知和自动生成的运行报告统一使用英文； 本文保留中文解释，用户名称、路径及外部程序原始消息不会被翻译。"
+msgstr "NepTrain training, MD, and labeling commands can run locally or submit to a Slurm target defined in `project.yaml`. Upload, submission, waiting, and collection progress goes to stderr; the final result is a human-readable summary by default. CLI output, help, notifications, and generated run reports use English. The documentation is bilingual; user-provided names, paths, and external program messages are preserved."
 
 #: ../../source/command/manual.md:10 1f34a08e3e69489992ccc014b7cdfccb
 msgid "训练"

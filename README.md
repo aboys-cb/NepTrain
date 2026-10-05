@@ -17,6 +17,10 @@ Standalone commands and automated workflows use the same scientific adapters
 and execution targets. The workflow layer owns planning, state transitions, and
 acceptance; it does not duplicate the scientific calculation logic.
 
+Runtime messages, CLI help, notifications, and generated project/report text use
+English. README files and documentation remain available in English and Chinese.
+User-provided names, paths, and external program messages are preserved.
+
 ## What NepTrain provides
 
 - GPUMD or TorchNEP training with a canonical `nep.txt` result.

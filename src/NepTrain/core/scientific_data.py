@@ -33,18 +33,18 @@ class ScientificDataError(ValueError):
 def optional_dataset_issue(path: Path | None, *, role: str) -> str | None:
     """Explain why an optional dataset should be skipped, without reading all frames."""
     if path is None:
-        reason = "未配置路径"
+        reason = "no path configured"
     else:
         try:
             with path.open("rb") as handle:
                 while chunk := handle.read(8192):
                     if chunk.strip():
                         return None
-            reason = "文件为空"
+            reason = "file is empty"
         except OSError as error:
-            reason = f"文件不可用（{error}）"
-    location = f"，路径：{path}" if path is not None else ""
-    return f"{role}已跳过：{reason}{location}；不阻止主流程。"
+            reason = f"file is unavailable ({error})"
+    location = f"; path: {path}" if path is not None else ""
+    return f"{role} skipped: {reason}{location}. The workflow can continue."
 
 
 def _canonical_float64(value: object) -> bytes:

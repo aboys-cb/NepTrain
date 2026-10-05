@@ -2847,7 +2847,7 @@ def test_empty_acquisition_cannot_advance_convergence_streak():
     )
     assert result["acquisition_converged"] is False
     assert result["acquisition_convergence_streak"] == 0
-    assert "证据不足" in result["convergence_reasons"][0]
+    assert "Insufficient evidence" in result["convergence_reasons"][0]
 
 
 @pytest.mark.parametrize("model_state", ["missing", "empty"])

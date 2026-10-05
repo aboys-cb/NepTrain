@@ -122,16 +122,16 @@ class WorkflowWorkspace:
         )
         (workspace.root / "README.md").write_text(
             "# NepTrain workflow\n\n"
-            "- `project.yaml`：本次运行采用的完整配置快照。\n"
-            "- `inputs/`：进入 workflow 的输入快照。\n"
-            "- `results/`：最新通过验收的模型、训练集和指标。\n"
-            "- `generations/`：按代组织的采样、标注、训练和评价证据。\n"
-            "- `logs/`：Controller 与执行后端日志。\n"
-            "- `.neptrain/`：账本、计划、可移植任务和执行状态，通常无需编辑。\n"
-            "\n常用命令：`neptrain workflow status .`、"
-            "`neptrain workflow resume .`、`neptrain workflow stop .`。\n"
-            "`stop` 默认同时取消当前计算任务；仅停止 Controller 时使用："
-            "`neptrain workflow stop . --keep-jobs`。\n",
+            "- `project.yaml`: Complete configuration snapshot for this run.\n"
+            "- `inputs/`: Input snapshots used by the workflow.\n"
+            "- `results/`: Latest published model, training set, and metrics; see results/summary.md for convergence status.\n"
+            "- `generations/`: Training, sampling, labeling, and evaluation evidence for each generation.\n"
+            "- `logs/`: Controller and execution backend logs.\n"
+            "- `.neptrain/`: Ledger, plans, portable tasks, and execution state. Managed by NepTrain.\n"
+            "\nCommon commands: `neptrain workflow status .`, "
+            "`neptrain workflow resume .`, `neptrain workflow stop .`.\n"
+            "By default, `stop` also cancels active jobs. To stop only the controller, use: "
+            "`neptrain workflow stop . --keep-jobs`.\n",
             encoding="utf-8",
         )
         return workspace
@@ -372,26 +372,26 @@ class WorkflowWorkspace:
         )
         converged = decision.get("workflow_converged") is True
         if converged:
-            state = "已收敛"
+            state = "Converged"
         elif decision.get("finalization_pending"):
-            state = "采样判据已通过，等待最终训练；尚未确认流程收敛"
+            state = "Sampling criteria met; awaiting final training. Workflow convergence is not yet confirmed."
         else:
-            state = "尚未确认流程收敛"
+            state = "Convergence not yet established"
         lines = [
-            "# NepTrain workflow 结果",
+            "# NepTrain workflow results",
             "",
-            f"- 最新完成代：{generation}",
-            f"- 收敛状态：{state}",
+            f"- Latest completed generation: {generation}",
+            f"- Convergence: {state}",
         ]
         for reason in decision.get("convergence_reasons", []):
-            lines.append(f"- 收敛说明：{reason}")
+            lines.append(f"- Convergence note: {reason}")
         if decision.get("production_ready") is not None:
-            coverage = "已满足" if decision["production_ready"] else "未满足"
-            lines.append(f"- 生产采样覆盖：{coverage}")
+            coverage = "Met" if decision["production_ready"] else "Not met"
+            lines.append(f"- Production coverage: {coverage}")
         streak = decision.get("acquisition_convergence_streak")
         required = decision.get("acquisition_convergence_required")
         if streak is not None and required is not None:
-            lines.append(f"- 新增结构精度连续达标：{streak}/{required} 代")
+            lines.append(f"- Consecutive passing generations: {streak}/{required}")
 
         labels = (
             ("energy_rmse", "Energy RMSE (eV/atom)"),
@@ -399,33 +399,48 @@ class WorkflowWorkspace:
             ("virial_rmse", "Virial RMSE (eV/atom)"),
             ("mforce_rmse", "Magnetic-force RMSE (eV/μB)"),
         )
-        lines.extend(["", "## 新增标注结构的预测精度（训练前）", ""])
+        lines.extend(["", "## Predictions on new labels before training on them", ""])
         if record["kind"] == "finalization":
-            lines.append("本代只做最终训练，不采样；采样验收证据见上一采样代报告。")
+            lines.append(
+                "This generation performs final training only, with no sampling. See the previous sampling generation for acceptance evidence."
+            )
         else:
             available = [
-                f"- {label}：{acquisition['current_model_' + key]}"
+                f"- {label}: {acquisition['current_model_' + key]}"
                 for key, label in labels
                 if acquisition.get("current_model_" + key) is not None
             ]
-            lines.extend(available or ["暂无有效预测误差，不能据此确认精度达标。"])
+            lines.extend(
+                available
+                or [
+                    "No valid prediction errors are available; accuracy cannot be assessed from this report."
+                ]
+            )
 
-        lines.extend(["", "## 辅助测试（仅供参考，不参与收敛）", ""])
-        available = [
-            f"- {label}：{evaluation[key]}"
-            for key, label in labels
-            if evaluation.get(key) is not None
-        ]
-        lines.extend(available or ["未配置或未获得有效测试误差。"])
-        for warning in evaluation.get("validation_warnings", []):
-            lines.append(f"- 提示：{warning}")
-        prefix = "最终" if converged else "当前"
         lines.extend(
             [
                 "",
-                f"{prefix}模型：`nep.txt`",
-                f"{prefix}模型使用的训练集：`train.xyz`",
-                "完整指标：`metrics.json`",
+                "## Optional test (diagnostic only; does not determine convergence)",
+                "",
+            ]
+        )
+        available = [
+            f"- {label}: {evaluation[key]}"
+            for key, label in labels
+            if evaluation.get(key) is not None
+        ]
+        lines.extend(
+            available or ["No test configured, or no valid test errors available."]
+        )
+        for warning in evaluation.get("validation_warnings", []):
+            lines.append(f"- Note: {warning}")
+        prefix = "Final" if converged else "Current"
+        lines.extend(
+            [
+                "",
+                f"{prefix} model: `nep.txt`",
+                f"Training set used by the {prefix.lower()} model: `train.xyz`",
+                "Full metrics: `metrics.json`",
                 "",
             ]
         )

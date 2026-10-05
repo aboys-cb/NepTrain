@@ -85,36 +85,36 @@ def run_smoke_command(args):
 
 
 _STATE_LABELS = {
-    "prepared": "待启动",
-    "running": "运行中",
-    "waiting": "等待中",
-    "degraded": "连接异常",
-    "paused": "已暂停",
-    "complete": "已完成",
-    "failed": "失败",
-    "rejected": "验收未通过",
-    "stalled": "已停滞",
-    "budget_exhausted": "代次预算耗尽",
-    "coverage_exhausted": "采样覆盖耗尽",
-    "damaged": "状态损坏",
+    "prepared": "Ready to start",
+    "running": "Running",
+    "waiting": "Waiting",
+    "degraded": "Connection issue",
+    "paused": "Paused",
+    "complete": "Complete",
+    "failed": "Failed",
+    "rejected": "Acceptance criteria not met",
+    "stalled": "Stalled",
+    "budget_exhausted": "Sampling budget exhausted",
+    "coverage_exhausted": "Sampling coverage exhausted",
+    "damaged": "Invalid workflow state",
 }
 _STAGE_LABELS = {
-    "train": "训练",
-    "validate": "模型检查",
-    "explore": "采样",
-    "select": "选样",
-    "label": "标注",
-    "diagnose": "诊断",
-    "merge": "合并训练集",
-    "retrain": "重新训练",
-    "evaluate": "评估",
-    "update": "更新训练集",
+    "train": "Training",
+    "validate": "Model check",
+    "explore": "Sampling",
+    "select": "Selection",
+    "label": "Labeling",
+    "diagnose": "Diagnostics",
+    "merge": "Merge dataset",
+    "retrain": "Retraining",
+    "evaluate": "Evaluation",
+    "update": "Update dataset",
 }
 
 
 def _updated_text(value):
     if not value:
-        return "暂无时间记录"
+        return "No timestamp"
     try:
         observed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if observed.tzinfo is None:
@@ -122,14 +122,14 @@ def _updated_text(value):
         now = datetime.now(timezone.utc)
         seconds = max(0, int((now - observed.astimezone(timezone.utc)).total_seconds()))
         if seconds < 5:
-            age = "刚刚"
+            age = "just now"
         elif seconds < 60:
-            age = f"{seconds} 秒前"
+            age = f"{seconds}s ago"
         elif seconds < 3600:
-            age = f"{seconds // 60} 分钟前"
+            age = f"{seconds // 60}m ago"
         else:
-            age = f"{seconds // 3600} 小时前"
-        return f"{observed.astimezone().strftime('%H:%M:%S')}（{age}）"
+            age = f"{seconds // 3600}h ago"
+        return f"{observed.astimezone().strftime('%H:%M:%S')} ({age})"
     except (TypeError, ValueError):
         return str(value)
 
@@ -139,11 +139,11 @@ def _ps(value):
 
 
 _MATURITY_LABELS = {
-    "untested": "未测试",
-    "smoke_passed": "短试跑",
-    "short_stable": "短程",
-    "long_stable": "长程",
-    "production_ready": "生产",
+    "untested": "Untested",
+    "smoke_passed": "Smoke",
+    "short_stable": "Short",
+    "long_stable": "Long",
+    "production_ready": "Production",
 }
 
 
@@ -151,24 +151,24 @@ def _sampling_cell(cell):
     temperature = f"{float(cell['temperature']):g} K"
     state = cell["state"]
     if state == "pending":
-        return f"{temperature} ○ 未开始"
+        return f"{temperature} ○ Not started"
     if state == "attempted":
-        return f"{temperature} 已尝试（缺少完成证据）"
+        return f"{temperature} Attempted (completion unverified)"
     labels = {
-        "complete": "轨迹完成",
-        "failed": "有失败",
-        "active": "执行中",
-        "collected": "执行结束，待科学阶段确认",
+        "complete": "Trajectories complete",
+        "failed": "Failures reported",
+        "active": "In progress",
+        "collected": "Jobs finished; trajectory checks pending",
     }
     parts = [f"{temperature} {labels.get(state, state)}"]
     if cell.get("total"):
-        prefix = "执行完成" if cell.get("live") else "轨迹正常"
+        prefix = "Finished" if cell.get("live") else "Healthy trajectories"
         parts.append(f"{prefix} {cell['completed']}/{cell['total']}")
         for key, label in (
-            ("running", "运行"),
-            ("waiting", "排队"),
-            ("failed", "失败"),
-            ("unknown", "状态未知"),
+            ("running", "Running"),
+            ("waiting", "Queued"),
+            ("failed", "Failed"),
+            ("unknown", "Unknown state"),
         ):
             if cell.get(key):
                 parts.append(f"{label} {cell[key]}")
@@ -187,30 +187,30 @@ def _sampling_cell(cell):
                 else f"{_ps(lower)}–{_ps(target)}"
             )
             parts.append(
-                f"已读轨迹 {progress}/{goal} ps（{cell.get('readable', 1)}/{cell['total']} 可读）"
+                f"Trajectory progress {progress}/{goal} ps ({cell.get('readable', 1)}/{cell['total']} readable)"
             )
         else:
-            parts.append("轨迹时间暂不可读")
+            parts.append("Trajectory time unavailable")
     levels = [
         _MATURITY_LABELS.get(level, level)
         for level in cell.get("target_levels", [])
         if level != "unknown"
     ]
     if levels:
-        parts.append("目标：" + "/".join(levels))
+        parts.append("Target: " + "/".join(levels))
     maturity = cell.get("maturities", {})
     if maturity:
         parts.append(
-            "已记录等级："
-            + "、".join(
+            "Sampling levels: "
+            + ", ".join(
                 f"{_MATURITY_LABELS.get(k, k)} {v}" for k, v in maturity.items()
             )
         )
     coverage = cell.get("production_coverage")
     if coverage:
-        model = str(cell.get("production_model_sha256") or "未知")[:8]
+        model = str(cell.get("production_model_sha256") or "Unknown")[:8]
         parts.append(
-            f"生产覆盖 {coverage['verified']}/{coverage['total']}（模型 {model}）"
+            f"Production coverage {coverage['verified']}/{coverage['total']} (model {model})"
         )
     return " | ".join(parts)
 
@@ -253,25 +253,25 @@ def _table(rows):
 def _generation_state(generation, status):
     state = generation["state"]
     if state == "accepted":
-        return "完成"
+        return "Complete"
     if state == "rejected":
-        return "未通过"
+        return "Not met"
     if state == "not_started":
-        return "未开始"
+        return "Not started"
     if generation["generation"] == status.generation and status.stage:
         stage = _STAGE_LABELS.get(status.stage, status.stage)
         state = getattr(status, "state", "running")
         suffix = {
-            "failed": "失败",
-            "paused": "已暂停",
-            "degraded": "连接异常",
-            "waiting": "等待中",
-            "stalled": "停滞",
-            "damaged": "状态损坏",
-            "prepared": "待开始",
-        }.get(state, "中")
-        return f"{stage}{suffix}"
-    return "进行中"
+            "failed": "Failed",
+            "paused": "Paused",
+            "degraded": "Connection issue",
+            "waiting": "Waiting",
+            "stalled": "Stalled",
+            "damaged": "Invalid workflow state",
+            "prepared": "Pending",
+        }.get(state, "Running")
+        return f"{stage}: {suffix}"
+    return "In progress"
 
 
 def _print_precision(status, *, details=False):
@@ -294,28 +294,41 @@ def _print_precision(status, *, details=False):
             and generation["state"] != "not_started"
         ):
             print(
-                f"G{generation['generation']} 最终训练：{_generation_state(generation, status)}（本代不采样）"
+                f"G{generation['generation']} Final training: {_generation_state(generation, status)} (no sampling)"
             )
     if not observed:
-        print("精度变化：暂无新增结构的训练前预测结果")
+        print(
+            "New structure evaluation: No predictions available yet"
+            if acquisition
+            else "Optional test: No results available yet"
+        )
         return
     visible = observed if details else observed[-3:]
     print(
-        "新增结构预测精度（训练前 RMSE）："
+        "Prediction RMSE on new structures (before training on them):"
         if acquisition
-        else "辅助测试精度（仅供参考）："
+        else "Optional test RMSE (diagnostic only):"
     )
     names = [
-        (key, title)
-        for key, title in (
-            ("energy_rmse", "E/meV·atom⁻¹"),
-            ("force_rmse", "F/meV·Å⁻¹"),
-            ("virial_rmse", "V/meV·atom⁻¹"),
-            ("mforce_rmse", "M/meV/μB"),
+        (key, title, unit)
+        for key, title, unit in (
+            ("energy_rmse", "Energy", "meV/atom"),
+            ("force_rmse", "Force", "meV/Å"),
+            ("virial_rmse", "Virial", "meV/atom"),
+            ("mforce_rmse", "Magnetic force", "meV/μB"),
         )
         if any(g["quality"][metric_key].get(key) is not None for g in visible)
     ]
-    rows = [("代", "状态", "新标签", *[title for _, title in names], "本轮判据")]
+    rows = [
+        (
+            "Generation",
+            "State",
+            "New labels",
+            *[title for _, title, _ in names],
+            "Criteria",
+        ),
+        ("", "", "", *[unit for _, _, unit in names], ""),
+    ]
     previous = {}
     for generation in visible:
         quality = generation["quality"]
@@ -327,7 +340,7 @@ def _print_precision(status, *, details=False):
                 (
                     quality.get("acquisition_count")
                     if quality.get("acquisition_count") is not None
-                    else "未知"
+                    else "Unknown"
                 ),
                 *[
                     _metric_cell(
@@ -335,12 +348,12 @@ def _print_precision(status, *, details=False):
                         None if acquisition else previous.get(key),
                         scale=1000,
                     )
-                    for key, _ in names
+                    for key, _, _ in names
                 ],
                 (
-                    "通过"
+                    "Met"
                     if accepted is True
-                    else "未通过" if accepted is False else "未判定"
+                    else "Not met" if accepted is False else "Not assessed"
                 ),
             )
         )
@@ -353,9 +366,13 @@ def _print_precision(status, *, details=False):
         )
     _table(rows)
     if acquisition:
-        print("每代评估结构不同，跨代误差变化不直接代表模型提升。")
+        print(
+            "Each generation evaluates different structures; changes in RMSE alone do not measure model improvement."
+        )
     if len(visible) < len(observed):
-        print("仅显示最近 3 次评估；--details 查看历史及辅助 test。")
+        print(
+            "Showing the latest 3 evaluations. Use --details for the full history and optional test results."
+        )
 
 
 def _print_acceptance(status):
@@ -369,7 +386,7 @@ def _print_acceptance(status):
         return
     latest = evaluated[-1]
     quality = latest["quality"]
-    rows = [("判据", "当前值", "要求", "结果")]
+    rows = [("Criterion", "Observed", "Required", "Result")]
 
     def add(label, value, threshold, *, minimum=False, scale=1, unit=""):
         if threshold is None:
@@ -380,17 +397,17 @@ def _print_acceptance(status):
         rows.append(
             (
                 label,
-                "缺数据" if value is None else f"{value * scale:.4g}{unit}",
+                "No data" if value is None else f"{value * scale:.4g}{unit}",
                 f"{'≥' if minimum else '≤'}{threshold * scale:.4g}{unit}",
-                "待确认" if value is None else "达标" if passed else "未达标",
+                "Not assessed" if value is None else "Met" if passed else "Not met",
             )
         )
 
     names = {
-        "energy": ("能量", " meV/atom"),
-        "force": ("力", " meV/Å"),
+        "energy": ("Energy", " meV/atom"),
+        "force": ("Force", " meV/Å"),
         "virial": ("Virial", " meV/atom"),
-        "mforce": ("磁力", " meV/μB"),
+        "mforce": ("Magnetic force", " meV/μB"),
     }
     for metric, limit in policy.get("acquisition_max_rmse", {}).items():
         label, unit = names[metric.removesuffix("_rmse")]
@@ -414,7 +431,7 @@ def _print_acceptance(status):
             worst = attempts[worst_id].get(metric)
             if worst is None or worst > limit:
                 add(
-                    f"最差轨迹 {worst_id[:8]} {label} RMSE",
+                    f"Worst trajectory {worst_id[:8]} {label} RMSE",
                     worst,
                     limit,
                     scale=1000,
@@ -428,13 +445,13 @@ def _print_acceptance(status):
             minimum=True,
         )
     for key, label in (
-        ("element_force_r2", "最差元素"),
-        ("condition_force_r2", "最差温压条件"),
+        ("element_force_r2", "Worst element"),
+        ("condition_force_r2", "Worst condition"),
     ):
         values = quality.get(key, {})
         worst = min(values, key=values.get) if values else None
         add(
-            f"{label} {worst or '未知'} 力 R²",
+            f"{label} {worst or 'Unknown'} force R²",
             values.get(worst),
             policy.get("group_min_force_r2"),
             minimum=True,
@@ -442,21 +459,21 @@ def _print_acceptance(status):
     outliers = quality.get("outlier_fraction", {})
     worst = max(outliers, key=outliers.get) if outliers else None
     add(
-        f"异常残差比例 {worst or ''}",
+        f"Outlier fraction {worst or ''}",
         outliers.get(worst),
         policy.get("max_outlier_fraction"),
         scale=100,
         unit="%",
     )
     add(
-        "有效新标签",
+        "Evaluated new labels",
         quality.get("acquisition_count"),
         policy.get("min_selected", 1),
         minimum=True,
     )
     if quality.get("acquisition_convergence_streak") is not None:
         add(
-            "连续达标代数",
+            "Consecutive passing generations",
             quality["acquisition_convergence_streak"],
             quality.get(
                 "acquisition_convergence_required",
@@ -464,7 +481,7 @@ def _print_acceptance(status):
             ),
             minimum=True,
         )
-    print(f"\n最近评估判据 · G{latest['generation']}：")
+    print(f"\nLatest convergence checks · G{latest['generation']}:")
     _table(rows)
 
 
@@ -474,9 +491,9 @@ def _print_current_progress(status, generation):
     )
     if not record:
         return
-    print(f"\n本轮进展 · G{generation}：")
+    print(f"\nGeneration progress · G{generation}:")
     if record.get("kind") == "finalization":
-        print("最终训练（本代不采样）")
+        print("Final training (no sampling)")
     else:
         completed = record.get("completed_stages", ())
         stages = ("train", "explore", "select", "label", "evaluate", "update")
@@ -501,10 +518,10 @@ def _print_current_progress(status, generation):
                 label = (
                     _generation_state(record, status)
                     if record["state"] != "not_started"
-                    else label + "待开始"
+                    else label + "Pending"
                 )
             else:
-                label += "待开始"
+                label += "Pending"
             cells.append(label)
         line = ""
         for cell in cells:
@@ -519,10 +536,10 @@ def _print_current_progress(status, generation):
     sampling = record.get("sampling", {})
     parts = []
     for key, label in (
-        ("candidate_count", "候选"),
-        ("candidate_count_after_deduplication", "排重后候选"),
-        ("selected_count", "选中"),
-        ("labeled_count", "已标注"),
+        ("candidate_count", "Candidates"),
+        ("candidate_count_after_deduplication", "After deduplication"),
+        ("selected_count", "Selected"),
+        ("labeled_count", "Labeled"),
     ):
         if sampling.get(key) is not None:
             parts.append(f"{label} {sampling[key]}")
@@ -532,15 +549,15 @@ def _print_current_progress(status, generation):
     before, after = training.get("before_count"), training.get("merged_count")
     if before is not None:
         print(
-            f"训练集：{before} → {after}（新增 {training.get('added_count', 0)}）"
+            f"Training set: {before} → {after} (+{training.get('added_count', 0)})"
             if after is not None
-            else f"训练集：{before} 帧（本轮新标签尚未合并）"
+            else f"Training set: {before} structures (new labels not merged yet)"
         )
     progress = getattr(status, "training_progress", None)
     if progress:
-        label = "epoch" if progress.get("backend") == "torchnep" else "训练步"
+        label = "epoch" if progress.get("backend") == "torchnep" else "step"
         print(
-            f"训练记录：{label} {progress['step']:g} | loss {progress['loss']:.4g} | 日志更新 {_updated_text(progress['updated_at'])}"
+            f"Latest training log: {label} {progress['step']:g} | loss {progress['loss']:.4g} | updated {_updated_text(progress['updated_at'])}"
         )
     current_jobs = [job for job in status.jobs if job.get("current")]
     if current_jobs:
@@ -548,20 +565,20 @@ def _print_current_progress(status, generation):
         for job in current_jobs:
             state = str(job["state"]).upper()
             label = {
-                "COMPLETED": "执行完成",
-                "RUNNING": "运行",
-                "PENDING": "排队",
-                "QUEUED": "排队",
-                "SUBMITTED": "排队",
-                "FAILED": "失败",
-                "SKIPPED": "跳过",
-                "UNKNOWN": "未知",
+                "COMPLETED": "Finished",
+                "RUNNING": "Running",
+                "PENDING": "Queued",
+                "QUEUED": "Queued",
+                "SUBMITTED": "Queued",
+                "FAILED": "Failed",
+                "SKIPPED": "Skipped",
+                "UNKNOWN": "Unknown",
             }.get(state, state)
             counts[label] = counts.get(label, 0) + 1
         print(
-            "当前任务："
+            "Current jobs: "
             + " | ".join(f"{label} {count}" for label, count in counts.items())
-            + "（执行状态，尚不代表科学验收）"
+            + " (job status only; model accuracy and trajectory checks are separate)"
         )
 
 
@@ -572,12 +589,12 @@ def _print_reports(status, *, details=False):
     generation = available[-1]
     reports = generation["reports"]
     labels = {
-        "training-parity-train": "训练集对角线",
-        "training-parity-test": "训练器 test 对角线",
-        "acquisition-parity": "新标签对角线",
-        "selection-pca": "选样 PCA",
-        "training": "训练曲线",
-        "evaluation-parity": "辅助 test 对角线",
+        "training-parity-train": "Training parity",
+        "training-parity-test": "Trainer test parity",
+        "acquisition-parity": "New-label parity",
+        "selection-pca": "Selection PCA",
+        "training": "Training loss",
+        "evaluation-parity": "Optional test parity",
     }
     shown = False
     for report in reports:
@@ -585,27 +602,27 @@ def _print_reports(status, *, details=False):
         if not details and name in {"training-parity-test", "evaluation-parity"}:
             continue
         if not shown:
-            print(f"\n图片 · G{generation['generation']}：")
+            print(f"\nPlots · G{generation['generation']}:")
             shown = True
         label = labels.get(name, name)
         if report.get("chart"):
-            print(f"  {label}：{report['chart']}")
+            print(f"  {label}: {report['chart']}")
         else:
-            reason = report.get("reason") or "没有有效绘图数据"
+            reason = report.get("reason") or "No valid data to plot"
             if reason in {
                 "no parity series contains finite pairs",
                 "no eligible candidate structures",
             }:
                 reason = (
-                    "没有有效的新标签预测数据"
+                    "No valid predictions for new labels"
                     if name == "acquisition-parity"
                     else (
-                        "没有可选候选结构"
+                        "No eligible candidates"
                         if name == "selection-pca"
-                        else "训练器未提供有效的预测输出"
+                        else "No valid prediction output from the trainer"
                     )
                 )
-            print(f"  {label}：未出图（{reason}）")
+            print(f"  {label}: Not generated ({reason})")
 
 
 def _compact_job_ids(jobs):
@@ -620,7 +637,7 @@ def _compact_job_ids(jobs):
         if numbers == list(range(numbers[0], numbers[-1] + 1)):
             return f"{numbers[0]}–{numbers[-1]}"
     preview = ", ".join(unique[:3])
-    return preview + (f", …（共 {len(unique)} 个）" if len(unique) > 3 else "")
+    return preview + (f", … ({len(unique)} total)" if len(unique) > 3 else "")
 
 
 def _print_job_batches(jobs):
@@ -634,45 +651,54 @@ def _print_job_batches(jobs):
         )
         groups.setdefault(key, []).append(job)
     print()
-    print("执行批次：")
+    print("Job batches:")
     if not groups:
-        print("  暂无执行任务")
+        print("  No jobs recorded")
         return
     state_labels = {
-        "COMPLETED": "完成",
-        "RUNNING": "运行",
-        "PENDING": "等待",
-        "SUBMITTED": "等待",
-        "SUBMITTING": "等待",
-        "LAUNCHING": "等待",
-        "QUEUED": "等待",
-        "NOT_SUBMITTED": "等待",
-        "FAILED": "失败",
-        "CANCELLED": "取消",
-        "CANCELLING": "取消中",
-        "SKIPPED": "跳过",
-        "UNKNOWN": "未知",
+        "COMPLETED": "Complete",
+        "RUNNING": "Running",
+        "PENDING": "Waiting",
+        "SUBMITTED": "Waiting",
+        "SUBMITTING": "Waiting",
+        "LAUNCHING": "Waiting",
+        "QUEUED": "Waiting",
+        "NOT_SUBMITTED": "Waiting",
+        "FAILED": "Failed",
+        "CANCELLED": "Cancelled",
+        "CANCELLING": "Cancelling",
+        "SKIPPED": "Skipped",
+        "UNKNOWN": "Unknown",
     }
     for (generation, stage, attempt, target), batch in groups.items():
         counts = {}
         for job in batch:
             label = state_labels.get(str(job["state"]).upper(), str(job["state"]))
             counts[label] = counts.get(label, 0) + 1
-        parts = [f"{len(batch)} 个任务"]
+        parts = [f"Jobs: {len(batch)}"]
         ordered_labels = (
-            "完成",
-            "运行",
-            "等待",
-            "失败",
-            "取消",
-            "取消中",
-            "跳过",
-            "未知",
+            "Complete",
+            "Running",
+            "Waiting",
+            "Failed",
+            "Cancelled",
+            "Cancelling",
+            "Skipped",
+            "Unknown",
         )
         for label in ordered_labels:
             if counts.get(label):
                 parts.append(f"{label} {counts[label]}")
-        known = {"完成", "运行", "等待", "失败", "取消", "取消中", "跳过", "未知"}
+        known = {
+            "Complete",
+            "Running",
+            "Waiting",
+            "Failed",
+            "Cancelled",
+            "Cancelling",
+            "Skipped",
+            "Unknown",
+        }
         parts.extend(
             f"{label} {count}"
             for label, count in sorted(counts.items())
@@ -681,9 +707,10 @@ def _print_job_batches(jobs):
         prefix = f"G{generation} " if generation is not None else ""
         if target:
             prefix += f"[{target}] "
+        attempt_label = f" {attempt}" if attempt else ""
         print(
-            f"  {prefix}{_STAGE_LABELS.get(str(stage), stage)} "
-            f"{attempt}：{' | '.join(parts)} | Job {_compact_job_ids(batch)}"
+            f"  {prefix}{_STAGE_LABELS.get(str(stage), stage)}{attempt_label}: "
+            f"{' | '.join(parts)} | Job IDs: {_compact_job_ids(batch)}"
         )
 
 
@@ -692,29 +719,28 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
     generation = status.generation or status.completed_generations
     stage = _STAGE_LABELS.get(status.stage, status.stage) if status.stage else None
     location = (
-        f"第 {generation}/{status.total_generations} 代"
+        f"Generation {generation}/{status.total_generations}"
         if generation
-        else f"0/{status.total_generations} 代"
+        else f"Generation 0/{status.total_generations}"
     )
     if stage:
-        suffix = (
-            "中"
-            if status.state in {"running", "waiting", "degraded"}
-            else ""
-        )
-        location += f" | {stage}{suffix}"
+        location += f" | {stage}"
     print(f"NepTrain · {status.workflow_id}")
-    print(f"路径：{status.project_path}")
-    print(f"状态：{state} | {location}")
-    print(f"控制器心跳：{_updated_text(status.updated_at)}（不代表计算进度更新）")
+    print(f"Path: {status.project_path}")
+    print(f"Status: {state} | {location}")
+    print(
+        f"Controller heartbeat: {_updated_text(status.updated_at)} (not a job progress timestamp)"
+    )
     observations = [job.get("observed_at") for job in status.jobs if job.get("current")]
     known = [value for value in observations if value]
     if observations:
         print(
-            f"任务状态：控制器缓存；最早检查 {_updated_text(min(known)) if known else '暂无记录'}（{len(known)}/{len(observations)} 有检查时间）"
+            f"Job status: last recorded by controller | oldest check {_updated_text(min(known)) if known else 'unknown'} ({len(known)}/{len(observations)} timestamped)"
         )
     if getattr(status, "convergence_configured", None) is False:
-        print("收敛：未启用自动收敛；完成采样覆盖或用尽预算不代表精度达标。")
+        print(
+            "Convergence checks are disabled. Coverage or budget exhaustion does not establish accuracy."
+        )
     if status.state in {
         "degraded",
         "paused",
@@ -725,22 +751,24 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
         "coverage_exhausted",
         "damaged",
     }:
-        print(f"原因：{status.reason}")
+        print(f"Reason: {status.reason}")
 
     _print_current_progress(status, generation)
     if status.sampling_routes:
         print()
-        print("采样进度：")
+        print("Sampling progress: ")
         total_failed = 0
         for route in status.sampling_routes:
             print(
-                f"  {route['route_id']} | P={route.get('pressure', 0):g}（模板压力单位）"
+                f"  {route['route_id']} | P={route.get('pressure', 0):g} (template pressure units)"
             )
             for cell in route["temperatures"]:
                 print("    " + _sampling_cell(cell))
             total_failed += int(route.get("failed", 0))
         if total_failed:
-            print(f"异常：{total_failed} 条采样轨迹失败，失败证据已保留")
+            print(
+                f"Sampling failures: {total_failed} trajectories; diagnostic evidence retained"
+            )
 
     _print_precision(status, details=details)
     _print_acceptance(status)
@@ -756,15 +784,20 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
             and any(value is not None for value in test_metrics.values())
         ):
             values = ", ".join(
-                f"{name}={float(value) * 1000:.4g}"
-                for name, value in test_metrics.items()
-                if value is not None
+                f"{label} RMSE={float(test_metrics[key]) * 1000:.4g} {unit}"
+                for key, label, unit in (
+                    ("energy_rmse", "Energy", "meV/atom"),
+                    ("force_rmse", "Force", "meV/Å"),
+                    ("virial_rmse", "Virial", "meV/atom"),
+                    ("mforce_rmse", "Magnetic force", "meV/μB"),
+                )
+                if test_metrics.get(key) is not None
             )
             print(
-                f"G{generation_record['generation']} 辅助测试（仅供参考，E/V: meV/atom，F: meV/Å，M: meV/μB）：{values}"
+                f"G{generation_record['generation']} Optional test (diagnostic only): {values}"
             )
         for warning in quality.get("validation_warnings", []):
-            print(f"提示 G{generation_record['generation']}：{warning}")
+            print(f"Note G{generation_record['generation']}: {warning}")
     decisions = [
         generation
         for generation in status.generations
@@ -776,56 +809,68 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
         quality = latest["quality"]
         print()
         if quality.get("workflow_converged"):
-            print("收敛判断：采样判据已通过，最终模型训练完成。")
+            print("Convergence: Sampling criteria met and final training complete.")
         elif quality.get("finalization_pending"):
-            print("收敛判断：采样精度与生产覆盖已通过，进入最终训练。")
+            print(
+                "Convergence: Accuracy and production coverage requirements met; final training is next."
+            )
         else:
-            print(f"收敛判断（G{latest['generation']}）：尚未收敛")
+            print(f"Convergence (G{latest['generation']}): Not yet established")
         for reason in quality.get("convergence_reasons", []):
             print(f"  · {reason}")
     _print_reports(status, details=details)
     if show_jobs:
-        print("\n任务状态来自控制器上次记录；历史失败可能已由后续重试恢复。")
+        print(
+            "\nJob states are cached by the controller. Later retries may have resolved earlier failures."
+        )
         _print_job_batches(status.jobs)
     if status.notifications:
         notification = status.notifications
         notification_state = {
-            "configured": "已配置",
-            "ok": "正常",
-            "degraded": "异常",
+            "configured": "Configured",
+            "ok": "Healthy",
+            "degraded": "Delivery issue",
         }.get(notification["state"], notification["state"])
         print()
         print(
-            "通知：飞书"
-            f"{notification_state} | 成功 {notification['delivered']} | "
-            f"失败 {notification['failed']}"
+            "Notifications: Feishu | "
+            f"{notification_state} | Delivered {notification['delivered']} | "
+            f"Failed {notification['failed']}"
         )
         if notification.get("last_error"):
-            print(f"通知错误：{notification['last_error']}")
+            print(f"Notification error: {notification['last_error']}")
     if status.state in {"failed", "rejected", "stalled", "damaged"}:
         root = Path(status.project_path)
-        print(f"日志：{root / 'logs'}")
+        print(f"Logs: {root / 'logs'}")
         if generation:
-            print(f"本代计算与报告：{root / 'generations' / f'{generation:04d}'}")
+            print(f"Generation files: {root / 'generations' / f'{generation:04d}'}")
         failed_jobs = [job for job in status.jobs if str(job["state"]).upper() in {"FAILED", "SKIPPED"}]
         for job in failed_jobs[-3:]:
             if job.get("detail"):
                 print(f"  {job.get('stage', '')} / Job {job.get('job_id')}: {job['detail']}")
             if job.get("bundle"):
-                print(f"  任务目录（stdout.log / output）：{job['bundle']}")
+                print(f"  Job directory (stdout.log / output): {job['bundle']}")
         if status.state in {"failed", "rejected"}:
-            print("先修复日志中的原因，再执行恢复；resume 会重试未完成阶段。")
-            print("若需更改固定的结构、模板或策略，请修改原始项目并用新的 --output 目录运行。")
+            print(
+                "Resolve the error shown in the logs, then resume to retry unfinished stages."
+            )
+            print(
+                "To change structures, templates, or policies, edit the source project and start with a new --output directory."
+            )
     result_root = Path(status.project_path) / "results"
     available_results = [result_root / name for name in ("nep.txt", "train.xyz")
                          if (result_root / name).is_file()]
     if available_results:
-        print("结果（流程已完成）：" if status.state == "complete" else "当前结果（尚未确认流程收敛）：")
+        print(
+            "Results (workflow complete):"
+            if status.state == "complete"
+            else "Current results (convergence not yet established):"
+        )
         for path in available_results:
             print(f"  {path}")
-        print(f"逐代报告：{Path(status.project_path) / 'generations'}")
+        print(f"Generation reports: {Path(status.project_path) / 'generations'}")
     if status.next_action and status.state not in {"running", "waiting", "degraded"}:
-        print(f"下一步：{status.next_action}")
+        print(f"Next: {status.next_action}")
 
 
 def _print_workflow_control(payload, *, json_output=False):
@@ -833,34 +878,50 @@ def _print_workflow_control(payload, *, json_output=False):
         _print_json(payload)
         return
     action = payload.get("action", "")
-    labels = {"prepare": "已准备，尚未启动", "start": "已启动", "resume": "已恢复",
-              "restart": "已重新启动", "restart_preview": "重算预览（未执行）",
-              "repair": "已修复", "noop": "无需重复执行", "stop": "已停止"}
+    labels = {
+        "prepare": "Prepared; not started",
+        "start": "Started",
+        "resume": "Resumed",
+        "restart": "Restarted",
+        "restart_preview": "Restart preview (no changes made)",
+        "repair": "Repaired",
+        "noop": "No action needed",
+        "stop": "Stopped",
+    }
     name = payload.get("workflow_id") or Path(payload.get("project", "workflow")).name
     print(f"NepTrain · {name}")
     if action:
-        print(f"操作：{labels.get(action, action)}")
+        print(f"Action: {labels.get(action, action)}")
     root = payload.get("project")
     if root:
-        print(f"路径：{root}")
+        print(f"Path: {root}")
     if "total_model_generations" in payload:
-        print(f"采样代预算：{payload['previous_model_generations']} → "
-              f"{payload['total_model_generations']}（增加 {payload['added_generations']} 代）")
-    for key, label in (("reused_stages", "保留阶段"), ("restarted_stages", "重算阶段")):
+        print(
+            f"Sampling generation budget: {payload['previous_model_generations']} → "
+            f"{payload['total_model_generations']} (+{payload['added_generations']})"
+        )
+    for key, label in (
+        ("reused_stages", "Preserved stages"),
+        ("restarted_stages", "Restarted stages"),
+    ):
         if key in payload:
-            print(f"{label}：{', '.join(payload[key]) or '无'}")
+            print(f"{label}: {', '.join(payload[key]) or 'none'}")
     if "retried_tasks" in payload:
-        print(f"任务：保留 {payload.get('preserved_tasks', 0)}，重试 {payload['retried_tasks']}")
+        print(
+            f"Tasks: preserved {payload.get('preserved_tasks', 0)}, retried {payload['retried_tasks']}"
+        )
     if isinstance(payload.get("current_execution"), dict):
         execution = payload["current_execution"]
-        print(f"当前任务：{execution.get('action', '-')}；{execution.get('detail', '')}")
+        print(
+            f"Current jobs: {execution.get('action', '-')}; {execution.get('detail', '')}"
+        )
     if "controller_exit_code" in payload:
-        print(f"Controller 退出码：{payload['controller_exit_code']}")
+        print(f"Controller exit code: {payload['controller_exit_code']}")
     if root:
-        print(f"查看状态：neptrain workflow status {shlex.quote(root)} --jobs")
-        print(f"日志目录：{Path(root) / 'logs'}")
+        print(f"Status: neptrain workflow status {shlex.quote(root)} --jobs")
+        print(f"Logs: {Path(root) / 'logs'}")
     if payload.get("next_action"):
-        print(f"下一步：{payload['next_action']}")
+        print(f"Next: {payload['next_action']}")
 
 
 def run_project_command(args):
@@ -1442,7 +1503,7 @@ def run_doctor(args):
     if config is not None:
         from NepTrain.core.project_checks import check_project_inputs
 
-        print("项目输入检查（FAIL 必须修复，WARN 为提示）：")
+        print("Project checks (FAIL requires a fix; WARN is advisory):")
         for level, detail in check_project_inputs(config, project.parent):
             print(f"{level} {detail}")
             if level == "FAIL":
@@ -1466,8 +1527,10 @@ def run_doctor(args):
         except (KeyError, OSError, RuntimeError, ValueError) as error:
             resource_contract = None
             failures.append("labeling resource contract")
-            print(f"FAIL 标注资源清单：{error}")
-            print("  补齐资源清单中的元素、文件路径和真实 SHA256；参见对应后端示例。")
+            print(f"FAIL Labeling resource manifest: {error}")
+            print(
+                "  Fill in the required elements, file paths, and actual SHA256 hashes in the manifest; see the example for your backend."
+            )
         labeling = config.get("labeling", {})
         labeling_backend = str(labeling.get("backend", "vasp"))
         if labeling_backend == "model":
@@ -1519,7 +1582,9 @@ def run_doctor(args):
             except (OSError, RuntimeError, ValueError, KeyError) as error:
                 failures.append(f"execution target {name}")
                 print(f"FAIL execution target {name}: {error}")
-                print("  检查该 target 的 setup_script、command、host 和标注输入；修复后重跑 doctor。")
+                print(
+                    "  Check this target's setup_script, command, host, and labeling inputs, then rerun doctor."
+                )
                 continue
             available = completed.returncode == 0
             location = target.host or "local"
@@ -1667,7 +1732,9 @@ def run_doctor(args):
                 failures.append("Feishu webhook")
                 print(f"  {result.detail}")
     if failures:
-        print(f"检查结束：{len(failures)} 项必须修复；按上面的路径和提示处理后重跑 doctor。")
+        print(
+            f"Project check failed: {len(failures)} issues require a fix. Follow the guidance above, then rerun doctor."
+        )
         raise SystemExit("Doctor failed: " + ", ".join(failures))
     print("Doctor completed successfully.")
 
