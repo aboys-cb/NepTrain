@@ -215,10 +215,23 @@ def spin_to_lammps(spin: np.ndarray) -> LammpsSpin:
     vector = np.asarray(spin, dtype=np.float64)
     if vector.ndim != 2 or vector.shape[1] != 3:
         raise SpinDataError("spin must have shape (natoms, 3)")
-    magnitude = np.linalg.norm(vector, axis=1)
-    if np.any(magnitude <= 0.0):
-        raise SpinDataError("LAMMPS DynSpin does not accept zero-length spins")
-    return LammpsSpin(direction=vector / magnitude[:, None], magnitude=magnitude)
+    if not np.isfinite(vector).all():
+        raise SpinDataError("spin contains non-finite values")
+    magnitude = np.hypot.reduce(vector, axis=1)
+    if not np.isfinite(magnitude).all():
+        raise SpinDataError("spin magnitude contains non-finite values")
+    # LAMMPS normalizes the direction when reading atom_style spin, even for
+    # nonmagnetic sites. Give zero moments a unit direction but keep their
+    # magnitude exactly zero; no physical magnetic moment is introduced.
+    direction = np.zeros_like(vector)
+    direction[:, 2] = 1.0
+    np.divide(
+        vector,
+        magnitude[:, None],
+        out=direction,
+        where=magnitude[:, None] > 0.0,
+    )
+    return LammpsSpin(direction=direction, magnitude=magnitude)
 
 
 def spin_from_lammps(direction: np.ndarray, magnitude: np.ndarray) -> np.ndarray:

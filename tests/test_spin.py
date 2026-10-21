@@ -43,6 +43,34 @@ def test_spin_lammps_roundtrip_preserves_evolving_magnitude():
     )
 
 
+@pytest.mark.parametrize(
+    "spins",
+    [
+        [[0.0, 3.0, 4.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        [[0.0, 0.0, 0.0]],
+        [[1e-300, 0.0, 0.0], [0.0, 0.0, 0.0]],
+    ],
+)
+def test_spin_lammps_roundtrip_preserves_zero_moments(spins):
+    spins = np.asarray(spins)
+    original = spins.copy()
+    with np.errstate(divide="raise", invalid="raise"):
+        converted = spin_to_lammps(spins)
+        restored = spin_from_lammps(converted.direction, converted.magnitude)
+
+    np.testing.assert_allclose(np.linalg.norm(converted.direction, axis=1), 1.0)
+    np.testing.assert_allclose(restored, spins, atol=0.0)
+    zero = np.all(spins == 0.0, axis=1)
+    np.testing.assert_array_equal(converted.magnitude[zero], 0.0)
+    np.testing.assert_array_equal(spins, original)
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_spin_lammps_rejects_nonfinite_moments(value):
+    with pytest.raises(SpinDataError, match="non-finite"):
+        spin_to_lammps(np.asarray([[0.0, value, 0.0]]))
+
+
 def test_spin_labels_are_mandatory_for_training():
     atoms = Atoms("Fe", positions=[[0, 0, 0]])
     atoms.set_array("spin", np.asarray([[1.0, 0.0, 0.0]]))

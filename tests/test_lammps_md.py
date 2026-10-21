@@ -325,6 +325,31 @@ def test_write_spin_data_uses_direction_then_magnitude(tmp_path: Path):
     np.testing.assert_allclose(values[5:9], [0.0, 0.6, 0.8, 5.0])
 
 
+def test_write_spin_data_preserves_nonmagnetic_elements(tmp_path: Path):
+    atoms = Atoms(
+        "FeOY",
+        positions=[[1, 1, 1], [2, 2, 2], [3, 3, 3]],
+        cell=[[0, 4, 0], [-4, 1, 0], [0, 0, 4]],
+        pbc=True,
+    )
+    spins = np.asarray([[0.0, 3.0, 4.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    atoms.set_array("spin", spins)
+    path = tmp_path / "structure.data"
+
+    prism = write_lammps_data(path, atoms, ("Fe", "O", "Y"), spin=True)
+    rows = path.read_text().split("Atoms # spin\n\n", 1)[1].splitlines()
+    values = np.asarray([list(map(float, row.split())) for row in rows])
+    directions, magnitudes = values[:, 5:8], values[:, 8]
+
+    assert np.isfinite(values).all()
+    np.testing.assert_array_equal(values[:, 1], [1, 2, 3])
+    np.testing.assert_allclose(np.linalg.norm(directions, axis=1), 1.0)
+    np.testing.assert_array_equal(magnitudes, [5.0, 0.0, 0.0])
+    np.testing.assert_allclose(
+        prism.vector_to_ase(directions * magnitudes[:, None]), spins
+    )
+
+
 def test_default_spin_template_matches_documented_compute_order():
     template = files("NepTrain.core.md").joinpath("templates/spin-nvt.in").read_text()
     assert "property/atom sp spx spy spz fmx fmy fmz fx fy fz" in template
