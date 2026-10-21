@@ -93,11 +93,28 @@ def validate_spin_structure(atoms: Atoms, *, require_mforce: bool) -> bool:
     spin = _vector_array(atoms, SPIN_KEY)
     mforce = _vector_array(atoms, MFORCE_KEY)
     if spin is None:
+        if "spin_active" in atoms.arrays:
+            raise SpinDataError("spin_active is present but spin is missing")
         if mforce is not None:
             raise SpinDataError("mforce is present but spin is missing")
         return False
     if require_mforce and mforce is None:
         raise SpinDataError("spin frame is missing mandatory mforce labels")
+    if "spin_active" in atoms.arrays:
+        active = np.asarray(atoms.arrays["spin_active"])
+        if (
+            active.shape != (len(atoms),)
+            or not np.isin(active, [0, 1]).all()
+            or not active.any()
+        ):
+            raise SpinDataError(
+                "spin_active requires one binary value per atom and at least one active site"
+            )
+        inactive = active == 0
+        if mforce is not None and np.any(mforce[inactive] != 0):
+            raise SpinDataError(
+                "unconstrained mforce entries must be zero constraint multipliers"
+            )
     return True
 
 

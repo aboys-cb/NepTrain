@@ -39,7 +39,21 @@ labeling:
 
 `LDELTASPIN=.TRUE.` 开启约束，`LNONCOLLINEAR=.TRUE.` 开启三分量磁矩。标注保持固定结构，要求 `IBRION=-1`、`NSW=0`；当前接口使用 `SAXIS=0 0 1`，输入和输出的自旋坐标因此与结构笛卡尔坐标一致。
 
-`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。`DELTASPIN_ATOMS` 自动生成为每原子一个 1，`DELTASPIN_COMPONENTS` 为 `1 1 1`。不要在通用模板中写死原子数或某一帧的目标磁矩。部分原子约束、部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。
+`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。默认约束所有原子，也支持只约束部分原子的完整三分量。`DELTASPIN_COMPONENTS` 为 `1 1 1`；部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。
+
+混合原子数的数据集应在每帧写入 `spin_active:I:1`，其中 1 表示独立自旋变量，0 表示不施加磁矩约束。该数组逐帧生成 `DELTASPIN_ATOMS`，覆盖 INCAR 模板中的旧掩码，并随 POSCAR 元素排序一起重排。没有 `spin_active` 时保留 INCAR 中的二进制 `DELTASPIN_ATOMS`（必须与该帧原子数相同）；两者都没有则全部为 1。不能用磁矩大小自动猜测约束掩码，受约束的零磁矩也是合法目标。
+
+例如 Bi₂Fe₂O₆ 中只约束 Fe、让 O/Bi 自洽响应：
+
+```python
+atoms.set_array("spin_active", np.array([0, 0, 1, 1, 0, 0, 0, 0, 0, 0]))
+```
+
+实际写出的 `DELTASPIN_ATOMS` 为 `0 0 1 1 0 0 0 0 0 0`。`spin_active` 只用于输入及约束生成，不写入训练 XYZ；掩码保存在 `vasp-result.json`。重新标注训练 XYZ 时，应重新提供逐帧掩码或匹配原子数的 INCAR 掩码。
+
+训练 XYZ 的原子列为 `species、pos、spin、mforce、forces`，不导出 `spin_active、initial_magmoms、spin_projected`。`spin` 保存所有原子最后收敛的磁矩：受约束原子来自高精度最终约束表，未约束 Bi/O 来自最后的 `magnetization (x/y/z)`，保留其非零感应磁矩。后者的原始打印分辨率为 0.001 μB，记录在 manifest 中。部分原子约束当前要求 `DELTASPIN_MOMENT_DEF=0`。
+
+`mforce` 保留 VASP 最终约束乘子；未约束原子为程序输出的零乘子。保存全原子磁矩不意味着独立 O 自旋扰动或其磁能曲率已得到验证。
 
 `MAGMOM` 是初始猜测，流程统一将其设为每帧输入 `spin`，与 `M_DELTASPIN` 使用相同的目标磁矩；模板中已有的 `MAGMOM` 也会被覆盖。NepTrain 会随 POSCAR 一起重排这两个字段，输出再还原原子顺序。非共线计算写入 `ISPIN=1`，避免 ASE 自动生成共线设置。
 
@@ -68,7 +82,7 @@ neptrain label selected-spin.xyz --backend vasp --project project.yaml --wait --
 
 ## 检查结果
 
-OUTCAR 必须包含一次 `DeltaSpin final status`，其中 `SCF convergence` 和 `Moment constraint` 都为 `reached`，并满足报告的误差容限。缺失、非有限、部分约束或原子顺序不匹配的磁矩/磁性力表均拒收，输入中残留的旧 `mforce` 不能代替新结果。
+OUTCAR 必须包含一次 `DeltaSpin final status`，其中 `SCF convergence` 和 `Moment constraint` 都为 `reached`，并满足报告的误差容限。磁矩表必须完整包含全部活动原子，磁性力表必须包含所有原子，约束标记必须与实际写出的 `DELTASPIN_ATOMS` 一致。缺失、非有限、分量约束不匹配或原子顺序错误均拒收，输入中残留的旧 `mforce` 不能代替新结果。
 
 输出 `spin` 来自实际收敛磁矩表，单位 μB；`mforce` 来自 `Magnetic force (eV/uB)` 表，按 `spin_lambda` 原符号保存，对应 `L=E+lambda.(M-M_target)`。能量、原子力和 virial 沿用 ASE 的 VASP 读取路径。`vasp-result.json` 保存输入/输出哈希、磁矩定义、误差和单位。
 

@@ -66,7 +66,9 @@ def read_vasp_input(calculator, filename):
                 if assignment.strip():
                     ordinary.append(assignment)
                 continue
-            if key in {"ldeltaspin", "m_deltaspin", "ediff_rho"} or key.startswith("deltaspin_"):
+            if key in {"ldeltaspin", "m_deltaspin", "ediff_rho"} or key.startswith(
+                ("deltaspin_", "scf_cuda_")
+            ):
                 custom[key] = value.strip()
             else:
                 ordinary.append(assignment)

@@ -83,6 +83,10 @@ def structure_id(atoms: Atoms) -> str:
     if "spin" in atoms.arrays:
         digest.update(b"spin")
         digest.update(_canonical_extxyz_array(atoms.arrays["spin"]))
+        active = atoms.arrays.get("spin_active")
+        if active is not None and not np.all(np.asarray(active) == 1):
+            digest.update(b"spin-active")
+            digest.update(_canonical_extxyz_array(active))
     else:
         digest.update(b"ordinary")
         initial_magmoms = atoms.arrays.get("initial_magmoms")

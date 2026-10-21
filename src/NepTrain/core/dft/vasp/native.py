@@ -125,11 +125,12 @@ def run_native_vasp(
         energy, forces, stress = _validated_results(calculator.results, len(atoms))
         forces = forces[resort]
         if electronic_mode == "deltaspin":
+            params = deltaspin.custom_parameters(calculator)
             magnetic_result = deltaspin.read_result(
                 case_dir / "OUTCAR", input_atoms.get_chemical_symbols(),
                 np.asarray(input_atoms.arrays["spin"]),
+                active=deltaspin.numbers(params["deltaspin_atoms"]).astype(bool),
             )
-            params = deltaspin.custom_parameters(calculator)
             if magnetic_result.moment_def != int(params.get("deltaspin_moment_def", "0")):
                 raise deltaspin.DeltaSpinError("DeltaSpin moment definition differs between input and output")
             if "deltaspin_tol" in params and not np.isclose(
@@ -151,16 +152,20 @@ def run_native_vasp(
         raise
 
     frame = atoms.copy()
-    frame.calc = SinglePointCalculator(frame, energy=energy, forces=forces)
     frame.info["virial"] = _stress_to_virial(stress, frame.get_volume())
     frame.info["dft_electronic_mode"] = electronic_mode
     if magnetic_result is not None:
-        frame.set_array("spin", magnetic_result.spin[resort])
+        frame.set_array("spin", magnetic_result.projected[resort])
         frame.set_array("mforce", magnetic_result.mforce[resort])
-        frame.set_initial_magnetic_moments(magnetic_result.spin[resort])
+        for key in ("spin_active", "initial_magmoms", "spin_projected"):
+            frame.arrays.pop(key, None)
+        for key in ("spin_model", "inactive_spin_semantics", "inactive_mforce_semantics",
+                    "induced_moment_print_precision_muB"):
+            frame.info.pop(key, None)
         frame.info["deltaspin_moment_def"] = magnetic_result.moment_def
         frame.info["deltaspin_max_error"] = magnetic_result.max_error
         frame.info["deltaspin_tolerance"] = magnetic_result.tolerance
+    frame.calc = SinglePointCalculator(frame, energy=energy, forces=forces)
     frame.info.setdefault("Config_type", "NepTrain scf ")
     frame.info["Weight"] = 1.0
     _write_manifest(
@@ -328,6 +333,10 @@ def _write_manifest(
         payload["output_sha256"] = outputs
     if magnetic_result is not None:
         payload["deltaspin"] = {
+            "active_atom_mask": magnetic_result.active.astype(int).tolist(),
+            "projected_moments_muB": magnetic_result.projected.tolist(),
+            "label_scope": "final moments on all atoms; mforce is the constraint multiplier (zero on unconstrained atoms)",
+            "unconstrained_moment_print_precision_muB": 0.001 if not magnetic_result.active.all() else None,
             "moment_def": magnetic_result.moment_def,
             "max_moment_error_uB": magnetic_result.max_error,
             "tolerance_uB": magnetic_result.tolerance,

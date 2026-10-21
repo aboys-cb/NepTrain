@@ -12,3 +12,7 @@ against a tolerance of 1e-6 uB. Tests compare the printed values without
 changing the magnetic-force sign. Synthetic cases derived from this format
 test malformed/partial output and multi-element ordering; they do not validate
 VASP dynamics or finite-difference derivatives.
+
+## Partial-atom fixture
+
+`OUTCAR.partial.txt` contains final-status, constrained-observable and induced-moment excerpts from a converged ten-atom Bi2Fe2O6 SOC calculation (VASP c516 release c4efdd169767, 2026-10-14). Only Fe atoms 3 and 4 are constrained. The fixture exercises sparse high-precision moment rows, full multiplier rows and unconstrained oxygen diagnostics; it is a parser fixture, not a reference for physical J/D accuracy.

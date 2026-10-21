@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import inspect
 import os
 import logging
 from pathlib import Path
@@ -264,18 +265,31 @@ def _train_torchnep(request: TrainingRequest) -> TrainingResult:
     torch.cuda.manual_seed_all(request.seed)
 
     request.output_dir.mkdir(parents=True, exist_ok=True)
-    train_nep(
+    options = dict(
         config_file=str(request.config_file),
         data_file=str(request.train_file),
         output_dir=str(request.output_dir),
         device=request.device,
         precision=request.precision,
-        backend=request.torch_backend,
         use_compile=request.use_compile,
         restart=True,
         finetune_from=str(request.finetune_file) if request.finetune_file else None,
         resume_from=str(request.restart_file) if request.restart_file else None,
     )
+    parameters = inspect.signature(train_nep).parameters
+    if "backend" in parameters or any(
+        item.kind is inspect.Parameter.VAR_KEYWORD
+        for item in parameters.values()
+    ):
+        options["backend"] = request.torch_backend
+    elif request.torch_backend != "auto":
+        logging.getLogger(__name__).warning(
+            "This TorchNEP version selects its execution backend automatically; "
+            "training.torch_backend=%s is ignored.", request.torch_backend
+        )
+    if "run_seed" in parameters:
+        options["run_seed"] = request.seed
+    train_nep(**options)
     best = request.output_dir / "nep_best.txt"
     if not best.is_file():
         raise TrainingError("TorchNEP training completed without nep_best.txt")

@@ -295,7 +295,40 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
     }
     assert captured["finetune_from"] == str(finetune)
     assert captured["resume_from"] is None
+    assert captured["backend"] == "auto"
     assert seeds == [("cpu", 20260723), ("cuda", 20260723)]
+
+
+@pytest.mark.parametrize("backend", ["auto", "bmm"])
+def test_torchnep_current_api_receives_run_seed_without_legacy_backend(
+    tmp_path, monkeypatch, caplog, backend
+):
+    from NepTrain.core.training import _train_torchnep
+
+    received = {}
+
+    def current_train_nep(
+        config_file, data_file, output_dir, device, precision, use_compile,
+        restart, finetune_from, resume_from, run_seed=None,
+    ):
+        received["seed"] = run_seed
+        received["resume"] = resume_from
+        (Path(output_dir) / "nep_best.txt").write_text("nep4 1 Al\n")
+
+    monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(train_nep=current_train_nep))
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        manual_seed=lambda _: None,
+        cuda=types.SimpleNamespace(manual_seed_all=lambda _: None),
+    ))
+    request = TrainingRequest(
+        config_file=tmp_path / "nep.in", train_file=tmp_path / "train.xyz",
+        output_dir=tmp_path / "out", torch_backend=backend, seed=1234,
+        restart_file=tmp_path / "checkpoint.pt",
+    )
+    result = _train_torchnep(request)
+    assert received == {"seed": 1234, "resume": str(request.restart_file)}
+    assert result.best_model.read_text() == "nep4 1 Al\n"
+    assert ("selects its execution backend automatically" in caplog.text) == (backend != "auto")
 
 
 def test_training_rejects_model_that_nepadapters_cannot_load(tmp_path: Path, monkeypatch):
