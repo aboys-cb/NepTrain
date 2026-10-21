@@ -318,6 +318,8 @@ def test_native_abacus_spin_reports_vector_rms_per_atom(tmp_path: Path, monkeypa
         "spin",
         np.asarray([[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]),
     )
+    # This test deliberately constrains a zero target as well.
+    atoms.set_array("spin_active", np.ones(3, dtype=int))
     write(source, atoms, format="extxyz")
     resources = tmp_path / "resources"
     _resource_files(resources, elements=("Fe", "Al"))
@@ -344,6 +346,48 @@ def test_native_abacus_spin_reports_vector_rms_per_atom(tmp_path: Path, monkeypa
     )
     assert result.frames[0].info[INPUT_STRUCTURE_ID_KEY] == structure_id(atoms)
     assert structure_id(result.frames[0]) != structure_id(atoms)
+
+
+@pytest.mark.parametrize("explicit_mask", [False, True])
+@pytest.mark.parametrize("bad_inactive_force", [False, True])
+def test_abacus_partial_constraints_preserve_induced_moments(
+    tmp_path, monkeypatch, explicit_mask, bad_inactive_force
+):
+    atoms = Atoms("FeAlFe", positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]],
+                  cell=[6, 6, 6], pbc=True)
+    atoms.set_array("spin", np.array([[1., 0, 0], [0, 0, 0], [0, 0, 3.]]))
+    if explicit_mask:
+        atoms.arrays["spin"][1, 1] = 0.05
+        atoms.set_array("spin_active", np.array([1, 0, 1]))
+    source = tmp_path / "selected.xyz"
+    write(source, atoms, format="extxyz")
+    resources = tmp_path / "resources"
+    _resource_files(resources, elements=("Fe", "Al"))
+    args = _arguments(tmp_path, source, resources)
+    log = _spin_log().replace("Al 0.0 2.0 0.0", "Al 0.0 0.039 0.0")
+    if not bad_inactive_force:
+        log = log.replace("Al 0.7 0.8 0.9", "Al 0.0 0.0 0.0")
+    monkeypatch.setenv("NEPTRAIN_ABACUS_COMMAND", _fake_command(tmp_path, log))
+    module = importlib.import_module("NepTrain.core.dft.abacus.run")
+    if bad_inactive_force:
+        with pytest.raises(NativeAbacusError, match="unconstrained atoms"):
+            module.run_abacus(args)
+        manifest = json.loads(next((tmp_path / "work").rglob("abacus-result.json")).read_text())
+        assert manifest["status"] == "result_invalid"
+        return
+    frame = module.run_abacus(args)[0]
+    case = tmp_path / "work" / "000001-AlFe2"
+    stru = (case / "STRU").read_text()
+    assert stru.count("sc 1 1 1") == 2
+    assert stru.count("sc 0 0 0") == 1
+    rows = [line for line in stru.splitlines() if " sc " in line]
+    assert rows[-1].endswith("sc 0 0 0")
+    manifest = json.loads((case / "abacus-input.json").read_text())
+    assert manifest["spin_constraint_mask_stru_order"] == [1, 1, 0]
+    np.testing.assert_allclose(frame.arrays["spin"][1], [0, 0.039, 0])
+    np.testing.assert_allclose(frame.arrays["mforce"], [[.1, .2, .3], [0, 0, 0], [.4, .5, .6]])
+    assert "spin_active" not in frame.arrays
+    assert frame.info["spin_constraint_rms_uB"] == 0
 
 
 def test_abacus_parser_keeps_mforce_available_for_future_spin_adapter(tmp_path: Path):

@@ -10,10 +10,28 @@ from NepTrain.core.spin import (
     canonicalize_spin_arrays,
     collect_mforce_from_results,
     prepare_spin_for_dft,
+    spin_constraint_mask,
     spin_from_lammps,
     spin_to_lammps,
     validate_spin_dataset,
 )
+
+
+def test_constraint_mask_defaults_to_exactly_nonzero_targets():
+    atoms = Atoms("FeOY")
+    atoms.set_array("spin", np.array([[1e-300, 0, 0], [0, 0, 0], [0, 0, 0.]]))
+    np.testing.assert_array_equal(spin_constraint_mask(atoms), [1, 0, 0])
+    atoms.set_array("spin_active", np.array([0, 1, 1]))
+    np.testing.assert_array_equal(spin_constraint_mask(atoms), [0, 1, 1])
+
+
+def test_all_zero_constraint_targets_need_an_explicit_mask():
+    atoms = Atoms("Fe")
+    atoms.set_array("spin", np.zeros((1, 3)))
+    with pytest.raises(SpinDataError, match="set spin_active=1"):
+        spin_constraint_mask(atoms)
+    atoms.set_array("spin_active", np.ones(1, dtype=int))
+    np.testing.assert_array_equal(spin_constraint_mask(atoms), [1])
 
 
 def test_extxyz_roundtrip_uses_singular_spin_and_mforce(tmp_path: Path):

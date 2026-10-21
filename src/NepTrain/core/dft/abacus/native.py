@@ -18,7 +18,7 @@ from ase.data import atomic_masses, atomic_numbers
 from ase.units import Bohr
 
 from ...content_addressing import file_sha256
-from ...spin import prepare_spin_for_dft
+from ...spin import prepare_spin_for_dft, spin_constraint_mask
 from ..attempts import new_attempt_directory
 from .resources import validate_abacus_resources
 
@@ -63,6 +63,7 @@ def run_native_abacus(
 
     input_frame = atoms.copy()
     spin_frame = prepare_spin_for_dft(input_frame)
+    active = spin_constraint_mask(input_frame) if spin_frame else None
     parameters = dict(request.input_parameters)
     command = shlex.split(request.command)
     if not command:
@@ -134,6 +135,10 @@ def run_native_abacus(
             raise NativeAbacusError(
                 f"ABACUS spin result is missing mandatory magnetic force: {log_path}"
             )
+        if spin_frame and np.any(parsed.mforce[~active[list(ordered_indices)]] != 0):
+            raise NativeAbacusError(
+                f"ABACUS unconstrained atoms have nonzero constraint multipliers: {log_path}"
+            )
     except NativeAbacusError:
         _write_result_manifest(
             case_dir,
@@ -147,6 +152,7 @@ def run_native_abacus(
     forces = _restore_atom_order(parsed.forces, ordered_indices)
     frame = input_frame.copy()
     frame.arrays.pop("initial_magmoms", None)
+    frame.arrays.pop("spin_active", None)
     frame.calc = SinglePointCalculator(
         frame,
         energy=parsed.energy,
@@ -168,8 +174,8 @@ def run_native_abacus(
         frame.set_array("mforce", mforce)
         frame.info["spin_constraint_rms_uB"] = float(
             np.sqrt(
-                np.sum(np.square(magnetization - target_spin))
-                / len(target_spin)
+                np.sum(np.square(magnetization[active] - target_spin[active]))
+                / np.count_nonzero(active)
             )
         )
     _write_result_manifest(
@@ -336,6 +342,10 @@ def _render_case(
         pp_files,
         active_orb_files,
         resource_provenance=resource_provenance,
+        spin_constraint_mask_stru_order=(
+            spin_constraint_mask(atoms)[list(ordered_indices)].astype(int).tolist()
+            if "spin" in atoms.arrays else None
+        ),
     )
     return ordered_indices
 
@@ -373,6 +383,7 @@ def _write_stru(
         if "spin" in atoms.arrays
         else None
     )
+    active = spin_constraint_mask(atoms) if spin is not None else None
     rows.extend(["", "ATOMIC_POSITIONS", "Cartesian"])
     for element in species:
         indices = [index for index in ordered_indices if symbols[index] == element]
@@ -380,7 +391,8 @@ def _write_stru(
         for index in indices:
             row = f"{_format_vector(positions[index])} m {_format_int_vector(mobility[index])}"
             if spin is not None:
-                row += f" mag {_format_vector(spin[index])} sc 1 1 1"
+                flags = "1 1 1" if active[index] else "0 0 0"
+                row += f" mag {_format_vector(spin[index])} sc {flags}"
             rows.append(row)
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return ordered_indices
@@ -401,6 +413,7 @@ def _write_input_manifest(
     orb_files: Mapping[str, str],
     *,
     resource_provenance: Mapping[str, object],
+    spin_constraint_mask_stru_order: list[int] | None = None,
 ) -> None:
     resources = {}
     for element, filename in pp_files.items():
@@ -425,6 +438,7 @@ def _write_input_manifest(
                 "resource_dir": str(resource_dir),
                 "manifest": dict(resource_provenance),
                 "resources": resources,
+                "spin_constraint_mask_stru_order": spin_constraint_mask_stru_order,
             },
             indent=2,
             sort_keys=True,

@@ -8,6 +8,8 @@ import re
 
 import numpy as np
 
+from ...spin import SpinDataError, spin_constraint_mask
+
 
 class DeltaSpinError(ValueError):
     pass
@@ -76,17 +78,18 @@ def prepare_input(calculator, atoms):
     from .io import prepare_vector_moments
 
     params = custom_parameters(calculator)
-    if "spin_active" in atoms.arrays:
-        mask = np.asarray(atoms.arrays["spin_active"])
-        if mask.shape != (len(atoms),) or not np.isin(mask, [0, 1]).all() or not mask.any():
-            raise DeltaSpinError("spin_active must contain one binary value per atom and an active site")
+    if "spin_active" in atoms.arrays or "deltaspin_atoms" not in params:
+        try:
+            mask = spin_constraint_mask(atoms)
+        except SpinDataError as error:
+            raise DeltaSpinError(str(error)) from error
         # A per-frame mask owns this field, just as spin owns M_DELTASPIN.
         params["deltaspin_atoms"] = " ".join(str(int(v)) for v in mask)
         calculator.set(custom=params)
     if "deltaspin_atoms" in params and len(numbers(params["deltaspin_atoms"])) != len(atoms):
         raise DeltaSpinError("DELTASPIN_ATOMS must have one entry per input atom; omit it for automatic generation")
     validate_input(calculator)
-    mask = numbers(params.get("deltaspin_atoms", " ".join(["1"] * len(atoms)))).astype(int)
+    mask = numbers(params["deltaspin_atoms"]).astype(int)
     ordered, resort = prepare_vector_moments(calculator, atoms, atoms.arrays["spin"])
     mask = mask[np.argsort(resort)]
     params = custom_parameters(calculator)

@@ -42,9 +42,6 @@ msgstr "The complete built-in template follows. Numerical settings are based on 
 msgid "`LDELTASPIN=.TRUE.` 开启约束，`LNONCOLLINEAR=.TRUE.` 开启三分量磁矩。标注保持固定结构，要求 `IBRION=-1`、`NSW=0`；当前接口使用 `SAXIS=0 0 1`，输入和输出的自旋坐标因此与结构笛卡尔坐标一致。"
 msgstr "`LDELTASPIN=.TRUE.` enables constraints and `LNONCOLLINEAR=.TRUE.` enables three-component moments. Labeling keeps the geometry fixed and requires `IBRION=-1`, `NSW=0`. The adapter currently requires `SAXIS=0 0 1`, keeping spin coordinates aligned with Cartesian structure coordinates."
 
-msgid "`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。`DELTASPIN_ATOMS` 自动生成为每原子一个 1，`DELTASPIN_COMPONENTS` 为 `1 1 1`。不要在通用模板中写死原子数或某一帧的目标磁矩。部分原子约束、部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。"
-msgstr "`M_DELTASPIN` is generated from each frame's `spin`, replacing any template value. `DELTASPIN_ATOMS` is generated as one 1 per atom, and `DELTASPIN_COMPONENTS` is `1 1 1`. Avoid hard-coding an atom count or one frame's targets in a reusable template. Partial atom/component constraints and nonzero `DELTASPIN_CONSTRAINT_MODE` are rejected."
-
 msgid "`MAGMOM` 是初始猜测，流程统一将其设为每帧输入 `spin`，与 `M_DELTASPIN` 使用相同的目标磁矩；模板中已有的 `MAGMOM` 也会被覆盖。NepTrain 会随 POSCAR 一起重排这两个字段，输出再还原原子顺序。非共线计算写入 `ISPIN=1`，避免 ASE 自动生成共线设置。"
 msgstr "`MAGMOM` is the initial guess. The workflow always sets it from each input frame’s `spin`, using the same target moments as `M_DELTASPIN` and overriding any template `MAGMOM`. NepTrain reorders both fields together with POSCAR and restores output atom order. Noncollinear calculations write `ISPIN=1` to prevent ASE from inferring a collinear setting."
 
@@ -98,3 +95,10 @@ msgstr ""
 
 msgid "from ase.io import read\nframe = read(\"labeled-spin.xyz\")\nprint(frame.arrays[\"spin\"])\nprint(frame.arrays[\"mforce\"])\nprint(frame.info[\"deltaspin_max_error\"], frame.info[\"deltaspin_tolerance\"])\n"
 msgstr ""
+
+
+msgid "`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。默认只约束输入磁矩非零的原子，也支持用掩码明确指定需要约束的原子。`DELTASPIN_COMPONENTS` 为 `1 1 1`；部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。"
+msgstr "`M_DELTASPIN` is generated from each frame's `spin`, replacing any template value. By default, only atoms with nonzero input moments are constrained; use a mask to select constrained sites explicitly. `DELTASPIN_COMPONENTS` is `1 1 1`. Partial component constraints and nonzero `DELTASPIN_CONSTRAINT_MODE` are rejected."
+
+msgid "混合原子数的数据集应在每帧写入 `spin_active:I:1`，其中 1 表示独立自旋变量，0 表示不施加磁矩约束。该数组逐帧生成 `DELTASPIN_ATOMS`，覆盖 INCAR 模板中的旧掩码，并随 POSCAR 元素排序一起重排。没有 `spin_active` 时保留 INCAR 中的二进制 `DELTASPIN_ATOMS`（必须与该帧原子数相同）；两者都没有时，输入 `spin` 三分量全为零的原子不约束，其余原子约束；不使用磁矩大小阈值。需要约束到零磁矩时，必须显式设置该原子的 `spin_active=1`（或 INCAR 掩码为 1）。需要让非零感应磁矩自由自洽时，显式设置 `spin_active=0`。"
+msgstr "For datasets with varying atom counts, provide `spin_active:I:1` in each frame: 1 selects an independent spin variable; 0 leaves the moment unconstrained. This array overrides template `DELTASPIN_ATOMS` and follows the POSCAR atom ordering. Without it, an explicit binary INCAR mask is retained and must match the frame's atom count. With neither mask, exactly zero input moments are unconstrained and nonzero moments are constrained; no magnitude threshold is used. To constrain a zero target, explicitly set `spin_active=1` or the INCAR mask entry to 1. To let a nonzero induced moment relax freely, set `spin_active=0`."

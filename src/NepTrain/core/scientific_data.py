@@ -84,7 +84,9 @@ def structure_id(atoms: Atoms) -> str:
         digest.update(b"spin")
         digest.update(_canonical_extxyz_array(atoms.arrays["spin"]))
         active = atoms.arrays.get("spin_active")
-        if active is not None and not np.all(np.asarray(active) == 1):
+        persisted_spin = np.round(np.asarray(atoms.arrays["spin"]), decimals=8)
+        default_active = np.any(persisted_spin != 0, axis=1)
+        if active is not None and not np.array_equal(active, default_active):
             digest.update(b"spin-active")
             digest.update(_canonical_extxyz_array(active))
     else:

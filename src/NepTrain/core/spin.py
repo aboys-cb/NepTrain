@@ -130,6 +130,26 @@ def prepare_spin_for_dft(atoms: Atoms) -> bool:
     return is_spin
 
 
+def spin_constraint_mask(atoms: Atoms) -> np.ndarray:
+    """Use explicit site constraints, or constrain nonzero input moments.
+
+    No magnitude threshold is applied. A zero target that must be constrained
+    needs an explicit spin_active=1; an unconstrained induced moment needs 0.
+    """
+    spin = _vector_array(atoms, SPIN_KEY)
+    if spin is None:
+        raise SpinDataError("spin constraints require spin:R:3 input")
+    active = np.asarray(atoms.arrays.get("spin_active", np.any(spin != 0, axis=1)))
+    if active.shape != (len(atoms),) or not np.isin(active, [0, 1]).all():
+        raise SpinDataError("spin_active must contain one binary value per atom")
+    if not active.any():
+        raise SpinDataError(
+            "No active spin constraints: set spin_active=1 on sites that must "
+            "be constrained to zero, or omit spin for unconstrained DFT"
+        )
+    return active.astype(bool)
+
+
 def collect_mforce_from_results(atoms: Atoms, results: dict) -> None:
     """Copy a calculator magnetic-force result into canonical extxyz storage."""
 

@@ -140,14 +140,17 @@ def test_ordinary_vasp_still_rejects_spin_input(tmp_path):
 
 @pytest.mark.parametrize("missing_mforce", [False, True])
 @pytest.mark.parametrize("template_magmom", [None, "0 0 4 0 0 0.5 0 0 5"])
-@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("partial", [False, True, "auto"])
 def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, missing_mforce, template_magmom, partial):
     monkeypatch.delenv("NEPTRAIN_VASP_COMMAND", raising=False)
     atoms = Atoms("FeAlFe", positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]], cell=[6, 6, 6], pbc=True)
     spin = np.asarray([[0.1, 0, 2], [0.2, 0, 0.1], [-0.1, 0, 2]])
     if partial:
         spin[1] = [0.025, 0, 0]  # Unconstrained initial moments may be nonzero.
-        atoms.set_array("spin_active", np.asarray([1, 0, 1]))
+        if partial == "auto":
+            spin[1] = 0
+        else:
+            atoms.set_array("spin_active", np.asarray([1, 0, 1]))
     atoms.set_array("spin", spin)
     atoms.set_initial_magnetic_moments(np.full((3, 3), 9.0))
     atoms.set_array("spin_projected", np.full((3, 3), 999.0))
@@ -159,7 +162,7 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
         incar += "MAGMOM=" + template_magmom + "\n"
     incar += "M_DELTASPIN = 9*99\n"  # Each sampled input owns its targets.
     incar += "SCF_CUDA_NCL_GGA_MODE = 1\n"
-    if partial:
+    if partial is True:
         incar += "DELTASPIN_ATOMS = 2*0 2*1 6*0\n"  # Stale primitive mask must be replaced.
     request = _request(tmp_path, atoms, incar)
 
@@ -332,9 +335,9 @@ def test_partial_spin_mask_changes_input_identity_and_survives_extxyz(tmp_path):
     atoms.set_array('spin', np.array([[0., 0., 4.], [0., 0., 0.]]))
     original = structure_id(atoms)
     atoms.set_array('spin_active', np.array([1, 1]))
-    assert structure_id(atoms) == original
-    atoms.set_array('spin_active', np.array([1, 0]))
     assert structure_id(atoms) != original
+    atoms.set_array('spin_active', np.array([1, 0]))
+    assert structure_id(atoms) == original
     path = tmp_path/'candidate.xyz'; write(path, atoms, format='extxyz')
     assert structure_id(read(path)) == structure_id(atoms)
     assert validate_spin_structure(read(path), require_mforce=False)
@@ -343,3 +346,13 @@ def test_partial_spin_mask_changes_input_identity_and_survives_extxyz(tmp_path):
     atoms.set_array('mforce', np.ones((2, 3)))
     with pytest.raises(SpinDataError, match='unconstrained'):
         validate_spin_structure(atoms, require_mforce=True)
+
+
+def test_explicit_zero_constraint_identity_survives_xyz_rounding(tmp_path):
+    from NepTrain.core.scientific_data import structure_id
+    atoms = Atoms('FeO', cell=[5, 5, 5], pbc=True)
+    atoms.set_array('spin', np.array([[0., 0., 4.], [1e-12, 0., 0.]]))
+    atoms.set_array('spin_active', np.array([1, 1]))
+    path = tmp_path / 'candidate.xyz'
+    write(path, atoms, format='extxyz')
+    assert structure_id(read(path)) == structure_id(atoms)

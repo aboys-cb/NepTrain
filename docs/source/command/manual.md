@@ -166,6 +166,10 @@ VASP 的 `ISPIN=2` 仍只生成普通 energy/force/virial 标签。带 DeltaSpin
 可通过 `LDELTASPIN=.TRUE.` 标注完整 `spin/mforce`，并支持 SOC；配置和 INCAR
 写法见 [VASP DeltaSpin](vasp-deltaspin.md)。
 
+ABACUS 自旋标注默认只对输入 `spin` 非零的原子写入 `sc 1 1 1`；三分量全零的原子写入 `sc 0 0 0`，允许其磁矩自由自洽。每帧可用 `spin_active:I:1` 显式覆盖：1 表示约束全部三分量（包括零目标），0 表示不约束（也可带非零初始磁矩）。不按元素名称或磁矩大小阈值判断。全零目标若需要约束，必须明确设置活动掩码；普通无约束计算应省略 `spin` 字段。
+
+结果保留所有原子收敛后的磁矩和磁性力；未约束原子的约束乘子应为零，约束 RMS 只统计活动原子。输入掩码按 STRU 顺序保存在 `abacus-input.json`，不写入训练 XYZ。重新标注含感应磁矩的数据时应重新提供掩码，以免将非零感应磁矩当作约束目标。VASP DeltaSpin 使用相同的默认规则，显式 INCAR 掩码的优先级见 [VASP DeltaSpin](vasp-deltaspin.md)。
+
 预训练或微调后的等变模型可以作为与 VASP/ABACUS 平级的 Label Adapter：
 
 ```bash

@@ -39,9 +39,9 @@ labeling:
 
 `LDELTASPIN=.TRUE.` 开启约束，`LNONCOLLINEAR=.TRUE.` 开启三分量磁矩。标注保持固定结构，要求 `IBRION=-1`、`NSW=0`；当前接口使用 `SAXIS=0 0 1`，输入和输出的自旋坐标因此与结构笛卡尔坐标一致。
 
-`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。默认约束所有原子，也支持只约束部分原子的完整三分量。`DELTASPIN_COMPONENTS` 为 `1 1 1`；部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。
+`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。默认只约束输入磁矩非零的原子，也支持用掩码明确指定需要约束的原子。`DELTASPIN_COMPONENTS` 为 `1 1 1`；部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。
 
-混合原子数的数据集应在每帧写入 `spin_active:I:1`，其中 1 表示独立自旋变量，0 表示不施加磁矩约束。该数组逐帧生成 `DELTASPIN_ATOMS`，覆盖 INCAR 模板中的旧掩码，并随 POSCAR 元素排序一起重排。没有 `spin_active` 时保留 INCAR 中的二进制 `DELTASPIN_ATOMS`（必须与该帧原子数相同）；两者都没有则全部为 1。不能用磁矩大小自动猜测约束掩码，受约束的零磁矩也是合法目标。
+混合原子数的数据集应在每帧写入 `spin_active:I:1`，其中 1 表示独立自旋变量，0 表示不施加磁矩约束。该数组逐帧生成 `DELTASPIN_ATOMS`，覆盖 INCAR 模板中的旧掩码，并随 POSCAR 元素排序一起重排。没有 `spin_active` 时保留 INCAR 中的二进制 `DELTASPIN_ATOMS`（必须与该帧原子数相同）；两者都没有时，输入 `spin` 三分量全为零的原子不约束，其余原子约束；不使用磁矩大小阈值。需要约束到零磁矩时，必须显式设置该原子的 `spin_active=1`（或 INCAR 掩码为 1）。需要让非零感应磁矩自由自洽时，显式设置 `spin_active=0`。
 
 例如 Bi₂Fe₂O₆ 中只约束 Fe、让 O/Bi 自洽响应：
 
