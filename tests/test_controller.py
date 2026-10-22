@@ -5356,3 +5356,88 @@ def test_controller_and_status_allow_optional_snapshot_to_disappear(
     assert controller.workflow_id == prepared.workflow_id
     assert workflow_status(prepared.output_dir).workflow_id == prepared.workflow_id
     assert "skipped" in caplog.text
+
+
+@pytest.mark.parametrize('new_limit,expected_handles', [(1, 2), (3, 3)])
+def test_resume_resource_edits_preserve_live_jobs_and_update_label_capacity(
+    tmp_path, new_limit, expected_handles,
+):
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _controller_inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    launched = []
+
+    class RunningExecutor:
+        def __init__(self, target):
+            self.target = target
+
+        def inspect(self, handle):
+            return ExecutionStatus('running', 'RUNNING')
+
+        def launch(self, task):
+            launched.append((task.task_id, self.target.qos))
+            return ExecutionHandle(
+                task.task_id, self.target.name, 'slurm', 'new-job', str(task.bundle),
+            )
+
+    controller = PersistentController(prep.output_dir, executor_factory=RunningExecutor)
+    tasks = []
+    for index in range(3):
+        task_id = f'label-{index}'
+        bundle = prep.output_dir / '.neptrain/jobs' / task_id
+        bundle.mkdir()
+        (bundle / 'task.json').write_text('{"original": true}')
+        tasks.append({
+            'task_id': task_id, 'target': 'label', 'bundle': str(bundle),
+            'handle': {
+                'task_id': task_id, 'target': 'label', 'executor': 'slurm',
+                'execution_id': str(100 + index), 'local_bundle': str(bundle),
+            } if index < 2 else None,
+        })
+    controller.state.update(state='stopped', current={
+        'kind': 'task_group', 'generation': 1, 'stage': 'label',
+        'resource': 'labeling', 'attempt': 1, 'max_concurrent': 2, 'tasks': tasks,
+    })
+    controller._save()
+    old_handles = [dict(t['handle']) for t in tasks[:2]]
+    config, _ = load_config(prep.config_file)
+    config['labeling']['max_concurrent'] = new_limit
+    config['execution']['targets']['label']['qos'] = 'new-qos'
+    save_config(config, prep.config_file)
+    accept_config_changes(prep.output_dir)
+    resumed = PersistentController(prep.output_dir, executor_factory=RunningExecutor)
+    resumed.tick()
+    current = resumed.state['current']
+    assert current['max_concurrent'] == new_limit
+    assert [t['handle'] for t in current['tasks'][:2]] == old_handles
+    assert sum(t['handle'] is not None for t in current['tasks']) == expected_handles
+    assert launched == ([('label-2', 'new-qos')] if new_limit == 3 else [])
+    assert all((Path(t['bundle']) / 'task.json').read_text() == '{"original": true}' for t in tasks)
+
+
+@pytest.mark.usefixtures('legacy_workflow_protocol')
+def test_stop_edit_resume_keeps_current_handle_and_reports_applied_settings(tmp_path, monkeypatch):
+    from NepTrain.core.config import load_config, save_config
+
+    config, initial = _controller_inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    controller = PersistentController(
+        prep.output_dir, executor_factory=lambda target: ImmediateExecutor(target, []),
+    )
+    controller.tick()
+    current = controller.state['current']
+    assert current['stage'] == 'train'
+    original_handle = dict(current['handle'])
+    original_task = (Path(current['bundle']) / 'task.json').read_bytes()
+    stop_workflow(prep.output_dir, cancel_jobs=False)
+    edited, _ = load_config(prep.config_file)
+    edited['labeling']['max_concurrent'] = 100
+    save_config(edited, prep.config_file)
+    monkeypatch.setattr(controller_module, 'start_controller', lambda *_a, **_kw: 123)
+    result = resume_workflow(prep.output_dir)
+    assert result.config_changes[0]['field'] == 'labeling.max_concurrent'
+    state = json.loads((prep.output_dir / '.neptrain/controller.json').read_text())
+    assert state['current']['handle'] == original_handle
+    assert (Path(current['bundle']) / 'task.json').read_bytes() == original_task

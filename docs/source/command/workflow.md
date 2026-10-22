@@ -603,6 +603,43 @@ neptrain workflow stop workflow --keep-jobs
 先重新观察原 job handle，不重复提交。作业已离开 `squeue` 时还会查询 accounting；
 超过有界 grace 仍不存在才按 LOST 处理。
 
+### 修改运行中的项目配置
+
+调整 QoS、分区或并发数时，先停止主流程并保留计算任务，再编辑运行目录里的
+`project.yaml`，最后恢复：
+
+```bash
+neptrain workflow stop workflow --keep-jobs
+# Edit workflow/project.yaml, for example execution.targets.dft.qos.
+neptrain workflow status workflow
+neptrain workflow resume workflow
+```
+
+`status` 只读展示待生效的字段变化；`resume` 校验后自动接受受支持的修改，打印
+旧值、新值及生效范围，无需手动更新哈希。注释、空行等不改变配置含义的编辑也允许。
+必须修改本次运行目录的 `project.yaml`，修改最初用于 prepare 的源配置不会影响已有流程。
+
+允许调整已有执行目标的 `qos`、`partition`、`time`、`cpus_per_task`、`gpus_per_node`、
+`memory_ladder`，以及仅用于申请资源的 Slurm `directives`。这些修改用于随后提交的任务，
+已提交或正在运行的作业保持原设置。程序命令、主机、执行器、环境变量和 setup 脚本不属于
+资源调整，不能通过该入口更换。新增或删除执行目标也不支持。
+
+`labeling.max_concurrent` 在恢复后作用于当前标注任务组：提高上限可继续补交任务；
+降低上限不会取消已有作业，而是等在途任务降到上限以下再补交。
+`labeling.structures_per_job` 只影响后续新建的标注任务组，不重新拆分当前任务。
+`execution.poll_interval` 和通知配置在主流程恢复后生效；日志和变更记录中的飞书密钥及
+webhook 会隐藏。
+
+温度路径、轨迹步数、采样模板、训练与 DFT 设置、精度阈值等会影响科学证据，目前仍不支持
+直接修改已有流程。恢复时会指出具体字段，并拒绝整批编辑，不会只接受其中的 QoS 修改。
+恢复这些字段即可继续原流程；需要新的科学设置时，以已有合并训练集准备新流程。
+增加代数预算仍使用 `workflow extend`。模型、标签、输入模板和已完成结果继续严格检查哈希。
+
+配置版本快照保存在 `.neptrain/configurations/`，manifest 保留已接受修改的历史。
+旧 workflow 首次使用新版时，应在原配置尚未改动时执行 `stop --keep-jobs`，以保存比较基准。
+如果旧流程已经修改且没有基准，需先恢复原配置再执行上述步骤；不会通过重写哈希把未知修改
+直接当作有效配置。新建流程在 prepare 时自动保存基准。此功能不要求重建已有结果或升级流程协议。
+
 每代目录直接对应用户关心的阶段：
 
 ```text

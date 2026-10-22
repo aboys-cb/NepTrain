@@ -960,7 +960,7 @@ def test_workflow_rejects_prepared_input_drift(tmp_path: Path):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     preparation.config_file.write_text("changed: true\n", encoding="utf-8")
-    with pytest.raises(WorkflowError, match="artifact drifted"):
+    with pytest.raises(WorkflowError, match="Invalid edited project configuration"):
         workflow_status(preparation.output_dir)
 
 
@@ -1776,3 +1776,179 @@ def test_status_shows_plot_paths_and_explains_missing_plot_without_json(
     assert ".json" not in text and "evaluation-parity.png" not in text
     _print_reports(status, details=True)
     assert "evaluation-parity.png" in capsys.readouterr().out
+
+
+def _edit_runtime_project(preparation, edits):
+    from NepTrain.core.config import load_config, save_config
+
+    config, _ = load_config(preparation.config_file)
+    for path, value in edits.items():
+        parts = path.split('.')
+        parent = config
+        for part in parts[:-1]:
+            parent = parent.setdefault(part, {})
+        parent[parts[-1]] = value
+    save_config(config, preparation.config_file)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('execution.targets.label.qos', 'rush-1o2gpu'),
+    ('execution.targets.label.partition', '4V100'),
+    ('execution.targets.label.time', '04:00:00'),
+    ('execution.targets.label.gpus_per_node', 2),
+    ('execution.targets.label.cpus_per_task', 8),
+    ('execution.targets.label.memory_ladder', ['8G', '16G']),
+    ('execution.targets.label.directives', ['--nodes=1', '--ntasks=2', '--mem=8G']),
+    ('execution.poll_interval', 5),
+    ('labeling.max_concurrent', 100),
+    ('labeling.structures_per_job', 2),
+])
+def test_operational_edits_are_previewed_and_applied_on_start(tmp_path, monkeypatch, field, value):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    before = prep.manifest.read_bytes()
+    old_plans = [p.read_bytes() for p in prep.plans]
+    _edit_runtime_project(prep, {field: value})
+    status = workflow_status(prep.output_dir)
+    assert status.state == 'prepared'
+    assert [item['field'] for item in status.pending_config_changes] == [field]
+    assert prep.manifest.read_bytes() == before  # status is read-only
+    monkeypatch.setattr('NepTrain.core.controller.start_controller', lambda *_a, **_k: 123)
+    result = start_workflow(prep.output_dir)
+    assert result.config_changes[0]['field'] == field
+    manifest = json.loads(prep.manifest.read_text())
+    assert manifest['config']['sha256'] == hashlib.sha256(prep.config_file.read_bytes()).hexdigest()
+    update = manifest['config_updates'][0]
+    old = prep.output_dir / update['before']['snapshot']
+    assert old.is_file()
+    assert hashlib.sha256(old.read_bytes()).hexdigest() == update['before']['sha256']
+    assert [p.read_bytes() for p in prep.plans] == old_plans
+    assert not workflow_status(prep.output_dir).pending_config_changes
+
+
+@pytest.mark.parametrize('field,value', [
+    ('workflow.seed', 999),
+    ('workflow.max_model_generations', 10),
+    ('workflow.convergence', {'acquisition_max_rmse': {'force_rmse': 0.2, 'energy_rmse': 0.1}}),
+    ('sampling.selection.max_selected', 50),
+    ('execution.targets.label.command', 'other-neptrain'),
+    ('execution.targets.label.environment.TEST_SETTING', 'new'),
+    ('execution.targets.extra', {'partition': '4V100', 'qos': 'rush-1o2gpu'}),
+    ('execution.targets.label.directives', ['--export=ALL,TEST_SETTING=new']),
+    ('execution.targets.label.directives', ['--nodes=1 --export=ALL,TEST_SETTING=new']),
+])
+def test_scientific_and_execution_identity_edits_are_rejected_by_field(tmp_path, field, value):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    before = prep.manifest.read_bytes()
+    _edit_runtime_project(prep, {'execution.targets.label.qos': 'rush-1o2gpu', field: value})
+    with pytest.raises(WorkflowError, match='cannot be applied') as error:
+        start_workflow(prep.output_dir)
+    assert field in str(error.value)
+    assert prep.manifest.read_bytes() == before  # no partial acceptance of the QoS
+
+
+def test_notification_edits_are_redacted_in_output_and_audit(tmp_path, monkeypatch, capsys):
+    from NepTrain.cli.cli import _print_workflow_control, _workflow_resume_payload
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    secret = 'private-signing-secret'
+    _edit_runtime_project(prep, {
+        'notifications.feishu.webhook': 'https://open.feishu.cn/open-apis/bot/v2/hook/private-hook',
+        'notifications.feishu.secret': secret,
+    })
+    monkeypatch.setattr('NepTrain.core.controller.start_controller', lambda *_a, **_k: 123)
+    result = start_workflow(prep.output_dir)
+    _print_workflow_control(_workflow_resume_payload(result))
+    output = capsys.readouterr().out
+    assert 'Configuration changes applied:' in output
+    assert '[redacted]' in output
+    assert secret not in output + prep.manifest.read_text()
+    assert 'private-hook' not in output + prep.manifest.read_text()
+
+
+def test_legacy_workflow_stop_saves_baseline_before_edit(tmp_path, monkeypatch):
+    from NepTrain.core.controller import stop_workflow
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    manifest = json.loads(prep.manifest.read_text())
+    manifest['config'].pop('snapshot')
+    prep.manifest.write_text(json.dumps(manifest))
+    stop_workflow(prep.output_dir, cancel_jobs=False)
+    assert json.loads(prep.manifest.read_text())['config']['snapshot']
+    _edit_runtime_project(prep, {'execution.targets.label.qos': 'rush-1o2gpu'})
+    assert accept_config_changes(prep.output_dir)[0]['field'] == 'execution.targets.label.qos'
+
+
+def test_legacy_edit_without_baseline_is_not_silently_accepted(tmp_path):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    manifest = json.loads(prep.manifest.read_text())
+    manifest['config'].pop('snapshot')
+    prep.manifest.write_text(json.dumps(manifest))
+    _edit_runtime_project(prep, {'execution.targets.label.qos': 'rush-1o2gpu'})
+    with pytest.raises(WorkflowError, match='no saved configuration baseline'):
+        start_workflow(prep.output_dir)
+
+
+def test_resource_edits_do_not_hide_damaged_scientific_inputs(tmp_path):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    _edit_runtime_project(prep, {'execution.targets.label.qos': 'rush-1o2gpu'})
+    prep.initial_training.write_text('broken\n')
+    before = prep.manifest.read_bytes()
+    with pytest.raises(WorkflowError, match='artifact drifted'):
+        start_workflow(prep.output_dir)
+    assert prep.manifest.read_bytes() == before
+
+
+def test_config_updates_refuse_a_live_controller_and_preserve_snapshots(tmp_path):
+    import fcntl
+    from NepTrain.core.workflow_config import WorkflowConfigError, accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    workspace = WorkflowWorkspace.locate(prep.output_dir)
+    _edit_runtime_project(prep, {'execution.targets.label.qos': 'rush-1o2gpu'})
+    before = prep.manifest.read_bytes()
+    with workspace.controller_lock.open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(WorkflowConfigError, match='running or busy'):
+            accept_config_changes(prep.output_dir)
+    assert prep.manifest.read_bytes() == before
+
+
+def test_format_only_edits_and_budget_extension_refresh_baselines(tmp_path, monkeypatch):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    with prep.config_file.open('a') as stream:
+        stream.write('\n# User comment\n')
+    monkeypatch.setattr('NepTrain.core.controller.start_controller', lambda *_a, **_k: 123)
+    assert not start_workflow(prep.output_dir).config_changes
+    assert json.loads(prep.manifest.read_text())['config_updates'][0]['format_only']
+    extend_workflow(prep.output_dir, 4)
+    assert workflow_status(prep.output_dir).state == 'prepared'
+
+
+def test_damaged_baseline_is_rejected_even_when_project_hash_matches(tmp_path):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    record = json.loads(prep.manifest.read_text())['config']
+    (prep.output_dir / record['snapshot']).write_text('damaged\n')
+    with pytest.raises(WorkflowError, match='baseline is missing or damaged'):
+        workflow_status(prep.output_dir)
+
+
+def test_temperature_edit_identifies_the_nested_field(tmp_path):
+    from NepTrain.core.config import load_config, save_config
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    edited, _ = load_config(prep.config_file)
+    edited['sampling']['routes'][0]['conditions']['pressure'] = 1.0
+    save_config(edited, prep.config_file)
+    with pytest.raises(WorkflowError, match=r'sampling.routes.0.conditions.pressure'):
+        start_workflow(prep.output_dir)

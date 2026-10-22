@@ -211,6 +211,7 @@ class PersistentController:
                 "persistent controllers require workflow layout v4"
             )
         from .workflow import WorkflowError, _normalise_manifest
+        from .workflow_config import WorkflowConfigError, inspect_config
 
         try:
             self.manifest = _normalise_manifest(
@@ -223,8 +224,16 @@ class PersistentController:
             raise ControllerError(
                 "workflow was not prepared for the current controller"
             )
+        try:
+            inspect_config(self.manifest["config"])
+        except WorkflowConfigError as error:
+            raise ControllerError(str(error)) from error
+        if not _record_matches(self.manifest["config"]):
+            raise ControllerError(
+                "Project has unapplied configuration edits; use workflow resume "
+                "(or workflow run for a prepared workflow) to review and apply them."
+            )
         for record in [
-            self.manifest["config"],
             self.manifest["initial_training"],
             *self.manifest.get("plans", []),
             *self.manifest.get("dependencies", []),
@@ -631,6 +640,12 @@ class PersistentController:
 
         stage = str(current["stage"])
         maximum = int(current.get("max_concurrent", len(current["tasks"])))
+        if stage == "label":
+            maximum = int(self.config.get("labeling", {}).get(
+                "max_concurrent", DEFAULT_MAX_CONCURRENT
+            ))
+            # Existing handles stay intact even when the new limit is lower.
+            current["max_concurrent"] = maximum
         inflight = sum(
             item.get("handle") is not None
             and not item.get("collected_bundle")
@@ -2583,11 +2598,23 @@ def stop_workflow(
     if was_running:
         stop_controller(workspace.root)
 
+    # Legacy manifests have no comparison baseline. Capture the still-valid
+    # project before the user edits it; never bless an already modified file.
+    from .workflow_config import WorkflowConfigError, remember_config
+
+    config_warning = None
+    try:
+        remember_config(workspace.root)
+    except (OSError, ValueError, KeyError, WorkflowConfigError) as error:
+        config_warning = f"Could not save a configuration baseline: {error}"
+
     result: dict[str, Any] = {
         "project": str(workspace.root),
         "controller": "stopped" if was_running else "already_stopped",
         "current_execution": None,
     }
+    if config_warning:
+        result["config_warning"] = config_warning
 
     if not was_running:
         prior_state = (

@@ -31,6 +31,12 @@ from .persistence import atomic_write_json
 from .workflow_workspace import WorkflowWorkspace
 from .sampling_route import load_sampling_routes
 from .scientific_data import STRUCTURE_ID_VERSION
+from .workflow_config import (
+    WorkflowConfigError,
+    accept_config_changes,
+    inspect_config,
+    snapshot_config,
+)
 
 
 class WorkflowError(RuntimeError):
@@ -54,6 +60,7 @@ class WorkflowResume:
     manifest: Path
     controller_pid: int | None = None
     controller_exit_code: int | None = None
+    config_changes: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,7 @@ class WorkflowStatus:
     convergence_configured: bool | None = None
     convergence_policy: Mapping[str, Any] | None = None
     training_progress: Mapping[str, Any] | None = None
+    pending_config_changes: tuple[Mapping[str, Any], ...] = ()
 
 
 _STAGES = (
@@ -791,6 +799,7 @@ def prepare_workflow(
         "dependencies": dependencies,
         "sampling_routes": sampling_routes,
     }
+    manifest["config"] = snapshot_config(manifest["config"])
     atomic_write_json(manifest_path, manifest)
     return _preparation_from_manifest(manifest_path)
 
@@ -806,6 +815,18 @@ def extend_workflow(
     preparation = _coerce_preparation(preparation)
     with _workflow_lock(preparation.output_dir):
         manifest = _validated_manifest(preparation)
+        prior_config_record = dict(manifest["config"])
+        pending_changes = inspect_config(prior_config_record)
+        if not prior_config_record.get("snapshot"):
+            prior_config_record = snapshot_config(prior_config_record)
+        if pending_changes:
+            from .controller import controller_running
+
+            if controller_running(preparation.output_dir):
+                raise WorkflowError(
+                    "Stop the controller with --keep-jobs before accepting "
+                    "resource edits together with a budget extension."
+                )
         progress = _workflow_progress(preparation, manifest)
         if progress.state not in {"prepared", "complete", "incomplete"}:
             raise WorkflowError(
@@ -859,6 +880,19 @@ def extend_workflow(
         manifest.setdefault("extensions", []).append(extension)
         save_config(portable_config, preparation.config_file)
         manifest["config"]["sha256"] = file_sha256(preparation.config_file)
+        manifest["config"] = snapshot_config(manifest["config"])
+        manifest.setdefault("config_updates", []).append({
+            "created_at": extension["created_at"],
+            "before": prior_config_record,
+            "after": dict(manifest["config"]),
+            "changes": [*pending_changes, {
+                "field": "workflow.max_model_generations",
+                "before": current_total,
+                "after": total_generations,
+                "applies_to": "new generation plans (workflow extend)",
+            }],
+            "format_only": False,
+        })
         atomic_write_json(preparation.manifest, manifest)
         if workspace.controller_file.is_file():
             controller_state = _read_json(
@@ -882,8 +916,11 @@ def _validated_manifest(preparation: WorkflowPreparation) -> dict[str, Any]:
         raise WorkflowError(
             "unsupported workflow manifest; create a new workflow with the current NepTrain"
         )
+    try:
+        inspect_config(manifest["config"])
+    except WorkflowConfigError as error:
+        raise WorkflowError(str(error)) from error
     for record in [
-        manifest["config"],
         manifest["initial_training"],
         *manifest["plans"],
         *manifest.get("dependencies", []),
@@ -1757,6 +1794,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
 
     preparation = _coerce_preparation(output_dir)
     manifest = _validated_manifest(preparation)
+    pending_config_changes = inspect_config(manifest["config"])
     ledger = _read_workflow_ledger(preparation)
     progress = _workflow_progress(preparation, manifest, ledger=ledger)
     generations = _scientific_progress(preparation, manifest, ledger=ledger)
@@ -2059,6 +2097,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         precision_basis="acquisition",
         convergence_policy=dict(config.get("workflow", {}).get("convergence", {})),
         training_progress=_training_progress(controller, config),
+        pending_config_changes=pending_config_changes,
     )
 
 
@@ -2233,6 +2272,10 @@ def resume_workflow(
         )
     if controller_running(output):
         raise WorkflowError("workflow is already running")
+    try:
+        config_changes = accept_config_changes(output)
+    except WorkflowConfigError as error:
+        raise WorkflowError(str(error)) from error
     if status.state == "damaged":
         repair_error = None
         try:
@@ -2281,6 +2324,7 @@ def resume_workflow(
         preparation.manifest,
         controller_pid=None if foreground else controller_result,
         controller_exit_code=controller_result if foreground else None,
+        config_changes=config_changes,
     )
 
 
@@ -2391,6 +2435,10 @@ def start_workflow(
     if controller_running(output):
         raise WorkflowError("workflow is already running")
     try:
+        config_changes = accept_config_changes(output)
+    except WorkflowConfigError as error:
+        raise WorkflowError(str(error)) from error
+    try:
         controller_result = start_controller(
             output,
             foreground=foreground,
@@ -2404,6 +2452,7 @@ def start_workflow(
         preparation.manifest,
         controller_pid=None if foreground else controller_result,
         controller_exit_code=controller_result if foreground else None,
+        config_changes=config_changes,
     )
 
 

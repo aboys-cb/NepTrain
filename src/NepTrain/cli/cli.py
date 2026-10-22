@@ -818,6 +818,7 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
             print(f"Convergence (G{latest['generation']}): Not yet established")
         for reason in quality.get("convergence_reasons", []):
             print(f"  · {reason}")
+    _print_config_changes(getattr(status, "pending_config_changes", ()), pending=True)
     _print_reports(status, details=details)
     if show_jobs:
         print(
@@ -873,6 +874,20 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
         print(f"Next: {status.next_action}")
 
 
+def _print_config_changes(changes, *, pending=False):
+    if not changes:
+        return
+    print("Pending configuration changes:" if pending else "Configuration changes applied:")
+    for change in changes:
+        old = json.dumps(change["before"], ensure_ascii=False)
+        new = json.dumps(change["after"], ensure_ascii=False)
+        print(f"  {change['field']}: {old} -> {new}")
+        print(f"    Applies to: {change['applies_to']}")
+    print("Existing jobs retain their submitted settings.")
+    if pending:
+        print("Stop the controller with --keep-jobs, then resume to apply these changes.")
+
+
 def _print_workflow_control(payload, *, json_output=False):
     if json_output:
         _print_json(payload)
@@ -895,6 +910,9 @@ def _print_workflow_control(payload, *, json_output=False):
     root = payload.get("project")
     if root:
         print(f"Path: {root}")
+    _print_config_changes(payload.get("config_changes", ()))
+    if payload.get("config_warning"):
+        print(f"Note: {payload['config_warning']}")
     if "total_model_generations" in payload:
         print(
             f"Sampling generation budget: {payload['previous_model_generations']} → "
