@@ -2882,7 +2882,7 @@ done
         state = observation.state
         exit_code = observation.exit_code
         if state in _ACTIVE:
-            return ExecutionStatus("running", state)
+            return ExecutionStatus("running", state + (f" on node {observation.nodes}" if observation.nodes else ""))
         if worker_status is not None and worker_status.state == "failed":
             scheduler_detail = f"Slurm {state} exit={exit_code}"
             detail = worker_status.detail
@@ -2903,7 +2903,7 @@ done
                 detail,
                 "out_of_memory" if state == "OUT_OF_MEMORY" else None,
             )
-        return ExecutionStatus("running", state)
+        return ExecutionStatus("running", state + (f" on node {observation.nodes}" if observation.nodes else ""))
 
     def inspect(self, handle: ExecutionHandle) -> ExecutionStatus:
         bundle = handle.remote_bundle or handle.local_bundle
@@ -2969,9 +2969,9 @@ if [ "${#numeric[@]}" -eq 0 ]; then
   exit 0
 fi
 csv=$(IFS=,; printf '%s' "${numeric[*]}")
-while IFS='|' read -r job_id state; do
-  [ -n "$job_id" ] && printf 'Q\t%s\t%s\n' "$job_id" "$state"
-done < <(squeue --noheader --jobs "$csv" --format '%A|%T' 2>/dev/null || true)
+while IFS='|' read -r job_id state nodes; do
+  [ -n "$job_id" ] && printf 'Q\t%s\t%s\t%s\n' "$job_id" "$state" "$nodes"
+done < <(squeue --noheader --jobs "$csv" --format '%A|%T|%N' 2>/dev/null || true)
 while IFS='|' read -r job_id state exit_code _rest; do
   [ -n "$job_id" ] && printf 'A\t%s\t%s\t%s\n' "$job_id" "$state" "$exit_code"
 done < <(sacct --noheader -X --parsable2 --jobs "$csv" --format 'JobIDRaw,State,ExitCode' 2>/dev/null || true)
@@ -2989,6 +2989,7 @@ done < <(sacct --noheader -X --parsable2 --jobs "$csv" --format 'JobIDRaw,State,
 
         worker_states: dict[int, str] = {}
         queue_states: dict[str, list[str]] = {}
+        queue_nodes: dict[str, set[str]] = {}
         account_states: dict[str, list[str]] = {}
         account_exits: dict[str, list[str]] = {}
         try:
@@ -2996,8 +2997,10 @@ done < <(sacct --noheader -X --parsable2 --jobs "$csv" --format 'JobIDRaw,State,
                 columns = line.split("\t")
                 if len(columns) == 3 and columns[0] == "W":
                     worker_states[int(columns[1])] = columns[2]
-                elif len(columns) == 3 and columns[0] == "Q":
+                elif len(columns) >= 3 and columns[0] == "Q":
                     queue_states.setdefault(columns[1], []).append(columns[2])
+                    if len(columns) > 3 and columns[3]:
+                        queue_nodes.setdefault(columns[1], set()).add(columns[3])
                 elif len(columns) >= 4 and columns[0] == "A":
                     account_states.setdefault(columns[1], []).append(columns[2])
                     account_exits.setdefault(columns[1], []).append(columns[3])
@@ -3025,7 +3028,7 @@ done < <(sacct --noheader -X --parsable2 --jobs "$csv" --format 'JobIDRaw,State,
             job_id = handle.execution_id
             queue_state = aggregate_states(queue_states.get(job_id, ()))
             if queue_state is not None:
-                observation = SlurmQuery(queue_state, source="squeue")
+                observation = SlurmQuery(queue_state, source="squeue", nodes=",".join(sorted(queue_nodes.get(job_id, ()))))
             else:
                 account_state = aggregate_states(
                     account_states.get(job_id, ())

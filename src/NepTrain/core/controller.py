@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -190,6 +191,8 @@ class RestartPlan:
     restarted_stages: tuple[str, ...]
     preserved_tasks: int = 0
     retried_tasks: int = 0
+    force: bool = False
+    unconfirmed_jobs: tuple[Mapping[str, Any], ...] = ()
 
 
 class PersistentController:
@@ -450,15 +453,15 @@ class PersistentController:
         return None
 
     def _attempt(self, generation: int, stage: str) -> int:
-        count = sum(
-            int(item.get("generation", -1)) == generation
-            and item.get("stage") == stage
+        attempts = [
+            int(item.get("attempt", 1))
             for item in self.state.get("history", [])
-        )
+            if int(item.get("generation", -1)) == generation and item.get("stage") == stage
+        ]
         current = self.state.get("current")
         if current and int(current.get("generation", -1)) == generation and current.get("stage") == stage:
-            return int(current.get("attempt", count + 1))
-        return count + 1
+            return int(current.get("attempt", max(attempts, default=0) + 1))
+        return max(attempts, default=0) + 1
 
     def _install_result(
         self,
@@ -1880,13 +1883,54 @@ class PersistentController:
             "cancelled",
         }
 
+    def _inspect_restart_current(self) -> dict[str, Any] | None:
+        """Refresh a copy only: previews never collect, cancel, submit, or save."""
+        current = deepcopy(self.state.get("current"))
+        if current is None:
+            return None
+        tasks = current.get("tasks", []) if current.get("kind") == "task_group" else [current]
+        pending: dict[str, list[dict[str, Any]]] = {}
+        for item in tasks:
+            if item.get("collected_bundle") or item.get("terminal_failure"):
+                continue
+            if item.get("observed_state") in {"completed", "failed", "cancelled"}:
+                continue
+            if item.get("handle") is not None:
+                pending.setdefault(self._task_target_key(item), []).append(item)
+        for items in pending.values():
+            try:
+                executor = self.executor_factory(self._task_target(items[0]))
+                handles = tuple(ExecutionHandle.from_mapping(item["handle"]) for item in items)
+                inspect_many = getattr(executor, "inspect_many", None)
+                statuses = tuple(inspect_many(handles)) if callable(inspect_many) else tuple(
+                    executor.inspect(handle) for handle in handles
+                )
+                if len(statuses) != len(items):
+                    raise ExecutionError("scheduler returned an incomplete job status response")
+            except ExecutionError as error:
+                statuses = tuple(ExecutionStatus("unknown", str(error)) for _ in items)
+            for item, status in zip(items, statuses):
+                item.update(observed_state=status.state, observed_at=_now(), detail=status.detail)
+        return current
+
     def plan_restart(
+        self, *, generation: int, from_stage: str,
+        task_scope: str = "failed", force: bool = False,
+    ) -> RestartPlan:
+        """Inspect execution state and preview a restart without writing anything."""
+        plan, _ = self._plan_restart(
+            generation=generation, from_stage=from_stage, task_scope=task_scope, force=force,
+        )
+        return plan
+
+    def _plan_restart(
         self,
         *,
         generation: int,
         from_stage: str,
         task_scope: str = "failed",
-    ) -> RestartPlan:
+        force: bool = False,
+    ) -> tuple[RestartPlan, dict[str, Any] | None]:
         """Validate and describe an explicit restart without changing state."""
 
         if task_scope not in {"failed", "all"}:
@@ -1939,7 +1983,8 @@ class PersistentController:
                 f"its next stage is {expected}"
             )
 
-        current = self.state.get("current")
+        current = self._inspect_restart_current()
+        unconfirmed = []
         preserved_tasks = 0
         retried_tasks = 0
         if current is not None:
@@ -1950,10 +1995,28 @@ class PersistentController:
                     "controller execution does not belong to the requested generation"
                 )
             if not self._current_execution_is_terminal(current):
-                raise ControllerError(
-                    "the current execution is not terminal; stop and reconcile its "
-                    "scheduler jobs before restarting"
-                )
+                tasks = current.get("tasks", []) if current.get("kind") == "task_group" else [current]
+                for item in tasks:
+                    if (item.get("collected_bundle") or item.get("terminal_failure")
+                            or item.get("observed_state") in {"completed", "failed", "cancelled"}):
+                        continue
+                    unconfirmed.append({
+                        "execution_id": (item.get("handle") or {}).get("execution_id"),
+                        "target": item.get("target"),
+                        "state": item.get("observed_state", "unknown"),
+                        "detail": item.get("detail", "execution has no confirmed terminal state"),
+                    })
+                if not force:
+                    details = "; ".join(
+                        f"job {job['execution_id'] or 'unknown'} on target {job['target']}: {job['detail']}"
+                        for job in unconfirmed[:8]
+                    )
+                    raise ControllerError(
+                        f"restart is waiting for {len(unconfirmed)} execution(s): {details}. "
+                        "Cancellation may still be cleaning up on the node. Retry after cleanup, "
+                        "or use --force to abandon these attempts and start in new directories. "
+                        "--force does not cancel old jobs; they may still consume resources."
+                    )
             if (
                 task_scope == "failed"
                 and current_stage == from_stage
@@ -1977,7 +2040,9 @@ class PersistentController:
             restarted_stages=tuple(sequence[start:]),
             preserved_tasks=preserved_tasks,
             retried_tasks=retried_tasks,
-        )
+            force=force,
+            unconfirmed_jobs=tuple(unconfirmed),
+        ), current
 
     def restart_from(
         self,
@@ -1985,18 +2050,19 @@ class PersistentController:
         generation: int,
         from_stage: str,
         task_scope: str = "failed",
+        force: bool = False,
     ) -> RestartPlan:
         """Restart the latest unfinished generation from a chosen stage."""
 
-        plan = self.plan_restart(
+        plan, current = self._plan_restart(
             generation=generation,
             from_stage=from_stage,
             task_scope=task_scope,
+            force=force,
         )
         generation_plan = next(
             item for item in self.plans if item.generation == generation
         )
-        current = self.state.get("current")
         retry_current_group = bool(
             task_scope == "failed"
             and current is not None
@@ -2012,8 +2078,14 @@ class PersistentController:
             )
         except IterationError as error:
             raise ControllerError(str(error)) from error
+        self.state["current"] = current
         if retry_current_group:
             assert current is not None
+            if plan.unconfirmed_jobs:
+                archived = deepcopy(current)
+                archived["abandoned_at"] = _now()
+                archived["abandoned_jobs"] = list(plan.unconfirmed_jobs)
+                self.state.setdefault("history", []).append(archived)
             for item in current["tasks"]:
                 if not item.get("collected_bundle"):
                     item["retryable"] = True
@@ -2023,13 +2095,16 @@ class PersistentController:
             return plan
 
         if current is not None:
-            archived = dict(current)
+            archived = deepcopy(current)
             archived["superseded_at"] = _now()
             archived["superseded_by"] = {
                 "generation": generation,
                 "from_stage": from_stage,
                 "task_scope": task_scope,
             }
+            if plan.unconfirmed_jobs:
+                archived["abandoned_at"] = _now()
+                archived["abandoned_jobs"] = list(plan.unconfirmed_jobs)
             self.state.setdefault("history", []).append(archived)
         self.state["current"] = None
         self.state["state"] = "idle"
@@ -2861,6 +2936,7 @@ def stop_workflow(
             "detail": status.detail,
         }
         result["current_execution"] = record
+        current.update(observed_state=status.state, observed_at=_now(), detail=status.detail)
         if status.state == "completed":
             controller.state["state"] = "stopped"
             controller.state["reason"] = (

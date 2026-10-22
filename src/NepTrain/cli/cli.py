@@ -932,6 +932,10 @@ def _print_workflow_control(payload, *, json_output=False):
     ):
         if key in payload:
             print(f"{label}: {', '.join(payload[key]) or 'none'}")
+    if payload.get("unconfirmed_jobs"):
+        print("Warning: old job exits are unconfirmed. Their results will not be used; old jobs may still consume resources.")
+        for job in payload["unconfirmed_jobs"]:
+            print(f"  Job {job['execution_id']} / {job['target']}: {job['detail']}")
     if "retried_tasks" in payload:
         print(
             f"Tasks: preserved {payload.get('preserved_tasks', 0)}, retried {payload['retried_tasks']}"
@@ -1098,6 +1102,7 @@ def run_restart_command(args):
             from_stage=args.from_stage,
             task_scope=args.tasks,
             dry_run=args.dry_run,
+            force=getattr(args, "force", False),
             foreground=args.foreground,
             poll_interval=args.poll_interval,
         )
@@ -2679,6 +2684,10 @@ def build_workflow_commands(subparsers):
         "--dry-run",
         action="store_true",
         help="Show the restart plan without changing workflow state.",
+    )
+    restart.add_argument(
+        "--force", action="store_true",
+        help="Abandon attempts whose exit is unconfirmed and use new task directories. Does not cancel old jobs; they may still consume resources.",
     )
     restart.add_argument("--foreground", action="store_true")
     restart.add_argument("--poll-interval", type=float)

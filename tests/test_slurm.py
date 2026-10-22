@@ -188,3 +188,16 @@ def test_shared_submission_parses_cluster_suffix_and_classifies_throttling():
         assert "QOSMaxSubmitJobPerUserLimit" in str(error)
     else:  # pragma: no cover - assertion explains the expected exception
         raise AssertionError("submission throttling was not classified")
+
+
+def test_completing_queue_state_takes_precedence_over_cancelled_accounting():
+    calls = []
+    def run(command):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "COMPLETING|node05\n", "")
+    result = query_job(run, "123")
+    assert result.state == "COMPLETING"
+    assert result.nodes == "node05"
+    assert result.source == "squeue"
+    assert len(calls) == 1
+    assert aggregate_states(["COMPLETING", "COMPLETED"]) == "COMPLETING"

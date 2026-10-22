@@ -208,6 +208,8 @@ neptrain workflow extend workflow 15
 
 Workflow control commands default to readable summaries; use `--json` for scripts. `extend workflow 15` sets the total sampling budget to 15; it does not add 15 generations. Follow the printed next action to start or resume.
 
+Before a stage restart, NepTrain refreshes unconfirmed job states. If a cluster fault leaves a job stuck in cleanup, `workflow restart ... --force` abandons that attempt and uses a new task directory; late results are ignored. Stop the controller first. Old jobs are not cancelled by this flag and may still consume resources. Add `--dry-run` to preview without changes; see the [recovery guide](docs/source/command/workflow.md).
+
 Workflow status shows the current stage, dataset growth, training progress, and
 MD progress as a ps range with readable-trajectory counts. It shows the latest
 three new-label evaluations, convergence thresholds and coverage gaps, plus plot

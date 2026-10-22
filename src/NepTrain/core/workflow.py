@@ -78,6 +78,8 @@ class WorkflowRestart:
     restarted_stages: tuple[str, ...]
     preserved_tasks: int = 0
     retried_tasks: int = 0
+    force: bool = False
+    unconfirmed_jobs: tuple[Mapping[str, Any], ...] = ()
     controller_pid: int | None = None
     controller_exit_code: int | None = None
 
@@ -2320,6 +2322,7 @@ def restart_workflow(
     from_stage: str,
     task_scope: str = "failed",
     dry_run: bool = False,
+    force: bool = False,
     foreground: bool = False,
     poll_interval: float | None = None,
 ) -> WorkflowRestart:
@@ -2341,19 +2344,19 @@ def restart_workflow(
             )
         try:
             controller = PersistentController(output)
-            plan = controller.plan_restart(
-                generation=generation,
-                from_stage=from_stage,
-                task_scope=task_scope,
-            )
             if dry_run:
+                plan = controller.plan_restart(
+                    generation=generation, from_stage=from_stage,
+                    task_scope=task_scope, force=force,
+                )
                 controller_result = None
                 action = "restart_preview"
             else:
-                controller.restart_from(
+                plan = controller.restart_from(
                     generation=generation,
                     from_stage=from_stage,
                     task_scope=task_scope,
+                    force=force,
                 )
                 controller.state["notification_start"] = {
                     "kind": "restarted", "generation": generation, "stage": from_stage,
@@ -2386,6 +2389,8 @@ def restart_workflow(
         restarted_stages=plan.restarted_stages,
         preserved_tasks=plan.preserved_tasks,
         retried_tasks=plan.retried_tasks,
+        force=plan.force,
+        unconfirmed_jobs=plan.unconfirmed_jobs,
         controller_pid=(
             None if dry_run or foreground else controller_result
         ),

@@ -339,6 +339,8 @@ neptrain workflow run workflow
 输出目录默认使用 `workflow.id`，也可用 `--output` 覆盖。Controller 默认脱离终端，
 不占计算节点，也不依赖 Slurm `afterok`。
 
+阶段重启前会刷新尚未确认退出的作业状态。集群故障导致作业一直停留在清理状态时，可在停止主控制器后用 `workflow restart ... --force` 放弃旧 attempt，新任务使用独立目录，旧结果不再合并。此选项不取消旧作业，也不保证释放资源；加 `--dry-run` 可只读预览。详见[恢复指南](docs/source/command/workflow.md)。
+
 日常控制：
 
 ```bash

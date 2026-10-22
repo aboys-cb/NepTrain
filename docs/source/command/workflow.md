@@ -535,8 +535,19 @@ neptrain workflow restart workflow \
 及其下游的已提交记录转入 `recovery_attempts`，当前执行转入 history，不会删除
 失败证据。若 current 是 `label` 或 `explore` task group，`--tasks failed` 保留
 已收集且校验通过的 shard，只为失败或未完成 shard 创建新 attempt；`--tasks all`
-则重建整组任务。仍有 scheduler 作业未终止时 restart 会拒绝执行，必须先 stop 并
-完成状态核对，避免重复提交。
+则重建整组任务。重启前会重新查询尚未确认终止的作业，不再只依赖保存的状态。
+仍在运行、清理或查询失败时，提示具体作业及查询结果；Slurm 能返回节点时也显示节点。
+
+集群故障导致取消长期停留在 `COMPLETING`，或无法确认旧任务退出时，可以显式使用 `--force` 放弃旧 attempt。旧任务记录和文件保留用于排查，新任务使用递增的 attempt、新任务标识和独立目录，旧任务迟到的结果不再用于当前流程。`--tasks failed` 仍保留已经收集的成功结果。
+
+```bash
+# Preview recovery from a stuck training job after stopping the controller.
+neptrain workflow restart workflow --generation 3 --from train --tasks all --force --dry-run
+# Apply the same recovery plan.
+neptrain workflow restart workflow --generation 3 --from train --tasks all --force
+```
+
+`--force` 不取消旧作业，也不保证释放其资源；它只解除对旧 attempt 的等待。仍须先停止主控制器，且不能绕过代次、阶段和科学输入校验。`--force --dry-run` 只查询并预览，不修改状态、不取消或提交作业。单独查看 `status --jobs` 仍使用缓存记录，不负责刷新 Slurm。
 
 `--from` 使用该 generation 的 ledger 中实际记录的 stage 名。新
 `active_learning_v4` 中 `evaluate` 表示“对新增标签评估旧模型”；旧

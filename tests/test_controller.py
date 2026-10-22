@@ -2252,8 +2252,9 @@ def test_controller_restart_archives_downstream_state_without_deleting_history(
     assert set(generation["recovery_attempts"][0]["stages"]) == {"select"}
 
 
+@pytest.mark.parametrize("force", [False, True])
 def test_controller_restart_label_retries_failed_tasks_and_preserves_successes(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, force
 ):
     config, initial = _controller_inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
@@ -2312,6 +2313,15 @@ def test_controller_restart_label_retries_failed_tasks_and_preserves_successes(
             },
         }
     )
+    if force:
+        item = controller.state["current"]["tasks"][1]
+        item.pop("terminal_failure")
+        item["observed_state"] = "running"
+        item["handle"] = {"task_id": "failed", "target": "label", "executor": "slurm",
+                          "execution_id": "123", "local_bundle": "failed-bundle"}
+        controller.executor_factory = lambda _: SimpleNamespace(
+            inspect=lambda _: ExecutionStatus("running", "COMPLETING on node test-node")
+        )
     controller._save()
 
     rebuilt = []
@@ -2328,6 +2338,7 @@ def test_controller_restart_label_retries_failed_tasks_and_preserves_successes(
         generation=1,
         from_stage="label",
         task_scope="failed",
+        force=force,
     )
 
     assert result.preserved_tasks == 1
@@ -2344,6 +2355,13 @@ def test_controller_restart_label_retries_failed_tasks_and_preserves_successes(
     assert current["tasks"][0]["collected_bundle"] == "ok-result"
     assert current["tasks"][1]["task_id"] == "failed-attempt-2"
     assert controller.state["state"] == "launching"
+
+    if force:
+        archived = controller.state["history"][-1]
+        assert archived["abandoned_jobs"][0]["execution_id"] == "123"
+        assert archived["tasks"][1]["task_id"] == "failed"
+        assert archived["tasks"][1]["handle"]["execution_id"] == "123"
+        assert current["tasks"][1]["handle"] is None
 
 
 def test_controller_restart_can_reopen_latest_rejected_generation(tmp_path):
@@ -5631,3 +5649,107 @@ def test_failed_first_tick_does_not_send_started_notification(tmp_path, monkeypa
     monkeypatch.setattr(PersistentController, 'tick', lambda *a, **k: ControllerTick('failed'))
     assert run_controller(prep.output_dir, poll_interval=0.2) == 2
     assert not events and progress == ['failed']
+
+
+class RestartProbeExecutor(ImmediateExecutor):
+    """No real jobs: release results explicitly to simulate a late worker."""
+    def __init__(self, target):
+        super().__init__(target, [])
+        self.tasks = []
+        self.inspected = []
+        self.collected = []
+        self.status = ExecutionStatus("running", "COMPLETING on node test-node")
+
+    def launch(self, task):
+        self.tasks.append(task)
+        return ExecutionHandle(task.task_id, task.target, "slurm", str(700 + len(self.tasks)), str(task.bundle))
+
+    def inspect(self, handle):
+        self.inspected.append(handle.task_id)
+        if isinstance(self.status, Exception):
+            raise self.status
+        return self.status
+
+    def collect(self, handle):
+        self.collected.append(handle.task_id)
+        return Path(handle.local_bundle)
+
+
+def _restart_probe(tmp_path):
+    config, initial = _controller_inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    executor = RestartProbeExecutor(None)
+    controller = PersistentController(preparation.output_dir, executor_factory=lambda _: executor)
+    controller.tick()
+    controller.state["state"] = "stopped"
+    controller.state["current"]["observed_state"] = "running"
+    controller._save()
+    return controller, executor
+
+
+@pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
+def test_restart_refreshes_stale_running_record(tmp_path, state):
+    controller, executor = _restart_probe(tmp_path)
+    executor.status = ExecutionStatus(state, "scheduler confirmed terminal")
+    original = controller.workspace.controller_file.read_bytes()
+    preview = controller.plan_restart(generation=1, from_stage="train")
+    assert not preview.unconfirmed_jobs
+    assert controller.workspace.controller_file.read_bytes() == original
+    assert controller.state["current"]["observed_state"] == "running"
+    controller.restart_from(generation=1, from_stage="train")
+    assert controller.state["current"] is None
+    assert controller.state["history"][-1]["observed_state"] == state
+    assert len(executor.tasks) == 1  # Planning/applying does not launch work.
+
+
+@pytest.mark.parametrize("status", [
+    ExecutionStatus("running", "COMPLETING on node test-node"),
+    ExecutionStatus("unknown", "squeue and sacct unavailable"),
+    ExecutionError("scheduler connection lost"),
+])
+def test_restart_unconfirmed_requires_force_and_preview_is_read_only(tmp_path, status):
+    controller, executor = _restart_probe(tmp_path)
+    executor.status = status
+    before = {p: p.read_bytes() for p in (controller.workspace.controller_file, controller.workspace.ledger)}
+    with pytest.raises(ControllerError, match=r"job 701.*--force"):
+        controller.restart_from(generation=1, from_stage="train")
+    preview = controller.plan_restart(generation=1, from_stage="train", force=True)
+    assert preview.unconfirmed_jobs[0]["execution_id"] == "701"
+    assert {p: p.read_bytes() for p in before} == before
+    assert not executor.collected
+    controller.restart_from(generation=1, from_stage="train", force=True)
+    archived = controller.state["history"][-1]
+    assert archived["abandoned_jobs"][0]["execution_id"] == "701"
+    assert archived["abandoned_at"]
+    assert controller.state["current"] is None
+
+
+def test_force_restart_ignores_late_old_result_and_uses_distinct_bundle(tmp_path):
+    controller, executor = _restart_probe(tmp_path)
+    old_task = executor.tasks[0]
+    # Prior grouped retries can leave a high attempt number with few history rows.
+    controller.state["current"]["attempt"] = 7
+    controller.restart_from(generation=1, from_stage="train", force=True)
+    controller.tick()
+    new_task = executor.tasks[-1]
+    assert new_task.bundle != old_task.bundle
+    assert new_task.task_id != old_task.task_id
+    assert controller.state["current"]["attempt"] == 8
+    ImmediateExecutor.launch(executor, old_task)  # Old worker returns after detachment.
+    ImmediateExecutor.launch(executor, new_task)
+    executor.status = ExecutionStatus("completed", "worker result complete")
+    executor.inspected.clear()
+    controller.tick()
+    assert executor.inspected == [new_task.task_id]
+    assert executor.collected == [new_task.task_id]
+    assert (old_task.bundle / "result.json").is_file()  # Diagnostic evidence retained.
+    ledger = json.loads(controller.workspace.ledger.read_text())
+    assert "train" in ledger["generations"]["1"]["stages"]
+
+
+def test_force_does_not_bypass_generation_or_stage_rules(tmp_path):
+    controller, _ = _restart_probe(tmp_path)
+    with pytest.raises(ControllerError, match="has not started"):
+        controller.restart_from(generation=9, from_stage="train", force=True)
+    with pytest.raises(ControllerError, match="has not reached"):
+        controller.restart_from(generation=1, from_stage="label", force=True)

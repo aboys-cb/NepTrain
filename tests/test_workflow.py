@@ -1116,6 +1116,7 @@ def test_restart_command_exposes_explicit_stage_and_task_scope(
             "from_stage": "label",
             "task_scope": "failed",
             "dry_run": True,
+            "force": True,
             "foreground": False,
             "poll_interval": None,
         }
@@ -1129,6 +1130,7 @@ def test_restart_command_exposes_explicit_stage_and_task_scope(
             from_stage="label",
             tasks="failed",
             dry_run=True,
+            force=True,
             foreground=False,
             poll_interval=None,
         )
@@ -1149,7 +1151,8 @@ def test_restart_command_exposes_explicit_stage_and_task_scope(
     assert "controller_pid" not in payload
 
 
-def test_restart_dry_run_does_not_change_ledger_or_controller_state(tmp_path: Path):
+@pytest.mark.parametrize("force", [False, True])
+def test_restart_dry_run_does_not_change_ledger_or_controller_state(tmp_path: Path, force):
     config, initial = _inputs(tmp_path)
     preparation = prepare_workflow(config, initial, tmp_path / "workflow")
     workspace = WorkflowWorkspace.locate(preparation.output_dir)
@@ -1199,6 +1202,7 @@ def test_restart_dry_run_does_not_change_ledger_or_controller_state(tmp_path: Pa
         generation=1,
         from_stage="label",
         dry_run=True,
+        force=force,
     )
 
     assert result.action == "restart_preview"
@@ -2063,3 +2067,11 @@ def test_extend_accepts_launch_script_edits(tmp_path):
     assert not workflow_status(prep.output_dir).pending_config_changes
     updated = json.loads(prep.manifest.read_text())
     assert updated['config_updates'][-1]['launch_inputs_before']
+
+
+def test_force_restart_still_requires_a_stopped_controller(tmp_path, monkeypatch):
+    config, initial = _inputs(tmp_path)
+    preparation = prepare_workflow(config, initial, tmp_path / "workflow")
+    monkeypatch.setattr("NepTrain.core.controller.controller_running", lambda _: True)
+    with pytest.raises(WorkflowError, match="workflow is running"):
+        restart_workflow(preparation.output_dir, generation=1, from_stage="train", force=True)

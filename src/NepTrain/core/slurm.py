@@ -90,6 +90,7 @@ class SlurmQuery:
     exit_code: str = ""
     source: str | None = None
     error: str | None = None
+    nodes: str = ""
 
 
 SchedulerRunner = Callable[
@@ -123,8 +124,10 @@ def aggregate_states(states: Sequence[str]) -> str | None:
     values = [normalize_state(value) for value in states if value.strip()]
     if not values:
         return None
-    if any(value in {"RUNNING", "COMPLETING"} for value in values):
+    if "RUNNING" in values:
         return "RUNNING"
+    if "COMPLETING" in values:
+        return "COMPLETING"
     if any(value in ACTIVE_STATES for value in values):
         return "PENDING"
     failures = [value for value in values if value in FAILURE_STATES]
@@ -263,13 +266,15 @@ def query_job(run: SchedulerRunner, job_id: str | None) -> SlurmQuery:
             "--jobs",
             selected_id,
             "--format",
-            "%T",
+            "%T|%N",
         ]
     )
     if queue.returncode == 0:
-        state = aggregate_states(queue.stdout.splitlines())
+        rows = [line.split("|", 1) for line in queue.stdout.splitlines() if line.strip()]
+        state = aggregate_states([row[0] for row in rows])
         if state is not None:
-            return SlurmQuery(state, source="squeue")
+            nodes = ",".join(sorted({row[1].strip() for row in rows if len(row) > 1 and row[1].strip()}))
+            return SlurmQuery(state, source="squeue", nodes=nodes)
 
     account = run(
         [
