@@ -3388,16 +3388,27 @@ def test_md_wave_retry_preserves_completed_attempts(tmp_path):
     )
     assert failed_task["terminal_failure"] is True
     assert completed_task["collected_bundle"]
+    # The initial MD wave submits in parallel; either launch order is valid.
+    assert sorted(
+        target for stage, target in launches if stage == "explore"
+    ) == ["md", "md2"]
+    launches_before_retry = len(launches)
+    completed_task_id = completed_task["task_id"]
+    completed_bundle = completed_task["collected_bundle"]
+    failed_task_id = failed_task["task_id"]
 
     controller.retry()
+    assert completed_task["task_id"] == completed_task_id
+    assert completed_task["collected_bundle"] == completed_bundle
+    assert failed_task["task_id"] != failed_task_id
     controller.tick()
     controller.tick()
 
     assert [
         target
-        for stage, target in launches
+        for stage, target in launches[launches_before_retry:]
         if stage == "explore"
-    ] == ["md", "md2", "md2"]
+    ] == ["md2"]
     ledger = json.loads(
         (preparation.output_dir / ".neptrain/ledger.json").read_text()
     )
