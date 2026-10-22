@@ -9,6 +9,7 @@ from typing import Iterable
 
 import numpy as np
 from ase import Atoms
+from ase.data import atomic_numbers
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
@@ -116,6 +117,47 @@ def validate_spin_structure(atoms: Atoms, *, require_mforce: bool) -> bool:
                 "unconstrained mforce entries must be zero constraint multipliers"
             )
     return True
+
+
+def validate_constrained_elements(elements) -> None:
+    """Validate the optional project default without inferring model semantics."""
+    if elements is None:
+        return
+    if (
+        not isinstance(elements, list)
+        or not elements
+        or any(
+            not isinstance(symbol, str) or symbol not in atomic_numbers or symbol == "X"
+            for symbol in elements
+        )
+        or len(set(elements)) != len(elements)
+    ):
+        raise SpinDataError(
+            "labeling.constrained_elements must be a nonempty list of unique "
+            "element symbols, for example [Fe, Co]"
+        )
+
+
+def apply_constraint_elements(atoms: Atoms, elements) -> Atoms:
+    """Apply project defaults to a copy; an explicit site mask remains authoritative."""
+    validate_constrained_elements(elements)
+    if elements is None:
+        return atoms
+    if not validate_spin_structure(atoms, require_mforce=False):
+        raise SpinDataError("labeling.constrained_elements requires spin:R:3 input")
+    if "spin_active" in atoms.arrays:
+        return atoms
+    active = np.isin(atoms.get_chemical_symbols(), elements).astype(int)
+    if not active.any():
+        raise SpinDataError(
+            "labeling.constrained_elements matches no atoms in this structure; "
+            "choose elements present in the structure or supply spin_active"
+        )
+    frame = atoms.copy()
+    # Labels from an earlier calculation do not describe the new constraints.
+    frame.arrays.pop(MFORCE_KEY, None)
+    frame.set_array("spin_active", active)
+    return frame
 
 
 def prepare_spin_for_dft(atoms: Atoms) -> bool:

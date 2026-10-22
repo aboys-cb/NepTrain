@@ -7,6 +7,7 @@ from ase.io import read, write
 
 from NepTrain.core.spin import (
     SpinDataError,
+    apply_constraint_elements,
     canonicalize_spin_arrays,
     collect_mforce_from_results,
     prepare_spin_for_dft,
@@ -15,6 +16,43 @@ from NepTrain.core.spin import (
     spin_to_lammps,
     validate_spin_dataset,
 )
+
+
+def test_element_constraints_include_zero_targets_and_exclude_induced_moments():
+    atoms = Atoms("FeOY")
+    atoms.set_array("spin", np.array([[0., 0, 0], [0, .04, 0], [0, 0, .001]]))
+    atoms.set_array("mforce", np.ones((3, 3)))
+    frame = apply_constraint_elements(atoms, ["Fe"])
+    np.testing.assert_array_equal(spin_constraint_mask(frame), [1, 0, 0])
+    np.testing.assert_array_equal(frame.arrays["spin"], atoms.arrays["spin"])
+    assert "mforce" not in frame.arrays
+    assert "spin_active" not in atoms.arrays
+    assert "mforce" in atoms.arrays
+
+
+def test_explicit_site_constraints_override_element_defaults():
+    atoms = Atoms("Fe2O")
+    atoms.set_array("spin", np.zeros((3, 3)))
+    atoms.set_array("spin_active", np.array([1, 0, 0]))
+    frame = apply_constraint_elements(atoms, ["Fe", "O"])
+    np.testing.assert_array_equal(spin_constraint_mask(frame), [1, 0, 0])
+
+
+def test_missing_element_defaults_preserve_legacy_mask_inference():
+    atoms = Atoms("FeO")
+    atoms.set_array("spin", np.array([[0., 0, 2], [0, 0, 0]]))
+    frame = apply_constraint_elements(atoms, None)
+    assert "spin_active" not in frame.arrays
+    np.testing.assert_array_equal(spin_constraint_mask(frame), [1, 0])
+
+
+def test_element_constraints_require_spin_and_a_matching_site():
+    atoms = Atoms("FeO")
+    with pytest.raises(SpinDataError, match="requires spin"):
+        apply_constraint_elements(atoms, ["Fe"])
+    atoms.set_array("spin", np.zeros((2, 3)))
+    with pytest.raises(SpinDataError, match="matches no atoms"):
+        apply_constraint_elements(atoms, ["Co"])
 
 
 def test_constraint_mask_defaults_to_exactly_nonzero_targets():

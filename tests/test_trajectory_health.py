@@ -69,6 +69,21 @@ def test_force_spike_marks_successful_process_as_unhealthy():
     assert "max_force" not in report.unavailable_thresholds
 
 
+@pytest.mark.parametrize("key", ["nep_mforce", "mforce"])
+def test_predicted_and_legacy_magnetic_force_health(key):
+    frames = _frames(3)
+    for frame in frames:
+        frame.set_array(key, np.zeros((2, 3)))
+    frames[2].arrays[key][0, 0] = 101.
+    report = classify_trajectory(
+        frames, frames[0], process_completed=True,
+        policy=TrajectoryHealthPolicy(max_mforce=100.),
+    )
+    assert report.first_bad_step == 20
+    assert report.reason_codes == ("max_mforce_above_limit",)
+    assert "max_mforce" not in report.unavailable_thresholds
+
+
 def test_nonzero_exit_without_physical_anomaly_uses_fallback_tail_window():
     frames = _frames()
 

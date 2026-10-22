@@ -152,7 +152,6 @@ def run_native_abacus(
     forces = _restore_atom_order(parsed.forces, ordered_indices)
     frame = input_frame.copy()
     frame.arrays.pop("initial_magmoms", None)
-    frame.arrays.pop("spin_active", None)
     frame.calc = SinglePointCalculator(
         frame,
         energy=parsed.energy,
@@ -165,6 +164,7 @@ def run_native_abacus(
     frame.info["Weight"] = 1.0
     frame.info["dft_electronic_mode"] = electronic_mode
     if spin_frame:
+        frame.set_array("spin_active", active.astype(int))
         magnetization = _restore_atom_order(
             parsed.magnetization, ordered_indices
         )

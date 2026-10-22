@@ -335,6 +335,24 @@ route 指纹由 route id、模板内容哈希、结构输入内容哈希、规�
 progression 共同生成。场景身份还包含具体结构哈希、温度、压强和采样模型哈希。
 因此修改模板或 route 条件后不能复用旧结果；完全相同的配置和内容可以确定性恢复。
 
+## DFT 磁矩约束元素
+
+VASP DeltaSpin 和 ABACUS 自旋标注可以在项目中统一指定约束元素。例如 YIG 只约束 Fe：
+
+```yaml
+labeling:
+  backend: abacus
+  constrained_elements: [Fe]
+```
+
+`constrained_elements` 是非空、无重复的元素符号列表。列表中的原子三个磁矩分量都受约束，包括目标磁矩为零的原子；未列出的元素不施加约束，即使它们存在非零感应磁矩。目标数值仍来自每帧的 `spin:R:3`，这个字段不会修改磁矩，也不替代自旋 DFT 输入模板。
+
+逐原子 `spin_active:I:1` 优先于元素列表，适用于同种元素只有部分位点受约束的情况。不设置元素列表时兼容原有行为：优先使用逐原子掩码；VASP 其次使用 INCAR 的 `DELTASPIN_ATOMS`；没有掩码时按输入磁矩是否严格非零判断，不设大小阈值。元素列表不从 `nep.in` 推断，训练模型的 `spin_dof_type`、`spin_env_type` 与 DFT 约束应分别按物理问题设置。
+
+此设置同时用于 workflow 和 `neptrain label --project project.yaml`。DFT 输出保留实际约束掩码，LAMMPS 轨迹按原子 ID 传递它；若要改变已有结构的约束策略，也需修改或删除其 `spin_active`。未配置此字段的旧项目无需迁移，仍使用 schema 8。它改变物理标注设置，不属于队列或资源参数调整，已有 workflow 应按科学输入变更处理。
+
+LAMMPS 输出的模型磁性力保存为 `nep_mforce`，继续用于轨迹健康检查；DFT 的 `mforce` 保存实际约束乘子。两者分开，避免把未约束位点上的模型预测误判成非法 DFT 标签。
+
 ## 第一性原理标注与 k 点
 
 默认让用户输入文件管理 k 点：

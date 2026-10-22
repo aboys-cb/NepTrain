@@ -52,6 +52,7 @@ _FIELDS: dict[str, set[str]] = {
     },
     "labeling": {
         "backend",
+        "constrained_elements",
         "gamma_centered",
         "input_path",
         "resource_path",
@@ -547,6 +548,14 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError(
                 "labeling.precision must be float32 or float64"
             )
+    from .spin import SpinDataError, validate_constrained_elements
+
+    try:
+        validate_constrained_elements(labeling.get("constrained_elements"))
+    except SpinDataError as error:
+        raise ConfigError(str(error)) from error
+    if labeling.get("constrained_elements") is not None and backend not in {"vasp", "abacus"}:
+        raise ConfigError("labeling.constrained_elements requires the vasp or abacus backend")
     kpoint_mode = labeling.get("kpoint_mode", "auto")
     if backend in {"vasp", "abacus"} and kpoint_mode not in {
         "auto",

@@ -2876,6 +2876,7 @@ def test_workflow_label_routes_production_dft_through_label_interface(
         "input_path": str(input_file),
         "resource_path": str(resource_dir),
         "gamma_centered": True,
+        "constrained_elements": ["Fe"],
     }
     if kpoint_mode == "kpoints":
         dft_options.update(kpoint_mode="kpoints", kpoints=[2, 3, 4])
@@ -2916,6 +2917,7 @@ def test_workflow_label_routes_production_dft_through_label_interface(
     assert request.settings["resource_dir"] == resource_dir
     assert request.settings["n_cpu"] == 4
     assert request.settings["use_gamma"] is True
+    assert request.settings["constrained_elements"] == ["Fe"]
     assert request.settings["kpoint_mode"] == kpoint_mode
     assert request.settings["ka"] == (
         (2, 3, 4) if kpoint_mode == "kpoints" else (1, 1, 1)

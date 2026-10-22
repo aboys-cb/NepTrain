@@ -572,6 +572,8 @@ Properties=species:S:1:pos:R:3:spin:R:3:mforce:R:3
   energy/force/virial 标签；不会把共线磁计算伪装成 `spin/mforce` 数据。
 - VASP 6 DeltaSpin 与 ABACUS DeltaSpin 支持全矢量约束并读取最终磁矩和 mforce。
   VASP 的初始化命令、INCAR 和输出要求见 [VASP DeltaSpin](docs/source/command/vasp-deltaspin.md)。
+
+自旋 DFT 标注可在项目中设置 `labeling.constrained_elements: [Fe]`；逐原子 `spin_active` 掩码优先。详见[约束规则](docs/source/command/workflow.md)。
 - LAMMPS DynSpin dump 根据 `compute property/atom` 定义解析，不写死
   `c_spin[n]` 的意义。
 

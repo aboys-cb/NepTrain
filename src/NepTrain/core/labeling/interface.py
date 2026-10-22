@@ -88,6 +88,7 @@ def _dft_namespace(request: LabelRequest):
             else None
         ),
         n_cpu=int(settings.get("n_cpu", 1)),
+        constrained_elements=settings.get("constrained_elements"),
         use_gamma=bool(settings.get("use_gamma", False)),
         kpoint_mode=str(settings.get("kpoint_mode", "auto")),
         kspacing=settings.get("kspacing"),

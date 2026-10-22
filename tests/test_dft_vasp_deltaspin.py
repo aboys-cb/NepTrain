@@ -140,7 +140,7 @@ def test_ordinary_vasp_still_rejects_spin_input(tmp_path):
 
 @pytest.mark.parametrize("missing_mforce", [False, True])
 @pytest.mark.parametrize("template_magmom", [None, "0 0 4 0 0 0.5 0 0 5"])
-@pytest.mark.parametrize("partial", [False, True, "auto"])
+@pytest.mark.parametrize("partial", [False, True, "auto", "project"])
 def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, missing_mforce, template_magmom, partial):
     monkeypatch.delenv("NEPTRAIN_VASP_COMMAND", raising=False)
     atoms = Atoms("FeAlFe", positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]], cell=[6, 6, 6], pbc=True)
@@ -149,7 +149,7 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
         spin[1] = [0.025, 0, 0]  # Unconstrained initial moments may be nonzero.
         if partial == "auto":
             spin[1] = 0
-        else:
+        elif partial is True:
             atoms.set_array("spin_active", np.asarray([1, 0, 1]))
     atoms.set_array("spin", spin)
     atoms.set_initial_magnetic_moments(np.full((3, 3), 9.0))
@@ -162,9 +162,13 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
         incar += "MAGMOM=" + template_magmom + "\n"
     incar += "M_DELTASPIN = 9*99\n"  # Each sampled input owns its targets.
     incar += "SCF_CUDA_NCL_GGA_MODE = 1\n"
-    if partial is True:
+    if partial is True or partial == "project":
         incar += "DELTASPIN_ATOMS = 2*0 2*1 6*0\n"  # Stale primitive mask must be replaced.
     request = _request(tmp_path, atoms, incar)
+    if partial == "project":
+        request.settings["constrained_elements"] = ["Fe"]
+    elif partial is True:
+        request.settings["constrained_elements"] = ["Al"]  # Explicit mask wins.
 
     class ReplayVasp(VaspInput):
         def _run(self, **kwargs):
@@ -219,7 +223,8 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
     if partial:
         expected_spin[1] = 0.039
     np.testing.assert_array_equal(frame.arrays["spin"], expected_spin)
-    assert not {"spin_active", "spin_projected", "initial_magmoms"} & frame.arrays.keys()
+    assert not {"spin_projected", "initial_magmoms"} & frame.arrays.keys()
+    np.testing.assert_array_equal(frame.arrays["spin_active"], [1, 0 if partial else 1, 1])
     np.testing.assert_array_equal(frame.arrays["mforce"], [[1, -1, 2], [0, 0, 0] if partial else [3, -3, 6], [2, -2, 4]])
     np.testing.assert_array_equal(frame.get_forces(), [[1, 2, 3], [7, 8, 9], [4, 5, 6]])
     assert frame.info["dft_electronic_mode"] == "deltaspin"

@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from ase import Atoms
 from ase.calculators.lammps.coordinatetransform import Prism
 from ase.io import read as ase_read
@@ -18,6 +19,7 @@ from NepTrain.core.md.lammps import (
     write_lammps_data,
 )
 from NepTrain.core.md import MdRequest, run_md
+from NepTrain.core.spin import validate_spin_structure
 
 
 def test_compute_property_order_drives_dump_meaning():
@@ -28,6 +30,35 @@ def test_compute_property_order_drives_dump_meaning():
     assert columns["c_spin[2]"] == "spx"
     assert columns["c_spin[4]"] == "spz"
     assert columns["c_spin[7]"] == "fmz"
+
+
+@pytest.mark.parametrize("ids", [(2, 1), (2, 2), (3, 1)])
+def test_dump_preserves_site_constraints_by_atom_id(tmp_path, ids):
+    reference = Atoms("FeO", cell=[4, 4, 4], pbc=True)
+    reference.set_array("spin", np.array([[0., 0, 2], [0, 0, .04]]))
+    reference.set_array("spin_active", np.array([1, 0]))
+    dump = tmp_path / "traj.dump"
+    dump.write_text(
+        "ITEM: TIMESTEP\n10\nITEM: NUMBER OF ATOMS\n2\n"
+        "ITEM: BOX BOUNDS pp pp pp\n0 4\n0 4\n0 4\n"
+        "ITEM: ATOMS id type x y z sp spx spy spz fmx fmy fmz\n"
+        f"{ids[0]} 2 2 2 2 0.04 0 0 1 .1 .2 .3\n"
+        f"{ids[1]} 1 0 0 0 2 0 0 1 .4 .5 .6\n"
+    )
+    from NepTrain.core.md.lammps import LammpsError
+    if ids != (2, 1):
+        with pytest.raises(LammpsError, match="cannot restore spin_active"):
+            read_lammps_dump(dump, Prism(reference.cell), ("Fe", "O"), spin=True, reference_atoms=reference)
+        return
+    frame = read_lammps_dump(dump, Prism(reference.cell), ("Fe", "O"), spin=True, reference_atoms=reference)[0]
+    np.testing.assert_array_equal(frame.arrays["spin_active"], [1, 0])
+    assert frame.get_chemical_symbols() == ["Fe", "O"]
+    np.testing.assert_allclose(frame.arrays["nep_mforce"][1], [.1, .2, .3])
+    assert "mforce" not in frame.arrays  # Model predictions are not DFT multipliers.
+    assert validate_spin_structure(frame, require_mforce=False)
+    path = tmp_path / "trajectory.xyz"
+    ase_write(path, frame, format="extxyz")
+    np.testing.assert_array_equal(ase_read(path).arrays["spin_active"], [1, 0])
 
 
 def test_custom_template_receives_route_variables_without_ensemble_inference(
@@ -148,7 +179,7 @@ ITEM: ATOMS id type x y z c_spin[1] c_spin[2] c_spin[3] c_spin[4] c_spin[5] c_sp
         property_columns=mapping,
     )
     np.testing.assert_allclose(frames[0].arrays["spin"], [[1.5, 2.0, 0.0]])
-    np.testing.assert_allclose(frames[0].arrays["mforce"], [[0.1, 0.2, 0.3]])
+    np.testing.assert_allclose(frames[0].arrays["nep_mforce"], [[0.1, 0.2, 0.3]])
     assert frames[0].info["lammps_step"] == 100
 
 

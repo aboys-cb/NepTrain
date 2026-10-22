@@ -55,6 +55,7 @@ sampling:
     novelty: auto
 labeling:
   backend: vasp
+  constrained_elements: [Fe]
   input_path: ./INCAR
   resource_path: /REPLACE/WITH/YOUR/potpaw_PBE
   potcar_manifest_path: ./vasp-resources.json

@@ -8,11 +8,13 @@ from ase.io import write as ase_write
 from rich.progress import track
 
 from ...structures import read_structures
+from ...spin import apply_constraint_elements
 from .io import read_input_file
 from .native import NativeAbacusRequest, run_native_abacus
 
 
 def calculate_abacus(atoms: Atoms, args, *, case_index: int = 1):
+    atoms = apply_constraint_elements(atoms, getattr(args, "constrained_elements", None))
     resource_dir = Path(getattr(args, "resource_dir", None) or "./").resolve()
     raw_manifest = getattr(args, "resource_manifest", None)
     resource_manifest = (

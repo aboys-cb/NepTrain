@@ -157,7 +157,10 @@ def run_native_vasp(
     if magnetic_result is not None:
         frame.set_array("spin", magnetic_result.projected[resort])
         frame.set_array("mforce", magnetic_result.mforce[resort])
-        for key in ("spin_active", "initial_magmoms", "spin_projected"):
+        frame.set_array(
+            "spin_active", deltaspin.numbers(params["deltaspin_atoms"]).astype(int)[resort]
+        )
+        for key in ("initial_magmoms", "spin_projected"):
             frame.arrays.pop(key, None)
         for key in ("spin_model", "inactive_spin_semantics", "inactive_mforce_semantics",
                     "induced_moment_print_precision_muB"):

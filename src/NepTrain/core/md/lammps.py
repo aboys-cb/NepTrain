@@ -247,6 +247,7 @@ def read_lammps_dump(
     spin: bool,
     property_columns: Mapping[str, str] | None = None,
     allow_incomplete_tail: bool = False,
+    reference_atoms: Atoms | None = None,
 ) -> list[Atoms]:
     if not path.is_file():
         raise LammpsError(f"LAMMPS dump does not exist: {path}")
@@ -325,12 +326,20 @@ def read_lammps_dump(
             magnitude = np.asarray([float(row[index["sp"]]) for row in rows])
             physical_spin = spin_from_lammps(direction, magnitude)
             frame.set_array(SPIN_KEY, prism.vector_to_ase(physical_spin))
+            if reference_atoms is not None and "spin_active" in reference_atoms.arrays:
+                ids = [int(row[index["id"]]) for row in rows]
+                if (
+                    ids != list(range(1, len(reference_atoms) + 1))
+                    or symbols != reference_atoms.get_chemical_symbols()
+                ):
+                    raise LammpsError("cannot restore spin_active: dump atom IDs or elements changed")
+                frame.set_array("spin_active", reference_atoms.arrays["spin_active"].copy())
             mforce_columns = ("fmx", "fmy", "fmz")
             if all(name in index for name in mforce_columns):
                 mforces = np.asarray(
                     [[float(row[index[name]]) for name in mforce_columns] for row in rows]
                 )
-                frame.set_array("mforce", prism.vector_to_ase(mforces))
+                frame.set_array("nep_mforce", prism.vector_to_ase(mforces))
         frames.append(frame)
         cursor = frame_end
     if not frames:
@@ -495,6 +504,7 @@ def run_lammps(
             spin=spin,
             property_columns=compute_property_columns(rendered_input),
             allow_incomplete_tail=not run_completed,
+            reference_atoms=atoms,
         )
     except LammpsError as error:
         if run_completed:

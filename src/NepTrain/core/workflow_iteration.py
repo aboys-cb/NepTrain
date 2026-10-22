@@ -2301,6 +2301,7 @@ class WorkflowIterationAdapter:
                         else None
                     ),
                     "ka": self._labeling_kpoints(options),
+                    "constrained_elements": options.get("constrained_elements"),
                     "model_file": self._optional_path(
                         options.get("model_path")
                     ),

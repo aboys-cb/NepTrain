@@ -1180,3 +1180,21 @@ msgstr "Configuration snapshots are stored under `.neptrain/configurations/`, an
 
 msgid "TorchNEP 训练会按任务内可见 GPU 数自动启用单节点多卡 DDP；训练 target 只需申请相应的 `gpus_per_node`，保留 `--nodes=1` 和 `--ntasks=1`。批量语义、单卡选择和环境要求见[独立步骤中的训练说明](manual.md)。"
 msgstr "TorchNEP training automatically enables single-node multi-GPU DDP according to the GPUs visible inside the task. Request the desired `gpus_per_node` on the training target and keep `--nodes=1` and `--ntasks=1`. See [the standalone training instructions](manual.md) for batch semantics, single-device selection, and environment requirements."
+
+msgid "DFT 磁矩约束元素"
+msgstr "Elements with DFT moment constraints"
+
+msgid "VASP DeltaSpin 和 ABACUS 自旋标注可以在项目中统一指定约束元素。例如 YIG 只约束 Fe："
+msgstr "For VASP DeltaSpin and ABACUS spin labeling, set the constrained elements in the project. For example, constrain only Fe in YIG:"
+
+msgid "`constrained_elements` 是非空、无重复的元素符号列表。列表中的原子三个磁矩分量都受约束，包括目标磁矩为零的原子；未列出的元素不施加约束，即使它们存在非零感应磁矩。目标数值仍来自每帧的 `spin:R:3`，这个字段不会修改磁矩，也不替代自旋 DFT 输入模板。"
+msgstr "`constrained_elements` is a nonempty list of unique element symbols. All three moment components are constrained on listed elements, including zero targets. Unlisted elements remain unconstrained even when their induced moments are nonzero. Targets still come from each frame’s `spin:R:3`; this setting neither changes moments nor replaces the spin DFT input template."
+
+msgid "逐原子 `spin_active:I:1` 优先于元素列表，适用于同种元素只有部分位点受约束的情况。不设置元素列表时兼容原有行为：优先使用逐原子掩码；VASP 其次使用 INCAR 的 `DELTASPIN_ATOMS`；没有掩码时按输入磁矩是否严格非零判断，不设大小阈值。元素列表不从 `nep.in` 推断，训练模型的 `spin_dof_type`、`spin_env_type` 与 DFT 约束应分别按物理问题设置。"
+msgstr "A per-atom `spin_active:I:1` mask takes precedence over the element list and can select only some sites of the same element. Omitting the list preserves existing behavior: use the per-atom mask first, then VASP’s INCAR `DELTASPIN_ATOMS` if present; otherwise constrain exactly nonzero input moments, with no magnitude threshold. The element list is not inferred from `nep.in`. Set the model’s `spin_dof_type` and `spin_env_type` and the DFT constraints according to their separate physical roles."
+
+msgid "此设置同时用于 workflow 和 `neptrain label --project project.yaml`。DFT 输出保留实际约束掩码，LAMMPS 轨迹按原子 ID 传递它；若要改变已有结构的约束策略，也需修改或删除其 `spin_active`。未配置此字段的旧项目无需迁移，仍使用 schema 8。它改变物理标注设置，不属于队列或资源参数调整，已有 workflow 应按科学输入变更处理。"
+msgstr "This setting applies to both workflows and `neptrain label --project project.yaml`. DFT output retains the actual constraint mask, and LAMMPS trajectories pass it through by atom ID. Update or remove existing `spin_active` arrays when changing a structure’s constraint policy. Existing projects without this field need no migration and remain on schema 8. This changes physical labeling settings, not queue or resource settings; treat it as a scientific input change for an existing workflow."
+
+msgid "LAMMPS 输出的模型磁性力保存为 `nep_mforce`，继续用于轨迹健康检查；DFT 的 `mforce` 保存实际约束乘子。两者分开，避免把未约束位点上的模型预测误判成非法 DFT 标签。"
+msgstr "LAMMPS stores predicted magnetic forces as `nep_mforce`, which remains available to trajectory health checks. DFT `mforce` stores the actual constraint multipliers. Keeping them separate prevents model predictions on unconstrained sites from being mistaken for invalid DFT labels."

@@ -39,9 +39,9 @@ labeling:
 
 `LDELTASPIN=.TRUE.` 开启约束，`LNONCOLLINEAR=.TRUE.` 开启三分量磁矩。标注保持固定结构，要求 `IBRION=-1`、`NSW=0`；当前接口使用 `SAXIS=0 0 1`，输入和输出的自旋坐标因此与结构笛卡尔坐标一致。
 
-`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。默认只约束输入磁矩非零的原子，也支持用掩码明确指定需要约束的原子。`DELTASPIN_COMPONENTS` 为 `1 1 1`；部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。
+`M_DELTASPIN` 由每帧的 `spin` 自动生成；模板中已有的值也会被替换。约束位点可以用项目的 `labeling.constrained_elements` 或逐原子掩码指定。`DELTASPIN_COMPONENTS` 为 `1 1 1`；部分分量约束和非零 `DELTASPIN_CONSTRAINT_MODE` 会被拒绝。
 
-混合原子数的数据集应在每帧写入 `spin_active:I:1`，其中 1 表示独立自旋变量，0 表示不施加磁矩约束。该数组逐帧生成 `DELTASPIN_ATOMS`，覆盖 INCAR 模板中的旧掩码，并随 POSCAR 元素排序一起重排。没有 `spin_active` 时保留 INCAR 中的二进制 `DELTASPIN_ATOMS`（必须与该帧原子数相同）；两者都没有时，输入 `spin` 三分量全为零的原子不约束，其余原子约束；不使用磁矩大小阈值。需要约束到零磁矩时，必须显式设置该原子的 `spin_active=1`（或 INCAR 掩码为 1）。需要让非零感应磁矩自由自洽时，显式设置 `spin_active=0`。
+推荐在项目中设置 `labeling.constrained_elements: [Fe]`，让任意原子数、任意排序的结构都只约束 Fe；Fe 的零目标也受约束，其他元素的非零感应磁矩可以自由自洽。逐原子数组 `spin_active:I:1` 的优先级更高：1 表示施加磁矩约束，0 表示不约束；它可以区分同种元素中的不同位点。两种设置都会覆盖 INCAR 的 `DELTASPIN_ATOMS`，并随 POSCAR 元素排序一起重排。两者都未设置时，保留 INCAR 中与该帧原子数匹配的二进制掩码；INCAR 也未提供时，严格非零的输入磁矩受约束，严格零磁矩不受约束。
 
 例如 Bi₂Fe₂O₆ 中只约束 Fe、让 O/Bi 自洽响应：
 
@@ -49,9 +49,9 @@ labeling:
 atoms.set_array("spin_active", np.array([0, 0, 1, 1, 0, 0, 0, 0, 0, 0]))
 ```
 
-实际写出的 `DELTASPIN_ATOMS` 为 `0 0 1 1 0 0 0 0 0 0`。`spin_active` 只用于输入及约束生成，不写入训练 XYZ；掩码保存在 `vasp-result.json`。重新标注训练 XYZ 时，应重新提供逐帧掩码或匹配原子数的 INCAR 掩码。
+实际写出的 `DELTASPIN_ATOMS` 为 `0 0 1 1 0 0 0 0 0 0`。DFT 输出保留实际使用的 `spin_active`，LAMMPS 轨迹也按原子 ID 继承输入掩码，因此再次标注时不会把感应磁矩误当成约束目标。已有逐原子掩码会覆盖项目默认值；若要改变旧结构的约束策略，需要相应修改或删除其 `spin_active`。
 
-训练 XYZ 的原子列为 `species、pos、spin、mforce、forces`，不导出 `spin_active、initial_magmoms、spin_projected`。`spin` 保存所有原子最后收敛的磁矩：受约束原子来自高精度最终约束表，未约束 Bi/O 来自最后的 `magnetization (x/y/z)`，保留其非零感应磁矩。后者的原始打印分辨率为 0.001 μB，记录在 manifest 中。部分原子约束当前要求 `DELTASPIN_MOMENT_DEF=0`。
+训练 XYZ 保留 `species、pos、spin、spin_active、mforce、forces`，不导出 `initial_magmoms、spin_projected`。`spin_active` 是约束元数据，不定义模型的自旋自由度。`spin` 保存所有原子最后收敛的磁矩：受约束原子来自高精度最终约束表，未约束 Bi/O 来自最后的 `magnetization (x/y/z)`，保留其非零感应磁矩。后者的原始打印分辨率为 0.001 μB，记录在 manifest 中。部分原子约束当前要求 `DELTASPIN_MOMENT_DEF=0`。
 
 `mforce` 保留 VASP 最终约束乘子；未约束原子为程序输出的零乘子。保存全原子磁矩不意味着独立 O 自旋扰动或其磁能曲率已得到验证。
 

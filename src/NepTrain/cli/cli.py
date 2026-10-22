@@ -2252,6 +2252,7 @@ def run_manual_label_command(args):
             else bool(settings.get("gamma_centered", False))
         ),
         kpoint_mode=kpoint_mode,
+        constrained_elements=settings.get("constrained_elements"),
         kspacing=kspacing,
         ka=ka,
         structures_per_job=(

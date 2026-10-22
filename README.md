@@ -296,3 +296,5 @@ warnings in CI.
 - [PyPI](https://pypi.org/project/NepTrain/)
 
 VASP 6 DeltaSpin spin labeling: [configuration and INCAR](docs/source/command/vasp-deltaspin.md).
+
+Spin DFT labeling can select elements in the project, for example `labeling.constrained_elements: [Fe]`. Per-atom `spin_active` masks take precedence. See the [constraint rules](docs/source/command/workflow.md).

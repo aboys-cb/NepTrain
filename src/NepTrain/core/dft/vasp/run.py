@@ -10,11 +10,13 @@ from ase.io import write as ase_write
 from rich.progress import track
 
 from ...structures import read_structures
+from ...spin import apply_constraint_elements
 from .native import NativeVaspRequest, run_native_vasp
 from .io import default_vasp_command
 
 
 def calculate_vasp(atoms: Atoms, args, *, case_index: int = 1):
+    atoms = apply_constraint_elements(atoms, getattr(args, "constrained_elements", None))
     if not getattr(args, "resource_dir", None):
         raise FileNotFoundError(
             "VASP labeling requires labeling.resource_path or --resources"

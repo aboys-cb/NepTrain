@@ -103,6 +103,28 @@ def test_schema_v8_loads_without_migration(tmp_path):
     assert changes == []
 
 
+@pytest.mark.parametrize("backend", ["vasp", "abacus"])
+def test_constrained_elements_is_optional_in_schema_v8(tmp_path, backend):
+    config, changes = load_config(_write(tmp_path, _project(
+        md={"spin": True}, labeling={"backend": backend, "constrained_elements": ["Fe", "Co"]},
+    )))
+    assert config["labeling"]["constrained_elements"] == ["Fe", "Co"]
+    assert changes == []
+
+
+@pytest.mark.parametrize("elements", [[], "Fe", ["fe"], ["Fe", "Fe"], ["X"], [1], [["Fe"]]])
+def test_constrained_elements_rejects_invalid_lists(tmp_path, elements):
+    with pytest.raises(ConfigError, match="constrained_elements"):
+        load_config(_write(tmp_path, _project(
+            labeling={"backend": "vasp", "constrained_elements": elements},
+        )))
+
+
+def test_constrained_elements_rejects_unsupported_label_backend(tmp_path):
+    with pytest.raises(ConfigError, match="requires the vasp or abacus"):
+        load_config(_write(tmp_path, _project(labeling={"constrained_elements": ["Fe"]})))
+
+
 def test_sampling_accepts_excluded_reduced_compositions(tmp_path):
     value = _project()
     value["sampling"]["excluded_compositions"] = ["Al2Co3Fe6Ni3Ta2"]

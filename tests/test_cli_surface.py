@@ -549,6 +549,12 @@ def test_manual_dft_inherits_project_parallelism_and_normalizes_scalar_kpoints(
     tmp_path, monkeypatch, capsys
 ):
     project = _manual_project(tmp_path)
+    yaml = YAML()
+    value = yaml.load(project.read_text())
+    value["labeling"].update(backend="abacus", constrained_elements=["Fe"],
+                             resource_path="./resources", resource_manifest_path="./abacus-resources.json")
+    with project.open("w") as handle:
+        yaml.dump(value, handle)
     captured = {}
 
     def fake_prepare(*args, **kwargs):
@@ -594,6 +600,7 @@ def test_manual_dft_inherits_project_parallelism_and_normalizes_scalar_kpoints(
     assert captured["structures_per_job"] == 3
     assert captured["max_concurrent"] == 9
     assert captured["ka"] == [4, 4, 4]
+    assert captured["constrained_elements"] == ["Fe"]
     assert json.loads(capsys.readouterr().out)["state"] == "complete"
 
 

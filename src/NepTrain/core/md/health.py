@@ -143,7 +143,7 @@ def _frame_health(
         if policy.max_force is not None and maximum_force > policy.max_force:
             reasons.append("max_force_above_limit")
 
-    maximum_mforce, mforce_finite = _maximum_norm(frame, ("mforce",))
+    maximum_mforce, mforce_finite = _maximum_norm(frame, ("nep_mforce", "mforce"))
     if not mforce_finite:
         reasons.append("non_finite_mforce")
     elif maximum_mforce is not None:
@@ -198,7 +198,7 @@ def classify_trajectory(
     }
     if "nep_force" in first_arrays or "forces" in first_arrays:
         available_signals.add("force")
-    if "mforce" in first_arrays:
+    if "nep_mforce" in first_arrays or "mforce" in first_arrays:
         available_signals.add("mforce")
     if "spin" in first_arrays:
         available_signals.add("spin_magnitude")

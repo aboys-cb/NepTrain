@@ -348,7 +348,7 @@ def test_native_abacus_spin_reports_vector_rms_per_atom(tmp_path: Path, monkeypa
     assert structure_id(result.frames[0]) != structure_id(atoms)
 
 
-@pytest.mark.parametrize("explicit_mask", [False, True])
+@pytest.mark.parametrize("explicit_mask", [False, True, "project"])
 @pytest.mark.parametrize("bad_inactive_force", [False, True])
 def test_abacus_partial_constraints_preserve_induced_moments(
     tmp_path, monkeypatch, explicit_mask, bad_inactive_force
@@ -358,12 +358,14 @@ def test_abacus_partial_constraints_preserve_induced_moments(
     atoms.set_array("spin", np.array([[1., 0, 0], [0, 0, 0], [0, 0, 3.]]))
     if explicit_mask:
         atoms.arrays["spin"][1, 1] = 0.05
-        atoms.set_array("spin_active", np.array([1, 0, 1]))
+        if explicit_mask is True:
+            atoms.set_array("spin_active", np.array([1, 0, 1]))
     source = tmp_path / "selected.xyz"
     write(source, atoms, format="extxyz")
     resources = tmp_path / "resources"
     _resource_files(resources, elements=("Fe", "Al"))
     args = _arguments(tmp_path, source, resources)
+    args.constrained_elements = ["Fe"] if explicit_mask == "project" else ["Al"] if explicit_mask is True else None
     log = _spin_log().replace("Al 0.0 2.0 0.0", "Al 0.0 0.039 0.0")
     if not bad_inactive_force:
         log = log.replace("Al 0.7 0.8 0.9", "Al 0.0 0.0 0.0")
@@ -375,8 +377,24 @@ def test_abacus_partial_constraints_preserve_induced_moments(
         manifest = json.loads(next((tmp_path / "work").rglob("abacus-result.json")).read_text())
         assert manifest["status"] == "result_invalid"
         return
-    frame = module.run_abacus(args)[0]
-    case = tmp_path / "work" / "000001-AlFe2"
+    if explicit_mask == "project":
+        from NepTrain.core.execution import ExecutionTarget
+        from NepTrain.core.manual import prepare_labeling, run_manual_worker
+
+        operation = prepare_labeling(
+            source, backend="abacus", output=tmp_path / "manual-labels.xyz",
+            workdir=tmp_path / "manual", target=ExecutionTarget("local", "process"),
+            input_file=args.incar, resource_dir=resources,
+            resource_manifest=resources / "abacus-resources.json",
+            constrained_elements=["Fe"],
+        )
+        assert run_manual_worker(operation.root, 0) == 0
+        result_file = next(operation.root.glob("jobs/*/labeled.xyz"))
+        frame = read(result_file)
+        case = next(operation.root.rglob("abacus-input.json")).parent
+    else:
+        frame = module.run_abacus(args)[0]
+        case = tmp_path / "work" / "000001-AlFe2"
     stru = (case / "STRU").read_text()
     assert stru.count("sc 1 1 1") == 2
     assert stru.count("sc 0 0 0") == 1
@@ -386,7 +404,7 @@ def test_abacus_partial_constraints_preserve_induced_moments(
     assert manifest["spin_constraint_mask_stru_order"] == [1, 1, 0]
     np.testing.assert_allclose(frame.arrays["spin"][1], [0, 0.039, 0])
     np.testing.assert_allclose(frame.arrays["mforce"], [[.1, .2, .3], [0, 0, 0], [.4, .5, .6]])
-    assert "spin_active" not in frame.arrays
+    np.testing.assert_array_equal(frame.arrays["spin_active"], [1, 0, 1])
     assert frame.info["spin_constraint_rms_uB"] == 0
 
 
