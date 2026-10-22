@@ -367,6 +367,23 @@ neptrain workflow stop workflow --keep-jobs
 `--prepare-only` 的目录优先使用 `workflow run`；`workflow resume` 用于恢复
 暂停、失败或中断过的流程。
 
+飞书通知可在 `project.yaml` 中配置：
+
+```yaml
+notifications:
+  feishu:
+    webhook: https://open.feishu.cn/open-apis/bot/v2/hook/REPLACE
+    secret: REPLACE
+    timeout_seconds: 5
+```
+
+`neptrain doctor --project project.yaml` 会真实发送测试消息。正式通知覆盖成功启动和恢复、
+主动暂停或停止、阶段重算、每代进度、故障和最终完成；正常恢复不会显示为停滞。
+消息注明工作目录及已有作业是否保留。持续查询故障在五分钟后提醒一次，恢复后再通知一次。
+待发送消息落盘并在后台有限重试，通知失败不影响计算与收敛。`workflow status` 显示待发送、
+重试中、历史投递失败及最近成功时间；中途启用通知不会重发所有历史代。
+详见[通知说明](docs/source/command/workflow.md)。
+
 ## schema v8
 
 自动采样只有 `sampling.routes` 一个权威位置。每条 route 显式绑定结构、MD

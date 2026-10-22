@@ -5521,3 +5521,113 @@ def test_local_slurm_sources_packaged_setup_after_original_changes(tmp_path, rem
     script = executor._write_submission_script(task, str(bundle)).read_text()
     assert f'source {bundle}/target-setup.sh' in script
     assert f'source {source}\n' not in script
+
+
+@pytest.mark.parametrize('previous,context,expected', [
+    ('idle', None, 'Workflow started'),
+    ('running', {'kind': 'resumed'}, 'Workflow resumed'),
+    ('launching', None, 'Workflow recovered'),
+    ('running', None, 'Workflow recovered'),
+    ('idle', {'kind': 'restarted', 'generation': 1, 'stage': 'label'}, 'Stage restart started'),
+])
+def test_controller_lifecycle_uses_explicit_start_reason(tmp_path, monkeypatch, previous, context, expected):
+    config, initial = _controller_inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    controller = PersistentController(prep.output_dir)
+    controller.state['state'] = previous
+    if context:
+        controller.state['notification_start'] = context
+    controller._save()
+    events = []
+    class Notifier:
+        def enqueue(self, event): events.append(event)
+        def observe(self, **kwargs): pass
+        def close(self): pass
+    monkeypatch.setattr('NepTrain.core.notifications.build_workflow_notifier', lambda *a: Notifier())
+    ticks = iter([ControllerTick('running'), ControllerTick('complete')])
+    monkeypatch.setattr(PersistentController, 'tick', lambda *a, **k: next(ticks))
+    assert run_controller(prep.output_dir, poll_interval=0.2) == 0
+    assert len(events) == 1 and expected in events[0].text
+    assert 'stalled' not in events[0].text
+    state = json.loads((prep.output_dir / '.neptrain/controller.json').read_text())
+    assert state['notification_session']
+    assert 'notification_start' not in state
+
+
+@pytest.mark.usefixtures('legacy_workflow_protocol')
+@pytest.mark.parametrize('controller_failed', [False, True])
+def test_normal_resume_notification_preserves_job_without_interruption_warning(tmp_path, monkeypatch, controller_failed):
+    config, initial = _controller_inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    controller = PersistentController(prep.output_dir, executor_factory=lambda t: ImmediateExecutor(t, []))
+    controller.tick()
+    handle = controller.state['current']['handle']
+    controller.state.update(state='stopped', reason='controller stopped by user')
+    if controller_failed:
+        controller.state.update(state='failed', reason='controller error', preserve_current_on_retry=True)
+    controller._save()
+    events = []
+    class Notifier:
+        def enqueue(self, event): events.append(event)
+        def observe(self, **kwargs): pass
+        def close(self): pass
+    monkeypatch.setattr('NepTrain.core.notifications.build_workflow_notifier', lambda *a: Notifier())
+    ticks = iter([ControllerTick('running'), ControllerTick('complete')])
+    monkeypatch.setattr(PersistentController, 'tick', lambda *a, **k: next(ticks))
+    monkeypatch.setattr(controller_module, 'start_controller', lambda root, **kw: run_controller(root, poll_interval=0.2))
+    resume_workflow(prep.output_dir)
+    assert len(events) == 1 and 'Workflow resumed' in events[0].text
+    assert 'Retained job handles: 1' in events[0].text
+    assert 'stalled' not in events[0].text and 'unexpected' not in events[0].text
+    if controller_failed:
+        assert 'recheck retained jobs' in events[0].text
+        assert 'Failed tasks will be retried' not in events[0].text
+    state = json.loads((prep.output_dir / '.neptrain/controller.json').read_text())
+    assert state['current']['handle'] == handle
+
+
+@pytest.mark.parametrize('cancel_jobs,status', [(False, 'running'), (True, 'cancelling'), (True, 'cancelled')])
+@pytest.mark.usefixtures('legacy_workflow_protocol')
+def test_user_stop_notification_reports_actual_job_policy(tmp_path, monkeypatch, cancel_jobs, status):
+    config, initial = _controller_inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    controller = PersistentController(prep.output_dir, executor_factory=lambda t: ImmediateExecutor(t, []))
+    controller.tick()
+    events = []
+    class Notifier:
+        def enqueue(self, event): events.append(event)
+        def close(self): pass
+    class Canceller(ImmediateExecutor):
+        def cancel(self, handle): return ExecutionStatus(status)
+    def stop(root):
+        controller.state.update(state='stopped', reason='controller stopped by user')
+        controller._save()
+    monkeypatch.setattr('NepTrain.core.notifications.build_workflow_notifier', lambda *a: Notifier())
+    monkeypatch.setattr(controller_module, 'controller_running', lambda *a: True)
+    monkeypatch.setattr(controller_module, 'stop_controller', stop)
+    stop_workflow(prep.output_dir, cancel_jobs=cancel_jobs, executor_factory=lambda t: Canceller(t, []))
+    assert len(events) == 1
+    text = events[0].text
+    assert ('Workflow stopped' if cancel_jobs else 'Workflow paused') in text
+    if cancel_jobs:
+        assert f'Cancellation result: {status}' in text
+    else:
+        assert 'were not cancelled' in text
+    assert 'stalled' not in text
+    monkeypatch.setattr(controller_module, 'controller_running', lambda *a: False)
+    stop_workflow(prep.output_dir, cancel_jobs=False)
+    assert len(events) == 1  # An already-stopped controller is a no-op.
+
+
+def test_failed_first_tick_does_not_send_started_notification(tmp_path, monkeypatch):
+    config, initial = _controller_inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    events, progress = [], []
+    class Notifier:
+        def enqueue(self, event): events.append(event)
+        def observe(self, **kw): progress.append(kw['tick'].state)
+        def close(self): pass
+    monkeypatch.setattr('NepTrain.core.notifications.build_workflow_notifier', lambda *a: Notifier())
+    monkeypatch.setattr(PersistentController, 'tick', lambda *a, **k: ControllerTick('failed'))
+    assert run_controller(prep.output_dir, poll_interval=0.2) == 2
+    assert not events and progress == ['failed']

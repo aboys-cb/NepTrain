@@ -831,15 +831,21 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
             "configured": "Configured",
             "ok": "Healthy",
             "degraded": "Delivery issue",
+            "disabled": "Disabled",
+            "pending": "Pending delivery",
+            "retrying": "Retrying delivery",
         }.get(notification["state"], notification["state"])
         print()
         print(
             "Notifications: Feishu | "
             f"{notification_state} | Delivered {notification['delivered']} | "
-            f"Failed {notification['failed']}"
+            f"Pending {notification.get('pending', 0)} | Retrying {notification.get('retrying', 0)} | "
+            f"Failed deliveries {notification['failed']}"
         )
+        if notification.get("last_success_at"):
+            print(f"Last notification delivered: {notification['last_success_at']}")
         if notification.get("last_error"):
-            print(f"Notification error: {notification['last_error']}")
+            print(f"Last notification delivery error: {notification['last_error']}")
     if status.state in {"failed", "rejected", "stalled", "damaged"}:
         root = Path(status.project_path)
         print(f"Logs: {root / 'logs'}")

@@ -2035,53 +2035,10 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         next_action = f"neptrain workflow run {workflow_path}"
 
     notification_summary = None
-    configured_notifications = bool(
-        config.get("notifications", {}).get("feishu")
-    )
-    if configured_notifications or workspace.notification_state.is_file():
-        notification_summary = {
-            "provider": "feishu",
-            "state": "configured",
-            "delivered": 0,
-            "failed": 0,
-            "last_error": None,
-        }
-        if workspace.notification_state.is_file():
-            try:
-                notification_state = _read_json(
-                    workspace.notification_state,
-                    role="notification state",
-                )
-                events = notification_state.get("events", {})
-                if not isinstance(events, Mapping):
-                    raise ValueError("notification events must be a mapping")
-                delivered = sum(
-                    isinstance(record, Mapping)
-                    and record.get("state") == "delivered"
-                    for record in events.values()
-                )
-                failed_records = [
-                    record
-                    for record in events.values()
-                    if isinstance(record, Mapping)
-                    and record.get("state") == "failed"
-                ]
-                notification_summary.update(
-                    state="degraded" if failed_records else "ok",
-                    delivered=delivered,
-                    failed=len(failed_records),
-                    last_error=(
-                        failed_records[-1].get("last_error")
-                        if failed_records
-                        else None
-                    ),
-                )
-            except Exception as error:
-                notification_summary.update(
-                    state="degraded",
-                    failed=1,
-                    last_error=f"cannot read notification state: {error}",
-                )
+    settings = config.get("notifications", {}).get("feishu", {})
+    if settings or workspace.notification_state.is_file():
+        from .notifications import notification_summary as summarize_notifications
+        notification_summary = summarize_notifications(settings, workspace)
 
     return WorkflowStatus(
         workflow_id=preparation.workflow_id,
@@ -2314,6 +2271,10 @@ def resume_workflow(
                 preparation.manifest,
             )
     controller = PersistentController(output)
+    recovery = controller.state.get("state") in {"running", "launching", "waiting", "degraded"} or (
+        "external signal" in str(controller.state.get("reason", ""))
+    )
+    retained_execution = bool(controller.state.get("preserve_current_on_retry"))
     action = "resume"
     if status.state == "failed":
         controller.retry()
@@ -2324,6 +2285,16 @@ def resume_workflow(
     elif status.state == "paused":
         controller.resume_stopped()
         action = "resume"
+    controller.state["notification_start"] = {
+        "kind": "recovered" if recovery else "resumed",
+        "detail": (
+            "The controller will recheck retained jobs and results before continuing."
+            if retained_execution else
+            "Failed tasks will be retried; completed results are retained."
+            if action in {"retry", "recover_rejected"} else ""
+        ),
+    }
+    controller._save()
     try:
         controller_result = start_controller(
             output,
@@ -2384,6 +2355,11 @@ def restart_workflow(
                     from_stage=from_stage,
                     task_scope=task_scope,
                 )
+                controller.state["notification_start"] = {
+                    "kind": "restarted", "generation": generation, "stage": from_stage,
+                    "detail": f"Restarting from G{generation} / {from_stage}; task scope: {task_scope}. Completed earlier stages are retained.",
+                }
+                controller._save()
                 controller_result = None
                 action = "restart"
         except ControllerError as error:

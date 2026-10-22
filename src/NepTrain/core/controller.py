@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable, Mapping
 
 from ase.io import read as ase_read
@@ -2231,18 +2232,15 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                 f"{os.getpid()}\n", encoding="utf-8"
             )
             controller = PersistentController(workspace.root)
-            # A state of running/degraded/waiting means the previous controller
-            # stopped without reaching a terminal state - it crashed, was
-            # killed, or its node went down.  That is worth reporting once we
-            # take over, because a killed process cannot report itself.
             previous_state = str(controller.state.get("state") or "")
-            previous_heartbeat = controller.state.get("heartbeat_at")
             previous_reason = str(controller.state.get("reason") or "")
-            resume_after_interruption = previous_state in {
-                "running",
-                "degraded",
-                "waiting",
-            }
+            start_context = controller.state.pop("notification_start", {})
+            start_kind = start_context.get("kind") or (
+                "recovered" if previous_state in {"running", "launching", "degraded", "waiting"}
+                or "external signal" in previous_reason else
+                "resumed" if previous_state == "stopped" else "started"
+            )
+            controller.state["notification_session"] = uuid.uuid4().hex
             stop_marker = workspace.internal_dir / STOP_REQUEST_NAME
             if stop_marker.exists():
                 # Any marker left over belongs to a stop that already finished.
@@ -2288,48 +2286,20 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         flush=True,
                     )
 
-            def report_controller_event(
-                event_id: str, tick: ControllerTick
-            ) -> None:
-                """Push a controller-level event, not a workflow stage result."""
-
+            def report_controller_event(kind: str, detail: str = "") -> None:
                 if notifier is None:
                     return
-                from .notifications import NotificationEvent, _terminal_event
-
                 try:
-                    event = _terminal_event(
-                        controller.workflow_id,
-                        len(controller.plans),
-                        controller.state,
-                        tick,
-                        workflow_path=workspace.root,
-                    )
-                    notifier.enqueue(NotificationEvent(event_id, event.text))
+                    from .notifications import _lifecycle_event
+                    notifier.enqueue(_lifecycle_event(
+                        controller.workflow_id, workspace.root, kind,
+                        {**controller.state, "notification_start": start_context},
+                        controller.state["notification_session"], detail=detail,
+                    ))
                 except Exception as error:
-                    print(
-                        f"NepTrain notification warning: {error}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    print(f"NepTrain notification warning: {error}", file=sys.stderr, flush=True)
 
-            if resume_after_interruption:
-                detail = (
-                    f"The previous controller exited without a clean shutdown (state: {previous_state}"
-                    + (
-                        f"; last heartbeat: {previous_heartbeat}"
-                        if previous_heartbeat
-                        else ""
-                    )
-                    + (f"; reason: {previous_reason}" if previous_reason else "")
-                    + "). This controller has taken over; the ledger and submitted jobs are preserved."
-                )
-                report_controller_event(
-                    "controller-restarted:"
-                    f"{previous_heartbeat or previous_state}",
-                    ControllerTick("stalled", detail=detail),
-                )
-
+            startup_reported = False
             try:
                 while not stop_event.is_set():
                     try:
@@ -2385,6 +2355,11 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         tick = ControllerTick("degraded", detail=str(error))
                         if failures >= MAX_INTERNAL_FAILURES:
                             raise
+                    if not startup_reported and tick.state not in {
+                        "complete", "rejected", "failed", "stalled", "budget_exhausted", "coverage_exhausted",
+                    }:
+                        report_controller_event(start_kind, start_context.get("detail", ""))
+                        startup_reported = True
                     report_progress(tick)
                     if tick.state in {
                         "complete",
@@ -2420,14 +2395,7 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                 )
                 controller._save()
                 report_controller_event(
-                    f"controller-signal:{name}:{controller.state.get('heartbeat_at')}",
-                    ControllerTick(
-                        "stalled",
-                        detail=(
-                            f"The controller received external signal {name}, not a workflow stop request. "
-                            "The workflow is paused and its ledger is intact. Run workflow resume to continue."
-                        ),
-                    ),
+                    "interrupted", f"The controller received external signal {name}, not a workflow stop request.",
                 )
                 return 1
             except Exception as error:
@@ -2704,6 +2672,35 @@ def stop_workflow(
                 "current_execution": result["current_execution"],
             },
         )
+        notifier = None
+        try:
+            from .notifications import build_workflow_notifier, _lifecycle_event
+            config, _ = load_config(workspace.project_file)
+            notifier = build_workflow_notifier(config, workspace)
+            if notifier is not None:
+                state = _read_json(workspace.controller_file, {})
+                execution = result.get("current_execution") or {}
+                details = ""
+                if cancel_jobs:
+                    records = execution.get("tasks", []) if isinstance(execution, Mapping) else []
+                    details = f"Cancellation result: {execution.get('action', 'see workflow status')}."
+                    if records:
+                        from collections import Counter
+                        counts = Counter(str(item.get("action", "unknown")) for item in records)
+                        details += " " + ", ".join(f"{key}: {value}" for key, value in sorted(counts.items()))
+                    details += " Check workflow status --jobs for scheduler confirmation."
+                notifier.enqueue(_lifecycle_event(
+                    state.get("workflow_id", workspace.root.name), workspace.root,
+                    "stopped" if cancel_jobs else "paused", state, uuid.uuid4().hex, detail=details,
+                ))
+        except Exception as error:
+            print(f"NepTrain notification warning: cannot report stop: {error}", file=sys.stderr, flush=True)
+        finally:
+            if notifier is not None:
+                try:
+                    notifier.close()
+                except Exception as error:
+                    print(f"NepTrain notification warning: cannot close sender: {error}", file=sys.stderr, flush=True)
         return result
 
     if not cancel_jobs:

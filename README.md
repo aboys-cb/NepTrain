@@ -236,10 +236,19 @@ notifications:
 ```
 
 `neptrain doctor --project project.yaml` sends a real connectivity probe.
-Workflow delivery runs on a background thread and is always best effort:
-notification failures never change workflow state, exit status, or the
-scientific ledger. Progress and terminal messages include both the workflow id
-and absolute workflow path so concurrent runs remain distinguishable.
+Notifications cover successful startup/resume, user pause/stop, stage restarts,
+generation progress, failures, and one final completion report. Normal resume
+is not a stall. Messages identify the workflow and whether existing jobs are
+retained. Sustained monitoring failures trigger one warning after five minutes
+and one recovery message.
+
+Delivery uses a persistent outbox with bounded background retries. Notification
+failures never change computation or convergence. `workflow status` shows
+pending deliveries, retries, historical failures, and the last successful
+delivery. Existing delivered records remain valid; enabling notifications
+midway through a run does not replay all historical generations. See the
+[notification documentation](docs/source/command/workflow.md) for shutdown
+and recovery behavior.
 
 ## Labeling backends
 

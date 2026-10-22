@@ -231,7 +231,7 @@ def test_complete_terminal_report_uses_actual_completed_generation():
 
     event = _terminal_event("Fe", 17, state, tick)
 
-    assert "Workflow converged and complete" in event.text
+    assert "Workflow completed" in event.text
     assert "Finished at: G15 (planned limit: G17)" in event.text
     assert "17/17" not in event.text
     assert "workflow converged" not in event.text
@@ -410,3 +410,337 @@ def test_notification_shows_magnetic_force_only_when_available(kind, mforce):
         assert "μB" not in event.text
     else:
         assert f"M={mforce * 1000:g} meV/μB" in event.text
+
+
+def _finish(worker):
+    worker.close()
+    if worker._thread is not None:
+        worker._thread.join(5)
+        assert not worker._thread.is_alive()
+
+
+def _ledger(workspace, generations):
+    workspace.ledger.write_text(json.dumps({'generations': generations}))
+
+
+def _complete_generation(kind='acquisition'):
+    return {'kind': kind, 'complete': True, 'accepted': True, 'stages': {
+        'train': {'metrics': {'training_count': 12}},
+        'evaluate': {'metrics': {'accepted': True, 'active_model_sha256': 'a' * 64}},
+    }}
+
+
+def test_terminal_delivery_retries_without_controller_polling(tmp_path, monkeypatch):
+    from NepTrain.core import notifications as module
+    monkeypatch.setattr(module, '_RETRY_DELAY_SECONDS', 0.01)
+    class FlakyPool(FakePool):
+        def request(self, *args, **kwargs):
+            response = super().request(*args, **kwargs)
+            if len(self.requests) == 1:
+                raise TimeoutError('temporary outage')
+            return response
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    pool = FlakyPool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    worker.enqueue(NotificationEvent('terminal:failed', 'Failed'))
+    _finish(worker)
+    record = json.loads(workspace.notification_state.read_text())['events']['terminal:failed']
+    assert len(pool.requests) == 2
+    assert record['state'] == 'delivered' and record['attempts'] == 2
+    assert 'last_error' not in record
+
+
+def test_failed_delivery_rearms_after_settings_change(tmp_path, monkeypatch):
+    from NepTrain.core import notifications as module
+    monkeypatch.setattr(module, '_RETRY_DELAY_SECONDS', 0.01)
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    bad = FakePool({'code': 19021, 'msg': 'bad signature'})
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=bad)
+    worker.enqueue(NotificationEvent('terminal:failed', 'Failed'))
+    _finish(worker)
+    assert len(bad.requests) == 3
+    same = FakePool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=same)
+    worker.enqueue(NotificationEvent('terminal:failed', 'Failed'))
+    _finish(worker)
+    assert not same.requests
+    good = FakePool()
+    worker = WorkflowNotificationWorker({**_settings(), 'secret': 'corrected'}, workspace, pool=good)
+    _finish(worker)
+    assert len(good.requests) == 1
+    record = json.loads(workspace.notification_state.read_text())['events']['terminal:failed']
+    assert record['attempts'] == 4 and record['state'] == 'delivered'
+
+
+def test_pending_delivery_survives_sender_restart(tmp_path, monkeypatch):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=FakePool())
+    monkeypatch.setattr(worker, '_ensure_thread', lambda: None)
+    worker.enqueue(NotificationEvent('pending', 'Pending message'))
+    assert json.loads(workspace.notification_state.read_text())['events']['pending']['text'].startswith('Pending message')
+    _finish(worker)
+    pool = FakePool()
+    resumed = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    _finish(resumed)
+    assert len(pool.requests) == 1
+
+
+def test_overlapping_senders_preserve_records_and_send_once(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    class SlowPool(FakePool):
+        def request(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(3)
+            return super().request(*args, **kwargs)
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    slow, fast = SlowPool(), FakePool()
+    first = WorkflowNotificationWorker(_settings(), workspace, pool=slow)
+    first.enqueue(NotificationEvent('first', 'First'))
+    assert entered.wait(1)
+    second = WorkflowNotificationWorker(_settings(), workspace, pool=fast)
+    second.enqueue(NotificationEvent('first', 'First'))
+    second.enqueue(NotificationEvent('second', 'Second'))
+    first.close()
+    release.set()
+    _finish(first)
+    _finish(second)
+    events = json.loads(workspace.notification_state.read_text())['events']
+    assert set(events) == {'first', 'second'}
+    assert all(r['state'] == 'delivered' for r in events.values())
+    assert len(slow.requests) + len(fast.requests) == 2
+
+
+@pytest.mark.parametrize('corrupt', [False, True])
+def test_first_enable_or_corruption_does_not_replay_history(tmp_path, corrupt):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    _ledger(workspace, {'1': _complete_generation()})
+    if corrupt:
+        workspace.notification_state.write_text('{broken')
+    pool = FakePool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    plans = [{'generation': 1, 'max_selected': 10}, {'generation': 2, 'max_selected': 10}]
+    tick = SimpleNamespace(state='running')
+    worker.observe(workflow_id='test', plans=plans, controller_state={}, tick=tick)
+    assert not pool.requests
+    _ledger(workspace, {'1': _complete_generation(), '2': _complete_generation()})
+    worker.observe(workflow_id='test', plans=plans, controller_state={}, tick=tick)
+    _finish(worker)
+    assert len(pool.requests) == 1
+    assert 'G2/2 complete' in json.loads(pool.requests[0][2]['body'])['content']['text']
+    if corrupt:
+        assert list(workspace.internal_dir.glob('notifications.corrupt-*.json'))
+
+
+def test_bad_generation_report_does_not_suppress_current_failure(tmp_path):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    pool = FakePool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    bad = _complete_generation()
+    bad['stages']['explore'] = {'metrics': {'scenario_temperatures': ['invalid']}}
+    _ledger(workspace, {'1': bad})
+    worker.observe(workflow_id='test', plans=[{'generation': 1, 'max_selected': 10}],
+                   controller_state={'current': {'generation': 2, 'stage': 'label'}},
+                   tick=SimpleNamespace(state='failed', generation=2, stage='label', detail='DFT failed'))
+    _finish(worker)
+    assert len(pool.requests) == 1
+    assert 'Labeling failed' in json.loads(pool.requests[0][2]['body'])['content']['text']
+
+
+def test_final_completion_is_one_message_with_final_model(tmp_path):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    pool = FakePool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    _ledger(workspace, {'1': _complete_generation('finalization')})
+    worker.observe(workflow_id='test', plans=[{'generation': 1, 'max_selected': 10}],
+                   controller_state={'completed_generation': 1}, tick=SimpleNamespace(state='complete'))
+    _finish(worker)
+    assert len(pool.requests) == 1
+    text = json.loads(pool.requests[0][2]['body'])['content']['text']
+    assert 'Workflow completed' in text
+    assert 'Final training set: 12 structures' in text
+    assert 'Model: aaaaaaaaaaaa' in text
+
+
+def test_new_controller_failure_is_not_deduplicated_as_old_failure():
+    tick = SimpleNamespace(state='failed', generation=3, stage='train', detail='controller error')
+    base = {'current': {'generation': 3, 'stage': 'train', 'attempt': 1}, 'preserve_current_on_retry': True}
+    first = _terminal_event('test', 8, {**base, 'notification_session': 'first'}, tick)
+    second = _terminal_event('test', 8, {**base, 'notification_session': 'second'}, tick)
+    assert first.event_id != second.event_id
+    assert 'Controller failed' in first.text
+    assert 'does not mean those jobs failed' in first.text
+
+
+def test_terminal_generation_is_never_guessed_from_budget():
+    tick = SimpleNamespace(state='stalled')
+    unknown = _terminal_event('test', 8, {}, tick)
+    known = _terminal_event('test', 8, {'last_generation': 3}, tick)
+    assert 'Generation: unknown' in unknown.text and '8/8' not in unknown.text
+    assert 'Generation: 3/8' in known.text
+
+
+def test_monitoring_alert_is_delayed_and_recovery_is_sent_once(tmp_path, monkeypatch):
+    from NepTrain.core import notifications as module
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=FakePool())
+    events = []
+    monkeypatch.setattr(worker, 'enqueue', events.append)
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
+    def observe(state):
+        worker.observe(workflow_id='test', plans=[], controller_state={}, tick=SimpleNamespace(state=state, detail='SSH unavailable'))
+    observe('degraded')
+    clock[0] += 100
+    observe('running')
+    assert not events
+    observe('degraded')
+    clock[0] += 301
+    observe('degraded')
+    observe('degraded')
+    observe('running')
+    observe('running')
+    assert len(events) == 2
+    assert 'Job monitoring unavailable' in events[0].text
+    assert 'Job monitoring restored' in events[1].text
+    _finish(worker)
+
+
+def test_notification_status_separates_history_from_current_health(tmp_path):
+    from NepTrain.core.notifications import notification_summary
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    workspace.notification_state.write_text(json.dumps({'events': {
+        'z-old': {'state': 'failed', 'last_error': 'old', 'last_attempt_at': '2026-01-01'},
+        'a-new': {'state': 'failed', 'last_error': 'new', 'last_attempt_at': '2026-01-02'},
+        'b-success': {'state': 'delivered', 'last_attempt_at': '2026-01-03', 'delivered_at': '2026-01-03'},
+    }}))
+    summary = notification_summary(_settings(), workspace)
+    assert summary['state'] == 'ok' and summary['failed'] == 2
+    assert summary['last_error'] == 'new'
+    assert summary['last_success_at'] == '2026-01-03'
+    assert notification_summary({}, workspace)['state'] == 'disabled'
+
+
+def test_delivery_error_redacts_credentials():
+    class BrokenPool:
+        def request(self, *args, **kwargs):
+            raise RuntimeError(_settings()['webhook'] + ' ' + _settings()['secret'])
+    result = send_feishu_text(_settings(), 'hello', pool=BrokenPool())
+    assert 'test-token' not in result.detail and 'test-secret' not in result.detail
+
+
+def test_close_deadline_keeps_undelivered_outbox_for_next_sender(tmp_path, monkeypatch):
+    from NepTrain.core import notifications as module
+    monkeypatch.setattr(module, '_SHUTDOWN_GRACE_SECONDS', 0)
+    entered, release = threading.Event(), threading.Event()
+    class SlowFailingPool(FakePool):
+        def request(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(2)
+            return super().request(*args, **kwargs)
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    pool = SlowFailingPool({'code': 1, 'msg': 'temporary'})
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    worker.enqueue(NotificationEvent('last', 'Final event'))
+    assert entered.wait(1)
+    worker.close()
+    release.set()
+    worker._thread.join(2)
+    assert not worker._thread.is_alive()
+    record = json.loads(workspace.notification_state.read_text())['events']['last']
+    assert record['state'] == 'retrying' and record['text'].startswith('Final event')
+
+
+def test_legacy_delivered_events_remain_deduplicated(tmp_path):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    workspace.notification_state.write_text(json.dumps({'version': 1, 'events': {
+        'generation:1:accepted': {'state': 'delivered', 'attempts': 1},
+    }}))
+    pool = FakePool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    worker.enqueue(NotificationEvent('generation:1:accepted', 'Already delivered'))
+    _finish(worker)
+    assert not pool.requests
+    assert json.loads(workspace.notification_state.read_text())['version'] == 2
+
+
+def test_transient_state_read_error_does_not_quarantine_valid_state(tmp_path, monkeypatch):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    workspace.notification_state.write_text('{"version": 1, "events": {}}')
+    original = Path.read_text
+    def read(path, *args, **kwargs):
+        if path == workspace.notification_state:
+            raise OSError('temporary shared filesystem error')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', read)
+    with pytest.raises(OSError):
+        WorkflowNotificationWorker(_settings(), workspace, pool=FakePool())
+    assert not list(workspace.internal_dir.glob('notifications.corrupt-*'))
+    assert workspace.notification_state.read_bytes() == b'{"version": 1, "events": {}}'
+
+
+def test_changed_credentials_do_not_inherit_inflight_failed_attempt(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    class SlowFailingPool(FakePool):
+        def request(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(2)
+            return super().request(*args, **kwargs)
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    first = WorkflowNotificationWorker(_settings(), workspace, pool=SlowFailingPool({'code': 1, 'msg': 'bad old key'}))
+    first.enqueue(NotificationEvent('event', 'Event'))
+    assert entered.wait(1)
+    pool = FakePool()
+    second = WorkflowNotificationWorker({**_settings(), 'secret': 'new'}, workspace, pool=pool)
+    release.set()
+    _finish(first)
+    _finish(second)
+    assert len(pool.requests) == 1
+    assert json.loads(workspace.notification_state.read_text())['events']['event']['state'] == 'delivered'
+
+
+def test_sampling_report_omits_absent_test_metrics():
+    event = _generation_event('test', 3, {'generation': 1, 'max_selected': 10}, _complete_generation())
+    assert 'RMSE' not in event.text
+
+
+def test_server_error_redacts_credentials():
+    settings = _settings()
+    pool = FakePool({'code': 1, 'msg': settings['webhook'] + ' ' + settings['secret']})
+    result = doctor_probe(settings, workflow_id='test', pool=pool)
+    assert 'test-token' not in result.detail and 'test-secret' not in result.detail
+
+
+def test_monitoring_recovery_is_retained_when_enqueue_fails(tmp_path, monkeypatch):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=FakePool())
+    with worker._transaction() as state:
+        state['monitoring'] = {'since': 0, 'id': 'outage', 'alerted': True}
+    monkeypatch.setattr(worker, 'enqueue', lambda event: False)
+    worker._monitor('test', {}, SimpleNamespace(state='running'))
+    assert json.loads(workspace.notification_state.read_text())['monitoring']['id'] == 'outage'
+    events = []
+    monkeypatch.setattr(worker, 'enqueue', events.append)
+    worker._monitor('test', {}, SimpleNamespace(state='running'))
+    worker._monitor('test', {}, SimpleNamespace(state='running'))
+    assert len(events) == 1 and 'Job monitoring restored' in events[0].text
+    _finish(worker)
+
+
+def test_idle_sender_waits_without_rewriting_state_and_wakes_for_new_event(tmp_path):
+    workspace = WorkflowWorkspace.create(tmp_path / 'run')
+    pool = FakePool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    worker.enqueue(NotificationEvent('first', 'First'))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if json.loads(workspace.notification_state.read_text())['events']['first']['state'] == 'delivered':
+            break
+        time.sleep(0.01)
+    time.sleep(0.1)  # Let the sender enter its idle wait after recording delivery.
+    before = workspace.notification_state.stat().st_mtime_ns
+    time.sleep(0.3)
+    assert workspace.notification_state.stat().st_mtime_ns == before
+    worker.enqueue(NotificationEvent('second', 'Second'))
+    _finish(worker)
+    assert len(pool.requests) == 2
