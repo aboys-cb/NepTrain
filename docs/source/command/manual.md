@@ -36,6 +36,18 @@ neptrain train train.xyz \
 best 模型不同。使用远程 target 时，原始图表留在计算侧，可按 `remote.txt` 找到目录；
 最终模型发布到 `-o` 指定的路径。
 
+### TorchNEP 单节点多卡训练
+
+当 `training.backend: torchnep` 且 `training.device: cuda` 时，NepTrain 根据任务内可见的 GPU 数选择训练入口：一张卡使用单设备训练，多张卡通过 torchrun 启动 `train_nep_sharded`，每卡一个 DDP 进程。独立 `neptrain train` 命令也使用同一规则。
+
+Slurm 训练 target 设置 `gpus_per_node: 4`，并在 `directives` 中设置 `--nodes=1`、`--ntasks=1`，即可运行单节点四卡训练。环境脚本需准备好 PyTorch、TorchNEP 和 NCCL；提交脚本仍只启动一个 NepTrain worker，不要再用 torchrun 或多任务 srun 包裹整个 worker。当前入口不支持多节点训练。
+
+`device: cuda:0` 显式选择一张可见 GPU；`device: cpu` 保持 CPU 训练。本机运行时可用 `CUDA_VISIBLE_DEVICES` 限制使用的卡；Slurm 作业应沿用调度器分配的可见设备。日志会明确打印单设备或 DDP 模式，不能只根据 TorchNEP 的可见设备列表判断是否多卡训练。
+
+多卡接口中的 `batch` 和 `eval_batch` 是每个 rank 的批量。例如四卡、`batch 32` 通常对应总批量 128，末批可能不足。NepTrain 不自动缩放批量或学习率；切换卡数后，优化轨迹和训练结果不保证与单卡一致。
+
+断点继续和跨代微调沿用原有 checkpoint 及模型输入。所有 rank 正常退出后，主 worker 才校验并发布模型、收集 checkpoint 和生成报告；任一 rank 失败都会让训练阶段失败，不发布部分结果。停止或取消任务仍使用 NepTrain 原有命令。
+
 ## 批量 MD
 
 ```bash

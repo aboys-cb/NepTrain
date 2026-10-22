@@ -471,3 +471,21 @@ msgstr "For ABACUS spin labeling, nonzero input moments receive `sc 1 1 1`; atom
 
 msgid "结果保留所有原子收敛后的磁矩和磁性力；未约束原子的约束乘子应为零，约束 RMS 只统计活动原子。输入掩码按 STRU 顺序保存在 `abacus-input.json`，不写入训练 XYZ。重新标注含感应磁矩的数据时应重新提供掩码，以免将非零感应磁矩当作约束目标。VASP DeltaSpin 使用相同的默认规则，显式 INCAR 掩码的优先级见 [VASP DeltaSpin](vasp-deltaspin.md)。"
 msgstr "Results retain the converged moments and magnetic forces for every atom. Unconstrained atoms must have zero constraint multipliers, and constraint RMS includes active atoms only. The input mask is saved in STRU order in `abacus-input.json`, not in the training XYZ. Supply a mask again when relabeling data with induced moments so that nonzero induced moments do not become constraint targets. VASP DeltaSpin uses the same default rule; see [VASP DeltaSpin](vasp-deltaspin.md) for the priority of explicit INCAR masks."
+
+msgid "TorchNEP 单节点多卡训练"
+msgstr "TorchNEP single-node multi-GPU training"
+
+msgid "当 `training.backend: torchnep` 且 `training.device: cuda` 时，NepTrain 根据任务内可见的 GPU 数选择训练入口：一张卡使用单设备训练，多张卡通过 torchrun 启动 `train_nep_sharded`，每卡一个 DDP 进程。独立 `neptrain train` 命令也使用同一规则。"
+msgstr "With `training.backend: torchnep` and `training.device: cuda`, NepTrain selects the trainer from the GPUs visible inside the task: one GPU uses single-device training; multiple GPUs launch `train_nep_sharded` through torchrun with one DDP process per GPU. The standalone `neptrain train` command follows the same rule."
+
+msgid "Slurm 训练 target 设置 `gpus_per_node: 4`，并在 `directives` 中设置 `--nodes=1`、`--ntasks=1`，即可运行单节点四卡训练。环境脚本需准备好 PyTorch、TorchNEP 和 NCCL；提交脚本仍只启动一个 NepTrain worker，不要再用 torchrun 或多任务 srun 包裹整个 worker。当前入口不支持多节点训练。"
+msgstr "For four GPUs on one Slurm node, set `gpus_per_node: 4` on the training target and include `--nodes=1` and `--ntasks=1` in `directives`. Prepare PyTorch, TorchNEP, and NCCL in the environment script. The submission script still starts one NepTrain worker; do not wrap that worker in torchrun or a multi-task srun command. This entry point does not support multi-node training."
+
+msgid "`device: cuda:0` 显式选择一张可见 GPU；`device: cpu` 保持 CPU 训练。本机运行时可用 `CUDA_VISIBLE_DEVICES` 限制使用的卡；Slurm 作业应沿用调度器分配的可见设备。日志会明确打印单设备或 DDP 模式，不能只根据 TorchNEP 的可见设备列表判断是否多卡训练。"
+msgstr "Use `device: cuda:0` to select one visible GPU explicitly, or `device: cpu` for CPU training. For local runs, use `CUDA_VISIBLE_DEVICES` to limit the GPUs used; Slurm jobs should retain the scheduler-assigned visibility. The log explicitly identifies single-device or DDP training; the visible-device list alone does not establish that training uses multiple GPUs."
+
+msgid "多卡接口中的 `batch` 和 `eval_batch` 是每个 rank 的批量。例如四卡、`batch 32` 通常对应总批量 128，末批可能不足。NepTrain 不自动缩放批量或学习率；切换卡数后，优化轨迹和训练结果不保证与单卡一致。"
+msgstr "In the distributed API, `batch` and `eval_batch` are per-rank batch sizes. For example, four GPUs with `batch 32` usually produce a global batch of 128, with a potentially smaller final batch. NepTrain does not rescale the batch size or learning rate automatically; changing the GPU count can change the optimization trajectory and training results."
+
+msgid "断点继续和跨代微调沿用原有 checkpoint 及模型输入。所有 rank 正常退出后，主 worker 才校验并发布模型、收集 checkpoint 和生成报告；任一 rank 失败都会让训练阶段失败，不发布部分结果。停止或取消任务仍使用 NepTrain 原有命令。"
+msgstr "Checkpoint continuation and cross-generation fine-tuning retain the existing checkpoint and model inputs. Only after all ranks exit successfully does the main worker validate and publish the model, collect checkpoints, and generate reports. A failure on any rank fails the training stage without publishing partial results. Use the existing NepTrain commands to stop or cancel tasks."

@@ -142,6 +142,8 @@ execution:
 可追踪的新 attempt，并依次使用 8G、16G；达到最后一级仍失败时流程正常进入
 `failed`，不会无限重试。不要同时在 `directives` 中再写 `--mem`。
 
+TorchNEP 训练会按任务内可见 GPU 数自动启用单节点多卡 DDP；训练 target 只需申请相应的 `gpus_per_node`，保留 `--nodes=1` 和 `--ntasks=1`。批量语义、单卡选择和环境要求见[独立步骤中的训练说明](manual.md)。
+
 默认情况下，全部 route 使用 `execution.stage_targets.sampling`。需要把某条
 route 送到另一台 Slurm 平台时，只写例外映射：
 

@@ -258,6 +258,7 @@ def test_torchnep_best_model_becomes_canonical_nep_txt(tmp_path: Path, monkeypat
         types.SimpleNamespace(
             manual_seed=lambda value: seeds.append(("cpu", value)),
             cuda=types.SimpleNamespace(
+                device_count=lambda: 1,
                 manual_seed_all=lambda value: seeds.append(("cuda", value))
             ),
         ),
@@ -318,7 +319,7 @@ def test_torchnep_current_api_receives_run_seed_without_legacy_backend(
     monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(train_nep=current_train_nep))
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
         manual_seed=lambda _: None,
-        cuda=types.SimpleNamespace(manual_seed_all=lambda _: None),
+        cuda=types.SimpleNamespace(device_count=lambda: 1, manual_seed_all=lambda _: None),
     ))
     request = TrainingRequest(
         config_file=tmp_path / "nep.in", train_file=tmp_path / "train.xyz",
@@ -351,7 +352,7 @@ def test_training_rejects_model_that_nepadapters_cannot_load(tmp_path: Path, mon
         "torch",
         types.SimpleNamespace(
             manual_seed=lambda _value: None,
-            cuda=types.SimpleNamespace(manual_seed_all=lambda _value: None),
+            cuda=types.SimpleNamespace(device_count=lambda: 1, manual_seed_all=lambda _value: None),
         ),
     )
     monkeypatch.setitem(
@@ -369,6 +370,143 @@ def test_training_rejects_model_that_nepadapters_cannot_load(tmp_path: Path, mon
             ),
             "torchnep",
         )
+
+
+@pytest.mark.parametrize("warm_start", [None, "restart_file", "finetune_file"])
+def test_torchnep_multigpu_launches_only_trainer_and_collects_once(tmp_path, monkeypatch, warm_start):
+    from NepTrain.core.training import _train_torchnep
+
+    def single(config_file, data_file, output_dir, device, precision, use_compile,
+               restart, finetune_from, resume_from, run_seed=None,
+               use_gpumd_qscaler=False, print_interval=1, prediction_interval=100):
+        pytest.fail("Multi-GPU training must not call the single-device trainer")
+
+    def sharded(config_file, data_file, output_dir, precision, use_compile,
+                restart, finetune_from, resume_from, run_seed=None,
+                use_gpumd_qscaler=True, print_interval=10, prediction_interval=20):
+        pytest.fail("The stage worker must not itself become a DDP rank")
+
+    monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(
+        train_nep=single, train_nep_sharded=sharded,
+    ))
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        manual_seed=lambda _: None,
+        cuda=types.SimpleNamespace(device_count=lambda: 4, manual_seed_all=lambda _: None),
+    ))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,4,6,7")
+    calls = []
+    output = tmp_path / "training output"
+
+    def launch(command, *, check):
+        calls.append(command)
+        assert command[:3] == [sys.executable, "-m", "torch.distributed.run"]
+        assert "--nproc-per-node=4" in command
+        assert "--max-restarts=0" in command
+        assert command[-2] == "NepTrain.core.torchnep_worker"
+        assert "stage-worker" not in command
+        assert not check
+        options = json.loads(Path(command[-1]).read_text())
+        assert "device" not in options
+        assert "backend" not in options  # Current TorchNEP selects this internally.
+        assert options["run_seed"] == 17
+        assert options["use_gpumd_qscaler"] is False
+        assert options["print_interval"] == 1
+        assert options["prediction_interval"] == 100
+        assert options["resume_from"] == (str(tmp_path / "previous.pt") if warm_start == "restart_file" else None)
+        assert options["finetune_from"] == (str(tmp_path / "previous.pt") if warm_start == "finetune_file" else None)
+        assert __import__('os').environ['CUDA_VISIBLE_DEVICES'] == '2,4,6,7'
+        assert not (output / "nep.txt").exists()
+        (output / "nep_best.txt").write_text("best model")
+        (output / "nep_final.txt").write_text("final model")
+        (output / "checkpoint.pt").write_bytes(b"checkpoint")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", launch)
+    request = TrainingRequest(tmp_path / "nep.in", tmp_path / "train.xyz", output,
+                              seed=17, **({warm_start: tmp_path / "previous.pt"} if warm_start else {}))
+    result = _train_torchnep(request)
+    assert len(calls) == 1
+    assert result.best_model.read_text() == "best model"
+    assert result.final_model.read_text() == "final model"
+    assert result.checkpoint.read_bytes() == b"checkpoint"
+    assert not Path(calls[0][-1]).exists()
+
+
+def test_torchnep_rank_failure_does_not_publish_partial_model(tmp_path, monkeypatch):
+    from NepTrain.core.training import _train_torchnep
+
+    monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(
+        train_nep=lambda **kw: None, train_nep_sharded=lambda **kw: None,
+    ))
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        manual_seed=lambda _: None,
+        cuda=types.SimpleNamespace(device_count=lambda: 2, manual_seed_all=lambda _: None),
+    ))
+    def fail(command, **kwargs):
+        options = json.loads(Path(command[-1]).read_text())
+        (Path(options['output_dir']) / 'nep_best.txt').write_text('partial')
+        return subprocess.CompletedProcess(command, 1)
+    monkeypatch.setattr(subprocess, 'run', fail)
+    with pytest.raises(TrainingError, match='distributed training failed'):
+        _train_torchnep(TrainingRequest(tmp_path / 'nep.in', tmp_path / 'train.xyz', tmp_path / 'out'))
+    assert not (tmp_path / 'out/nep.txt').exists()
+    assert not list((tmp_path / 'out').glob('.torchnep-ddp-*'))
+
+
+@pytest.mark.parametrize('device,count', [('cuda', 1), ('cuda:2', 4), ('cpu', 4), ('mps', 4)])
+def test_torchnep_single_device_selection(tmp_path, monkeypatch, device, count):
+    from NepTrain.core.training import _train_torchnep
+
+    received = []
+    def single(**kw):
+        received.append(kw['device'])
+        (Path(kw['output_dir']) / 'nep_best.txt').write_text('best')
+    monkeypatch.setitem(sys.modules, 'torchnep', types.SimpleNamespace(train_nep=single))
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(
+        manual_seed=lambda _: None,
+        cuda=types.SimpleNamespace(device_count=lambda: count, manual_seed_all=lambda _: None),
+    ))
+    _train_torchnep(TrainingRequest(tmp_path / 'nep.in', tmp_path / 'train.xyz', tmp_path / 'out', device=device))
+    assert received == [device]
+
+
+@pytest.mark.parametrize('environment,error', [
+    ({'WORLD_SIZE': '4'}, 'without torchrun'),
+    ({'SLURM_JOB_NUM_NODES': '2'}, 'one node'),
+    ({}, 'no train_nep_sharded'),
+])
+def test_torchnep_rejects_unsupported_launch_before_training(tmp_path, monkeypatch, environment, error):
+    from NepTrain.core.training import _train_torchnep
+
+    monkeypatch.setitem(sys.modules, 'torchnep', types.SimpleNamespace(train_nep=lambda **kw: pytest.fail('launched')))
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(cuda=types.SimpleNamespace(device_count=lambda: 4)))
+    for key in ('WORLD_SIZE', 'SLURM_JOB_NUM_NODES'):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(TrainingError, match=error):
+        _train_torchnep(TrainingRequest(tmp_path / 'nep.in', tmp_path / 'train.xyz', tmp_path / 'out'))
+
+
+def test_distributed_worker_binds_local_rank_and_only_calls_sharded_api(tmp_path, monkeypatch):
+    from NepTrain.core import torchnep_worker
+
+    payload = {'run_seed': 12, 'resume_from': '/checkpoint.pt', 'output_dir': str(tmp_path)}
+    request = tmp_path / 'request.json'
+    request.write_text(json.dumps(payload))
+    calls = []
+    monkeypatch.setattr(sys, 'argv', ['torchnep_worker', str(request)])
+    monkeypatch.setenv('WORLD_SIZE', '4')
+    monkeypatch.setenv('LOCAL_RANK', '2')
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(cuda=types.SimpleNamespace(
+        is_available=lambda: True, device_count=lambda: 4,
+        set_device=lambda rank: calls.append(rank),
+    )))
+    monkeypatch.setitem(sys.modules, 'torchnep', types.SimpleNamespace(
+        train_nep_sharded=lambda **kw: calls.append(kw),
+    ))
+    torchnep_worker.main()
+    assert calls == [2, payload]
 
 
 @pytest.mark.parametrize("contents", [None, "", " \n\t"])

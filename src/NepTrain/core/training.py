@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import inspect
+import json
 import os
 import logging
 from pathlib import Path
@@ -12,6 +13,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 from typing import Mapping
 
 from ase.data import atomic_numbers
@@ -244,6 +247,29 @@ def _train_gpumd(
     )
 
 
+def _launch_torchnep_distributed(
+    options: dict, gpu_count: int, output_dir: Path,
+) -> None:
+    """Run only the trainer on each rank; the stage worker owns publication."""
+    with tempfile.TemporaryDirectory(prefix=".torchnep-ddp-", dir=output_dir) as directory:
+        request_file = Path(directory).resolve() / "request.json"
+        request_file.write_text(json.dumps(options), encoding="utf-8")
+        command = [
+            sys.executable, "-m", "torch.distributed.run",
+            "--standalone", "--nnodes=1", f"--nproc-per-node={gpu_count}",
+            "--max-restarts=0", "--module", "NepTrain.core.torchnep_worker",
+            str(request_file),
+        ]
+        # Inherit the stage's process group, CUDA visibility, environment and
+        # log streams. Slurm/task cancellation must terminate the ranks too.
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            raise TrainingError(
+                f"TorchNEP distributed training failed (exit code {completed.returncode}). "
+                "See the task log for the failing rank; no model was published."
+            )
+
+
 def _train_torchnep(request: TrainingRequest) -> TrainingResult:
     if request.restart_file is not None and request.finetune_file is not None:
         raise TrainingError("TorchNEP restart_file and finetune_file are mutually exclusive")
@@ -259,6 +285,26 @@ def _train_torchnep(request: TrainingRequest) -> TrainingResult:
         ) from error
     import torch
 
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise TrainingError(
+            "Run NepTrain once per task, without torchrun. NepTrain launches "
+            "distributed TorchNEP training internally."
+        )
+    gpu_count = torch.cuda.device_count() if request.device == "cuda" else 1
+    if request.device == "cuda" and int(os.environ.get("SLURM_JOB_NUM_NODES", "1")) > 1:
+        raise TrainingError("TorchNEP workflow training currently supports one node; request --nodes=1.")
+
+    trainer = train_nep
+    if gpu_count > 1:
+        try:
+            from torchnep import train_nep_sharded
+        except ImportError as error:
+            raise TrainingError(
+                "Multiple GPUs are visible, but TorchNEP has no train_nep_sharded "
+                "entry point. Upgrade TorchNEP or request one GPU."
+            ) from error
+        trainer = train_nep_sharded
+
     random.seed(request.seed)
     np.random.seed(request.seed % (2**32))
     torch.manual_seed(request.seed)
@@ -266,17 +312,17 @@ def _train_torchnep(request: TrainingRequest) -> TrainingResult:
 
     request.output_dir.mkdir(parents=True, exist_ok=True)
     options = dict(
-        config_file=str(request.config_file),
-        data_file=str(request.train_file),
-        output_dir=str(request.output_dir),
+        config_file=str(request.config_file.resolve()),
+        data_file=str(request.train_file.resolve()),
+        output_dir=str(request.output_dir.resolve()),
         device=request.device,
         precision=request.precision,
         use_compile=request.use_compile,
         restart=True,
-        finetune_from=str(request.finetune_file) if request.finetune_file else None,
-        resume_from=str(request.restart_file) if request.restart_file else None,
+        finetune_from=str(request.finetune_file.resolve()) if request.finetune_file else None,
+        resume_from=str(request.restart_file.resolve()) if request.restart_file else None,
     )
-    parameters = inspect.signature(train_nep).parameters
+    parameters = inspect.signature(trainer).parameters
     if "backend" in parameters or any(
         item.kind is inspect.Parameter.VAR_KEYWORD
         for item in parameters.values()
@@ -289,7 +335,20 @@ def _train_torchnep(request: TrainingRequest) -> TrainingResult:
         )
     if "run_seed" in parameters:
         options["run_seed"] = request.seed
-    train_nep(**options)
+    if gpu_count > 1:
+        options.pop("device")  # The distributed trainer binds LOCAL_RANK to CUDA.
+        # Some releases have different defaults between their two APIs. Keep
+        # initialization and reporting consistent with single-device training.
+        single_parameters = inspect.signature(train_nep).parameters
+        for name in ("use_gpumd_qscaler", "print_interval", "prediction_interval"):
+            parameter = single_parameters.get(name)
+            if name in parameters and parameter is not None and parameter.default is not inspect.Parameter.empty:
+                options[name] = parameter.default
+        print(f"TorchNEP training: {gpu_count} GPUs, distributed data parallel (one process per GPU).", flush=True)
+        _launch_torchnep_distributed(options, gpu_count, request.output_dir)
+    else:
+        print(f"TorchNEP training: single device ({request.device}).", flush=True)
+        train_nep(**options)
     best = request.output_dir / "nep_best.txt"
     if not best.is_file():
         raise TrainingError("TorchNEP training completed without nep_best.txt")
