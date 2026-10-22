@@ -38,6 +38,7 @@ def _record(
     validation_accepted=False,
     model_improved=False,
     final_model_id="model-1",
+    confident=False,
 ):
     return ladder.record(
         attempts,
@@ -46,6 +47,11 @@ def _record(
         },
         diagnostic_accepted={
             attempt.attempt_id: bool(accepted) for attempt in attempts
+        },
+        diagnostic={
+            "attempt_progression_confident": {
+                attempt.attempt_id: confident for attempt in attempts
+            }
         },
         history=history,
         validation_accepted=validation_accepted,
@@ -596,3 +602,137 @@ def test_extra_production_probes_depend_on_acquisition_not_optional_test(
     assert probe[0].replica == 2
     history["acquisition_pending"] = False
     assert not ladder.schedule(["structure-a"], history=history, **kwargs)
+
+
+def test_strong_local_evidence_accelerates_without_skipping_smoke_or_production():
+    ladder = _ladder(
+        path=(1000, 1200, 1400, 1600, 1800),
+        production=(1000, 1200, 1400, 1600, 1800),
+        replicas={
+            "smoke_passed": 1, "short_stable": 1,
+            "long_stable": 2, "production_ready": 3,
+        },
+    )
+
+    def schedule(generation, history=None):
+        return ladder.schedule(
+            ["mature", "cold"], pressure=0, generation=generation,
+            seed=42, limit=100, model_id=f"model-{generation}", history=history,
+        )
+
+    first = schedule(1)
+    assert {(a.temperature, a.steps) for a in first} == {(1000, 10)}
+    history = ladder.record(
+        first, completed={a.attempt_id: True for a in first},
+        diagnostic_accepted={a.attempt_id: True for a in first},
+        diagnostic={
+            "attempt_progression_confident": {
+                a.attempt_id: a.structure_id == "mature" for a in first
+            }
+        },
+        validation_accepted=None, model_improved=False, novelty_converged=True,
+        final_model_id="model-1",
+    )
+    second = schedule(2, history)
+    mature_long = [
+        a for a in second if a.structure_id == "mature" and a.temperature == 1000
+    ]
+    assert len(mature_long) == 2
+    assert all(a.target_level == "long_stable" for a in mature_long)
+    assert any(a.structure_id == "cold" and a.target_level == "short_stable" for a in second)
+    assert {a.temperature for a in second} == {1000, 1200}
+    history = ladder.record(
+        second, completed={a.attempt_id: True for a in second},
+        diagnostic_accepted={a.attempt_id: True for a in second}, history=history,
+        diagnostic={
+            "attempt_progression_confident": {
+                a.attempt_id: a.structure_id == "mature" for a in second
+            }
+        },
+        validation_accepted=None, model_improved=True, novelty_converged=True,
+        final_model_id="model-2",
+    )
+    third = schedule(3, history)
+    assert {a.temperature for a in third if a.structure_id == "mature"} == {1000, 1200, 1400, 1600}
+    assert {a.temperature for a in third if a.structure_id == "cold"} == {1000, 1200, 1400}
+    assert all(a.target_level == "smoke_passed" for a in third if a.temperature >= 1400)
+    production = [a for a in third if a.target_level == "production_ready"]
+    assert len(production) == 3
+    assert all(a.steps == 640 for a in production)
+    assert not ladder.production_ready(["mature"], pressure=0, model_id="model-3", history=history)
+    # Restarting planning cannot change seeds or task identities.
+    assert third == schedule(3, history)
+
+
+def test_failed_shortcut_returns_to_conservative_duration():
+    ladder = _ladder(path=(300,), production=(300,))
+    first = ladder.schedule(
+        ["a"], pressure=0, generation=1, seed=1, limit=10, model_id="m1",
+    )
+    history = _record(ladder, first, confident=True, final_model_id="m1")
+    second = ladder.schedule(
+        ["a"], pressure=0, generation=2, seed=2, limit=10, model_id="m2", history=history,
+    )
+    assert second[0].target_level == "long_stable"
+    history = _record(
+        ladder, second, history=history, completed=False,
+        accepted=False, final_model_id="m2",
+    )
+    third = ladder.schedule(
+        ["a"], pressure=0, generation=3, seed=3, limit=10, model_id="m3", history=history,
+    )
+    assert third[0].target_level == "short_stable"
+
+
+def test_failed_temperature_cannot_be_bridged_by_a_successful_lookahead():
+    ladder = _ladder(path=(300, 500, 700, 900, 1100), production=(300, 500, 700, 900, 1100))
+    history = None
+    for generation in (1, 2):
+        attempts = ladder.schedule(
+            ["a"], pressure=0, generation=generation, seed=1,
+            limit=50, model_id="m", history=history,
+        )
+        history = _record(
+            ladder, attempts, history=history, confident=True, final_model_id="m",
+        )
+    probes = ladder.schedule(
+        ["a"], pressure=0, generation=3, seed=1, limit=50, model_id="m", history=history,
+    )
+    accepted = {a.attempt_id: a.temperature != 700 for a in probes}
+    history = ladder.record(
+        probes, completed=accepted, diagnostic_accepted=accepted,
+        history=history, validation_accepted=None, model_improved=False,
+        novelty_converged=True, final_model_id="m",
+    )
+    retried = ladder.schedule(
+        ["a"], pressure=0, generation=4, seed=1, limit=50, model_id="new", history=history,
+    )
+    assert any(a.temperature == 700 for a in retried)
+    assert all(a.temperature < 900 for a in retried)
+    # Keep evidence, block further expansion.
+    assert any(
+        r["temperature"] == 900 and r["maturity"] == "smoke_passed"
+        for r in history["scenarios"].values()
+    )
+
+
+def test_later_production_failure_invalidates_old_successes():
+    ladder = _ladder(path=(300,), production=(300,))
+    history = None
+    for generation in range(1, 5):
+        attempts = ladder.schedule(
+            ["a"], pressure=0, generation=generation, seed=1,
+            limit=10, model_id="m", history=history,
+        )
+        history = _record(ladder, attempts, history=history, final_model_id="m")
+    assert ladder.production_ready(["a"], pressure=0, model_id="m", history=history)
+    history["acquisition_pending"] = True
+    probes = ladder.schedule(
+        ["a"], pressure=0, generation=5, seed=1, limit=10, model_id="m", history=history,
+    )
+    history = _record(ladder, probes, history=history, accepted=False, final_model_id="m")
+    assert not ladder.production_ready(["a"], pressure=0, model_id="m", history=history)
+    recheck = ladder.schedule(
+        ["a"], pressure=0, generation=6, seed=1, limit=10, model_id="m", history=history,
+    )
+    assert len(recheck) == 1 and recheck[0].target_level == "production_ready"

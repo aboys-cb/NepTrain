@@ -423,6 +423,30 @@ def _acquisition_convergence_status(
     }
 
 
+def _progression_confidence(
+    diagnostic: Mapping[str, Any], policy: Mapping[str, Any]
+) -> dict[str, bool]:
+    """Allow bounded shortcuts only with ample, comfortably passing DFT evidence."""
+    thresholds = dict(policy.get("acquisition_max_rmse", {}))
+    checks = _acquisition_convergence_status(diagnostic, policy, {})
+    eligible = bool(thresholds and checks.get("acquisition_accepted"))
+    minimum = max(10, int(policy.get("min_selected", 1)))
+    counts = diagnostic.get("attempt_evaluated_counts", {})
+    return {
+        str(attempt): bool(
+            eligible
+            and int(counts.get(attempt, 0)) >= minimum
+            and all(
+                name in metrics
+                and np.isfinite(float(metrics[name]))
+                and 0 <= float(metrics[name]) <= 0.8 * float(limit)
+                for name, limit in thresholds.items()
+            )
+        )
+        for attempt, metrics in diagnostic.get("attempt_metrics", {}).items()
+    }
+
+
 def _nep_prediction_evaluation(
     model: Path, frames: Sequence[Atoms], backend: str
 ) -> PredictionEvaluation:
@@ -2585,12 +2609,19 @@ class WorkflowIterationAdapter:
             "diagnostic_accepted": diagnostic_accepted,
             "attempt_accepted": attempt_accepted,
             "attempt_metrics": attempt_metrics,
+            "attempt_evaluated_counts": {
+                attempt_id: len(attempt_frames)
+                for attempt_id, attempt_frames in grouped.items()
+            },
             "element_force_r2": quality["element_force_r2"],
             "condition_force_r2": condition_force_r2,
             "outlier_fraction": quality["outlier_fraction"],
             "evaluated_count": len(frames),
             "spin_frame_count": spin_count,
         }
+        signals["attempt_progression_confident"] = _progression_confidence(
+            signals, convergence_policy
+        )
         output = atomic_write_json(
             context.work_dir / "acquisition-signals.json", signals
         )
@@ -2809,38 +2840,17 @@ class WorkflowIterationAdapter:
 
     def _retrain(self, context: StageContext) -> StageOutcome:
         training_input = context.artifacts["training_set"]
-        diagnostic = json.loads(
-            context.artifacts["acquisition_signals"].read_text(encoding="utf-8")
-        )
-        attempts = json.loads(
-            context.artifacts["md_attempts"].read_text(encoding="utf-8")
-        )["attempts"]
-        failed_md = any(not bool(item["completed"]) for item in attempts)
         parent_model_sha256 = file_sha256(context.artifacts["model"])
         training_count = len(_read_frames(training_input))
         previous_training_count = len(
             _read_frames(context.artifacts["training_input"])
         )
         added_count = training_count - previous_training_count
-        retrain_required = bool(
-            added_count > 0
-            and (
-                failed_md
-                or not diagnostic.get("diagnostic_accepted", False)
-            )
-        )
+        retrain_required = added_count > 0
         if not retrain_required:
             decision = {
                 "retrained": False,
-                "reason": (
-                    "no novel structures required labeling; "
-                    "advance coverage without changing the model"
-                    if added_count == 0
-                    else (
-                        "current model passed new-label diagnostics; "
-                        "continue certification without changing the model"
-                    )
-                ),
+                "reason": "no new labels; advance coverage without changing the model",
             }
             lineage = {
                 "version": 1,
@@ -2905,15 +2915,7 @@ class WorkflowIterationAdapter:
             artifacts["retraining_config"] = config_file
         decision = {
             "retrained": True,
-            "reason": (
-                "MD recovery required"
-                if failed_md
-                else (
-                    "trajectory label diagnostics exceeded thresholds"
-                    if not diagnostic.get("diagnostic_accepted", False)
-                    else "new labels require a new model generation"
-                )
-            ),
+            "reason": "new labels require a new model generation",
         }
         artifacts["retraining_decision"] = atomic_write_json(
             context.work_dir / "retraining-decision.json", decision

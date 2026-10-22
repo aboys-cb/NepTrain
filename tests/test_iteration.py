@@ -31,6 +31,7 @@ from NepTrain.core.workflow_iteration import (
     WorkflowRuntime,
     _batched_descriptors,
     _acquisition_convergence_status,
+    _progression_confidence,
     _nep_prediction_evaluation,
     _evaluation_quality,
     _structure_descriptors,
@@ -172,6 +173,93 @@ def test_r2_convergence_requires_aggregate_groups_outliers_and_enough_labels():
     rejected = _acquisition_convergence_status(diagnostic, policy, {})
     assert rejected["acquisition_groups_accepted"] is False
     assert rejected["acquisition_converged"] is False
+
+
+@pytest.mark.parametrize(
+    ("count", "error", "minimum", "expected"),
+    [
+        (10, 0.07, 1, True), (9, 0.07, 1, False),
+        (10, 0.09, 1, False), (10, 0.07, 20, False),
+        (20, 0.07, 20, True), (10, float("nan"), 1, False),
+        (10, -0.01, 1, False), (0, 0.0, 1, False),
+    ],
+)
+def test_progression_requires_enough_local_labels_and_an_error_margin(
+    count, error, minimum, expected,
+):
+    policy = {"acquisition_max_rmse": {"force_rmse": 0.1}, "min_selected": minimum}
+    diagnostic = {
+        "evaluated_count": 1000,
+        "current_model_force_rmse": 0.01,
+        "attempt_metrics": {"a": {"force_rmse": error}},
+        "attempt_evaluated_counts": {"a": count},
+    }
+    assert _progression_confidence(diagnostic, policy) == {"a": expected}
+
+
+@pytest.mark.parametrize("missing_or_failed", ["rmse", "count", "r2", "group", "outliers"])
+def test_progression_never_bypasses_configured_quality_checks(missing_or_failed):
+    policy = {
+        "acquisition_max_rmse": {"force_rmse": 0.1},
+        "acquisition_min_r2": {"force_r2": 0.95},
+        "group_min_force_r2": 0.9,
+        "max_outlier_fraction": 0.05,
+    }
+    diagnostic = {
+        "evaluated_count": 100,
+        "current_model_force_rmse": 0.01,
+        "current_model_force_r2": 0.99,
+        "element_force_r2": {"Fe": 0.99},
+        "condition_force_r2": {"T=300": 0.99},
+        "outlier_fraction": {"force": 0.01},
+        "attempt_metrics": {"a": {"force_rmse": 0.01}},
+        "attempt_evaluated_counts": {"a": 20},
+    }
+    assert _progression_confidence(diagnostic, policy) == {"a": True}
+    if missing_or_failed == "rmse":
+        diagnostic["attempt_metrics"]["a"] = {}
+    elif missing_or_failed == "count":
+        diagnostic.pop("attempt_evaluated_counts")  # Old histories lack this evidence.
+    elif missing_or_failed == "r2":
+        diagnostic["current_model_force_r2"] = 0.8
+    elif missing_or_failed == "group":
+        diagnostic["condition_force_r2"]["T=300"] = 0.8
+    else:
+        diagnostic["outlier_fraction"]["force"] = 0.1
+    assert _progression_confidence(diagnostic, policy) == {"a": False}
+    assert _progression_confidence(diagnostic, {}) == {"a": False}
+
+
+def test_diagnosis_records_local_label_counts_for_progression(tmp_path):
+    teacher = ToyTeacher("ordinary")
+    frames = [teacher.label(frame) for frame in toy_candidate_frames("ordinary", 7, 14)]
+    for index, frame in enumerate(frames):
+        frame.info["scenario_attempt_id"] = "enough" if index < 12 else "sparse"
+    labeled = tmp_path / "labeled.xyz"
+    ase_write(labeled, frames, format="extxyz")
+    model = tmp_path / "nep.txt"
+    model.write_text("model\n")
+    adapter = WorkflowIterationAdapter(
+        {"workflow": {"convergence": {"acquisition_max_rmse": {"force_rmse": 0.1}}}},
+        initial_training=None,
+        active_stage="diagnose",
+        runtime=WorkflowRuntime(
+            predict=lambda *_args: PredictionEvaluation({"force_rmse": 0.01})
+        ),
+    )
+    outcome = adapter._diagnose(
+        StageContext(
+            generation=1,
+            generation_dir=tmp_path,
+            plan=GenerationPlan(1, 7, 20),
+            artifacts={"labeled": labeled, "model": model},
+            previous_artifacts={},
+            stage_dir=tmp_path,
+        )
+    )
+    signals = json.loads(outcome.artifacts["acquisition_signals"].read_text())
+    assert signals["attempt_evaluated_counts"] == {"enough": 12, "sparse": 2}
+    assert signals["attempt_progression_confident"] == {"enough": True, "sparse": False}
 
 
 def test_evaluation_quality_keeps_element_force_information():
@@ -2533,8 +2621,9 @@ def test_candidate_model_must_pass_activation_before_the_next_round(
     assert next_round.artifacts["checkpoint"] == expected_checkpoint
 
 
-def test_retrain_updates_only_when_diagnostics_require_a_new_model(
-    tmp_path: Path,
+@pytest.mark.parametrize("diagnostic_passed", [False, True])
+def test_new_labels_always_trigger_retraining(
+    tmp_path: Path, diagnostic_passed,
 ):
     initial_frames = [
         ToyTeacher("ordinary").label(
@@ -2660,7 +2749,7 @@ def test_retrain_updates_only_when_diagnostics_require_a_new_model(
     assert reused.artifacts["model"] == model
 
     diagnostic.write_text(
-        json.dumps({"diagnostic_accepted": False}), encoding="utf-8"
+        json.dumps({"diagnostic_accepted": diagnostic_passed}), encoding="utf-8"
     )
     expanded_training = tmp_path / "expanded-train.xyz"
     ase_write(
