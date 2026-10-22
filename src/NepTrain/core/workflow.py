@@ -35,7 +35,10 @@ from .workflow_config import (
     WorkflowConfigError,
     accept_config_changes,
     inspect_config,
+    inspect_setup_changes,
+    setup_records,
     snapshot_config,
+    snapshot_setup_records,
 )
 
 
@@ -800,6 +803,7 @@ def prepare_workflow(
         "sampling_routes": sampling_routes,
     }
     manifest["config"] = snapshot_config(manifest["config"])
+    manifest["dependencies"] = snapshot_setup_records(workspace.root, manifest["dependencies"])
     atomic_write_json(manifest_path, manifest)
     return _preparation_from_manifest(manifest_path)
 
@@ -816,7 +820,9 @@ def extend_workflow(
     with _workflow_lock(preparation.output_dir):
         manifest = _validated_manifest(preparation)
         prior_config_record = dict(manifest["config"])
-        pending_changes = inspect_config(prior_config_record)
+        pending_changes = (*inspect_config(prior_config_record), *inspect_setup_changes(manifest))
+        old_launch_inputs = [r for r in manifest.get("dependencies", []) if r.get("role", "").startswith("execution_setup_")]
+        new_launch_inputs = snapshot_setup_records(preparation.output_dir, setup_records(manifest))
         if not prior_config_record.get("snapshot"):
             prior_config_record = snapshot_config(prior_config_record)
         if pending_changes:
@@ -825,7 +831,7 @@ def extend_workflow(
             if controller_running(preparation.output_dir):
                 raise WorkflowError(
                     "Stop the controller with --keep-jobs before accepting "
-                    "resource edits together with a budget extension."
+                    "configuration edits together with a budget extension."
                 )
         progress = _workflow_progress(preparation, manifest)
         if progress.state not in {"prepared", "complete", "incomplete"}:
@@ -881,6 +887,9 @@ def extend_workflow(
         save_config(portable_config, preparation.config_file)
         manifest["config"]["sha256"] = file_sha256(preparation.config_file)
         manifest["config"] = snapshot_config(manifest["config"])
+        manifest["dependencies"] = [
+            r for r in manifest.get("dependencies", []) if not r.get("role", "").startswith("execution_setup_")
+        ] + new_launch_inputs
         manifest.setdefault("config_updates", []).append({
             "created_at": extension["created_at"],
             "before": prior_config_record,
@@ -892,6 +901,8 @@ def extend_workflow(
                 "applies_to": "new generation plans (workflow extend)",
             }],
             "format_only": False,
+            "launch_inputs_before": old_launch_inputs,
+            "launch_inputs_after": new_launch_inputs,
         })
         atomic_write_json(preparation.manifest, manifest)
         if workspace.controller_file.is_file():
@@ -918,6 +929,7 @@ def _validated_manifest(preparation: WorkflowPreparation) -> dict[str, Any]:
         )
     try:
         inspect_config(manifest["config"])
+        inspect_setup_changes(manifest)
     except WorkflowConfigError as error:
         raise WorkflowError(str(error)) from error
     for record in [
@@ -925,6 +937,8 @@ def _validated_manifest(preparation: WorkflowPreparation) -> dict[str, Any]:
         *manifest["plans"],
         *manifest.get("dependencies", []),
     ]:
+        if record.get("role", "").startswith("execution_setup_"):
+            continue  # Editable launch inputs are reviewed separately above.
         if record.get("role") in {"training_test", "evaluation_validation"}:
             issue = optional_dataset_issue(Path(record["path"]), role=record["role"])
             if issue:
@@ -1794,7 +1808,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
 
     preparation = _coerce_preparation(output_dir)
     manifest = _validated_manifest(preparation)
-    pending_config_changes = inspect_config(manifest["config"])
+    pending_config_changes = (*inspect_config(manifest["config"]), *inspect_setup_changes(manifest))
     ledger = _read_workflow_ledger(preparation)
     progress = _workflow_progress(preparation, manifest, ledger=ledger)
     generations = _scientific_progress(preparation, manifest, ledger=ledger)

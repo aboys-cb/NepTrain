@@ -622,9 +622,27 @@ neptrain workflow resume workflow
 必须修改本次运行目录的 `project.yaml`，修改最初用于 prepare 的源配置不会影响已有流程。
 
 允许调整已有执行目标的 `qos`、`partition`、`time`、`cpus_per_task`、`gpus_per_node`、
-`memory_ladder`，以及仅用于申请资源的 Slurm `directives`。这些修改用于随后提交的任务，
-已提交或正在运行的作业保持原设置。程序命令、主机、执行器、环境变量和 setup 脚本不属于
-资源调整，不能通过该入口更换。新增或删除执行目标也不支持。
+`memory_ladder`，以及仅用于申请资源的 Slurm `directives`。这些资源修改用于随后提交的任务，
+已提交或正在运行的作业保持原来的资源申请。主机、执行器以及执行目标的增删仍不支持直接修改。
+
+已有执行目标的 `command`、`environment`、`setup_script` 路径和脚本内容也可以修改。
+恢复时会提示这些修改可能改变程序版本或数值环境，并保存新版本，无需手动维护哈希。
+环境变量值在提示和变更记录中隐藏。新的启动设置只用于随后新建的任务包；已经准备、排队或
+运行的任务保留其保存的启动设置，恢复不会自动重提这些作业，也不会重算历史结果。
+
+启动脚本版本保存在 `.neptrain/launch-inputs/`，每个任务包还保存自己的 `target-setup.sh`。
+主流程运行期间编辑原脚本不会改变当前主流程使用的版本；停止并恢复后才接受新版本。
+旧版已提交作业可能仍直接引用原脚本，若该作业尚未开始，修改原文件可能改变它的启动环境；
+检测到这种引用时会额外提示。新版不能改写调度器已经保存的旧脚本。
+
+例如，希望 ABACUS 的 MPI 进程数跟随 Slurm 申请的任务数，可以在 setup 脚本中设置：
+
+```bash
+export NEPTRAIN_ABACUS_COMMAND="mpirun -np ${SLURM_NTASKS:-1} abacus"
+```
+
+再通过目标的 `directives: ["--ntasks=2"]` 申请两个任务。申请 GPU 数量本身不会修改硬编码的
+`mpirun -np 1`；`--map-by` 等绑定选项仍需按平台设置。
 
 `labeling.max_concurrent` 在恢复后作用于当前标注任务组：提高上限可继续补交任务；
 降低上限不会取消已有作业，而是等在途任务降到上限以下再补交。

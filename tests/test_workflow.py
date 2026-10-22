@@ -1799,6 +1799,8 @@ def _edit_runtime_project(preparation, edits):
     ('execution.targets.label.cpus_per_task', 8),
     ('execution.targets.label.memory_ladder', ['8G', '16G']),
     ('execution.targets.label.directives', ['--nodes=1', '--ntasks=2', '--mem=8G']),
+    ('execution.targets.label.command', 'other-neptrain'),
+    ('execution.targets.label.environment.TEST_SETTING', 'new'),
     ('execution.poll_interval', 5),
     ('labeling.max_concurrent', 100),
     ('labeling.structures_per_job', 2),
@@ -1831,8 +1833,6 @@ def test_operational_edits_are_previewed_and_applied_on_start(tmp_path, monkeypa
     ('workflow.max_model_generations', 10),
     ('workflow.convergence', {'acquisition_max_rmse': {'force_rmse': 0.2, 'energy_rmse': 0.1}}),
     ('sampling.selection.max_selected', 50),
-    ('execution.targets.label.command', 'other-neptrain'),
-    ('execution.targets.label.environment.TEST_SETTING', 'new'),
     ('execution.targets.extra', {'partition': '4V100', 'qos': 'rush-1o2gpu'}),
     ('execution.targets.label.directives', ['--export=ALL,TEST_SETTING=new']),
     ('execution.targets.label.directives', ['--nodes=1 --export=ALL,TEST_SETTING=new']),
@@ -1952,3 +1952,114 @@ def test_temperature_edit_identifies_the_nested_field(tmp_path):
     save_config(edited, prep.config_file)
     with pytest.raises(WorkflowError, match=r'sampling.routes.0.conditions.pressure'):
         start_workflow(prep.output_dir)
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_launch_script_edits_are_adopted_without_manual_hash_updates(tmp_path, legacy):
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    manifest = json.loads(prep.manifest.read_text())
+    old = next(r for r in manifest['dependencies'] if r['role'] == 'execution_setup_label')
+    original = Path(old['path']).read_bytes()
+    if legacy:
+        old.pop('snapshot')
+        prep.manifest.write_text(json.dumps(manifest))
+    changed = 'export NEPTRAIN_ABACUS_COMMAND="mpirun -np ${SLURM_NTASKS:-1} abacus"\n'
+    Path(old['path']).write_text(changed)
+    before = prep.manifest.read_bytes()
+    preview = workflow_status(prep.output_dir).pending_config_changes
+    assert len(preview) == 1 and preview[0]['warning']
+    assert prep.manifest.read_bytes() == before
+    assert accept_config_changes(prep.output_dir) == preview
+    updated = json.loads(prep.manifest.read_text())
+    assert updated['config']['sha256'] == manifest['config']['sha256']
+    audit = updated['config_updates'][-1]
+    assert old in audit['launch_inputs_before']
+    new = next(r for r in audit['launch_inputs_after'] if r['role'] == old['role'])
+    assert (prep.output_dir / new['snapshot']).read_text() == changed
+    if not legacy:
+        assert (prep.output_dir / old['snapshot']).read_bytes() == original
+    assert not workflow_status(prep.output_dir).pending_config_changes
+
+
+@pytest.mark.parametrize('replacement', ['new', None, 'missing'])
+def test_launch_script_path_changes(tmp_path, replacement):
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    path = prep.output_dir / 'inputs/replacement.sh'
+    if replacement == 'new':
+        path.write_text('export OMP_NUM_THREADS=2\n')
+    _edit_runtime_project(prep, {'execution.targets.label.setup_script': str(path) if replacement else None})
+    before = prep.manifest.read_bytes()
+    if replacement == 'missing':
+        with pytest.raises(WorkflowError, match='Cannot read launch script'):
+            accept_config_changes(prep.output_dir)
+        assert prep.manifest.read_bytes() == before
+    else:
+        changes = accept_config_changes(prep.output_dir)
+        assert any(c['field'].endswith('setup_script') for c in changes)
+        assert not workflow_status(prep.output_dir).pending_config_changes
+
+
+def test_launch_environment_values_are_redacted_and_warned(tmp_path, capsys):
+    from NepTrain.cli.cli import _print_config_changes
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    _edit_runtime_project(prep, {'execution.targets.label.environment.ACCESS_TOKEN': 'secret-value'})
+    changes = accept_config_changes(prep.output_dir)
+    _print_config_changes(changes)
+    output = capsys.readouterr().out
+    assert 'Note:' in output and '[redacted]' in output
+    assert 'secret-value' not in output + prep.manifest.read_text()
+
+
+def test_launch_script_edits_do_not_hide_scientific_input_damage(tmp_path):
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    manifest = json.loads(prep.manifest.read_text())
+    script = next(r for r in manifest['dependencies'] if r['role'] == 'execution_setup_label')
+    Path(script['path']).write_text('export OMP_NUM_THREADS=2\n')
+    prep.initial_training.write_text('damaged\n')
+    before = prep.manifest.read_bytes()
+    with pytest.raises(WorkflowError, match='artifact drifted'):
+        accept_config_changes(prep.output_dir)
+    assert prep.manifest.read_bytes() == before
+
+
+def test_legacy_submitted_script_reference_is_reported(tmp_path):
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    manifest = json.loads(prep.manifest.read_text())
+    old = next(r for r in manifest['dependencies'] if r['role'] == 'execution_setup_label')
+    bundle = prep.output_dir / 'old-task'
+    bundle.mkdir()
+    (bundle / 'submit.sh').write_text(f"source {old['path']}\n")
+    state = {'current': {'tasks': [{'target': 'label', 'bundle': str(bundle), 'handle': {'execution_id': '123'}}]}}
+    state_file = prep.output_dir / '.neptrain/controller.json'
+    state_file.write_text(json.dumps(state))
+    Path(old['path']).write_text('export OMP_NUM_THREADS=2\n')
+    changes = accept_config_changes(prep.output_dir)
+    assert 'previously submitted job' in changes[0]['warning']
+    assert json.loads(state_file.read_text()) == state
+
+
+def test_extend_accepts_launch_script_edits(tmp_path):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    manifest = json.loads(prep.manifest.read_text())
+    script = next(r for r in manifest['dependencies'] if r['role'] == 'execution_setup_label')
+    Path(script['path']).write_text('export OMP_NUM_THREADS=2\n')
+    extend_workflow(prep.output_dir, 4)
+    assert not workflow_status(prep.output_dir).pending_config_changes
+    updated = json.loads(prep.manifest.read_text())
+    assert updated['config_updates'][-1]['launch_inputs_before']

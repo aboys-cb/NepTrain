@@ -883,7 +883,9 @@ def _print_config_changes(changes, *, pending=False):
         new = json.dumps(change["after"], ensure_ascii=False)
         print(f"  {change['field']}: {old} -> {new}")
         print(f"    Applies to: {change['applies_to']}")
-    print("Existing jobs retain their submitted settings.")
+        if change.get("warning"):
+            print(f"    Note: {change['warning']}")
+    print("Submitted jobs are not resubmitted. Check any launch-script notes above.")
     if pending:
         print("Stop the controller with --keep-jobs, then resume to apply these changes.")
 

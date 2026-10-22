@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -211,7 +211,7 @@ class PersistentController:
                 "persistent controllers require workflow layout v4"
             )
         from .workflow import WorkflowError, _normalise_manifest
-        from .workflow_config import WorkflowConfigError, inspect_config
+        from .workflow_config import WorkflowConfigError, inspect_config, inspect_setup_changes
 
         try:
             self.manifest = _normalise_manifest(
@@ -226,6 +226,10 @@ class PersistentController:
             )
         try:
             inspect_config(self.manifest["config"])
+            if inspect_setup_changes(self.manifest):
+                raise WorkflowConfigError(
+                    "Launch scripts have unapplied edits; use workflow resume to review and apply them."
+                )
         except WorkflowConfigError as error:
             raise ControllerError(str(error)) from error
         if not _record_matches(self.manifest["config"]):
@@ -271,6 +275,16 @@ class PersistentController:
         ) = self._execution_config(
             self.config, self.workspace.root
         )
+        # Edits to project scripts are adopted on resume, never midway through
+        # a controller run. New tasks copy this accepted, versioned script.
+        for record in self.manifest.get("dependencies", []):
+            role = record.get("role", "")
+            if role.startswith("execution_setup_") and record.get("snapshot"):
+                name = role.removeprefix("execution_setup_")
+                snapshot = self.workspace.root / record["snapshot"]
+                if not snapshot.is_file() or file_sha256(snapshot) != record["sha256"]:
+                    raise ControllerError(f"Saved launch script is missing or damaged: {snapshot}")
+                self.targets[name] = replace(self.targets[name], setup_script=str(snapshot))
         self.state = _read_json(
             self.workspace.controller_file,
             {
@@ -326,6 +340,32 @@ class PersistentController:
                 + ", ".join(unknown)
             )
         return targets, routes, sampling_route_targets
+
+    def _task_target(self, record: Mapping[str, Any]) -> ExecutionTarget:
+        """Keep prepared tasks on their saved launcher, with current resources."""
+        target = self.targets[str(record["target"])]
+        bundle = Path(record["bundle"])
+        descriptor = _read_json(bundle / "task.json", {})
+        saved = descriptor.get("target")
+        if not saved:
+            return target
+        setup = saved.get("setup_script")
+        if setup == "target-setup.sh":
+            setup = str(bundle / setup)
+        return replace(
+            target, command=saved.get("command", target.command),
+            environment=saved.get("environment", {}), setup_script=setup,
+        )
+
+    def _task_target_key(self, record: Mapping[str, Any]) -> str:
+        target = self._task_target(record)
+        setup = target.setup_script
+        if setup and Path(setup).is_file():
+            setup = file_sha256(Path(setup))
+        return canonical_sha256({
+            "target": target.name, "command": target.command,
+            "environment": dict(target.environment), "setup": setup,
+        })
 
     def _save(self) -> None:
         self.state["heartbeat_at"] = _now()
@@ -669,7 +709,7 @@ class PersistentController:
         ]
 
         def observe(item):
-            target = self.targets[str(item["target"])]
+            target = self._task_target(item)
             executor = self.executor_factory(target)
             handle = ExecutionHandle.from_mapping(item["handle"])
             status = executor.inspect(handle)
@@ -767,12 +807,12 @@ class PersistentController:
             observations = []
             observed_by_target: dict[str, list[dict[str, Any]]] = {}
             for item in observed_items:
-                observed_by_target.setdefault(str(item["target"]), []).append(
+                observed_by_target.setdefault(self._task_target_key(item), []).append(
                     item
                 )
 
             def observe_target(target_items):
-                target = self.targets[str(target_items[0]["target"])]
+                target = self._task_target(target_items[0])
                 executor = self.executor_factory(target)
                 inspect_many = getattr(executor, "inspect_many", None)
                 if callable(inspect_many):
@@ -829,7 +869,7 @@ class PersistentController:
             grouped: dict[str, list[tuple[Any, ...]]] = {}
             for observation in completed:
                 grouped.setdefault(
-                    str(observation[0]["target"]),
+                    self._task_target_key(observation[0]),
                     [],
                 ).append(observation)
             for target_observations in grouped.values():
@@ -921,7 +961,7 @@ class PersistentController:
         ][: max(0, maximum - inflight)]
 
         def launch(item):
-            target = self.targets[str(item["target"])]
+            target = self._task_target(item)
             executor = self.executor_factory(target)
             task = StageTask(
                 str(item["task_id"]),
@@ -983,11 +1023,11 @@ class PersistentController:
             and not submission_deferred
             and not (should_stop is not None and should_stop())
             and len(
-                {str(item["target"]) for item in launch_candidates}
+                {self._task_target_key(item) for item in launch_candidates}
             )
             == 1
         ):
-            target = self.targets[str(launch_candidates[0]["target"])]
+            target = self._task_target(launch_candidates[0])
             executor = self.executor_factory(target)
             launch_many = getattr(executor, "launch_many", None)
             if callable(launch_many):
@@ -1281,7 +1321,7 @@ class PersistentController:
                     return result
                 current = None
         if current is not None:
-            target = self.targets[str(current["target"])]
+            target = self._task_target(current)
             executor = self.executor_factory(target)
             bundle = Path(current["bundle"])
             handle_value = current.get("handle")
@@ -2028,7 +2068,7 @@ class PersistentController:
                     )
                     continue
                 executor = self.executor_factory(
-                    self.targets[str(item["target"])]
+                    self._task_target(item)
                 )
                 handle = ExecutionHandle.from_mapping(handle_value)
                 recorded_state = item.get("observed_state")
@@ -2129,7 +2169,7 @@ class PersistentController:
             self.retry()
             return
         executor = self.executor_factory(
-            self.targets[str(current["target"])]
+            self._task_target(current)
         )
         handle = ExecutionHandle.from_mapping(handle_value)
         status = executor.inspect(handle)

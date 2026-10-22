@@ -2296,10 +2296,10 @@ class ProcessExecutor:
             archive.mkdir(parents=True, exist_ok=False)
             local_execution.replace(archive / "execution.json")
         lines = ["#!/bin/bash", "set -eo pipefail"]
-        setup = setup_line(
-            self.target.setup_script,
-            local=self.target.host is None,
-            packaged_remote_path=f"{bundle}/target-setup.sh",
+        setup = (
+            f"source {shlex.quote(f'{bundle}/target-setup.sh')}"
+            if (task.bundle / "target-setup.sh").is_file()
+            else setup_line(self.target.setup_script, local=self.target.host is None)
         )
         if setup:
             lines.append(setup)
@@ -2612,10 +2612,10 @@ cat "$bundle/execution.json"
         bundle: str,
     ) -> Path:
         script = task.bundle / "submit.sh"
-        setup = setup_line(
-            self.target.setup_script,
-            local=self.target.host is None,
-            packaged_remote_path=f"{bundle}/target-setup.sh",
+        setup = (
+            f"source {shlex.quote(f'{bundle}/target-setup.sh')}"
+            if (task.bundle / "target-setup.sh").is_file()
+            else setup_line(self.target.setup_script, local=self.target.host is None)
         )
         script.write_text(
             render_script(

@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import json
 from pathlib import Path
 import shlex
 from typing import Any
@@ -22,6 +23,12 @@ _RESOURCE_FIELDS = {
     "partition", "qos", "time", "cpus_per_task", "gpus_per_node",
     "memory_ladder", "directives",
 }
+_LAUNCH_FIELDS = {"command", "environment", "setup_script"}
+_LAUNCH_SCOPE = "new task bundles; prepared and submitted tasks keep their launch settings"
+_LAUNCH_WARNING = (
+    "Launch settings can change the software or numerical environment. "
+    "Existing results retain their original provenance and are not recomputed."
+)
 # Directives that only choose resources, without changing the worker command,
 # environment, working directory, or output/collection contract.
 _RESOURCE_DIRECTIVES = {
@@ -67,7 +74,7 @@ def _differences(before: Any, after: Any, path: tuple[str, ...] = ()):
             yield from _differences(old, new, (*path, str(index)))
     elif before != after:
         # Descend into additions/removals too, so adding a target cannot evade
-        # the executor/host/command restrictions.
+        # the executor/host restrictions.
         if isinstance(before, Mapping) and after is None:
             yield from _differences(before, {}, path)
         elif before is None and isinstance(after, Mapping):
@@ -85,6 +92,8 @@ def _scope(path: tuple[str, ...], before: Any, after: Any) -> str | None:
         return "new submissions, including the current labeling group"
     if path == ("labeling", "structures_per_job"):
         return "new labeling groups"
+    if len(path) >= 4 and path[:2] == ("execution", "targets") and path[3] in _LAUNCH_FIELDS:
+        return _LAUNCH_SCOPE
     if len(path) == 4 and path[:2] == ("execution", "targets") and path[3] in _RESOURCE_FIELDS:
         if path[3] == "directives":
             for value in (before, after):
@@ -143,12 +152,15 @@ def inspect_config(record: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
         if scope is None:
             blocked.append(field)
         else:
-            secret = parts[:1] == ("notifications",) and parts[-1] in {"secret", "webhook"}
+            secret = (
+                parts[:1] == ("notifications",) and parts[-1] in {"secret", "webhook"}
+            ) or (parts[:2] == ("execution", "targets") and parts[3:4] == ("environment",))
             changes.append({
                 "field": field,
                 "before": "[redacted]" if secret else old,
                 "after": "[redacted]" if secret else new,
                 "applies_to": scope,
+                **({"warning": _LAUNCH_WARNING} if scope == _LAUNCH_SCOPE else {}),
             })
     if blocked:
         hint = (
@@ -165,6 +177,84 @@ def inspect_config(record: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
             "No edits were accepted; existing results are retained."
         )
     return tuple(changes)
+
+
+def setup_records(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Describe the launch scripts referenced by the current editable project."""
+    project = Path(manifest["config"]["path"])
+    config, _ = load_config(project)
+    records = []
+    for name, target in config.get("execution", {}).get("targets", {}).items():
+        value = target.get("setup_script")
+        if not value or value == "auto":
+            continue
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = project.parent / path
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise WorkflowConfigError(f"Cannot read launch script for target {name}: {path}: {error}") from error
+        records.append({"role": f"execution_setup_{name}", "kind": "file", "path": str(path.resolve()), "sha256": _sha(data)})
+    return records
+
+
+def inspect_setup_changes(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    before = {r["role"]: r for r in manifest.get("dependencies", []) if r.get("role", "").startswith("execution_setup_")}
+    after = {r["role"]: r for r in setup_records(manifest)}
+    changes = []
+    for role in sorted(before.keys() | after.keys()):
+        old, new = before.get(role), after.get(role)
+        if old and new and all(old[k] == new[k] for k in ("path", "sha256")):
+            continue
+        name = role.removeprefix("execution_setup_")
+        changes.append({
+            "field": f"execution.targets.{name}.setup_script.contents",
+            "before": old["sha256"][:12] if old else None,
+            "after": new["sha256"][:12] if new else None,
+            "applies_to": _LAUNCH_SCOPE,
+            "warning": _LAUNCH_WARNING,
+        })
+        # Older submissions may still source the editable project path. We
+        # cannot rewrite Slurm's stored batch script or recover an overwritten
+        # file on behalf of that job; surface this limitation without blocking.
+        state_path = Path(manifest["config"]["path"]).parent / ".neptrain/controller.json"
+        if old and state_path.is_file():
+            current = json.loads(state_path.read_text(encoding="utf-8")).get("current") or {}
+            tasks = current.get("tasks", [current])
+            for task in tasks:
+                if task.get("target") != name or not task.get("handle") or task.get("collected_bundle"):
+                    continue
+                script = Path(task["bundle"]) / "submit.sh"
+                if script.is_file() and old["path"] in script.read_text(encoding="utf-8"):
+                    changes[-1]["warning"] += (
+                        " A previously submitted job still references the editable script. "
+                        "Its launch environment may change if it has not started yet."
+                    )
+                    break
+    return tuple(changes)
+
+
+def snapshot_setup_records(root: Path, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for record in records:
+        if not record.get("role", "").startswith("execution_setup_"):
+            result.append(record)
+            continue
+        data = Path(record["path"]).read_bytes()
+        if _sha(data) != record["sha256"]:
+            raise WorkflowConfigError("Launch script changed while saving its version; retry.")
+        relative = Path(".neptrain/launch-inputs") / f"{record['sha256']}.sh"
+        snapshot = root / relative
+        snapshot.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not snapshot.exists():
+            with snapshot.open("xb") as stream:
+                snapshot.chmod(0o600)
+                stream.write(data)
+        if _sha(snapshot.read_bytes()) != record["sha256"]:
+            raise WorkflowConfigError(f"Saved launch script is damaged: {snapshot}")
+        result.append({**record, "snapshot": str(relative)})
+    return result
 
 
 def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
@@ -186,28 +276,40 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
         manifest = _validated_manifest(_coerce_preparation(root))
         record = manifest["config"]
         current_hash = _sha(workspace.project_file.read_bytes())
-        changes = inspect_config(record)
+        launch_records = setup_records(manifest)
+        changes = (*inspect_config(record), *inspect_setup_changes(manifest))
+        if launch_records != setup_records(manifest):
+            raise WorkflowConfigError("Launch script changed during configuration review; retry.")
         if _sha(workspace.project_file.read_bytes()) != current_hash:
             raise WorkflowConfigError("Project changed during configuration review; retry.")
-        if current_hash == record["sha256"] and record.get("snapshot"):
+        old_launch = [r for r in manifest.get("dependencies", []) if r.get("role", "").startswith("execution_setup_")]
+        if (
+            current_hash == record["sha256"] and record.get("snapshot") and not changes
+            and all(r.get("snapshot") for r in old_launch)
+        ):
             return ()
         updated = snapshot_config({**record, "sha256": current_hash})
-        if current_hash != record["sha256"]:
+        new_launch = snapshot_setup_records(root, launch_records)
+        if current_hash != record["sha256"] or changes:
             manifest.setdefault("config_updates", []).append({
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "before": dict(record),
                 "after": dict(updated),
                 "changes": list(changes),
                 "format_only": not changes,
+                "launch_inputs_before": old_launch,
+                "launch_inputs_after": new_launch,
             })
         manifest["config"] = updated
+        manifest["dependencies"] = [
+            r for r in manifest.get("dependencies", []) if not r.get("role", "").startswith("execution_setup_")
+        ] + new_launch
         atomic_write_json(workspace.manifest, manifest)
         return changes
 
 
 def remember_config(root: Path) -> None:
     """Give unchanged legacy workflows a baseline before their first edit."""
-    import json
     from .workflow import _workflow_lock
     from .workflow_workspace import WorkflowWorkspace
 

@@ -1471,3 +1471,21 @@ def test_remote_manual_bundle_is_published_atomically(tmp_path, monkeypatch):
     quarantined = list(destination.parent.glob(destination.name + ".incomplete.*"))
     assert len(quarantined) == 1
     assert (quarantined[0] / "partial").is_file()
+
+
+def test_local_manual_operation_keeps_a_verified_setup_copy(tmp_path):
+    source = _structures(tmp_path / 'input.xyz')
+    setup = tmp_path / 'setup.sh'
+    setup.write_text('export OMP_NUM_THREADS=2\n')
+    operation = prepare_labeling(
+        source, backend='toy', output=tmp_path / 'labeled.xyz',
+        workdir=tmp_path / 'run', target=ExecutionTarget('local', 'process', setup_script=str(setup)),
+    )
+    setup.write_text('exit 99\n')
+    saved = load_operation(operation.root)
+    descriptor = json.loads((operation.root / 'operation.json').read_text())
+    packaged = Path(descriptor['target']['setup_script'])
+    assert packaged.read_text() == 'export OMP_NUM_THREADS=2\n'
+    packaged.write_text('damaged\n')
+    with pytest.raises(ManualTaskError, match='drift|hash|changed|checksum'):
+        load_operation(saved.root)

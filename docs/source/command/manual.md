@@ -323,3 +323,7 @@ neptrain task status runs/label-... --json
 operation、结构顺序和 artifact hash。最终文件只在全部 shard 均通过该契约后
 原子发布。损坏 `execution.json`、缺少 `result.json` 或顺序不一致都会显示为
 可诊断失败，不会把部分 `labeled.xyz` 当成完整结果。
+
+
+本地和远程手动任务都会保存 setup 脚本副本。任务准备完成后修改原脚本不会改变已有任务；
+使用修改后的启动环境时，请准备一个新任务。

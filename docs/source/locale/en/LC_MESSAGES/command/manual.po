@@ -489,3 +489,7 @@ msgstr "In the distributed API, `batch` and `eval_batch` are per-rank batch size
 
 msgid "断点继续和跨代微调沿用原有 checkpoint 及模型输入。所有 rank 正常退出后，主 worker 才校验并发布模型、收集 checkpoint 和生成报告；任一 rank 失败都会让训练阶段失败，不发布部分结果。停止或取消任务仍使用 NepTrain 原有命令。"
 msgstr "Checkpoint continuation and cross-generation fine-tuning retain the existing checkpoint and model inputs. Only after all ranks exit successfully does the main worker validate and publish the model, collect checkpoints, and generate reports. A failure on any rank fails the training stage without publishing partial results. Use the existing NepTrain commands to stop or cancel tasks."
+
+
+msgid "本地和远程手动任务都会保存 setup 脚本副本。任务准备完成后修改原脚本不会改变已有任务； 使用修改后的启动环境时，请准备一个新任务。"
+msgstr "Both local and remote manual tasks save a copy of the setup script. Editing the original after preparation does not change an existing task. Prepare a new task to use the updated launch environment."

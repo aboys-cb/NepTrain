@@ -256,10 +256,10 @@ def _write_operation(
     if max_concurrent < 1:
         raise ManualTaskError("max_concurrent must be at least 1")
     setup = Path(target.setup_script).expanduser() if target.setup_script else None
-    if target.host and setup and setup.is_file():
+    if setup and setup.is_file():
         packaged = root / "inputs" / "setup.sh"
         _copy(setup, packaged)
-        target = replace(target, setup_script="./inputs/setup.sh")
+        target = replace(target, setup_script="./inputs/setup.sh" if target.host else str(packaged.resolve()))
     value = {
         "protocol": "neptrain.manual-operation.v4",
         "operation_id": operation_id,

@@ -3569,8 +3569,10 @@ def test_process_executor_detaches_and_reports_completion(tmp_path):
         tmp_path / "dummy_worker.py",
         """
 import json
+import os
 import pathlib
 import sys
+assert os.environ['LAUNCH_VERSION'] == 'prepared'
 bundle = pathlib.Path(sys.argv[-1])
 (bundle / 'result').mkdir(exist_ok=True)
 (bundle / 'result.json').write_text('{}')
@@ -3578,11 +3580,15 @@ bundle = pathlib.Path(sys.argv[-1])
 """,
     )
     task = StageTask("abc", "demo", 1, "train", "local", bundle)
+    setup = _write(tmp_path / "setup.sh", "export LAUNCH_VERSION=prepared\n")
+    (bundle / "target-setup.sh").write_text(setup.read_text())
+    setup.write_text("exit 99\n")
     executor = ProcessExecutor(
         ExecutionTarget(
             "local",
             "process",
             command=f"{sys.executable} {script}",
+            setup_script=str(setup),
         )
     )
 
@@ -5441,3 +5447,66 @@ def test_stop_edit_resume_keeps_current_handle_and_reports_applied_settings(tmp_
     state = json.loads((prep.output_dir / '.neptrain/controller.json').read_text())
     assert state['current']['handle'] == original_handle
     assert (Path(current['bundle']) / 'task.json').read_bytes() == original_task
+
+
+@pytest.mark.usefixtures('legacy_workflow_protocol')
+def test_resume_keeps_prepared_launcher_and_pins_new_launch_settings(tmp_path):
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _controller_inputs(tmp_path)
+    editable, _ = load_config(config)
+    target_name = editable['execution']['stage_targets']['training']
+    source = _write(tmp_path / 'setup.sh', 'export LAUNCH_VERSION=old\n')
+    editable['execution']['targets'][target_name].update(
+        setup_script=str(source), command='old-neptrain', environment={'VERSION': 'old'},
+    )
+    save_config(editable, config)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    controller = PersistentController(prep.output_dir, executor_factory=lambda target: ImmediateExecutor(target, []))
+    controller.tick()
+    current = controller.state['current']
+    descriptor = Path(current['bundle']) / 'task.json'
+    original = descriptor.read_bytes()
+    old_target = controller._task_target(current)
+    script_record = next(r for r in controller.manifest['dependencies'] if r['role'] == f'execution_setup_{target_name}')
+    Path(script_record['path']).write_text('export LAUNCH_VERSION=new\n')
+    editable, _ = load_config(prep.config_file)
+    editable['execution']['targets'][target_name].update(
+        command='new-neptrain', environment={'VERSION': 'new'}, qos='new-qos',
+    )
+    save_config(editable, prep.config_file)
+    accept_config_changes(prep.output_dir)
+    resumed = PersistentController(prep.output_dir)
+    target = resumed._task_target(current)
+    assert target.command == old_target.command == 'old-neptrain'
+    assert target.environment == {'VERSION': 'old'}
+    assert target.qos == 'new-qos'
+    assert Path(target.setup_script).read_text() == 'export LAUNCH_VERSION=old\n'
+    assert resumed.targets[target_name].command == 'new-neptrain'
+    assert resumed.targets[target_name].environment == {'VERSION': 'new'}
+    Path(script_record['path']).write_text('export LAUNCH_VERSION=unaccepted\n')
+    assert Path(resumed.targets[target_name].setup_script).read_text() == 'export LAUNCH_VERSION=new\n'
+    assert descriptor.read_bytes() == original
+    assert resumed.state['current']['handle'] == current['handle']
+    # Identical per-task copies can still share one batched scheduler query.
+    second = tmp_path / 'second-bundle'
+    shutil.copytree(current['bundle'], second)
+    assert resumed._task_target_key(current) == resumed._task_target_key({**current, 'bundle': str(second)})
+
+
+@pytest.mark.parametrize('removed', [False, True])
+def test_local_slurm_sources_packaged_setup_after_original_changes(tmp_path, removed):
+    source = _write(tmp_path / 'setup.sh', 'export VERSION=old\n')
+    bundle = tmp_path / 'task'
+    bundle.mkdir()
+    (bundle / 'target-setup.sh').write_text(source.read_text())
+    if removed:
+        source.unlink()
+    else:
+        source.write_text('exit 99\n')
+    task = StageTask('abc', 'demo', 1, 'train', 'slurm', bundle)
+    executor = SlurmExecutor(ExecutionTarget('slurm', 'slurm', partition='cpu', setup_script=str(source)))
+    script = executor._write_submission_script(task, str(bundle)).read_text()
+    assert f'source {bundle}/target-setup.sh' in script
+    assert f'source {source}\n' not in script
