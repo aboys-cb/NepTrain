@@ -24,9 +24,22 @@ class TrajectoryHealthReport:
     first_bad_metrics: Mapping[str, float]
     windows: tuple[str, ...]
     counts_by_window: Mapping[str, int]
-    thresholds: Mapping[str, float | None]
+    thresholds: Mapping[str, Any]
     available_signals: tuple[str, ...]
     unavailable_thresholds: tuple[str, ...]
+    first_bad_spin_violations: tuple[Mapping[str, Any], ...] = ()
+
+    def failure_description(self) -> str:
+        details = list(self.reason_codes)
+        for item in self.first_bad_spin_violations[:3]:
+            direction = "below minimum" if item["bound"] == "min" else "above maximum"
+            details.append(
+                f"{item['element']} atom #{item['atom_number']}: spin magnitude "
+                f"{item['magnitude']:.6g} μB {direction} {item['limit']:.6g} μB"
+            )
+        if len(self.first_bad_spin_violations) > 3:
+            details.append(f"{len(self.first_bad_spin_violations) - 3} more spin violations")
+        return "; ".join(details)
 
     def to_dict(self) -> dict[str, Any]:
         ranges = []
@@ -50,6 +63,10 @@ class TrajectoryHealthReport:
             "first_bad_step": self.first_bad_step,
             "reason_codes": list(self.reason_codes),
             "first_bad_metrics": dict(self.first_bad_metrics),
+            "first_bad_spin_violations": list(self.first_bad_spin_violations),
+            "first_bad_spin_violation_counts": dict(Counter(
+                item["element"] for item in self.first_bad_spin_violations
+            )),
             "window_ranges": ranges,
             "counts_by_window": dict(self.counts_by_window),
             "thresholds": dict(self.thresholds),
@@ -96,9 +113,10 @@ def _frame_health(
     *,
     reference_volume: float,
     policy: TrajectoryHealthPolicy,
-) -> tuple[tuple[str, ...], dict[str, float]]:
+) -> tuple[tuple[str, ...], dict[str, float], tuple[Mapping[str, Any], ...]]:
     reasons: list[str] = []
     metrics: dict[str, float] = {}
+    spin_violations = []
     positions = np.asarray(frame.positions, dtype=np.float64)
     cell = np.asarray(frame.cell, dtype=np.float64)
     if not np.all(np.isfinite(positions)):
@@ -156,12 +174,25 @@ def _frame_health(
         reasons.append("non_finite_spin")
     elif maximum_spin is not None:
         metrics["max_spin_magnitude"] = maximum_spin
-        if (
-            policy.max_spin_magnitude is not None
-            and maximum_spin > policy.max_spin_magnitude
-        ):
-            reasons.append("max_spin_magnitude_above_limit")
-    return tuple(dict.fromkeys(reasons)), metrics
+        magnitudes = np.linalg.norm(frame.arrays["spin"], axis=-1)
+        for index, (element, magnitude) in enumerate(zip(frame.get_chemical_symbols(), magnitudes)):
+            bounds = policy.spin_magnitude_by_element.get(element)
+            explicit = bounds is not None
+            if bounds is None:
+                bounds = {"max": policy.max_spin_magnitude}
+            for bound in ("min", "max"):
+                limit = bounds.get(bound)
+                if limit is None or not (magnitude < limit if bound == "min" else magnitude > limit):
+                    continue
+                reasons.append(
+                    f"spin_magnitude_{'below_min' if bound == 'min' else 'above_max'}:{element}"
+                    if explicit else "max_spin_magnitude_above_limit"
+                )
+                spin_violations.append({
+                    "element": element, "atom_number": index + 1,
+                    "magnitude": float(magnitude), "bound": bound, "limit": float(limit),
+                })
+    return tuple(dict.fromkeys(reasons)), metrics, tuple(spin_violations)
 
 
 def classify_trajectory(
@@ -191,6 +222,7 @@ def classify_trajectory(
     first_bad: int | None = None
     reason_codes: tuple[str, ...] = ()
     bad_metrics: dict[str, float] = {}
+    bad_spin_violations: tuple[Mapping[str, Any], ...] = ()
     first_arrays = frames[0].arrays
     available_signals = {
         "min_distance_ratio",
@@ -203,13 +235,14 @@ def classify_trajectory(
     if "spin" in first_arrays:
         available_signals.add("spin_magnitude")
     for index, frame in enumerate(frames):
-        reasons, metrics = _frame_health(
+        reasons, metrics, spin_violations = _frame_health(
             frame, reference_volume=reference_volume, policy=policy
         )
         if reasons:
             first_bad = index
             reason_codes = reasons
             bad_metrics = metrics
+            bad_spin_violations = spin_violations
             break
 
     if first_bad is not None:
@@ -238,6 +271,11 @@ def classify_trajectory(
         and "spin_magnitude" not in available_signals
     ):
         unavailable_thresholds.append("max_spin_magnitude")
+    if "spin_magnitude" not in available_signals:
+        present_elements = set(frames[0].get_chemical_symbols())
+        for element, bounds in policy.spin_magnitude_by_element.items():
+            if element in present_elements and any(value is not None for value in bounds.values()):
+                unavailable_thresholds.append(f"spin_magnitude_by_element.{element}")
     first_bad_step = (
         None
         if first_bad is None
@@ -261,6 +299,7 @@ def classify_trajectory(
         thresholds=asdict(policy),
         available_signals=tuple(sorted(available_signals)),
         unavailable_thresholds=tuple(unavailable_thresholds),
+        first_bad_spin_violations=bad_spin_violations,
     )
 
 

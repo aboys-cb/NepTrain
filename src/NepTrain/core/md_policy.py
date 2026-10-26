@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import math
 from typing import Any, Mapping
 
@@ -21,6 +21,7 @@ class TrajectoryHealthPolicy:
     max_force: float | None = 100.0
     max_mforce: float | None = 100.0
     max_spin_magnitude: float | None = 20.0
+    spin_magnitude_by_element: dict[str, dict[str, float | None]] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(
@@ -36,9 +37,12 @@ class TrajectoryHealthPolicy:
             raise TrajectoryHealthError(
                 f"unknown md.health settings: {', '.join(unknown)}"
             )
-        values: dict[str, float | None] = {}
+        values: dict[str, Any] = {}
         for name, default in defaults.items():
             raw = settings.get(name, default)
+            if name == "spin_magnitude_by_element":
+                values[name] = _spin_ranges(raw)
+                continue
             if raw is None:
                 values[name] = None
                 continue
@@ -63,6 +67,42 @@ class TrajectoryHealthPolicy:
                 "md.health volume ratios must satisfy min_volume_ratio < max_volume_ratio"
             )
         return policy
+
+
+def _spin_ranges(raw: Any) -> dict[str, dict[str, float | None]]:
+    """Explicit element ranges replace the legacy global spin limit."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise TrajectoryHealthError("md.health.spin_magnitude_by_element must be a mapping")
+    from ase.data import atomic_numbers
+
+    result = {}
+    for element, bounds in raw.items():
+        prefix = f"md.health.spin_magnitude_by_element.{element}"
+        if not isinstance(element, str) or element not in atomic_numbers or element == "X":
+            raise TrajectoryHealthError(f"{prefix}: expected a chemical element symbol")
+        if not isinstance(bounds, Mapping) or set(bounds) - {"min", "max"}:
+            raise TrajectoryHealthError(f"{prefix} must be a mapping with only min and max")
+        limits = {}
+        for key in ("min", "max"):
+            value = bounds.get(key)
+            if value is not None:
+                try:
+                    if isinstance(value, bool):
+                        raise ValueError
+                    value = float(value)
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError
+                except (ValueError, TypeError) as error:
+                    raise TrajectoryHealthError(
+                        f"{prefix}.{key} must be finite and non-negative, or null"
+                    ) from error
+            limits[key] = value
+        if limits["min"] is not None and limits["max"] is not None and limits["min"] > limits["max"]:
+            raise TrajectoryHealthError(f"{prefix} must satisfy min <= max")
+        result[element] = limits
+    return result
 
 
 __all__ = ["TrajectoryHealthError", "TrajectoryHealthPolicy"]

@@ -175,6 +175,26 @@ LAMMPS 运行期间，NepTrain 会按 `sampling.candidate_pool.health` 中的体
 LAMMPS 输入中复制一套不等价的物理算法。把相应 health 阈值设为 `null` 可以关闭
 该项检查。
 
+可以按元素设置局域磁矩模长范围，单位为 μB。以下阈值仅作配置示例，应按体系和研究范围确定；检查每个原子的 `spin` 矢量模长，不使用总磁矩，也不从 `labeling.constrained_elements` 或 `spin_active` 推断过滤范围。
+
+```yaml
+sampling:
+  candidate_pool:
+    health:
+      max_spin_magnitude: null
+      spin_magnitude_by_element:
+        Fe:
+          min: 1.0
+          max: 6.0
+        Co:
+          min: 0.5
+          max: 3.5
+```
+
+`spin_magnitude_by_element` 不设置、设为 `null` 或空映射时，不增加按元素限制，旧配置行为保持不变。某个元素一旦显式配置，它的范围替代该元素的全局磁矩上限；省略的 `min` / `max` 或 `null` 表示该侧无限制，边界值允许通过。未列出的元素仍受原有 `max_spin_magnitude` 上限约束（默认 20 μB），但没有下限。若只希望限制列出的元素，请像上例一样将全局上限设为 `null`；若不希望限制任何元素，则关闭全局上限并省略元素映射。
+
+按元素检查在轨迹回收后执行。任一指定原子越界时，该帧及其后的整段轨迹进入 `bad_tail`，不进入 FPS / DFT；异常之前的帧仍可使用，且该轨迹不会被视为健康完成。`trajectory-health.json` 记录首次异常帧中的元素、从 1 开始的原子编号、实际模长、触发的上下限及各元素异常原子数，任务失败原因也包含简短说明。非有限自旋仍判为异常；缺少自旋数组时，报告会列出无法执行的限制，不会把缺失数据当作零磁矩。
+
 选择 `md.backend: gpumd` 时，route 的 `template_path` 指向带占位符的 GPUMD
 `run.in`。NepTrain 与 LAMMPS 使用相同的 `{{ name }}` 替换语法，不限制模板中的
 系综类型，不按参数位置推断温压，也不插入或改写物理命令。升降温、非等向压强、

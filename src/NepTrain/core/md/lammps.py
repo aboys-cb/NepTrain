@@ -538,7 +538,7 @@ def run_lammps(
         result_failure_code = "trajectory_health"
         result_failure_reason = (
             f"trajectory health failed at step {health.first_bad_step}: "
-            + ", ".join(health.reason_codes)
+            + health.failure_description()
         )
         if failure_reason is not None:
             result_failure_reason += f"; LAMMPS also failed ({failure_reason})"

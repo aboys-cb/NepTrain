@@ -833,3 +833,16 @@ def test_convergence_allows_exact_selection_budget(tmp_path):
     value["sampling"]["selection"]["max_selected"] = 8
     config, _ = load_config(_write(tmp_path, value))
     assert config["workflow"]["convergence"]["min_selected"] == 8
+
+
+def test_element_spin_health_roundtrips_in_schema_v8(tmp_path):
+    project = _project(md={'spin': True})
+    health = {'max_spin_magnitude': None, 'spin_magnitude_by_element': {
+        'Fe': {'min': 1., 'max': 6.}, 'Co': {'min': None, 'max': 3.5}}}
+    project['sampling']['candidate_pool']['health'] = health
+    config, changes = load_config(_write(tmp_path, project))
+    assert config['sampling']['candidate_pool']['health'] == health
+    assert not changes
+    project['sampling']['candidate_pool']['health']['spin_magnitude_by_element']['Fe']['min'] = 7.
+    with pytest.raises(ConfigError, match='min <= max'):
+        load_config(_write(tmp_path, project))

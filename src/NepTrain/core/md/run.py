@@ -226,7 +226,7 @@ def _run_gpumd(
         failure_code = "trajectory_health"
         failure_reason = (
             f"trajectory health failed at step {health.first_bad_step}: "
-            + ", ".join(health.reason_codes)
+            + health.failure_description()
         )
         if process_failure is not None:
             failure_reason += f"; GPUMD also failed ({process_failure})"

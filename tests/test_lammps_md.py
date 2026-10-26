@@ -391,3 +391,38 @@ def test_default_spin_template_matches_documented_compute_order():
         {"steps": 10, "temperature": 300},
     )
     assert rendered == "run 10\nvariable x equal 300\n"
+
+
+def test_spin_range_failure_reaches_task_result_and_trajectory_windows(tmp_path, monkeypatch):
+    import json
+    from NepTrain.core.md_policy import TrajectoryHealthPolicy
+
+    model = tmp_path / 'model.txt'
+    model.write_text('fake model\n')
+    atoms = Atoms('FeO', positions=[[1, 1, 1], [4, 1, 1]], cell=[8, 8, 8], pbc=True)
+    atoms.set_array('spin', np.array([[0., 0., 3.], [0., 0., 0.]]))
+    frames = [atoms.copy() for _ in range(3)]
+    for i, frame in enumerate(frames):
+        frame.info['lammps_step'] = i * 10
+    frames[1].arrays['spin'][0] = [0., 0., .4]
+    monkeypatch.setitem(sys.modules, 'nep_adapters', SimpleNamespace(
+        inspect_model=lambda _: SimpleNamespace(elements=('Fe', 'O'), supports=lambda _: True)))
+    monkeypatch.setattr('NepTrain.core.md.lammps.resolve_backend', lambda *_: 'cpu')
+    monkeypatch.setattr('NepTrain.core.md.lammps.read_lammps_dump', lambda *a, **kw: frames)
+    monkeypatch.setattr('NepTrain.core.md.lammps.subprocess.run',
+                        lambda *a, **kw: subprocess.CompletedProcess([], 0, stdout='', stderr=''))
+    result = run_lammps(
+        atoms=atoms, model_file=model, output_dir=tmp_path / 'run',
+        output_file=tmp_path / 'trajectory.xyz', template='run {{ steps }}\n',
+        variables={'steps': 30}, inference_backend='cpu', lmp_command='lmp',
+        mpiexec='mpirun', mpi_ranks=1, spin=True,
+        health_policy=TrajectoryHealthPolicy.from_mapping({
+            'spin_magnitude_by_element': {'Fe': {'min': 1.}}}),
+    )
+    assert not result.completed
+    assert result.failure_code == 'trajectory_health'
+    assert 'Fe atom #1: spin magnitude 0.4 μB below minimum 1 μB' in result.failure_reason
+    health = json.loads(result.health_report.read_text())
+    assert health['first_bad_spin_violation_counts'] == {'Fe': 1}
+    saved = ase_read(result.trajectory, index=':')
+    assert [f.info['md_window'] for f in saved] == ['pre_failure', 'bad_tail', 'bad_tail']
