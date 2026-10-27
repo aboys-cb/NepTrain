@@ -1758,8 +1758,14 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert all(request.test_file is None for request in training_requests)
 
 
-def test_spin_workflow_accepts_spin3_training_config(tmp_path: Path):
-    """md.spin=true accepts any spin model family, not only spin_nep_lite."""
+@pytest.mark.parametrize("declaration", [
+    "spin_version 1", "  spin_version 1  # current GPUMD format",
+    "spin_version\t2",  # Leave supported versions to the selected trainer.
+    "spin_mode 1", "spin_mode 3 # legacy format", "spin_mode 4",
+    "spin_descriptor spin_nep_lite", "spin_descriptor spin_nep_lite # legacy TorchNEP",
+])
+def test_spin_workflow_accepts_current_and_legacy_training_config(tmp_path: Path, declaration):
+    """Valid model declarations reach the trainer without a workflow version allowlist."""
 
     initial = tmp_path / "initial-spin.xyz"
     template = tmp_path / "lammps-spin.in"
@@ -1788,10 +1794,7 @@ def test_spin_workflow_accepts_spin3_training_config(tmp_path: Path):
             initial_training=initial,
         )
 
-    # nep4_spin3: the O/C magnetic polynomial is a spin model as well.
-    build("type 5 Fe Co Ni Ti Al\nspin_mode 3\nspin_compress 2\n")
-    # the lite descriptor keeps working
-    build("type 5 Fe Co Ni Ti Al\nspin_descriptor spin_nep_lite\n")
+    build(f"type 5 Fe Co Ni Ti Al\n{declaration}\n")
     # a non-magnetic training config is still rejected
     with pytest.raises(WorkflowIterationError, match="must declare a spin model"):
         build("type 5 Fe Co Ni Ti Al\nspin_mode 0\n")
@@ -3048,3 +3051,13 @@ def test_explore_filters_spin_frames_but_keeps_unstable_completion_evidence(tmp_
         final_model_id=file_sha256(model))
     assert all(s['maturity'] == 'untested' for s in history['scenarios'].values())
     assert all(not e['accepted'] for s in history['scenarios'].values() for e in s['evidence'])
+
+
+@pytest.mark.parametrize("text", [
+    "", "spin_version 0", "spin_version -1", "spin_version invalid",
+    "spin_mode 0", "spin_mode -1", "# spin_version 1", "# spin_mode 3",
+    "spin_version 1 extra", "not_spin_version 1", "spin_descriptor ordinary",
+])
+def test_spin_declaration_does_not_accept_disabled_commented_or_malformed_values(text):
+    from NepTrain.core.workflow_iteration import _declares_spin_model
+    assert not _declares_spin_model(text)
