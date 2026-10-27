@@ -271,6 +271,34 @@ def test_terminal_report_is_stable_per_attempt():
     assert "resume" in event.text
 
 
+@pytest.mark.parametrize(
+    ("created", "display_time"),
+    [
+        ("2026-10-27T08:55:23.174284+00:00", "2026-10-27 16:55:23"),
+        ("2026-12-31T20:00:00+00:00", "2027-01-01 04:00:00"),
+        ("2026-10-27T01:55:23-07:00", "2026-10-27 16:55:23"),
+    ],
+)
+def test_notification_displays_shanghai_event_time(
+    tmp_path: Path, monkeypatch, created, display_time
+):
+    from NepTrain.core import notifications as module
+
+    monkeypatch.setattr(module, "_now", lambda: created)
+    workspace = WorkflowWorkspace.create(tmp_path / "workflow")
+    pool = FakePool()
+    worker = WorkflowNotificationWorker(_settings(), workspace, pool=pool)
+    event = NotificationEvent("terminal:stalled:1:label:1", "Labeling blocked")
+    assert worker.enqueue(event)
+    _finish(worker)
+
+    record = json.loads(workspace.notification_state.read_text())["events"][event.event_id]
+    assert record["created_at"] == created
+    expected = f"Labeling blocked\nEvent time: {display_time}"
+    assert record["text"] == expected
+    assert json.loads(pool.requests[0][2]["body"])["content"]["text"] == expected
+
+
 def test_worker_does_not_block_controller_and_deduplicates(tmp_path: Path):
     entered = threading.Event()
     release = threading.Event()

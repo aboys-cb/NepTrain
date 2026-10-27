@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import hmac
@@ -37,6 +37,7 @@ _MAX_DELIVERY_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 1.0
 _SHUTDOWN_GRACE_SECONDS = 30.0
 _MONITOR_WARNING_SECONDS = 300.0
+_SHANGHAI_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -541,10 +542,14 @@ class WorkflowNotificationWorker:
                     return True  # Exhausted retries; a settings change can rearm it.
                 if not old.get("text"):
                     created = _now()
+                    display_time = datetime.fromisoformat(created).astimezone(
+                        _SHANGHAI_TIMEZONE
+                    ).strftime("%Y-%m-%d %H:%M:%S")
                     state["events"][event.event_id] = {
                         "state": "pending", "attempts": old.get("attempts", 0),
                         "delivery_attempts": 0, "created_at": created,
-                        "text": _redact(event.text, self.settings) + f"\nEvent time (UTC): {created}",
+                        "text": _redact(event.text, self.settings)
+                        + f"\nEvent time: {display_time}",
                         "priority": event.priority, "next_attempt_at": 0,
                     }
             self._ensure_thread()
