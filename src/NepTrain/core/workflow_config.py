@@ -113,7 +113,63 @@ def _scope(path: tuple[str, ...], before: Any, after: Any) -> str | None:
     return None
 
 
-def inspect_config(record: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+def _before_first_labeling(project: Path) -> bool:
+    """Fail closed when any label preparation/execution/evidence already exists."""
+    state = project.parent / ".neptrain"
+    try:
+        ledger = json.loads((state / "ledger.json").read_text())
+        controller = json.loads((state / "controller.json").read_text())
+        if controller.get("state") != "stopped":
+            return False
+        for generation in ledger["generations"].values():
+            if "label" in generation.get("stages", {}):
+                return False
+        records = [controller.get("current"), *controller.get("history", [])]
+        if any(r and r.get("stage") == "label" for r in records):
+            return False
+        # Bundles are durable even if a controller crashed before recording submission.
+        jobs = state / "jobs"
+        if not jobs.is_dir():
+            return False
+        for bundle in jobs.iterdir():
+            if "-label-" in bundle.name:
+                return False
+            task = bundle / "task.json"
+            if task.is_file() and json.loads(task.read_text()).get("stage") == "label":
+                return False
+        if any((project.parent / "generations").glob("*/label*")):
+            return False
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return True
+
+
+def _before_sampling(project: Path) -> bool:
+    """No current execution or current-generation sampling evidence may survive."""
+    from .generation_policy import generation_stage_sequence
+
+    state = project.parent / ".neptrain"
+    try:
+        controller = json.loads((state / "controller.json").read_text())
+        if controller.get("current") is not None or controller.get("state") not in {"idle", "stopped"}:
+            return False
+        records = json.loads((state / "ledger.json").read_text())["generations"]
+        entered = [int(k) for k, v in records.items() if v.get("stages") is not None]
+        if not entered:
+            return False
+        record = records[str(max(entered))]
+        if record.get("complete"):
+            return False
+        sequence = generation_stage_sequence(record)
+        preceding = set(sequence[:sequence.index("explore")])
+        return bool(record.get("stages")) and set(record["stages"]) <= preceding
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def inspect_config(
+    record: Mapping[str, Any], *, sampling_restart: bool = False,
+) -> tuple[dict[str, Any], ...]:
     """Read-only classification; never accept changes or rewrite hashes here."""
     path = Path(record["path"])
     try:
@@ -148,6 +204,12 @@ def inspect_config(record: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     ]
     for parts, old, new in _differences(before, after):
         scope = _scope(parts, old, new)
+        if parts[:3] == ("sampling", "candidate_pool", "health") and (
+            sampling_restart or _before_sampling(path)
+        ):
+            scope = "sampling and downstream stages rebuilt; earlier training retained"
+        if (parts[:2] == ("labeling", "hubbard") or parts == ("labeling", "input_path")) and after.get("labeling", {}).get("hubbard") is not None and _before_first_labeling(path):
+            scope = "first labeling only; existing training jobs and results are retained"
         field = ".".join(parts)
         if scope is None:
             blocked.append(field)
@@ -288,6 +350,16 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
             and all(r.get("snapshot") for r in old_launch)
         ):
             return ()
+        new_label_inputs = None
+        old_label_inputs = [r for r in manifest.get("dependencies", []) if r.get("role") == "labeling_input"]
+        if any(c["field"].startswith("labeling.hubbard") or c["field"] == "labeling.input_path" for c in changes):
+            from .workflow import _dependencies, _resolved_config
+            from .dft.vasp.native import validate_vasp_input_file
+            config, _ = load_config(workspace.project_file)
+            config = _resolved_config(config, workspace.project_file.parent)
+            label = config["labeling"]
+            validate_vasp_input_file(label["input_path"], hubbard=label.get("hubbard"))
+            new_label_inputs = [r for r in _dependencies(config) if r.get("role") == "labeling_input"]
         updated = snapshot_config({**record, "sha256": current_hash})
         new_launch = snapshot_setup_records(root, launch_records)
         if current_hash != record["sha256"] or changes:
@@ -299,7 +371,11 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
                 "format_only": not changes,
                 "launch_inputs_before": old_launch,
                 "launch_inputs_after": new_launch,
+                "label_inputs_before": old_label_inputs,
+                "label_inputs_after": new_label_inputs if new_label_inputs is not None else old_label_inputs,
             })
+        if new_label_inputs is not None:
+            manifest["dependencies"] = [r for r in manifest.get("dependencies", []) if r.get("role") != "labeling_input"] + new_label_inputs
         manifest["config"] = updated
         manifest["dependencies"] = [
             r for r in manifest.get("dependencies", []) if not r.get("role", "").startswith("execution_setup_")

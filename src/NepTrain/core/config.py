@@ -53,6 +53,7 @@ _FIELDS: dict[str, set[str]] = {
     "labeling": {
         "backend",
         "constrained_elements",
+        "hubbard",
         "gamma_centered",
         "input_path",
         "resource_path",
@@ -513,7 +514,14 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 "sampling.selection.novelty thresholds must be finite and non-negative"
             )
 
+    from .dft.vasp.hubbard import validate_hubbard
+    try:
+        validate_hubbard(labeling.get("hubbard"))
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     backend = labeling.get("backend", "vasp")
+    if labeling.get("hubbard") is not None and backend != "vasp":
+        raise ConfigError("labeling.hubbard currently requires backend=vasp")
     if backend not in {"vasp", "abacus", "model", "toy"}:
         raise ConfigError(
             "labeling.backend must be vasp, abacus, model, or toy"

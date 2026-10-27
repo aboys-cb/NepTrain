@@ -95,3 +95,42 @@ print(frame.info["deltaspin_max_error"], frame.info["deltaspin_tolerance"])
 ```
 
 接口面向输出 `ion elem cx cy cz Mx My Mz |M|` 和 `MFx MFy MFz` 表的 VASP 6 DeltaSpin；不读取旧 VASP65 的磁性力格式。不同版本或磁矩定义的数据混用前，需要独立核对符号、单位和导数一致性。
+
+## 按元素配置 Hubbard U
+
+VASP 批量标注建议在 project.yaml 中使用元素映射：
+
+```yaml
+labeling:
+  backend: vasp
+  constrained_elements: [Fe]
+  hubbard:
+    Fe: {L: 2, U: 4.0, J: 0.0}
+    Bi: {L: -1, U: 0.0, J: 0.0}
+    O:  {L: -1, U: 0.0, J: 0.0}
+```
+
+INCAR 保留 `LDAU=.TRUE.`、`LDAUTYPE=2`，删除 `LDAUL/LDAUU/LDAUJ`。
+这里 U、J 的单位是 eV；目前支持 VASP Dudarev 形式（Ueff=U−J）。
+每种实际出现的元素都必须显式列出；`L=-1,U=J=0` 表示不加 U。
+参数绑定元素，不依赖原子数量、输入原子排序或元素块顺序。ASE 用实际
+`symbol_count` 生成三个列表。ASE 当前仅输出三位小数；不满足该精度的
+U/J 数值会被拒绝，避免静默舍入。
+
+映射与 INCAR 数值列表同时存在会报错。缺失元素、错误元素名、非有限参数、
+重复 INCAR 关键词及错误的输出输入对应关系会在 VASP 执行前拒绝。
+手动 `neptrain label --project ...` 与 workflow 共用此路径；未配置映射的
+旧输入继续保持原有列表语义，不能假定它已具备元素顺序保护。
+
+每个 case 的 `vasp-result.json` 中，`input_binding` 记录元素顺序、计数、U 参数、
+两个方向的原子排列和实际输入哈希。`vasp_to_original[i]` 是第 i 个 VASP 原子在
+原输入中的下标；`original_to_vasp` 是其逆排列。两个下标均从 0 开始。
+显式 `spin_active` 的优先级保持不变；不将任何材料的 Fe-only 假设写死到后端。
+
+### 已有工作流迁移
+
+先 `neptrain workflow stop RUN --keep-jobs`。只有尚未准备任何标注任务、
+也没有标注阶段记录时，才允许添加或修改 `labeling.hubbard` 并指定新的
+`labeling.input_path`。使用新的 INCAR 文件，保留旧文件及其哈希；不要原地
+改写已经归档的输入。`workflow resume RUN` 会校验新配置并记录迁移，保留
+原训练任务和产物。已有或已准备的标注任务会封闭该入口，此时需要新工作流。

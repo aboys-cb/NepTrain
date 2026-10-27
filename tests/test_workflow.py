@@ -2095,3 +2095,90 @@ def test_status_separates_process_completion_stability_and_frame_filtering(capsy
     assert 'MD runs: 16 completed, 0 interrupted' in output
     assert 'Trajectory stability: 1 passed, 15 not established' in output
     assert '4733 usable, 4983 spin outliers excluded, 0 in quarantined tails' in output
+
+
+def _sampling_restart_fixture(tmp_path):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    ws = WorkflowWorkspace.locate(prep.output_dir)
+    plan = GenerationPlan(**json.loads(prep.plans[0].read_text()))
+    sequence = ['train', 'evaluate', 'explore', 'select', 'label', 'diagnose', 'merge']
+    ws.ledger.write_text(json.dumps({'version': 1, 'workflow_id': prep.workflow_id,
+        'generations': {'1': {'plan_sha256': plan.sha256, 'kind': 'acquisition',
+        'stage_sequence': sequence, 'stages': {s: {'artifacts': {}, 'metrics': {}}
+        for s in sequence[:4]}}}}))
+    ws.controller_file.write_text(json.dumps({'protocol': 'neptrain.controller.v1',
+        'workflow_id': prep.workflow_id, 'state': 'stopped', 'history': [], 'current': None}))
+    _edit_runtime_project(prep, {
+        'sampling.candidate_pool.health.spin_magnitude_by_element.Fe.min': 0.0,
+        'sampling.candidate_pool.health.spin_magnitude_by_element.Fe.max': 6.0,
+    })
+    return prep, ws
+
+
+def test_health_restart_preview_preserves_all_evidence(tmp_path):
+    prep, ws = _sampling_restart_fixture(tmp_path)
+    paths = [prep.manifest, ws.controller_file, ws.ledger]
+    before = [p.read_bytes() for p in paths]
+    result = restart_workflow(prep.output_dir, generation=1, from_stage='explore',
+                              task_scope='all', dry_run=True)
+    assert result.reused_stages == ('train', 'evaluate')
+    assert [p.read_bytes() for p in paths] == before
+
+
+@pytest.mark.parametrize('stage,scope', [('select','all'), ('label','all'), ('explore','failed')])
+def test_health_restart_rejects_reusing_old_sampling(tmp_path, stage, scope):
+    prep, ws = _sampling_restart_fixture(tmp_path)
+    before = ws.ledger.read_bytes()
+    with pytest.raises(WorkflowError, match='configuration changes cannot'):
+        restart_workflow(prep.output_dir, generation=1, from_stage=stage, task_scope=scope)
+    assert ws.ledger.read_bytes() == before
+
+
+def test_health_restart_archives_pool_retains_training_and_adopts_launch(tmp_path, monkeypatch):
+    from NepTrain.core.controller import PersistentController
+    prep, ws = _sampling_restart_fixture(tmp_path)
+    manifest = json.loads(prep.manifest.read_text())
+    launch = next(r for r in manifest['dependencies'] if r['role']=='execution_setup_label')
+    Path(launch['path']).write_text('export CUDA_SCF_MAX_LANES=1\n')
+    old = json.loads(ws.ledger.read_text())['generations']['1']['stages']
+    seen = []
+    def start(path, **_):
+        controller = PersistentController(path)
+        record = controller._ledger()['generations']['1']
+        assert record['stages'] == {s: old[s] for s in ['train','evaluate']}
+        assert record['recovery_attempts'][-1]['stages'] == {s: old[s] for s in ['explore','select']}
+        assert controller.config['sampling']['candidate_pool']['health']['spin_magnitude_by_element']['Fe']=={'min':0., 'max':6.}
+        assert 'CUDA_SCF_MAX_LANES=1' in Path(controller.targets['label'].setup_script).read_text()
+        seen.append(True)
+        return 123
+    monkeypatch.setattr('NepTrain.core.controller.start_controller', start)
+    result=restart_workflow(prep.output_dir,generation=1,from_stage='explore',task_scope='all')
+    assert seen and result.controller_pid==123
+    updated=json.loads(prep.manifest.read_text())
+    assert updated['config_updates'][-1]['before']==manifest['config']
+    assert updated['initial_training']==manifest['initial_training']
+
+
+def test_health_restart_does_not_adopt_other_scientific_edits(tmp_path):
+    prep, ws = _sampling_restart_fixture(tmp_path)
+    from NepTrain.core.config import load_config, save_config
+    config, _ = load_config(prep.config_file)
+    config['sampling']['routes'][0]['conditions']['pressure'] = 1.0
+    save_config(config, prep.config_file)
+    before=ws.ledger.read_bytes()
+    with pytest.raises(WorkflowError,match='sampling.routes'):
+        restart_workflow(prep.output_dir,generation=1,from_stage='explore',task_scope='all')
+    assert ws.ledger.read_bytes()==before
+
+
+def test_health_resume_after_interrupted_reopen_keeps_old_results_archived(tmp_path, monkeypatch):
+    from NepTrain.core.workflow_config import accept_config_changes
+    from NepTrain.core.controller import PersistentController
+    prep,ws=_sampling_restart_fixture(tmp_path)
+    controller=PersistentController(prep.output_dir,_sampling_restart=True)
+    controller.restart_from(generation=1,from_stage='explore',task_scope='all')
+    # Simulate interruption before accepting the changed project.
+    assert accept_config_changes(prep.output_dir)
+    recovered=PersistentController(prep.output_dir)
+    assert set(recovered._ledger()['generations']['1']['stages'])=={'train','evaluate'}

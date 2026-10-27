@@ -2261,6 +2261,7 @@ def run_manual_label_command(args):
         ),
         kpoint_mode=kpoint_mode,
         constrained_elements=settings.get("constrained_elements"),
+        hubbard=settings.get("hubbard"),
         kspacing=kspacing,
         ka=ka,
         structures_per_job=(

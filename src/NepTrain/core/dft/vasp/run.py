@@ -45,6 +45,7 @@ def calculate_vasp(atoms: Atoms, args, *, case_index: int = 1):
             command=command,
             input_file=input_file.resolve(),
             use_gamma=bool(args.use_gamma),
+            hubbard=getattr(args, "hubbard", None),
             kpoint_mode=str(getattr(args, "kpoint_mode", "auto")),
             kspacing=args.kspacing,
             ka=tuple(int(value) for value in args.ka),

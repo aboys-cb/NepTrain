@@ -551,6 +551,12 @@ neptrain workflow restart workflow \
   --generation 3 --from select --tasks all
 ```
 
+修改 `sampling.candidate_pool.health`（例如 Fe 磁矩范围）后，使用
+`workflow restart workflow --generation 1 --from explore --tasks all --dry-run`
+预览，再去掉 `--dry-run` 执行。此操作保留训练，将本代旧采样、选择及下游记录
+归档后接纳新健康阈值，并重新采样；不能从 `select` 或 `label` 重启以沿用旧候选池。
+其他科学设置仍拒绝直接修改。中断后只有本代尚无采样证据和当前任务时才可接纳阈值。
+
 `restart` 只操作最新且尚未完成的代次。指定阶段之前的 artifact 保持权威；该阶段
 及其下游的已提交记录转入 `recovery_attempts`，当前执行转入 history，不会删除
 失败证据。若 current 是 `label` 或 `explore` task group，`--tasks failed` 保留

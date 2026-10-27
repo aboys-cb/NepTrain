@@ -208,6 +208,7 @@ class PersistentController:
         project: str | Path,
         *,
         executor_factory: ExecutorFactory = executor_for,
+        _sampling_restart: bool = False,
     ):
         self.workspace = WorkflowWorkspace.locate(project)
         if self.workspace.version != 4:
@@ -229,14 +230,14 @@ class PersistentController:
                 "workflow was not prepared for the current controller"
             )
         try:
-            inspect_config(self.manifest["config"])
-            if inspect_setup_changes(self.manifest):
+            inspect_config(self.manifest["config"], sampling_restart=_sampling_restart)
+            if inspect_setup_changes(self.manifest) and not _sampling_restart:
                 raise WorkflowConfigError(
                     "Launch scripts have unapplied edits; use workflow resume to review and apply them."
                 )
         except WorkflowConfigError as error:
             raise ControllerError(str(error)) from error
-        if not _record_matches(self.manifest["config"]):
+        if not _sampling_restart and not _record_matches(self.manifest["config"]):
             raise ControllerError(
                 "Project has unapplied configuration edits; use workflow resume "
                 "(or workflow run for a prepared workflow) to review and apply them."
@@ -246,6 +247,10 @@ class PersistentController:
             *self.manifest.get("plans", []),
             *self.manifest.get("dependencies", []),
         ]:
+            # Planning/reopening only; snapshots below still validate old launch inputs.
+            # The public restart adopts edited inputs after discarding sampling evidence.
+            if _sampling_restart and record.get("role", "").startswith("execution_setup_"):
+                continue
             if record.get("role") in {"training_test", "evaluation_validation"}:
                 issue = optional_dataset_issue(Path(record["path"]), role=record["role"])
                 if issue:

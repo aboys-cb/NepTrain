@@ -380,6 +380,7 @@ def prepare_labeling(
     use_gamma: bool = False,
     kpoint_mode: str = "auto",
     constrained_elements: list[str] | None = None,
+    hubbard: dict | None = None,
     kspacing: float | None = None,
     ka: Sequence[int] = (1, 1, 1),
     structures_per_job: int = DEFAULT_STRUCTURES_PER_LABEL_JOB,
@@ -392,6 +393,10 @@ def prepare_labeling(
     precision: str = "float32",
     force: bool = False,
 ) -> ManualOperation:
+    from .dft.vasp.hubbard import validate_hubbard
+    validate_hubbard(hubbard)
+    if hubbard is not None and backend != "vasp":
+        raise ManualTaskError("hubbard currently requires backend=vasp")
     if structures_per_job < 1:
         raise ManualTaskError("structures_per_job must be at least 1")
     selected_resource = (
@@ -475,7 +480,7 @@ def prepare_labeling(
         orders = sorted({vasp_element_order(frame) for frame in frames})
         try:
             electronic_mode = (
-                validate_vasp_input_file(input_file)
+                validate_vasp_input_file(input_file, hubbard=hubbard, symbols={s for frame in frames for s in frame.get_chemical_symbols()})
                 if input_file is not None
                 else "non_spin_polarized"
             )
@@ -633,6 +638,7 @@ def prepare_labeling(
             "use_gamma": bool(use_gamma),
             "kpoint_mode": kpoint_mode,
             "constrained_elements": constrained_elements,
+            "hubbard": hubbard,
             "kspacing": kspacing,
             "ka": [int(value) for value in ka],
             "teacher_profile": teacher_profile,
@@ -911,6 +917,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                             "use_gamma": bool(request["use_gamma"]),
                             "kpoint_mode": request["kpoint_mode"],
                             "constrained_elements": request.get("constrained_elements"),
+                            "hubbard": request.get("hubbard"),
                             "kspacing": request.get("kspacing"),
                             "ka": tuple(request["ka"]),
                             "profile": request["teacher_profile"],

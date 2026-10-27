@@ -29,6 +29,12 @@ class VaspInput(Vasp):
         self.input_params["setups"] = {"base": "recommended"}
         self.input_params["pp"] = ""
 
+    def write_input(self, atoms, properties=None, system_changes=None):
+        super().write_input(atoms, properties, system_changes)
+        if getattr(self, "input_binding", None) is not None:
+            from .hubbard import audit_written_input
+            self.input_audit = audit_written_input(self, atoms)
+
     def _build_pp_list(self, atoms, setups=None, special_setups=()):
         """Let ASE resolve POTCARs against this calculator's pinned root."""
 
@@ -58,6 +64,7 @@ def read_vasp_input(calculator, filename):
     text = Path(filename).read_text(encoding="utf-8")
     ordinary = []
     custom = {}
+    seen = set()
     for line in text.replace("\\\n", " ").splitlines():
         for assignment in re.split(r"[#!]", line, maxsplit=1)[0].split(";"):
             key, separator, value = assignment.partition("=")
@@ -66,6 +73,9 @@ def read_vasp_input(calculator, filename):
                 if assignment.strip():
                     ordinary.append(assignment)
                 continue
+            if key in seen:
+                raise ValueError(f"duplicate INCAR key: {key.upper()}")
+            seen.add(key)
             if key in {"ldeltaspin", "m_deltaspin", "ediff_rho"} or key.startswith(
                 ("deltaspin_", "scf_cuda_")
             ):

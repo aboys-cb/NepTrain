@@ -438,7 +438,7 @@ def _validate_vasp_preparation(
     try:
         input_path = labeling.get("input_path")
         electronic_mode = (
-            validate_vasp_input_file(input_path)
+            validate_vasp_input_file(input_path, hubbard=labeling.get("hubbard"), symbols={s for frame in frames_by_order.values() for s in frame.get_chemical_symbols()})
             if input_path
             else "non_spin_polarized"
         )
@@ -2338,13 +2338,15 @@ def restart_workflow(
         start_controller,
     )
 
+    sampling_restart = from_stage == "explore" and task_scope == "all"
     with _workflow_lock(output):
         if controller_running(output):
             raise WorkflowError(
                 "workflow is running; stop it before choosing a restart stage"
             )
         try:
-            controller = PersistentController(output)
+            controller = (PersistentController(output, _sampling_restart=True)
+                          if sampling_restart else PersistentController(output))
             if dry_run:
                 plan = controller.plan_restart(
                     generation=generation, from_stage=from_stage,
@@ -2370,6 +2372,14 @@ def restart_workflow(
             raise WorkflowError(str(error)) from error
 
     if not dry_run:
+        # Reopening archives the old sampling pool and all downstream evidence first.
+        # A crash here remains recoverable: resume can adopt health edits only while
+        # the latest generation has no current execution or sampling evidence.
+        if sampling_restart:
+            try:
+                accept_config_changes(output)
+            except WorkflowConfigError as error:
+                raise WorkflowError(str(error)) from error
         try:
             controller_result = start_controller(
                 output,

@@ -37,6 +37,7 @@ class NativeVaspRequest:
     kspacing: float | None
     ka: tuple[int, int, int]
     flat_single_case: bool = False
+    hubbard: dict | None = None
 
 
 def run_native_vasp(
@@ -53,6 +54,7 @@ def run_native_vasp(
     )
     resource_provenance = None
     magnetic_result = None
+    calculator = None
     try:
         resource_provenance = validate_vasp_resources(
             request.resource_dir,
@@ -61,6 +63,8 @@ def run_native_vasp(
         )
         calculator = VaspInput(pp_path=request.resource_dir)
         read_vasp_input(calculator, request.input_file)
+        from .hubbard import configure_hubbard
+        hubbard = configure_hubbard(calculator, request.hubbard, atoms.get_chemical_symbols())
         electronic_mode = _validate_single_point_input(calculator)
         validate_vasp_structure(atoms, electronic_mode=electronic_mode)
         settings = {
@@ -119,6 +123,13 @@ def run_native_vasp(
                 input_atoms, resort = prepare_vector_moments(calculator, atoms, initial)
             else:
                 calculator.set(ispin=1)
+        calculator.input_binding = dict(
+            hubbard=hubbard, order=np.argsort(resort).tolist(),
+            potcar_sha256=resource_provenance["combined_sha256"],
+            deltaspin=electronic_mode == "deltaspin",
+            active_mask=(deltaspin.numbers(deltaspin.custom_parameters(calculator)["deltaspin_atoms"]).tolist()
+                         if electronic_mode == "deltaspin" else None),
+        )
         calculator.calculate(input_atoms, ("energy", "forces", "stress"))
         if not calculator.converged:
             raise NativeVaspError(f"VASP electronic SCF did not converge in {case_dir}")
@@ -146,6 +157,7 @@ def run_native_vasp(
             error=str(error),
             electronic_mode=electronic_mode,
             resources=resource_provenance,
+            input_binding=getattr(calculator, "input_audit", None),
         )
         if isinstance(error, deltaspin.DeltaSpinError):
             raise NativeVaspError(str(error)) from error
@@ -180,6 +192,7 @@ def run_native_vasp(
         electronic_mode=electronic_mode,
         resources=resource_provenance,
         magnetic_result=magnetic_result,
+        input_binding=getattr(calculator, "input_audit", None),
     )
     return frame
 
@@ -217,12 +230,14 @@ def _validate_single_point_input(calculator: VaspInput) -> str:
     return "collinear_spin_polarized" if ispin == 2 else "non_spin_polarized"
 
 
-def validate_vasp_input_file(input_file: str | Path) -> str:
+def validate_vasp_input_file(input_file: str | Path, *, hubbard=None, symbols=None) -> str:
     """Validate the VASP physics contract without launching VASP."""
 
     calculator = Vasp()
     try:
         read_vasp_input(calculator, Path(input_file).expanduser().resolve())
+        from .hubbard import configure_hubbard
+        configure_hubbard(calculator, hubbard, symbols)
     except Exception as error:
         raise NativeVaspError(f"cannot parse VASP INCAR {input_file}: {error}") from error
     return _validate_single_point_input(calculator)
@@ -310,6 +325,7 @@ def _write_manifest(
     electronic_mode: str | None = None,
     resources: dict | None = None,
     magnetic_result: deltaspin.DeltaSpinResult | None = None,
+    input_binding: dict | None = None,
 ) -> None:
     inputs = {}
     for name in ("INCAR", "POSCAR", "KPOINTS", "POTCAR"):
@@ -327,6 +343,8 @@ def _write_manifest(
         "electronic_mode": electronic_mode,
         "spin_force_labels": electronic_mode == "deltaspin",
     }
+    if input_binding is not None:
+        payload["input_binding"] = input_binding
     outputs = {}
     for name in ("vasprun.xml", "OUTCAR"):
         path = case_dir / name
