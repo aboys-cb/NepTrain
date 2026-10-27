@@ -60,7 +60,7 @@ def test_shared_fps_anchors_strata_and_is_input_order_independent():
     assert first.counts_by_stratum == {"A": 3, "B": 1}
 
 
-def test_shared_fps_uses_global_novelty_after_stratum_anchors():
+def test_shared_fps_uses_global_novelty_before_stratum_coverage():
     points = np.asarray([[10.0], [9.0], [8.0], [1.0], [0.5], [0.25]])
     ids = ["a10", "a9", "a8", "b1", "b05", "b025"]
     strata = ["A", "A", "A", "B", "B", "B"]
@@ -73,7 +73,7 @@ def test_shared_fps_uses_global_novelty_after_stratum_anchors():
         strata=strata,
     )
 
-    assert result.selected_ids == ("a10", "b1", "a8", "a9")
+    assert result.selected_ids == ("a10", "a8", "b1", "a9")
     assert result.counts_by_stratum == {"A": 3, "B": 1}
 
 
@@ -101,13 +101,9 @@ def test_sqrt_quotas_and_stratum_anchors():
     assert result.groups[("Fe",)].selected_count == 3
     assert result.groups[("Fe", "O")].selected_count == 2
     assert sum(result.counts_by_stratum.values()) == 5
-    assert (
-        abs(
-            result.counts_by_stratum["cold"]
-            - result.counts_by_stratum["hot"]
-        )
-        == 1
-    )
+    # Composition quotas remain; condition counts need not be balanced when
+    # one condition contains the more novel states.
+    assert result.counts_by_stratum == {"cold": 4, "hot": 1}
 
 
 def test_budget_smaller_than_element_group_count_is_rejected():

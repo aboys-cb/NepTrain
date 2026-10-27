@@ -1982,7 +1982,8 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     } == {"failure-route"}
 
 
-def test_no_novel_candidates_skip_label_backend_and_retraining(tmp_path: Path):
+@pytest.mark.parametrize("final_induced_spin", [False, True])
+def test_no_novel_candidates_skip_label_backend_and_retraining(tmp_path: Path, final_induced_spin):
     frame = ToyTeacher("ordinary").label(
         toy_candidate_frames("ordinary", 41, 1)[0]
     )
@@ -1992,6 +1993,12 @@ def test_no_novel_candidates_skip_label_backend_and_retraining(tmp_path: Path):
     manifest = tmp_path / "candidate-pool.json"
     ase_write(initial, [frame], format="extxyz")
     candidate = frame.copy()
+    if final_induced_spin:
+        from NepTrain.core.scientific_data import INPUT_STRUCTURE_ID_KEY, structure_id
+        frame.info[INPUT_STRUCTURE_ID_KEY] = structure_id(candidate)
+        frame.set_array("spin", np.full((len(frame), 3), 0.01))
+        frame.set_array("mforce", np.zeros((len(frame), 3)))
+        ase_write(initial, [frame], format="extxyz")
     candidate.info.update(
         route_id="default",
         route_fingerprint="f" * 64,

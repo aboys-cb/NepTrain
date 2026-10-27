@@ -63,6 +63,7 @@ from .scientific_data import (
     optional_dataset_issue,
     ScientificDataError,
     deduplicate_labeled_frames,
+    known_labeled_structure_ids,
     labeled_input_structure_ids,
     reference_forces,
     structure_id,
@@ -1948,7 +1949,7 @@ class WorkflowIterationAdapter:
             "descriptor_reduction", GLOBAL_MEAN
         )
         training_elements = descriptor_elements(training)
-        known_ids = {structure_id(frame) for frame in training}
+        known_ids = known_labeled_structure_ids(training)
         candidates = [
             frame for frame in candidates if structure_id(frame) not in known_ids
         ]
@@ -2674,31 +2675,17 @@ class WorkflowIterationAdapter:
             validate_labeled_frames(original)
             if labeled:
                 validate_labeled_frames(labeled)
-            # A merged dataset may store the same state twice at extxyz's
-            # persisted precision; that is lossless to collapse, while two
-            # different label sets for one structure still fail closed.
-            original, duplicate_input_count = deduplicate_labeled_frames(original)
-            labeled, duplicate_labeled_count = (
+            # Check consistency without dropping multiplicity or per-frame Weight:
+            # repeated samples may deliberately change the training distribution.
+            _, duplicate_input_count = deduplicate_labeled_frames(original)
+            _, duplicate_labeled_count = (
                 deduplicate_labeled_frames(labeled) if labeled else ([], 0)
             )
+            merged = [*original, *labeled]
+            _, duplicate_total_count = deduplicate_labeled_frames(merged)
         except ScientificDataError as error:
             raise WorkflowIterationError(
                 f"training merge input violates the scientific data contract: {error}"
-            ) from error
-        original_ids = [structure_id(frame) for frame in original]
-        labeled_ids = [structure_id(frame) for frame in labeled]
-        overlap = set(original_ids) & set(labeled_ids)
-        if overlap:
-            raise WorkflowIterationError(
-                "new labels overlap the existing training set; refusing "
-                "to silently keep one of two labels"
-            )
-        merged = [*original, *labeled]
-        try:
-            validate_labeled_frames(merged)
-        except ScientificDataError as error:
-            raise WorkflowIterationError(
-                f"merged training set violates the scientific data contract: {error}"
             ) from error
         output = context.work_dir / "train.xyz"
         ase_write(output, merged, format="extxyz")
@@ -2709,6 +2696,10 @@ class WorkflowIterationAdapter:
                 "added_count": len(labeled),
                 "duplicate_labeled_count": duplicate_labeled_count,
                 "duplicate_input_count": duplicate_input_count,
+                "duplicate_cross_count": (
+                    duplicate_total_count - duplicate_input_count - duplicate_labeled_count
+                ),
+                "duplicate_policy": "preserve_consistent",
             },
         )
 

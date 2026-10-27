@@ -13,6 +13,7 @@ from math import floor, sqrt
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from scipy.spatial.distance import cdist
 
 
 ElementSet = tuple[str, ...]
@@ -86,19 +87,15 @@ class _GroupState:
         eligible = self.eligible(min_novelty)
         if not len(eligible):
             return None
-        # Preserve one anchor from every eligible stratum, then let novelty
-        # alone allocate the remaining budget.  Continually balancing stratum
-        # counts wastes labels on mature conditions once their candidates are
-        # already close to the reference set.
-        uncovered = [
-            int(index)
-            for index in eligible
-            if self.counts_by_stratum[self.strata[index]] == 0
-        ]
-        candidates = uncovered or [int(index) for index in eligible]
+        # Novelty is primary. An uncovered stratum only breaks equal-distance
+        # ties; coverage must not promote a near-reference frame over new data.
         return min(
-            candidates,
-            key=lambda index: (-float(self.distances[index]), self.ids[index]),
+            eligible,
+            key=lambda index: (
+                -float(self.distances[index]),
+                self.counts_by_stratum[self.strata[index]] > 0,
+                self.ids[index],
+            ),
         )
 
     def select(self, index: int) -> None:
@@ -251,21 +248,15 @@ def _nearest_distances(
     for point_start in range(0, len(points), point_batch_size):
         point_stop = min(point_start + point_batch_size, len(points))
         point_chunk = points[point_start:point_stop]
-        point_norm = np.einsum("ij,ij->i", point_chunk, point_chunk)
         chunk_min = np.full(len(point_chunk), np.inf, dtype=np.float64)
         for reference_start in range(0, len(references), reference_batch_size):
             reference_stop = min(
                 reference_start + reference_batch_size, len(references)
             )
             reference_chunk = references[reference_start:reference_stop]
-            reference_norm = np.einsum(
-                "ij,ij->i", reference_chunk, reference_chunk
-            )
-            squared = (
-                point_norm[:, None]
-                + reference_norm[None, :]
-                - 2.0 * point_chunk @ reference_chunk.T
-            )
+            # Subtract coordinates before squaring. ||x||²+||y||²-2x.y
+            # creates spurious novelty (or zeros real differences) near x == y.
+            squared = cdist(point_chunk, reference_chunk, metric="sqeuclidean")
             chunk_min = np.minimum(
                 chunk_min,
                 np.maximum(squared, 0.0).min(axis=1),
@@ -282,14 +273,9 @@ def _leave_one_out_nearest_distances(
     """Return each point's nearest distinct neighbour with bounded memory."""
 
     result = np.full(len(points), np.inf, dtype=np.float64)
-    point_norm = np.einsum("ij,ij->i", points, points)
     for start in range(0, len(points), batch_size):
         stop = min(start + batch_size, len(points))
-        squared = (
-            point_norm[start:stop, None]
-            + point_norm[None, :]
-            - 2.0 * points[start:stop] @ points.T
-        )
+        squared = cdist(points[start:stop], points, metric="sqeuclidean")
         rows = np.arange(stop - start)
         squared[rows, np.arange(start, stop)] = np.inf
         result[start:stop] = np.sqrt(
@@ -374,7 +360,7 @@ def farthest_point_sampling(
     candidate_ids: Sequence[str] | None = None,
     strata: Sequence[str] | None = None,
 ) -> FarthestPointResult:
-    """Select one deterministic FPS group with one anchor per stratum.
+    """Select one deterministic FPS group; strata break equal-novelty ties.
 
     ``min_novelty`` is a strict gate after the deterministic no-reference seed.
     Exact duplicates of a reference or selected candidate are therefore never

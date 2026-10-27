@@ -100,6 +100,21 @@ def structure_id(atoms: Atoms) -> str:
     return digest.hexdigest()
 
 
+def known_labeled_structure_ids(frames: Iterable[Atoms]) -> set[str]:
+    """Recognize both a label's final state and its persisted DFT input.
+
+    Final spin can differ from a constrained target within tolerance and can
+    include unconstrained induced moments. Neither makes that input new.
+    Legacy training frames without input provenance retain final-state matching.
+    """
+    known: set[str] = set()
+    for frame in frames:
+        known.add(structure_id(frame))
+        if INPUT_STRUCTURE_ID_KEY in frame.info:
+            known.update(labeled_input_structure_ids([frame]))
+    return known
+
+
 def geometry_id(atoms: Atoms) -> str:
     """Identify atom order and geometry while excluding electronic state."""
 
@@ -315,6 +330,7 @@ __all__ = [
     "bind_labeled_frames_to_inputs",
     "deduplicate_labeled_frames",
     "geometry_id",
+    "known_labeled_structure_ids",
     "labeled_input_structure_ids",
     "reference_energy",
     "reference_forces",
