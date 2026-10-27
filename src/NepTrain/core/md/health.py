@@ -28,6 +28,10 @@ class TrajectoryHealthReport:
     available_signals: tuple[str, ...]
     unavailable_thresholds: tuple[str, ...]
     first_bad_spin_violations: tuple[Mapping[str, Any], ...] = ()
+    first_hard_bad_frame: int | None = None
+    first_hard_bad_step: int | None = None
+    hard_reason_codes: tuple[str, ...] = ()
+    spin_filtered_frames: tuple[int, ...] = ()
 
     def failure_description(self) -> str:
         details = list(self.reason_codes)
@@ -39,6 +43,11 @@ class TrajectoryHealthReport:
             )
         if len(self.first_bad_spin_violations) > 3:
             details.append(f"{len(self.first_bad_spin_violations) - 3} more spin violations")
+        if self.first_hard_bad_frame is not None and self.first_hard_bad_frame != self.first_bad_frame:
+            details.append(
+                f"hard failure at step {self.first_hard_bad_step}: "
+                + ", ".join(self.hard_reason_codes)
+            )
         return "; ".join(details)
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,9 +64,16 @@ class TrajectoryHealthReport:
                 )
                 start = index
         return {
-            "version": 1,
+            "version": 2,
             "process_completed": self.process_completed,
             "trajectory_completed": self.trajectory_completed,
+            "trajectory_stable": self.trajectory_completed,
+            "usable_frame_count": sum(w not in {"bad_tail", "spin_filtered"} for w in self.windows),
+            "spin_filtered_frame_count": len(self.spin_filtered_frames),
+            "spin_filtered_frames": list(self.spin_filtered_frames),
+            "first_hard_bad_frame": self.first_hard_bad_frame,
+            "first_hard_bad_step": self.first_hard_bad_step,
+            "hard_reason_codes": list(self.hard_reason_codes),
             "frame_count": self.frame_count,
             "first_bad_frame": self.first_bad_frame,
             "first_bad_step": self.first_bad_step,
@@ -204,7 +220,11 @@ def classify_trajectory(
     pre_failure_frames: int = 2,
     bad_tail_frames: int = 1,
 ) -> TrajectoryHealthReport:
-    """Locate the first physically unhealthy frame and classify all windows."""
+    """Filter finite spin outliers per frame; quarantine hard failures and their tail.
+
+    A recovered frame is eligible for labeling, but any violation still prevents
+    the trajectory from supplying stable completion evidence to the scheduler.
+    """
 
     if not frames:
         raise TrajectoryHealthError("trajectory health requires at least one frame")
@@ -223,6 +243,9 @@ def classify_trajectory(
     reason_codes: tuple[str, ...] = ()
     bad_metrics: dict[str, float] = {}
     bad_spin_violations: tuple[Mapping[str, Any], ...] = ()
+    first_hard_bad: int | None = None
+    hard_reasons: tuple[str, ...] = ()
+    spin_filtered: set[int] = set()
     first_arrays = frames[0].arrays
     available_signals = {
         "min_distance_ratio",
@@ -238,25 +261,43 @@ def classify_trajectory(
         reasons, metrics, spin_violations = _frame_health(
             frame, reference_volume=reference_volume, policy=policy
         )
-        if reasons:
+        if reasons and first_bad is None:
             first_bad = index
             reason_codes = reasons
             bad_metrics = metrics
             bad_spin_violations = spin_violations
+        # Only finite, configured magnitude bounds are local frame filters.
+        # NaN/Inf spins, geometry, force and volume failures invalidate the tail.
+        hard_reasons_at_frame = tuple(
+            reason for reason in reasons
+            if not reason.startswith(("spin_magnitude_below_min:", "spin_magnitude_above_max:"))
+            and reason != "max_spin_magnitude_above_limit"
+        )
+        if hard_reasons_at_frame:
+            first_hard_bad = index
+            hard_reasons = hard_reasons_at_frame
             break
+        if spin_violations:
+            spin_filtered.add(index)
 
-    if first_bad is not None:
-        bad_start = first_bad
-    elif process_completed:
-        bad_start = len(frames)
-    else:
-        bad_start = max(0, len(frames) - bad_tail_frames)
-    pre_start = max(0, bad_start - pre_failure_frames)
+    bad_start = len(frames) if first_hard_bad is None else first_hard_bad
+    if not process_completed:
+        bad_start = min(bad_start, max(0, len(frames) - bad_tail_frames))
+    spin_filtered = {index for index in spin_filtered if index < bad_start}
+    boundaries = spin_filtered | ({bad_start} if bad_start < len(frames) else set())
+    pre_failure = {
+        index for boundary in boundaries
+        for index in range(max(0, boundary - pre_failure_frames), boundary)
+    }
     windows = tuple(
         "bad_tail"
         if index >= bad_start
+        else "spin_filtered"
+        if index in spin_filtered
         else "pre_failure"
-        if index >= pre_start and bad_start < len(frames)
+        if index in pre_failure
+        else "recovered"
+        if first_bad is not None and index > first_bad
         else "stable_prefix"
         for index in range(len(frames))
     )
@@ -300,6 +341,12 @@ def classify_trajectory(
         available_signals=tuple(sorted(available_signals)),
         unavailable_thresholds=tuple(unavailable_thresholds),
         first_bad_spin_violations=bad_spin_violations,
+        first_hard_bad_frame=first_hard_bad,
+        first_hard_bad_step=(None if first_hard_bad is None else int(
+            frames[first_hard_bad].info.get("md_step", frames[first_hard_bad].info.get("lammps_step", first_hard_bad))
+        )),
+        hard_reason_codes=hard_reasons,
+        spin_filtered_frames=tuple(sorted(spin_filtered)),
     )
 
 

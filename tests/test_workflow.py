@@ -2075,3 +2075,23 @@ def test_force_restart_still_requires_a_stopped_controller(tmp_path, monkeypatch
     monkeypatch.setattr("NepTrain.core.controller.controller_running", lambda _: True)
     with pytest.raises(WorkflowError, match="workflow is running"):
         restart_workflow(preparation.output_dir, generation=1, from_stage="train", force=True)
+
+
+def test_status_separates_process_completion_stability_and_frame_filtering(capsys):
+    from types import SimpleNamespace
+    from NepTrain.cli.cli import _print_current_progress
+
+    health = {
+        'process_completed': 16, 'process_failed': 0, 'process_unknown': 0,
+        'stable_trajectories': 1, 'unstable_trajectories': 15,
+        'usable_frames': 4733, 'spin_filtered_frames': 4983, 'bad_tail_frames': 0,
+    }
+    record = {'complete': True, 'accepted': True, 'stages': {
+        'explore': {'metrics': {'trajectory_health': health, 'candidate_count': 4733}},
+    }}
+    science = _generation_science({'generation': 1, 'max_selected': 100}, record)
+    _print_current_progress(SimpleNamespace(generations=(science,), generation=1, stage=None, jobs=()), 1)
+    output = capsys.readouterr().out
+    assert 'MD runs: 16 completed, 0 interrupted' in output
+    assert 'Trajectory stability: 1 passed, 15 not established' in output
+    assert '4733 usable, 4983 spin outliers excluded, 0 in quarantined tails' in output

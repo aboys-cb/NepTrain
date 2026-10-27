@@ -72,6 +72,23 @@ from .spin import validate_spin_dataset
 from .training import TrainingRequest, TrainingResult, train
 
 
+def _md_health_summary(attempts: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Keep process completion, stability and frame eligibility separate."""
+    health = [item.get("health") or {} for item in attempts]
+    counts = [item.get("window_counts") or {} for item in attempts]
+    return {
+        "process_completed": sum(h.get("process_completed") is True for h in health),
+        "process_failed": sum(h.get("process_completed") is False for h in health),
+        "process_unknown": sum(h.get("process_completed") is None for h in health),
+        "stable_trajectories": sum(bool(item.get("completed")) for item in attempts),
+        "unstable_trajectories": sum(not bool(item.get("completed")) for item in attempts),
+        "spin_filtered_frames": sum(c.get("spin_filtered", 0) for c in counts),
+        "bad_tail_frames": sum(c.get("bad_tail", 0) for c in counts),
+        "recovered_frames": sum(c.get("recovered", 0) for c in counts),
+        "usable_frames": sum(int(item.get("usable_frames", 0)) for item in attempts),
+    }
+
+
 class WorkflowIterationError(RuntimeError):
     """Raised when a real workflow stage cannot satisfy the iteration contract."""
 
@@ -1430,6 +1447,8 @@ class WorkflowIterationAdapter:
                     for window in (
                         "stable_prefix",
                         "pre_failure",
+                        "recovered",
+                        "spin_filtered",
                         "bad_tail",
                     )
                 }
@@ -1442,7 +1461,7 @@ class WorkflowIterationAdapter:
                     frame
                     for frame in run_frames
                     if frame.info.get("md_window", "stable_prefix")
-                    != "bad_tail"
+                    not in {"bad_tail", "spin_filtered"}
                 ]
                 usable_frames.sort(
                     key=lambda frame: (
@@ -1555,6 +1574,7 @@ class WorkflowIterationAdapter:
                     metrics={
                         "candidate_count": 0,
                         "scheduled_source_count": len(attempt_results),
+                        "trajectory_health": _md_health_summary(attempt_results),
                         "completed_source_count": 0,
                         "failed_source_count": failed,
                         "routes": route_metrics,
@@ -1654,6 +1674,7 @@ class WorkflowIterationAdapter:
                 ),
                 "source_count": len(groups),
                 "scheduled_source_count": len(attempt_results),
+                "trajectory_health": _md_health_summary(attempt_results),
                 "completed_source_count": sum(
                     bool(item["completed"]) for item in attempt_results
                 ),
@@ -1666,7 +1687,7 @@ class WorkflowIterationAdapter:
                         frame.info.get("md_window", "stable_prefix") == window
                         for frame in output_frames
                     )
-                    for window in ("stable_prefix", "pre_failure")
+                    for window in ("stable_prefix", "pre_failure", "recovered")
                     if any(
                         frame.info.get("md_window", "stable_prefix") == window
                         for frame in output_frames
@@ -1862,6 +1883,7 @@ class WorkflowIterationAdapter:
                     pool_manifest.route_fingerprints
                 ),
                 "scheduled_source_count": len(attempts),
+                "trajectory_health": _md_health_summary(attempts),
                 "completed_source_count": sum(
                     bool(item.get("completed")) for item in attempts
                 ),

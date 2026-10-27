@@ -101,6 +101,12 @@ def test_generation_report_contains_scientific_progress():
             "explore": {
                 "metrics": {
                     "candidate_count": 40,
+                    "failed_source_count": 1,
+                    "trajectory_health": {
+                        "process_completed": 2, "process_failed": 0, "process_unknown": 0,
+                        "stable_trajectories": 1, "unstable_trajectories": 1,
+                        "usable_frames": 40, "spin_filtered_frames": 3, "bad_tail_frames": 0,
+                    },
                     "routes": [
                         {"temperatures": [300, 500]},
                     ],
@@ -149,6 +155,10 @@ def test_generation_report_contains_scientific_progress():
     assert "G2/4" in event.text
     assert "Workflow: Fe" in event.text
     assert "Path: /work/Fe-run" in event.text
+    assert "MD runs: 2 completed, 0 interrupted" in event.text
+    assert "Trajectory stability: 1 passed, 1 not established" in event.text
+    assert "40 usable, 3 spin outliers excluded, 0 in quarantined tails" in event.text
+    assert "Failed sampling sources" not in event.text
     assert "40 candidates" in event.text
     assert "failed batches: 1" in event.text
     assert "Generation completed with partial results" in event.text

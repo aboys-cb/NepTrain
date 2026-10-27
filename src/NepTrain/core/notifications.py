@@ -21,7 +21,7 @@ from typing import Any, Mapping, Sequence
 import urllib3
 
 from .persistence import atomic_write_json
-from .workflow import _generation_science
+from .workflow import _generation_science, _sampling_health_lines
 from .workflow_workspace import WorkflowWorkspace
 
 
@@ -282,7 +282,7 @@ def _generation_event(
     partial = failed_labels > 0 or failed_sources > 0
     icon = "⚠️" if partial else "✅"
     outcome = (
-        "Generation completed with partial results; review the failures above."
+        "Generation completed with partial results; review sampling stability and labeling diagnostics."
         if partial
         else "Generation completed. Convergence is assessed separately."
     )
@@ -322,6 +322,7 @@ def _generation_event(
             + (f"; failed batches: {failed_labels}" if failed_labels else "")
         ),
         *([quality_text] if any(value is not None for value in quality.values()) else []),
+        *_sampling_health_lines(sampling),
         f"Outcome: {outcome}",
     ]
     training_line = (
@@ -334,8 +335,8 @@ def _generation_event(
     lines.insert(3, training_line)
     if generation_kind == "acquisition" and (training.get("added_count") or 0) > 0:
         decision_lines.append("Next: Train with the new labeled structures before further sampling.")
-    if failed_sources:
-        lines.insert(2, f"Failed sampling sources: {failed_sources}")
+    if failed_sources and not sampling.get("trajectory_health"):
+        lines.insert(2, f"Sampling sources without stable completion: {failed_sources}")
     sampling_range = _sampling_range(record)
     if sampling_range:
         lines.insert(2, f"Sampling range: {sampling_range}")

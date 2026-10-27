@@ -425,4 +425,12 @@ def test_spin_range_failure_reaches_task_result_and_trajectory_windows(tmp_path,
     health = json.loads(result.health_report.read_text())
     assert health['first_bad_spin_violation_counts'] == {'Fe': 1}
     saved = ase_read(result.trajectory, index=':')
-    assert [f.info['md_window'] for f in saved] == ['pre_failure', 'bad_tail', 'bad_tail']
+    assert [f.info['md_window'] for f in saved] == ['pre_failure', 'spin_filtered', 'recovered']
+
+    assert health['process_completed'] is True
+    assert health['trajectory_stable'] is False
+    assert health['usable_frame_count'] == 2
+    assert health['spin_filtered_frame_count'] == 1
+    assert [f.info['md_frame_usable'] for f in saved] == [True, False, True]
+    assert all(f.info['md_process_completed'] for f in saved)
+    assert not any(f.info['md_completed'] for f in saved)

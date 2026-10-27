@@ -115,7 +115,7 @@ def _mixed_spin_frame():
     return frame
 
 
-def test_element_spin_ranges_exclude_collapsed_frame_and_tail_with_diagnostics():
+def test_element_spin_ranges_filter_only_collapsed_frame_with_diagnostics():
     frames = [_mixed_spin_frame() for _ in range(4)]
     frames[2].arrays['spin'][0] = [0, 0, .42]
     frames[2].arrays['spin'][1] = [0, 0, 4]
@@ -127,7 +127,7 @@ def test_element_spin_ranges_exclude_collapsed_frame_and_tail_with_diagnostics()
     report = classify_trajectory(frames, frames[0], process_completed=True,
                                  policy=policy, pre_failure_frames=1)
     assert report.first_bad_frame == 2
-    assert report.windows == ('stable_prefix', 'pre_failure', 'bad_tail', 'bad_tail')
+    assert report.windows == ('stable_prefix', 'pre_failure', 'spin_filtered', 'recovered')
     assert report.reason_codes == ('spin_magnitude_below_min:Fe', 'spin_magnitude_above_max:Co')
     data = report.to_dict()
     assert data['first_bad_spin_violation_counts'] == {'Fe': 1, 'Co': 1}
@@ -197,3 +197,68 @@ def test_element_ranges_report_missing_spin_and_ignore_absent_species():
 def test_element_spin_ranges_reject_invalid_configuration(ranges):
     with pytest.raises(TrajectoryHealthError, match='spin_magnitude_by_element'):
         TrajectoryHealthPolicy.from_mapping({'spin_magnitude_by_element': ranges})
+
+
+@pytest.mark.parametrize("bounds", [{"max_spin_magnitude": 5},
+    {"spin_magnitude_by_element": {"Fe": {"min": 2, "max": 5}}}])
+def test_spin_outliers_are_filtered_per_frame_including_first_frame(bounds):
+    frames = _frames(6)
+    for frame, magnitude in zip(frames, [6, 3, 6, 6, 3, 3]):
+        frame.set_array("spin", np.array([[0., 0., magnitude], [0., 0., 3.]]))
+    report = classify_trajectory(frames, frames[0], process_completed=True,
+        policy=TrajectoryHealthPolicy.from_mapping(bounds), pre_failure_frames=0)
+    assert report.windows == ("spin_filtered", "recovered", "spin_filtered",
+                              "spin_filtered", "recovered", "recovered")
+    assert not report.trajectory_completed
+    assert report.first_hard_bad_frame is None
+    assert report.to_dict()["usable_frame_count"] == 3
+    assert report.spin_filtered_frames == (0, 2, 3)
+
+
+def test_persistent_spin_outliers_leave_no_candidates_without_hard_failure():
+    frames = [_mixed_spin_frame() for _ in range(4)]
+    for frame in frames:
+        frame.arrays["spin"][0] = 0
+    report = classify_trajectory(frames, frames[0], process_completed=True,
+        policy=TrajectoryHealthPolicy.from_mapping({"spin_magnitude_by_element": {"Fe": {"min": 2}}}))
+    assert report.windows == ("spin_filtered",) * 4
+    assert report.to_dict()["usable_frame_count"] == 0
+    assert report.first_hard_bad_frame is None
+    assert report.process_completed and not report.trajectory_completed
+
+
+@pytest.mark.parametrize("hard_failure", ["nonfinite_spin", "overlap", "volume", "force", "mforce"])
+def test_hard_failure_after_spin_recovery_still_quarantines_tail(hard_failure):
+    frames = _frames(6)
+    for frame in frames:
+        frame.set_array("spin", np.array([[0., 0., 3.], [0., 0., 3.]]))
+    frames[1].arrays["spin"][0] = 0
+    if hard_failure == "nonfinite_spin":
+        frames[3].arrays["spin"][0, 0] = np.nan
+    elif hard_failure == "overlap":
+        frames[3].positions[1] = frames[3].positions[0]
+    elif hard_failure == "volume":
+        frames[3].set_cell([12, 12, 12])
+    else:
+        frames[3].set_array("nep_" + hard_failure, np.array([[101., 0, 0], [0, 0, 0]]))
+    report = classify_trajectory(frames, frames[0], process_completed=True,
+        pre_failure_frames=0, policy=TrajectoryHealthPolicy.from_mapping({
+            "spin_magnitude_by_element": {"Fe": {"min": 2}}}))
+    assert report.windows == ("stable_prefix", "spin_filtered", "recovered", "bad_tail", "bad_tail", "bad_tail")
+    assert report.first_bad_step == 10
+    assert report.first_hard_bad_step == 30
+    assert report.hard_reason_codes
+    assert report.to_dict()["usable_frame_count"] == 2
+    assert not report.trajectory_completed
+
+
+def test_interrupted_process_quarantines_tail_even_after_earlier_spin_outlier():
+    frames = _frames(5)
+    for frame in frames:
+        frame.set_array("spin", np.array([[0., 0., 3.], [0., 0., 3.]]))
+    frames[1].arrays["spin"][0] = 30
+    report = classify_trajectory(frames, frames[0], process_completed=False,
+                                 pre_failure_frames=0, bad_tail_frames=2)
+    assert report.windows == ("stable_prefix", "spin_filtered", "recovered", "bad_tail", "bad_tail")
+    assert report.spin_filtered_frames == (1,)
+    assert not report.trajectory_completed

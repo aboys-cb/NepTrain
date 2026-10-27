@@ -534,6 +534,9 @@ def _print_current_progress(status, generation):
         if line:
             print(line)
     sampling = record.get("sampling", {})
+    from NepTrain.core.workflow import _sampling_health_lines
+    for line in _sampling_health_lines(sampling):
+        print(line)
     parts = []
     for key, label in (
         ("candidate_count", "Candidates"),
@@ -767,7 +770,7 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
             total_failed += int(route.get("failed", 0))
         if total_failed:
             print(
-                f"Sampling failures: {total_failed} trajectories; diagnostic evidence retained"
+                f"Trajectories without stable completion: {total_failed}; usable frames and diagnostics retained"
             )
 
     _print_precision(status, details=details)

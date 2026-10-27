@@ -215,6 +215,8 @@ def _run_gpumd(
         frame.info.update(
             md_window=window,
             md_completed=health.trajectory_completed,
+            md_process_completed=health.process_completed,
+            md_frame_usable=window not in {"bad_tail", "spin_filtered"},
         )
     health_payload = health.to_dict()
     health_payload["process_failure_reason"] = process_failure

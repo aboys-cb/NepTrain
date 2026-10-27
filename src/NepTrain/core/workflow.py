@@ -1258,6 +1258,7 @@ def _generation_science(
             ),
         },
         "sampling": {
+            "trajectory_health": explore.get("trajectory_health"),
             "candidate_count": explore.get("candidate_count"),
             "candidate_counts_by_window": dict(
                 explore.get("candidate_counts_by_window", {})
@@ -2449,6 +2450,24 @@ def start_workflow(
         controller_exit_code=controller_result if foreground else None,
         config_changes=config_changes,
     )
+
+
+
+def _sampling_health_lines(sampling: Mapping[str, Any]) -> list[str]:
+    """Human-readable sampling evidence, shared by status and notifications."""
+    health = sampling.get("trajectory_health")
+    if not health:
+        return []
+    unknown = health.get("process_unknown", 0)
+    return [
+        f"MD runs: {health['process_completed']} completed, {health['process_failed']} interrupted"
+        + (f", {unknown} with no process status" if unknown else ""),
+        f"Trajectory stability: {health['stable_trajectories']} passed, "
+        f"{health['unstable_trajectories']} not established",
+        f"Frame filtering: {health['usable_frames']} usable, "
+        f"{health['spin_filtered_frames']} spin outliers excluded, "
+        f"{health['bad_tail_frames']} in quarantined tails",
+    ]
 
 
 __all__ = [

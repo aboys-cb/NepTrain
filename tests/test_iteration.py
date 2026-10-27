@@ -1851,8 +1851,9 @@ def test_torchnep_restart_false_keeps_full_training_config(tmp_path: Path):
     assert not (stage_dir / "retraining" / "torchnep-finetune.in").exists()
 
 
+@pytest.mark.parametrize("eligible_window", ["stable_prefix", "recovered"])
 def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
-    tmp_path: Path,
+    tmp_path: Path, eligible_window,
 ):
     initial_frames = [
         ToyTeacher("spin").label(frame)
@@ -1902,7 +1903,7 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
 
     first, repeated = toy_candidate_frames("spin", 91, 2)
     first.info.update(
-        source_id="healthy", temperature=100.0, pressure=0.0, md_window="stable_prefix"
+        source_id="healthy", temperature=100.0, pressure=0.0, md_window=eligible_window
     )
     stable_duplicate = repeated.copy()
     stable_duplicate.info.update(
@@ -1969,6 +1970,7 @@ def test_workflow_selection_deduplicates_frames_and_keeps_pre_failure(
     assert outcome.metrics["duplicate_candidate_count"] == 1
     assert outcome.metrics["selected_count"] == 2
     assert outcome.metrics["configured_max_selected"] == 20
+    assert eligible_window in {frame.info["md_window"] for frame in selected}
     assert "pre_failure" in {frame.info["md_window"] for frame in selected}
     assert {
         frame.info["route_id"]
@@ -2974,3 +2976,75 @@ def test_v4_training_rejects_unusable_model_before_activation(tmp_path, model_st
             stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES,
         ))
     assert not (tmp_path / "generation" / "active-model-lineage.json").exists()
+
+
+@pytest.mark.parametrize('all_filtered', [False, True])
+def test_explore_filters_spin_frames_but_keeps_unstable_completion_evidence(tmp_path, all_filtered):
+    from NepTrain.core.md.health import classify_trajectory, TrajectoryHealthPolicy
+    from NepTrain.core.scenario import ScenarioLadder
+
+    atoms = Atoms('Fe2', positions=[[1, 1, 1], [3, 1, 1]], cell=[6, 6, 6], pbc=True)
+    atoms.set_array('spin', np.array([[0., 0., 3.], [0., 0., 3.]]))
+    structure = tmp_path / 'input.xyz'
+    ase_write(structure, atoms)
+    template = tmp_path / 'md.in'
+    template.write_text('run {{ steps }}\n')
+    model = tmp_path / 'nep.txt'
+    model.write_text('fake model\n')
+    training = tmp_path / 'nep.in'
+    training.write_text('type 1 Fe\nspin_mode 3\n')
+    config = {'training': {'config_path': str(training)},
+              'md': {'backend': 'lammps', 'spin': True}, 'sampling': _sampling(
+        structures=structure, template=template, max_selected=2)}
+
+    def fake_md(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        frames = [atoms.copy() for _ in range(4)]
+        for index, frame in enumerate(frames):
+            frame.info['md_step'] = index * 10
+            frame.positions[1, 0] += index * .05
+            if all_filtered or index == 1:
+                frame.arrays['spin'][0] = 0
+        health = classify_trajectory(frames, atoms, process_completed=True,
+            policy=TrajectoryHealthPolicy.from_mapping({'spin_magnitude_by_element': {'Fe': {'min': 2}}}))
+        for frame, window in zip(frames, health.windows):
+            frame.info['md_window'] = window
+        ase_write(request.output_file, frames)
+        report = request.output_dir / 'trajectory-health.json'
+        report.write_text(json.dumps(health.to_dict()))
+        return MdResult(backend, request.output_file, request.output_dir,
+                        completed=health.trajectory_completed, health_report=report)
+
+    adapter = WorkflowIterationAdapter(config, initial_training=structure,
+                                      runtime=WorkflowRuntime(md=fake_md))
+    plan = GenerationPlan(1, 19, 2)
+    context = StageContext(generation=1, generation_dir=tmp_path / 'wave', plan=plan,
+                           artifacts={'model': model}, previous_artifacts={},
+                           stage_input={'allow_empty': True})
+    outcome = adapter.run_stage('explore', context)
+    metrics = outcome.metrics['trajectory_health']
+    assert metrics['process_completed'] == 1
+    assert metrics['process_failed'] == 0
+    assert metrics['stable_trajectories'] == 0
+    assert metrics['unstable_trajectories'] == 1
+    assert metrics['spin_filtered_frames'] == (4 if all_filtered else 1)
+    assert metrics['usable_frames'] == (0 if all_filtered else 3)
+    if all_filtered:
+        assert 'candidates' not in outcome.artifacts
+        return
+    frames = ase_read(outcome.artifacts['candidates'], index=':')
+    assert {f.info['md_step'] for f in frames} == {0, 20, 30}
+    assert all(not f.info['md_completed'] for f in frames)
+    merged_context = StageContext(generation=1, generation_dir=tmp_path / 'merged', plan=plan,
+                                  artifacts={'model': model}, previous_artifacts={})
+    merged = adapter.merge_explore_outcomes(merged_context, [outcome])
+    assert merged.metrics['trajectory_health'] == metrics
+    route = json.loads(merged.artifacts['scenario_plan'].read_text())['routes'][0]
+    ladder = ScenarioLadder(config['sampling']['routes'][0]['progression']['steps'],
+                            temperature_path=(300.,), production_temperatures=(300.,))
+    history = ladder.record(route['attempts'], completed=route['completed'],
+        diagnostic_accepted={key: True for key in route['completed']},
+        validation_accepted=True, model_improved=True, novelty_converged=True,
+        final_model_id=file_sha256(model))
+    assert all(s['maturity'] == 'untested' for s in history['scenarios'].values())
+    assert all(not e['accepted'] for s in history['scenarios'].values() for e in s['evidence'])

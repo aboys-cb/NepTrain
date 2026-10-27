@@ -326,3 +326,22 @@ def test_failed_gpumd_run_recovers_frames_and_marks_fallback_tail(
         "pre_failure",
         "bad_tail",
     ]
+
+
+def test_gpumd_spin_recovery_remains_usable_without_stable_completion(tmp_path, monkeypatch):
+    frames = [_atoms() for _ in range(3)]
+    for frame, moment in zip(frames, [3., .5, 3.]):
+        frame.set_array("spin", np.array([[0., 0., moment], [0., 0., 3.]]))
+    def fake_run(command, *, stdout, stderr, cwd, check):
+        _write_dump(Path(cwd), frames, [10., 20., 25.])
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", fake_run)
+    result = run_md(_request(tmp_path, health={
+        "spin_magnitude_by_element": {"Fe": {"min": 2, "max": 6}}}), "gpumd")
+    saved = ase_read(result.trajectory, index=":")
+    assert [f.info["md_window"] for f in saved] == ["pre_failure", "spin_filtered", "recovered"]
+    assert [f.info["md_frame_usable"] for f in saved] == [True, False, True]
+    health = json.loads(result.health_report.read_text())
+    assert health["process_completed"] and not health["trajectory_stable"]
+    assert health["spin_filtered_frame_count"] == 1
+    assert not result.completed
