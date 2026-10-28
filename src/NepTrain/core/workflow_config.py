@@ -167,6 +167,57 @@ def _before_sampling(project: Path) -> bool:
         return False
 
 
+def _sampling_policy_boundary(project: Path) -> bool:
+    """A stopped controller may change future sampling, never an existing pool.
+
+    A retained training job owns its packaged input and can finish unchanged.
+    New route fingerprints invalidate maturity evidence from the old protocol.
+    """
+    state = project.parent / ".neptrain"
+    try:
+        controller = json.loads((state / "controller.json").read_text())
+        if controller.get("state") != "stopped":
+            return False
+        records = json.loads((state / "ledger.json").read_text())["generations"]
+        if not records:
+            return False
+        generation = max(map(int, records))
+        record = records[str(generation)]
+        current = controller.get("current")
+        if current is not None and (
+            current.get("generation") != generation or current.get("stage") != "train"
+        ):
+            return False
+        if not record.get("complete") and set(record.get("stages", {})) - {"train"}:
+            return False
+        # A crash may leave a submitted sampling bundle without a current intent.
+        for bundle in (state / "jobs").glob("*"):
+            task = bundle / "task.json"
+            if not task.is_file():
+                continue
+            spec = json.loads(task.read_text())
+            if (not record.get("complete") and spec.get("generation") == generation
+                    and spec.get("stage") not in {None, "train"}):
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def _reopened_sampling_boundary(project: Path) -> bool:
+    """Accept a new template after an explicit explore restart archived its pool."""
+    if not _before_sampling(project):
+        return False
+    try:
+        records = json.loads((project.parent / ".neptrain/ledger.json").read_text())["generations"]
+        entered = [int(k) for k, v in records.items() if v.get("stages") is not None]
+        record = records[str(max(entered))]
+        recoveries = record.get("recovery_attempts", [])
+        return bool(recoveries) and recoveries[-1].get("from_stage") == "explore"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def inspect_config(
     record: Mapping[str, Any], *, sampling_restart: bool = False,
 ) -> tuple[dict[str, Any], ...]:
@@ -202,10 +253,20 @@ def inspect_config(
         f"execution.targets.{name}"
         for name in sorted(old_targets.keys() ^ new_targets.keys())
     ]
+    sampling_boundary = (
+        sampling_restart or _sampling_policy_boundary(path)
+        or _reopened_sampling_boundary(path)
+    )
     for parts, old, new in _differences(before, after):
         scope = _scope(parts, old, new)
+        if (len(parts) == 4 and parts[:2] == ("sampling", "routes")
+                and parts[3] == "template_path" and sampling_boundary):
+            scope = "future sampling only; existing training and labels retained"
+        if (len(parts) == 6 and parts[:2] == ("sampling", "routes")
+                and parts[3:5] == ("progression", "steps") and sampling_boundary):
+            scope = "future sampling only; route maturity restarts under the new fingerprint"
         if parts[:3] == ("sampling", "candidate_pool", "health") and (
-            sampling_restart or _before_sampling(path)
+            sampling_boundary or _before_sampling(path)
         ):
             scope = "sampling and downstream stages rebuilt; earlier training retained"
         if (parts[:2] == ("labeling", "hubbard") or parts == ("labeling", "input_path")) and after.get("labeling", {}).get("hubbard") is not None and _before_first_labeling(path):
@@ -360,6 +421,22 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
             label = config["labeling"]
             validate_vasp_input_file(label["input_path"], hubbard=label.get("hubbard"))
             new_label_inputs = [r for r in _dependencies(config) if r.get("role") == "labeling_input"]
+        old_sampling = [r for r in manifest.get("dependencies", [])
+                        if r.get("role", "").startswith("sampling_route_")]
+        new_sampling = None
+        new_routes = None
+        if any(c["field"].startswith("sampling.routes.") for c in changes):
+            from .workflow import _dependencies, _resolved_config
+            from .sampling_route import load_sampling_routes
+            config, _ = load_config(workspace.project_file)
+            config = _resolved_config(config, workspace.project_file.parent)
+            new_sampling = [r for r in _dependencies(config)
+                            if r.get("role", "").startswith("sampling_route_")]
+            new_routes = [{"route_id": route.route_id,
+                           "route_fingerprint": route.fingerprint,
+                           "template_sha256": route.template_sha256,
+                           "structure_source_sha256": list(route.structure_source_sha256)}
+                          for route in load_sampling_routes(config["sampling"], base_dir=root)]
         updated = snapshot_config({**record, "sha256": current_hash})
         new_launch = snapshot_setup_records(root, launch_records)
         if current_hash != record["sha256"] or changes:
@@ -369,6 +446,8 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
                 "after": dict(updated),
                 "changes": list(changes),
                 "format_only": not changes,
+                "sampling_inputs_before": old_sampling,
+                "sampling_inputs_after": new_sampling if new_sampling is not None else old_sampling,
                 "launch_inputs_before": old_launch,
                 "launch_inputs_after": new_launch,
                 "label_inputs_before": old_label_inputs,
@@ -376,6 +455,10 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
             })
         if new_label_inputs is not None:
             manifest["dependencies"] = [r for r in manifest.get("dependencies", []) if r.get("role") != "labeling_input"] + new_label_inputs
+        if new_sampling is not None:
+            manifest["dependencies"] = [r for r in manifest.get("dependencies", [])
+                                        if not r.get("role", "").startswith("sampling_route_")] + new_sampling
+            manifest["sampling_routes"] = new_routes
         manifest["config"] = updated
         manifest["dependencies"] = [
             r for r in manifest.get("dependencies", []) if not r.get("role", "").startswith("execution_setup_")

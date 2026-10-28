@@ -1218,13 +1218,7 @@ class WorkflowIterationAdapter:
         for route_index, route in enumerate(self.routes):
             ladder = self.scenario_ladders[route.route_id]
             route_history_record = previous_route_histories.get(route.route_id)
-            route_history = None
-            if (
-                route_history_record is not None
-                and route_history_record.get("route_fingerprint")
-                == route.fingerprint
-            ):
-                route_history = route_history_record.get("history")
+            route_history = route.maturity_history(route_history_record, ladder)
             structure_ids = sorted(
                 {
                     structure_id(frame)
@@ -1310,13 +1304,7 @@ class WorkflowIterationAdapter:
         for route_index, route in enumerate(self.routes):
             ladder = self.scenario_ladders[route.route_id]
             route_history_record = previous_route_histories.get(route.route_id)
-            route_history = None
-            if (
-                route_history_record is not None
-                and route_history_record.get("route_fingerprint")
-                == route.fingerprint
-            ):
-                route_history = route_history_record.get("history")
+            route_history = route.maturity_history(route_history_record, ladder)
 
             route_structures = [
                 frame
@@ -3035,13 +3023,9 @@ class WorkflowIterationAdapter:
                     f"scenario plan route identity changed for {route_id!r}"
                 )
             previous_record = previous_routes.get(route_id)
-            previous_history = None
-            if previous_record is not None:
-                if previous_record.get("route_fingerprint") == route.fingerprint:
-                    previous_history = previous_record.get("history")
-                # A route change is a new sampling experiment.  Its own
-                # scenario plan must still match above, but maturity evidence
-                # from the former route identity must not leak into it.
+            previous_history = route.maturity_history(
+                previous_record, self.scenario_ladders[route_id]
+            )
             attempt_accepted = {
                 str(attempt["attempt_id"]): diagnostic.get(
                     "attempt_accepted", {}
@@ -3101,6 +3085,7 @@ class WorkflowIterationAdapter:
                 "route_id": route_id,
                 "route_fingerprint": route.fingerprint,
                 "template_sha256": route.template_sha256,
+                "maturity_fingerprint": route.maturity_fingerprint,
                 "production_ready": ready,
                 "production_status": production_status,
                 "history": route_history,

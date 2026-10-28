@@ -2182,3 +2182,113 @@ def test_health_resume_after_interrupted_reopen_keeps_old_results_archived(tmp_p
     assert accept_config_changes(prep.output_dir)
     recovered=PersistentController(prep.output_dir)
     assert set(recovered._ledger()['generations']['1']['stages'])=={'train','evaluate'}
+
+
+@pytest.mark.parametrize('current_stage', [None, 'train', 'explore', 'label'])
+def test_sampling_schedule_edit_boundary_retains_existing_training(tmp_path, current_stage):
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.workflow_config import accept_config_changes
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    state = prep.output_dir / '.neptrain'
+    current = None if current_stage is None else {'generation': 1, 'stage': current_stage,
+                                                  'handle': {'execution_id': 'existing-job'}}
+    original = {'state': 'stopped', 'current': current}
+    (state / 'controller.json').write_text(json.dumps(original))
+    (state / 'ledger.json').write_text(json.dumps({'generations': {'1': {'stages': {}}}}))
+    before = json.loads(prep.manifest.read_text())
+    edited, _ = load_config(prep.config_file)
+    old = next(r for r in before['dependencies'] if r['role'].endswith('_template'))
+    new = prep.output_dir / 'sampling-v2.in'
+    new.write_text(Path(old['path']).read_text()+'# new sampling output cadence\n')
+    edited['sampling']['routes'][0]['template_path'] = str(new)
+    edited['sampling']['routes'][0]['progression']['steps']['smoke_passed'] = 5
+    save_config(edited, prep.config_file)
+    if current_stage in {'explore', 'label'}:
+        with pytest.raises(WorkflowError, match='cannot be applied'):
+            accept_config_changes(prep.output_dir)
+        assert json.loads(prep.manifest.read_text()) == before
+        return
+    accepted = accept_config_changes(prep.output_dir)
+    after = json.loads(prep.manifest.read_text())
+    assert len(accepted) == 2
+    assert json.loads((state/'controller.json').read_text()) == original
+    assert after['initial_training'] == before['initial_training']
+    assert after['plans'] == before['plans']
+    assert after['sampling_routes'][0]['route_fingerprint'] != before['sampling_routes'][0]['route_fingerprint']
+    assert old in after['config_updates'][-1]['sampling_inputs_before']
+    assert Path(old['path']).exists()
+    assert not accept_config_changes(prep.output_dir)
+
+
+def test_sampling_schedule_refuses_untracked_bundle_and_old_pool(tmp_path):
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.workflow_config import accept_config_changes
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path/'workflow')
+    state = prep.output_dir/'.neptrain'
+    (state/'controller.json').write_text(json.dumps({'state':'stopped','current':None}))
+    (state/'ledger.json').write_text(json.dumps({'generations':{'1':{'stages':{}}}}))
+    b=state/'jobs'/'orphan-md';b.mkdir(parents=True)
+    (b/'task.json').write_text(json.dumps({'generation':1,'stage':'explore'}))
+    edited,_=load_config(prep.config_file)
+    edited['sampling']['routes'][0]['progression']['steps']['smoke_passed']=5
+    save_config(edited,prep.config_file)
+    with pytest.raises(WorkflowError,match='cannot be applied'):
+        accept_config_changes(prep.output_dir)
+    (b/'task.json').unlink()
+    (state/'ledger.json').write_text(json.dumps({'generations':{'1':{'stages':{'train':{},'explore':{}}}}}))
+    with pytest.raises(WorkflowError,match='cannot be applied'):
+        accept_config_changes(prep.output_dir)
+
+
+def test_sampling_schedule_completed_generation_boundary(tmp_path):
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.workflow_config import accept_config_changes
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path/'workflow')
+    state = prep.output_dir/'.neptrain'
+    (state/'controller.json').write_text(json.dumps({'state':'stopped','current':None}))
+    ledger={'generations':{'1':{'complete':True,'stages':{'train':{},'explore':{},'update':{}}}}}
+    (state/'ledger.json').write_text(json.dumps(ledger))
+    edited,_=load_config(prep.config_file)
+    edited['sampling']['routes'][0]['progression']['steps']['smoke_passed']=5
+    save_config(edited,prep.config_file)
+    assert accept_config_changes(prep.output_dir)
+    assert json.loads((state/'ledger.json').read_text())==ledger
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_template_restart_adopts_only_after_archiving_sampling(tmp_path, monkeypatch, interrupted):
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.controller import PersistentController
+    from NepTrain.core.workflow_config import accept_config_changes
+    prep, ws = _sampling_restart_fixture(tmp_path)
+    config, _ = load_config(prep.config_file)
+    original_template = Path(config["sampling"]["routes"][0]["template_path"])
+    if not original_template.is_absolute():
+        original_template = prep.output_dir / original_template
+    replacement = prep.output_dir / "dump1000.in"
+    replacement.write_text(original_template.read_text() + "\n# dump interval 1000\n")
+    config["sampling"]["routes"][0]["template_path"] = str(replacement)
+    save_config(config, prep.config_file)
+    before_ledger = ws.ledger.read_bytes()
+    with pytest.raises(WorkflowError, match="configuration changes cannot"):
+        accept_config_changes(prep.output_dir)
+    assert ws.ledger.read_bytes() == before_ledger
+    old = json.loads(before_ledger)["generations"]["1"]["stages"]
+    if interrupted:
+        controller = PersistentController(prep.output_dir, _sampling_restart=True)
+        controller.restart_from(generation=1, from_stage="explore", task_scope="all")
+        assert accept_config_changes(prep.output_dir)
+    else:
+        monkeypatch.setattr("NepTrain.core.controller.start_controller", lambda *a, **k: 123)
+        result = restart_workflow(prep.output_dir, generation=1, from_stage="explore", task_scope="all")
+        assert result.controller_pid == 123
+    controller = PersistentController(prep.output_dir)
+    record = controller._ledger()["generations"]["1"]
+    assert record["stages"] == {k: old[k] for k in ("train", "evaluate")}
+    assert record["recovery_attempts"][-1]["stages"] == {k: old[k] for k in ("explore", "select")}
+    assert controller.config["sampling"]["routes"][0]["template_path"] == str(replacement)
+    manifest = json.loads(prep.manifest.read_text())
+    assert any(r["path"] == str(replacement) for r in manifest["dependencies"])

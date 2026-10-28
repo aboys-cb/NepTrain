@@ -271,6 +271,45 @@ class ScenarioLadder:
         self._reconcile_maturity(copied)
         return copied
 
+    def rebind_output_history(
+        self, history: Mapping[str, Any], *, route_id: str,
+        old_fingerprint: str, old_template_sha256: str,
+        new_fingerprint: str, new_template_sha256: str,
+    ) -> dict[str, Any]:
+        """Copy proven-equivalent history into the new execution namespace.
+
+        The caller must first verify the route's maturity fingerprint. Original
+        attempt IDs and source hashes stay attached to every inherited record.
+        """
+        state = self._validated_history(history)
+        rebound = {}
+        for old_id, record in state["scenarios"].items():
+            if (
+                record["route_id"] != route_id
+                or record["route_fingerprint"] != old_fingerprint
+                or record["template_sha256"] != old_template_sha256
+                or old_id != _scenario_id(
+                    route_id, old_fingerprint, record["structure_id"],
+                    record["temperature"], record["pressure"],
+                )
+            ):
+                raise ScenarioMaturityError("inherited scenario identity changed")
+            for evidence in record["evidence"]:
+                evidence.setdefault("scenario_id", old_id)
+                evidence.setdefault("route_fingerprint", old_fingerprint)
+                evidence.setdefault("template_sha256", old_template_sha256)
+            new_id = _scenario_id(
+                route_id, new_fingerprint, record["structure_id"],
+                record["temperature"], record["pressure"],
+            )
+            record.update(
+                scenario_id=new_id, route_fingerprint=new_fingerprint,
+                template_sha256=new_template_sha256,
+            )
+            rebound[new_id] = record
+        state["scenarios"] = rebound
+        return state
+
     def _reconcile_maturity(self, state: dict[str, Any]) -> None:
         """Recognise trusted MD evidence written by older workflow versions.
 
@@ -756,6 +795,9 @@ class ScenarioLadder:
             record["evidence"].append(
                 {
                     "attempt_id": attempt.attempt_id,
+                    "scenario_id": attempt.scenario_id,
+                    "route_fingerprint": attempt.route_fingerprint,
+                    "template_sha256": attempt.template_sha256,
                     "generation": attempt.generation,
                     "model_id": attempt.model_id,
                     "replica": attempt.replica,

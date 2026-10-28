@@ -567,6 +567,20 @@ neptrain workflow restart workflow \
 归档后接纳新健康阈值，并重新采样；不能从 `select` 或 `label` 重启以沿用旧候选池。
 其他科学设置仍拒绝直接修改。中断后只有本代尚无采样证据和当前任务时才可接纳阈值。
 
+暂停控制器（`stop --keep-jobs`）后，若当前代尚未准备任何采样任务，或上一代已完整结束，
+可修改 route 的 `progression.steps`、改用一个新路径的采样模板，并调整候选健康阈值。
+`resume` 记录配置更新并保留已有训练任务、标签和历史 ledger。模板须另存新路径；
+直接覆盖旧模板仍按输入损坏拒绝。完整 route fingerprint 继续追踪实际输入，
+另用 `maturity_fingerprint` 判断成熟度是否可沿用：仅修改简单 LAMMPS 模板中
+`dump ... custom N ...`、`thermo N`、`dump_modify ID every N` 的正整数输出间隔时，
+继承已有成熟度。历史 attempt ID、模板哈希和 route 指纹仍保留在各条证据中。
+积分器、步长、控温控压、输出字段、初始结构、温度路径或 progression 改变时仍重置。
+变量表达式、续行、多行引用等未明确支持的写法保守地按完整输入区分。
+旧历史没有成熟度指纹时，原样输入仍正常继承，并在下一次正常 update 时补记指纹；
+不能证明等价的旧模板变更不会自动继承。减少输出帧后，新轨迹仍须通过现有健康检查，
+继承历史不表示新轨迹已验收。
+已经存在采样候选池或未登记的采样任务时拒绝接纳这些编辑。
+
 `restart` 只操作最新且尚未完成的代次。指定阶段之前的 artifact 保持权威；该阶段
 及其下游的已提交记录转入 `recovery_attempts`，当前执行转入 history，不会删除
 失败证据。若 current 是 `label` 或 `explore` task group，`--tasks failed` 保留

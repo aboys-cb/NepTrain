@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from .scenario import ScenarioLadder
 
 from .content_addressing import canonical_sha256, file_sha256
 
@@ -77,6 +80,26 @@ def _path_digest(path: Path) -> str:
     raise SamplingRouteError(f"sampling route input does not exist: {path}")
 
 
+def _maturity_template(text: str) -> str:
+    """Mask only literal LAMMPS output cadences, not output content or logic.
+
+    Keep unfamiliar syntax byte-sensitive. In particular, do not interpret
+    variables, continued commands or multiline quoted scripts as output-only.
+    """
+    if chr(34) * 3 in text or chr(39) * 3 in text or any(
+        line.rstrip().endswith("&") for line in text.splitlines()
+    ):
+        return text
+    patterns = (
+        r"^([ \t]*thermo[ \t]+)[1-9][0-9]*(?=[ \t]*(?:#|$))",
+        r"^([ \t]*dump[ \t]+[\w.-]+[ \t]+[\w.-]+[ \t]+custom[ \t]+)[1-9][0-9]*(?=[ \t]+)",
+        r"^([ \t]*dump_modify[ \t]+[\w.-]+[ \t]+every[ \t]+)[1-9][0-9]*(?=[ \t]*(?:#|$))",
+    )
+    for pattern in patterns:
+        text = re.sub(pattern, r"\1<output-cadence>", text, flags=re.MULTILINE)
+    return text
+
+
 @dataclass(frozen=True)
 class SamplingRoute:
     route_id: str
@@ -87,6 +110,7 @@ class SamplingRoute:
     template_sha256: str
     structure_source_sha256: tuple[str, ...]
     fingerprint: str
+    maturity_fingerprint: str
 
     @classmethod
     def from_config(
@@ -173,6 +197,40 @@ class SamplingRoute:
             template_sha256=template_sha256,
             structure_source_sha256=source_hashes,
             fingerprint=canonical_sha256(fingerprint_payload),
+            maturity_fingerprint=canonical_sha256({
+                **fingerprint_payload,
+                "template_sha256": canonical_sha256({
+                    "output_cadence_policy": 1,
+                    "template": _maturity_template(
+                        template_path.read_text(encoding="utf-8")
+                    ),
+                }),
+            }),
+        )
+
+
+    def maturity_history(
+        self, previous: Mapping[str, Any] | None, ladder: "ScenarioLadder"
+    ) -> dict[str, Any] | None:
+        """Reuse evidence only for an exact route or a proven cadence edit.
+
+        Legacy histories without a maturity fingerprint still work for exact
+        inputs. They gain the new fingerprint at the next normal update; never
+        infer equivalence from a route name or an unavailable old template.
+        """
+        if previous is None:
+            return None
+        if previous.get("route_fingerprint") == self.fingerprint:
+            return previous.get("history")
+        if previous.get("maturity_fingerprint") != self.maturity_fingerprint:
+            return None
+        return ladder.rebind_output_history(
+            previous["history"],
+            route_id=self.route_id,
+            old_fingerprint=previous["route_fingerprint"],
+            old_template_sha256=previous["template_sha256"],
+            new_fingerprint=self.fingerprint,
+            new_template_sha256=self.template_sha256,
         )
 
 
