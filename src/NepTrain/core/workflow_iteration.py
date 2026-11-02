@@ -2800,6 +2800,10 @@ class WorkflowIterationAdapter:
                 "workflow_converged": False,
                 "production_ready": production_ready,
                 "scenario_counts_by_maturity": history["counts_by_maturity"],
+                "production_status_by_route": {
+                    route_id: route["production_status"]
+                    for route_id, route in history["routes"].items()
+                },
             },
         )
 
@@ -3322,6 +3326,10 @@ class WorkflowIterationAdapter:
                 }
                 for route in self.routes
             ],
+            "production_status_by_route": {
+                route_id: route["production_status"]
+                for route_id, route in history["routes"].items()
+            },
             "production_ready": production_ready,
             "workflow_converged": workflow_converged,
             "workflow_stalled": False,

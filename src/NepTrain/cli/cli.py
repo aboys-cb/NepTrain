@@ -718,6 +718,8 @@ def _print_job_batches(jobs):
 
 
 def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = False):
+    from NepTrain.core.workflow import _convergence_summary_lines
+
     state = _STATE_LABELS.get(status.state, status.state)
     generation = status.generation or status.completed_generations
     stage = _STAGE_LABELS.get(status.stage, status.stage) if status.stage else None
@@ -819,8 +821,25 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
             )
         else:
             print(f"Convergence (G{latest['generation']}): Not yet established")
-        for reason in quality.get("convergence_reasons", []):
-            print(f"  · {reason}")
+        if details:
+            for route_id, production in quality.get("production_status_by_route", {}).items():
+                required = production["minimum_successful_replicas"]
+                for temperature, cell in production.get("by_temperature", {}).items():
+                    print(
+                        f"  · {route_id} / {temperature} K: "
+                        f"{cell['verified']}/{cell['total']} scenarios verified "
+                        f"({cell['coverage']:.0%}; required ≥{production['minimum_coverage']:.0%}); "
+                        f"{required} successful production replicas required per scenario."
+                    )
+            for reason in quality.get("convergence_reasons", []):
+                print(f"  · {reason}")
+        else:
+            for line in _convergence_summary_lines(quality):
+                print(f"  {line}")
+            print(
+                "  Full convergence details: neptrain workflow status "
+                f"{shlex.quote(str(status.project_path))} --details"
+            )
     _print_config_changes(getattr(status, "pending_config_changes", ()), pending=True)
     _print_reports(status, details=details)
     if show_jobs:

@@ -21,7 +21,7 @@ from typing import Any, Mapping, Sequence
 import urllib3
 
 from .persistence import atomic_write_json
-from .workflow import _generation_science, _sampling_health_lines
+from .workflow import _convergence_summary_lines, _generation_science, _sampling_health_lines
 from .workflow_workspace import WorkflowWorkspace
 
 
@@ -262,10 +262,7 @@ def _generation_event(
             f"Note: {warning}"
             for warning in science["quality"].get("validation_warnings", [])
         ),
-        *(
-            f"Convergence: {reason}"
-            for reason in science["quality"].get("convergence_reasons", [])
-        ),
+        *_convergence_summary_lines(science["quality"]),
     ]
     if science["quality"].get("finalization_pending"):
         decision_lines.append(
@@ -334,8 +331,16 @@ def _generation_event(
     if training.get("added_count") is not None:
         training_line += f" (+{_number(training.get('added_count'))})"
     lines.insert(3, training_line)
-    if generation_kind == "acquisition" and (training.get("added_count") or 0) > 0:
+    if (
+        generation_kind == "acquisition"
+        and (training.get("added_count") or 0) > 0
+        and not science["quality"].get("finalization_pending")
+    ):
         decision_lines.append("Next: Train with the new labeled structures before further sampling.")
+    if workflow_path is not None and decision_lines:
+        decision_lines.append(
+            f"Details: neptrain workflow status {shlex.quote(str(workflow_path))} --details"
+        )
     if failed_sources and not sampling.get("trajectory_health"):
         lines.insert(2, f"Sampling sources without stable completion: {failed_sources}")
     sampling_range = _sampling_range(record)

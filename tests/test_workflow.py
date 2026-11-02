@@ -1695,6 +1695,15 @@ def test_status_publishes_only_committed_report_and_sampling_evidence(tmp_path):
         root / "scenario-plan.json",
         json.dumps({"routes": [{"route_id": "r", "attempts": [], "completed": {}}]}),
     )
+    production = {
+        "minimum_coverage": 1.0,
+        "minimum_successful_replicas": 3,
+        "by_temperature": {"300": {"verified": 0, "total": 1, "coverage": 0.0}},
+    }
+    maturity = _write(
+        root / "scenario-maturity.json",
+        json.dumps({"routes": {"r": {"production_status": production}}}),
+    )
 
     def artifact(path):
         return {
@@ -1708,6 +1717,7 @@ def test_status_publishes_only_committed_report_and_sampling_evidence(tmp_path):
                 "artifacts": {
                     "selection_pca_report": artifact(report),
                     "scenario_plan": artifact(plan),
+                    "scenario_maturity": artifact(maturity),
                 }
             }
         }
@@ -1717,6 +1727,11 @@ def test_status_publishes_only_committed_report_and_sampling_evidence(tmp_path):
     )[0]
     assert summary["reports"][0]["chart"] == str(chart)
     assert summary["scenarios"]["routes"][0]["route_id"] == "r"
+    assert summary["quality"]["production_status_by_route"] == {"r": production}
+    maturity.write_text('{"routes": {}}')
+    assert not _scientific_progress(
+        preparation, manifest, ledger={"generations": {"1": record}}
+    )[0]["quality"]["production_status_by_route"]
     report.write_text('{"status":"ready","chart":"fake.png"}')
     assert (
         _scientific_progress(
@@ -1724,6 +1739,97 @@ def test_status_publishes_only_committed_report_and_sampling_evidence(tmp_path):
         )[0]["reports"]
         == []
     )
+
+
+@pytest.mark.parametrize("minimum,complete", [(1.0, 1), (0.5, 2)])
+def test_convergence_summary_counts_route_temperature_requirements(minimum, complete):
+    from NepTrain.core.workflow import _convergence_summary_lines
+
+    # Same temperature in different routes is a different requirement. A partially
+    # covered temperature counts only when its own coverage threshold is reached.
+    routes = {
+        "a": {"minimum_coverage": minimum, "by_temperature": {
+            "100": {"verified": 1, "total": 2, "coverage": 0.5},
+            "900": {"verified": 0, "total": 2, "coverage": 0.0},
+        }},
+        "b": {"minimum_coverage": 1.0, "by_temperature": {
+            "100": {"verified": 1, "total": 1, "coverage": 1.0},
+        }},
+    }
+    lines = _convergence_summary_lines({"production_status_by_route": routes})
+    assert lines == [f"Production validation (current model): {complete}/3 route-temperature points complete"]
+    assert _convergence_summary_lines({}) == []
+
+
+def test_convergence_summary_keeps_failures_visible_and_reports_passing_streak():
+    from NepTrain.core.workflow import _convergence_summary_lines
+
+    reasons = [
+        "New-label RMSE exceeds a configured limit or is unavailable.",
+        "New-label R² is below a configured minimum or is unavailable.",
+        "The outlier fraction exceeds the configured limit or is unavailable.",
+    ]
+    lines = _convergence_summary_lines({"convergence_reasons": reasons})
+    assert "RMSE" in lines[0] and "R²" in lines[1]
+    assert lines[2] == "Convergence: Additional checks needing attention: 1"
+    lines = _convergence_summary_lines({
+        "acquisition_evidence_count": 12, "acquisition_min_selected": 10,
+        "acquisition_accepted": True,
+        "acquisition_convergence_streak": 1, "acquisition_convergence_required": 2,
+        "convergence_reasons": [
+            "Accuracy criteria met this round; consecutive passing generations: 1/2. More sampling is needed."
+        ],
+    })
+    assert lines == [
+        "Accuracy evidence: 12/10 required new labels",
+        "Accuracy: Passed this round; consecutive passing generations 1/2",
+    ]
+
+
+def test_status_keeps_per_temperature_convergence_in_details(tmp_path, capsys):
+    from dataclasses import replace
+    from NepTrain.cli.cli import _print_workflow_status
+
+    config, initial = _inputs(tmp_path)
+    status = workflow_status(prepare_workflow(config, initial, tmp_path / "workflow").output_dir)
+    reason = (
+        "npt / 900 K: production coverage for the current model is 0%; required ≥100%. "
+        "Successful replicas required per scenario: 3."
+    )
+    other_reasons = [
+        "New-label RMSE exceeds a configured limit or is unavailable.",
+        "New-label R² is below a configured minimum or is unavailable.",
+        "The outlier fraction exceeds the configured limit or is unavailable.",
+    ]
+    science = _generation_science({"generation": 1, "max_selected": 10}, {
+        "kind": "acquisition",
+        "stage_sequence": ["train", "explore", "select", "label", "evaluate", "update"],
+        "stages": {"update": {"metrics": {
+            "acquisition_evidence_count": 3, "acquisition_min_selected": 10,
+            "convergence_reasons": [reason, *other_reasons],
+            "production_status_by_route": {"npt": {
+                "minimum_coverage": 1.0, "minimum_successful_replicas": 3,
+                "by_temperature": {
+                    "100": {"verified": 1, "total": 1, "coverage": 1.0},
+                    "900": {"verified": 0, "total": 1, "coverage": 0.0},
+                },
+            }},
+        }}},
+    })
+    status = replace(status, generations=(science,))
+    _print_workflow_status(status, show_jobs=False)
+    compact = capsys.readouterr().out
+    assert "Accuracy evidence: 3/10 required new labels" in compact
+    assert "1/2 temperature points complete" in compact
+    assert reason not in compact and "--details" in compact
+    assert other_reasons[-1] not in compact
+    assert "Additional checks needing attention: 1" in compact
+    _print_workflow_status(status, show_jobs=False, details=True)
+    detail = capsys.readouterr().out
+    assert reason in detail
+    assert all(detail.count(reason) == 1 for reason in other_reasons)
+    assert "npt / 100 K: 1/1 scenarios verified" in detail
+    assert "3 successful production replicas required per scenario" in detail
 
 
 def test_training_status_reads_latest_complete_finite_loss_row(tmp_path):

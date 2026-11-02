@@ -1297,6 +1297,11 @@ def _generation_science(
         },
         "quality": {
             "acquisition_count": diagnose.get("evaluated_count"),
+            "acquisition_evidence_count": decision.get("acquisition_evidence_count"),
+            "acquisition_min_selected": decision.get("acquisition_min_selected"),
+            "production_status_by_route": dict(
+                decision.get("production_status_by_route", {})
+            ),
             "element_force_r2": dict(diagnose.get("element_force_r2", {})),
             "condition_force_r2": dict(diagnose.get("condition_force_r2", {})),
             "outlier_fraction": dict(diagnose.get("outlier_fraction", {})),
@@ -1338,6 +1343,77 @@ def _generation_science(
             "counts_by_maturity": dict(decision.get("scenario_counts_by_maturity", {})),
         },
     }
+
+
+def _convergence_summary_lines(quality: Mapping[str, Any]) -> list[str]:
+    """Summarize recorded decisions for people; never recompute acceptance."""
+
+    lines = []
+    count = quality.get("acquisition_evidence_count")
+    required = quality.get("acquisition_min_selected")
+    if count is not None and required is not None:
+        lines.append(f"Accuracy evidence: {count}/{required} required new labels")
+    streak = quality.get("acquisition_convergence_streak")
+    streak_required = quality.get("acquisition_convergence_required")
+    passing = quality.get("acquisition_accepted") is True
+    if passing and streak is not None and streak_required is not None:
+        lines.append(
+            f"Accuracy: Passed this round; consecutive passing generations {streak}/{streak_required}"
+        )
+
+    coverage_reasons = []
+    other_reasons = []
+    for reason in quality.get("convergence_reasons", []):
+        if ": production coverage for the current model is " in reason:
+            coverage_reasons.append(reason)
+        elif (
+            reason.startswith("Insufficient evidence: evaluated ")
+            and count is not None
+            and required is not None
+        ):
+            continue
+        elif (
+            reason.startswith("Accuracy criteria met this round;")
+            and passing
+            and streak is not None
+            and streak_required is not None
+        ):
+            continue
+        else:
+            other_reasons.append(reason)
+    # Preserve failures and unfamiliar reasons, but keep long diagnostics out of
+    # notifications. The complete, unchanged reasons remain in status --details.
+    lines.extend(f"Convergence: {reason}" for reason in other_reasons[:2])
+    if len(other_reasons) > 2:
+        lines.append(
+            f"Convergence: Additional checks needing attention: {len(other_reasons) - 2}"
+        )
+
+    routes = quality.get("production_status_by_route", {})
+    if routes:
+        total = complete = 0
+        for status in routes.values():
+            for cell in status.get("by_temperature", {}).values():
+                total += 1
+                complete += int(
+                    cell["total"] > 0
+                    and cell["coverage"] >= status["minimum_coverage"]
+                )
+        if total:
+            points = (
+                "temperature points" if len(routes) == 1 else "route-temperature points"
+            )
+            lines.append(
+                f"Production validation (current model): {complete}/{total} {points} complete"
+            )
+    elif coverage_reasons:
+        # Older ledgers only record unmet points: they cannot supply a denominator.
+        lines.append(
+            f"Production validation (current model): {len(coverage_reasons)} route-temperature points below required coverage"
+        )
+    elif quality.get("production_ready") is True:
+        lines.append("Production validation (current model): Requirements met")
+    return lines
 
 
 def _scientific_progress(
@@ -1394,6 +1470,12 @@ def _scientific_progress(
                         summary["scenarios"]["maturity"] = _read_json(
                             path, role=name
                         ).get("routes", {})
+                        if not summary["quality"]["production_status_by_route"]:
+                            summary["quality"]["production_status_by_route"] = {
+                                route_id: route["production_status"]
+                                for route_id, route in summary["scenarios"]["maturity"].items()
+                                if "production_status" in route
+                            }
                     elif path.name.endswith("-report.json") and any(
                         token in path.name
                         for token in ("parity", "selection-pca", "training-report")

@@ -655,6 +655,11 @@ def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
     assert tuple(summary.metrics) == stages
     assert summary.metrics[evaluation_stage]["current_model_force_r2"] == 1.0
     assert summary.metrics[update_stage]["workflow_converged"] is False
+    maturity = json.loads(summary.artifacts["scenario_maturity"].read_text())
+    assert summary.metrics[update_stage]["production_status_by_route"] == {
+        route_id: route["production_status"]
+        for route_id, route in maturity["routes"].items()
+    }
     assert summary.metrics[update_stage]["generation_disposition"] in {
         "continue",
         "finalize",
@@ -1663,6 +1668,11 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert summary.metrics["explore"]["scenario_targets"] == ["smoke_passed"]
     assert summary.metrics["evaluate"]["scenario_counts_by_maturity"] == {
         "untested": 1,
+    }
+    maturity = json.loads(summary.artifacts["scenario_maturity"].read_text())
+    assert summary.metrics["evaluate"]["production_status_by_route"] == {
+        route_id: route["production_status"]
+        for route_id, route in maturity["routes"].items()
     }
     assert "scenario_maturity" in summary.artifacts
     assert "md_attempts" in summary.artifacts

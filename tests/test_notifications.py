@@ -386,6 +386,84 @@ def test_notification_prioritizes_acquisition_and_explains_test_warning():
     assert "Convergence: Consecutive passing generations: 1/2" in event.text
 
 
+@pytest.mark.parametrize("structured", [True, False])
+def test_notification_summarizes_nine_temperature_points_without_changing_decisions(structured):
+    from copy import deepcopy
+
+    temperatures = (100, 900, 1100, 1300, 1450, 1600, 1800, 2100, 2400)
+    reasons = ["Insufficient evidence: evaluated 3/10 required new labels."] + [
+        f"npt / {t} K: production coverage for the current model is 0%; required ≥100%. "
+        "Successful replicas required per scenario: 3."
+        for t in temperatures
+    ]
+    decision = {
+        "acquisition_evidence_count": 3,
+        "acquisition_min_selected": 10,
+        "acquisition_accepted": False,
+        "acquisition_convergence_streak": 0,
+        "acquisition_convergence_required": 1,
+        "production_ready": False,
+        "convergence_reasons": reasons,
+        "added_count": 3,
+    }
+    if structured:
+        decision["production_status_by_route"] = {
+            "npt": {
+                "minimum_coverage": 1.0,
+                "minimum_successful_replicas": 3,
+                "by_temperature": {
+                    str(t): {"verified": 0, "total": 1, "coverage": 0.0}
+                    for t in temperatures
+                },
+            }
+        }
+    record = {
+        "kind": "acquisition",
+        "stage_sequence": ["train", "explore", "select", "label", "evaluate", "update"],
+        "stages": {
+            "explore": {"metrics": {"scenario_temperatures": [100], "scenario_steps": [10_000]}},
+            "update": {"metrics": decision},
+        },
+    }
+    before = deepcopy(record)
+    text = _generation_event(
+        "example", 21, {"generation": 1, "max_selected": 100}, record,
+        workflow_path="/tmp/workflow with spaces",
+    ).text
+
+    assert record == before
+    assert "Temperature: 100 K; Longest run: 10,000 steps" in text
+    assert "Accuracy evidence: 3/10 required new labels" in text
+    assert "0/1" not in text  # insufficient evidence is not a failed accuracy test
+    assert "production coverage for the current model is" not in text
+    assert "Successful replicas required per scenario" not in text
+    assert text.count("Production validation") == 1
+    if structured:
+        assert "0/9 temperature points complete" in text
+    else:
+        assert "9 route-temperature points below required coverage" in text
+        assert "0/9" not in text  # old reasons cannot establish a denominator
+    assert "Next: Train with the new labeled structures" in text
+    assert "Details: neptrain workflow status '/tmp/workflow with spaces' --details" in text
+
+
+def test_finalization_pending_notification_has_one_next_action():
+    event = _generation_event(
+        "example", 21, {"generation": 1, "max_selected": 10},
+        {
+            "kind": "acquisition",
+            "stage_sequence": ["train", "explore", "select", "label", "evaluate", "update"],
+            "stages": {"update": {"metrics": {
+                "added_count": 3, "finalization_pending": True,
+                "production_ready": True,
+            }}},
+        },
+    )
+    assert event.text.count("Next:") == 1
+    assert "proceeding to final training" in event.text
+    assert "before further sampling" not in event.text
+
+
 def test_v3_notification_reports_merged_training_count():
     event = _generation_event(
         "Fe",
