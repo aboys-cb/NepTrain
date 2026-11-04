@@ -328,6 +328,9 @@ def _acquisition_convergence_status(
     diagnostic: Mapping[str, Any],
     policy: Mapping[str, Any],
     previous_signals: Mapping[str, Any],
+    *,
+    revision: int = 0,
+    policy_revision: int = 0,
 ) -> dict[str, Any]:
     """Judge convergence from errors made before the new labels are trained."""
 
@@ -336,6 +339,8 @@ def _acquisition_convergence_status(
             "acquisition_convergence_configured": False,
             "acquisition_converged": False,
             "acquisition_convergence_streak": 0,
+            "acquisition_convergence_revision": revision,
+            "acquisition_policy_revision": policy_revision,
             "convergence_reasons": [
                 "Convergence checks are disabled: workflow.convergence is not configured. Sampling coverage alone does not establish accuracy."
             ],
@@ -393,12 +398,20 @@ def _acquisition_convergence_status(
         and outliers_accepted
         and enough_evidence
     )
-    previous_streak = int(
-        previous_signals.get("acquisition_convergence_streak", 0)
+    policy_changed = (
+        int(previous_signals.get("acquisition_convergence_revision", 0))
+        != revision
+    )
+    previous_streak = (
+        int(previous_signals.get("acquisition_convergence_streak", 0))
+        if not policy_changed
+        else 0
     )
     streak = previous_streak + 1 if acquisition_accepted else 0
     required = int(policy.get("consecutive_generations", 1))
     reasons = []
+    if policy_changed and int(previous_signals.get("acquisition_convergence_streak", 0)):
+        reasons.append("Convergence criteria changed; the previous passing streak was reset.")
     if not enough_evidence:
         reasons.append(
             f"Insufficient evidence: evaluated {int(diagnostic.get('evaluated_count', 0))}/{min_selected} required new labels."
@@ -435,6 +448,9 @@ def _acquisition_convergence_status(
         "acquisition_min_selected": min_selected,
         "acquisition_accepted": acquisition_accepted,
         "acquisition_convergence_streak": streak,
+        "acquisition_convergence_revision": revision,
+        "acquisition_policy_revision": policy_revision,
+        "acquisition_policy_changed": policy_changed,
         "acquisition_convergence_required": required,
         "acquisition_converged": streak >= required,
         "convergence_reasons": reasons,
@@ -457,6 +473,8 @@ def _saturated_acquisition_convergence(
     if not (
         convergence["acquisition_convergence_configured"]
         and previous_signals.get("acquisition_accepted") is True
+        and int(previous_signals.get("acquisition_convergence_revision", 0))
+        == int(convergence["acquisition_convergence_revision"])
         and int(previous_signals.get("acquisition_convergence_streak", 0)) > 0
         and int(diagnostic.get("evaluated_count", 0)) == 0
         and diagnostic.get("skipped") is True
@@ -2769,6 +2787,8 @@ class WorkflowIterationAdapter:
             diagnostic,
             self.config.get("workflow", {}).get("convergence", {}),
             previous_signals,
+            revision=int(self.config.get("_convergence_revision", 0)),
+            policy_revision=int(self.config.get("_convergence_policy_revision", 0)),
         )
         validation_accepted = evaluation.get("validation_accepted")
         history, production_ready = self._record_route_histories(
@@ -3313,6 +3333,8 @@ class WorkflowIterationAdapter:
             diagnostic,
             self.config.get("workflow", {}).get("convergence", {}),
             previous_signals,
+            revision=int(self.config.get("_convergence_revision", 0)),
+            policy_revision=int(self.config.get("_convergence_policy_revision", 0)),
         )
         history, production_ready = self._record_route_histories(
             context,

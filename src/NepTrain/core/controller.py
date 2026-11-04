@@ -265,6 +265,12 @@ class PersistentController:
             self.config, _ = load_config(self.workspace.project_file)
         except ConfigError as error:
             raise ControllerError(f"invalid project configuration: {error}") from error
+        self.config["_convergence_revision"] = int(
+            self.manifest.get("convergence_evidence_revision", 0)
+        )
+        self.config["_convergence_policy_revision"] = int(
+            self.manifest.get("convergence_revision", 0)
+        )
         self.plans = tuple(_plan(Path(item["path"])) for item in self.manifest["plans"])
         self.initial_training = Path(self.manifest["initial_training"]["path"])
         self.generation_controller = GenerationController(

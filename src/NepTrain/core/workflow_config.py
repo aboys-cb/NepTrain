@@ -218,6 +218,75 @@ def _reopened_sampling_boundary(project: Path) -> bool:
         return False
 
 
+def _convergence_policy_boundary(project: Path) -> bool:
+    """A stopped workflow may change criteria before its next accuracy stage."""
+    from .generation_policy import stage_for_role
+
+    state = project.parent / ".neptrain"
+    try:
+        controller_file = state / "controller.json"
+        controller = (
+            json.loads(controller_file.read_text())
+            if controller_file.is_file()
+            else {"state": "prepared", "current": None}
+        )
+        if controller.get("state") not in {"prepared", "stopped", "idle"}:
+            return False
+        current = controller.get("current")
+        ledger_file = state / "ledger.json"
+        if not ledger_file.is_file():
+            return controller.get("state") == "prepared" and current is None
+        records = json.loads(ledger_file.read_text())["generations"]
+        if not records:
+            return current is None
+        generation = max(map(int, records))
+        record = records[str(generation)]
+        if record.get("complete"):
+            return current is None
+        evaluation_stage = stage_for_role(record, "evaluate")
+        if evaluation_stage is None or evaluation_stage in record.get("stages", {}):
+            return False
+        if current is not None and (
+            int(current.get("generation", -1)) != generation
+            or current.get("stage") == evaluation_stage
+        ):
+            return False
+        for bundle in (state / "jobs").glob("*"):
+            task = bundle / "task.json"
+            if not task.is_file():
+                continue
+            identity = json.loads(task.read_text()).get("identity", {})
+            if (
+                int(identity.get("generation", -1)) == generation
+                and identity.get("stage") == evaluation_stage
+            ):
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def _invalidates_prior_accuracy(change: Mapping[str, Any]) -> bool:
+    """Only a stricter per-generation test can invalidate an earlier pass."""
+    field = str(change["field"])
+    before, after = change["before"], change["after"]
+    if field.startswith("workflow.convergence.acquisition_max_rmse.") or field == (
+        "workflow.convergence.max_outlier_fraction"
+    ):
+        return after is not None and (before is None or float(after) < float(before))
+    if field.startswith("workflow.convergence.acquisition_min_r2.") or field == (
+        "workflow.convergence.group_min_force_r2"
+    ):
+        return after is not None and (before is None or float(after) > float(before))
+    if field == "workflow.convergence.min_selected":
+        return int(after if after is not None else 1) > int(
+            before if before is not None else 1
+        )
+    # Consecutive generations and production coverage are aggregate requirements;
+    # changing them does not turn an earlier passing accuracy generation into a fail.
+    return False
+
+
 def inspect_config(
     record: Mapping[str, Any], *, sampling_restart: bool = False,
 ) -> tuple[dict[str, Any], ...]:
@@ -257,8 +326,15 @@ def inspect_config(
         sampling_restart or _sampling_policy_boundary(path)
         or _reopened_sampling_boundary(path)
     )
-    for parts, old, new in _differences(before, after):
+    differences = tuple(_differences(before, after))
+    convergence_boundary = any(
+        parts[:2] == ("workflow", "convergence")
+        for parts, _, _ in differences
+    ) and _convergence_policy_boundary(path)
+    for parts, old, new in differences:
         scope = _scope(parts, old, new)
+        if parts[:2] == ("workflow", "convergence") and convergence_boundary:
+            scope = "next accuracy evaluation; prior results retained"
         if (len(parts) == 4 and parts[:2] == ("sampling", "routes")
                 and parts[3] == "template_path" and sampling_boundary):
             scope = "future sampling only; existing training and labels retained"
@@ -290,6 +366,14 @@ def inspect_config(
             "Use workflow extend to change the generation budget. "
             if "workflow.max_model_generations" in blocked else ""
         )
+        if all(field.startswith("workflow.convergence.") for field in blocked):
+            raise WorkflowConfigError(
+                "These convergence changes cannot be applied at the current "
+                "workflow boundary: " + ", ".join(blocked)
+                + ". Stop the controller with --keep-jobs before the next "
+                "accuracy evaluation, then edit "
+                "project.yaml. Existing results are retained; no edits were accepted."
+            )
         raise WorkflowConfigError(
             "These configuration changes cannot be applied to an existing workflow: "
             + ", ".join(blocked)
@@ -453,6 +537,18 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
                 "label_inputs_before": old_label_inputs,
                 "label_inputs_after": new_label_inputs if new_label_inputs is not None else old_label_inputs,
             })
+        convergence_changes = [
+            change for change in changes
+            if change["field"].startswith("workflow.convergence.")
+        ]
+        if convergence_changes:
+            manifest["convergence_revision"] = int(
+                manifest.get("convergence_revision", 0)
+            ) + 1
+            if any(_invalidates_prior_accuracy(change) for change in convergence_changes):
+                manifest["convergence_evidence_revision"] = int(
+                    manifest.get("convergence_evidence_revision", 0)
+                ) + 1
         if new_label_inputs is not None:
             manifest["dependencies"] = [r for r in manifest.get("dependencies", []) if r.get("role") != "labeling_input"] + new_label_inputs
         if new_sampling is not None:

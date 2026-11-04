@@ -1825,6 +1825,24 @@ def test_status_does_not_show_unmeasured_zero_label_checks_as_failures(capsys):
     assert "Not met" not in output
 
 
+def test_status_does_not_compare_old_accuracy_to_revised_criteria(capsys):
+    from NepTrain.cli.cli import _print_acceptance
+
+    status = SimpleNamespace(
+        convergence_policy={"acquisition_max_rmse": {"force_rmse": 0.2}},
+        convergence_revision=1,
+        pending_config_changes=(),
+        generations=[{"generation": 18, "quality": {
+            "acquisition_count": 12,
+            "acquisition_policy_revision": 0,
+        }}],
+    )
+    _print_acceptance(status)
+    output = capsys.readouterr().out
+    assert "earlier criteria" in output
+    assert "200 meV/Å" not in output
+
+
 def test_status_keeps_per_temperature_convergence_in_details(tmp_path, capsys):
     from dataclasses import replace
     from NepTrain.cli.cli import _print_workflow_status
@@ -1980,7 +1998,6 @@ def test_operational_edits_are_previewed_and_applied_on_start(tmp_path, monkeypa
 @pytest.mark.parametrize('field,value', [
     ('workflow.seed', 999),
     ('workflow.max_model_generations', 10),
-    ('workflow.convergence', {'acquisition_max_rmse': {'force_rmse': 0.2, 'energy_rmse': 0.1}}),
     ('sampling.selection.max_selected', 50),
     ('execution.targets.extra', {'partition': '4V100', 'qos': 'rush-1o2gpu'}),
     ('execution.targets.label.directives', ['--export=ALL,TEST_SETTING=new']),
@@ -1995,6 +2012,152 @@ def test_scientific_and_execution_identity_edits_are_rejected_by_field(tmp_path,
         start_workflow(prep.output_dir)
     assert field in str(error.value)
     assert prep.manifest.read_bytes() == before  # no partial acceptance of the QoS
+
+
+def test_convergence_criteria_edit_is_audited_without_changing_existing_plans(tmp_path):
+    from NepTrain.core.workflow_config import accept_config_changes
+    from NepTrain.core.controller import PersistentController
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    old_plans = [plan.read_bytes() for plan in prep.plans]
+    policy = {'acquisition_max_rmse': {'energy_rmse': 0.01, 'force_rmse': 0.1},
+              'min_selected': 10, 'consecutive_generations': 2}
+    _edit_runtime_project(prep, {'workflow.convergence': policy})
+    pending = workflow_status(prep.output_dir).pending_config_changes
+    assert {change['field'] for change in pending} == {
+        'workflow.convergence.acquisition_max_rmse.energy_rmse',
+        'workflow.convergence.acquisition_max_rmse.force_rmse',
+        'workflow.convergence.min_selected',
+        'workflow.convergence.consecutive_generations',
+    }
+    assert accept_config_changes(prep.output_dir) == pending
+    manifest = json.loads(prep.manifest.read_text())
+    assert manifest['convergence_revision'] == 1
+    assert manifest['convergence_evidence_revision'] == 1
+    assert [plan.read_bytes() for plan in prep.plans] == old_plans
+    assert PersistentController(prep.output_dir).config['_convergence_revision'] == 1
+    assert PersistentController(prep.output_dir).config['_convergence_policy_revision'] == 1
+
+
+@pytest.mark.parametrize('stage,allowed', [('label', True), ('evaluate', False)])
+def test_stopped_workflow_can_change_accuracy_before_evaluation(tmp_path, stage, allowed):
+    from NepTrain.core.workflow_config import accept_config_changes
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    workspace = WorkflowWorkspace.locate(prep.output_dir)
+    workspace.ledger.write_text(json.dumps({
+        'version': 1, 'workflow_id': prep.workflow_id,
+        'generations': {'1': {'kind': 'acquisition',
+            'stage_sequence': ['train','explore','select','label','evaluate','update'],
+            'stages': {'train': {}, 'explore': {}, 'select': {}}}},
+    }))
+    workspace.controller_file.write_text(json.dumps({
+        'protocol': 'neptrain.controller.v1', 'workflow_id': prep.workflow_id,
+        'state': 'stopped', 'current': {'generation': 1, 'stage': stage},
+        'history': [],
+    }))
+    _edit_runtime_project(prep, {'workflow.convergence': {
+        'acquisition_max_rmse': {'energy_rmse': 0.01, 'force_rmse': 0.1},
+    }})
+    if allowed:
+        assert accept_config_changes(prep.output_dir)
+        assert json.loads(workspace.controller_file.read_text())['current']['stage'] == 'label'
+    else:
+        before = prep.manifest.read_bytes()
+        with pytest.raises(WorkflowError, match='workflow.convergence'):
+            workflow_status(prep.output_dir)
+        assert prep.manifest.read_bytes() == before
+
+
+def test_prepared_evaluation_bundle_blocks_convergence_edit(tmp_path):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    workspace = WorkflowWorkspace.locate(prep.output_dir)
+    workspace.ledger.write_text(json.dumps({
+        'version': 1, 'workflow_id': prep.workflow_id,
+        'generations': {'1': {'kind': 'acquisition',
+            'stage_sequence': ['train', 'explore', 'select', 'label', 'evaluate', 'update'],
+            'stages': {'train': {}, 'explore': {}, 'select': {}}}},
+    }))
+    workspace.controller_file.write_text(json.dumps({
+        'protocol': 'neptrain.controller.v1', 'workflow_id': prep.workflow_id,
+        'state': 'stopped', 'current': {'generation': 1, 'stage': 'label'},
+        'history': [],
+    }))
+    bundle = prep.output_dir / '.neptrain/jobs/prepared-evaluation'
+    bundle.mkdir(parents=True)
+    (bundle / 'task.json').write_text(json.dumps({
+        'identity': {'generation': 1, 'stage': 'evaluate'},
+    }))
+    _edit_runtime_project(prep, {'workflow.convergence': {
+        'acquisition_max_rmse': {'energy_rmse': 0.01, 'force_rmse': 0.2},
+    }})
+    with pytest.raises(WorkflowError, match='workflow.convergence'):
+        workflow_status(prep.output_dir)
+
+
+def test_extend_with_convergence_edit_increments_policy_revision(tmp_path):
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    _edit_runtime_project(prep, {'workflow.convergence': {
+        'acquisition_max_rmse': {'energy_rmse': 0.01, 'force_rmse': 0.1},
+    }})
+    extend_workflow(prep.output_dir, 4)
+    manifest = json.loads(prep.manifest.read_text())
+    assert manifest['convergence_revision'] == 1
+    assert manifest['convergence_evidence_revision'] == 1
+    assert manifest['sampling_generation_budget'] == 4
+
+
+def test_relaxed_convergence_criteria_preserve_prior_accuracy_streak(tmp_path):
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.workflow_config import accept_config_changes
+    from NepTrain.core.controller import PersistentController
+
+    config, initial = _inputs(tmp_path)
+    values, _ = load_config(config)
+    values['workflow']['convergence'] = {
+        'acquisition_max_rmse': {'energy_rmse': 0.01, 'force_rmse': 0.1},
+        'min_selected': 10, 'consecutive_generations': 2,
+    }
+    save_config(values, config)
+    prep = prepare_workflow(config, initial, tmp_path / 'workflow')
+    _edit_runtime_project(prep, {
+        'workflow.convergence.acquisition_max_rmse.force_rmse': 0.2,
+        'workflow.convergence.min_selected': 5,
+        'workflow.convergence.consecutive_generations': 1,
+        'workflow.convergence.production_min_coverage': 0.8,
+    })
+    assert len(accept_config_changes(prep.output_dir)) == 4
+    manifest = json.loads(prep.manifest.read_text())
+    assert manifest['convergence_revision'] == 1
+    assert manifest.get('convergence_evidence_revision', 0) == 0
+    controller = PersistentController(prep.output_dir)
+    assert controller.config['_convergence_revision'] == 0
+    assert controller.config['_convergence_policy_revision'] == 1
+
+
+@pytest.mark.parametrize('field,before,after,invalidates', [
+    ('acquisition_max_rmse.force_rmse', 0.1, 0.2, False),
+    ('acquisition_max_rmse.force_rmse', 0.1, 0.05, True),
+    ('acquisition_min_r2.force_r2', 0.95, 0.9, False),
+    ('acquisition_min_r2.force_r2', 0.95, 0.98, True),
+    ('min_selected', 10, 5, False),
+    ('min_selected', 10, 20, True),
+    ('consecutive_generations', 2, 3, False),
+    ('production_min_coverage', 0.8, 1.0, False),
+])
+def test_only_stricter_accuracy_tests_invalidate_prior_passes(
+    field, before, after, invalidates
+):
+    from NepTrain.core.workflow_config import _invalidates_prior_accuracy
+
+    assert _invalidates_prior_accuracy({
+        'field': 'workflow.convergence.' + field,
+        'before': before, 'after': after,
+    }) is invalidates
 
 
 def test_notification_edits_are_redacted_in_output_and_audit(tmp_path, monkeypatch, capsys):

@@ -34,6 +34,7 @@ from .scientific_data import STRUCTURE_ID_VERSION
 from .workflow_config import (
     WorkflowConfigError,
     accept_config_changes,
+    _invalidates_prior_accuracy,
     inspect_config,
     inspect_setup_changes,
     setup_records,
@@ -105,6 +106,7 @@ class WorkflowStatus:
     convergence_policy: Mapping[str, Any] | None = None
     training_progress: Mapping[str, Any] | None = None
     pending_config_changes: tuple[Mapping[str, Any], ...] = ()
+    convergence_revision: int = 0
 
 
 _STAGES = (
@@ -906,6 +908,18 @@ def extend_workflow(
             "launch_inputs_before": old_launch_inputs,
             "launch_inputs_after": new_launch_inputs,
         })
+        convergence_changes = [
+            change for change in pending_changes
+            if change["field"].startswith("workflow.convergence.")
+        ]
+        if convergence_changes:
+            manifest["convergence_revision"] = int(
+                manifest.get("convergence_revision", 0)
+            ) + 1
+            if any(_invalidates_prior_accuracy(change) for change in convergence_changes):
+                manifest["convergence_evidence_revision"] = int(
+                    manifest.get("convergence_evidence_revision", 0)
+                ) + 1
         atomic_write_json(preparation.manifest, manifest)
         if workspace.controller_file.is_file():
             controller_state = _read_json(
@@ -1312,6 +1326,9 @@ def _generation_science(
             "acquisition_metric_basis": acquisition_basis,
             "validation_metric_basis": validation_basis,
             "acquisition_accepted": decision.get("acquisition_accepted"),
+            "acquisition_policy_revision": decision.get(
+                "acquisition_policy_revision", 0
+            ),
             "acquisition_convergence_basis": decision.get(
                 "acquisition_convergence_basis"
             ),
@@ -2092,8 +2109,9 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             )
         )
         next_action = (
-            "Review workflow.convergence and sampling coverage. To change structures, sampling policy, or convergence criteria, "
-            "edit the source project YAML and start with a new --output directory to preserve this run."
+            "Review workflow.convergence and sampling coverage. Convergence criteria "
+            "for a future evaluation can be edited in this run's project.yaml; "
+            "structure or sampling policy changes may require a new workflow."
         )
     elif controller_state == "stalled":
         state = "stalled"
@@ -2173,6 +2191,7 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
         ),
         precision_basis="acquisition",
         convergence_policy=dict(config.get("workflow", {}).get("convergence", {})),
+        convergence_revision=int(manifest.get("convergence_revision", 0)),
         training_progress=_training_progress(controller, config),
         pending_config_changes=pending_config_changes,
     )

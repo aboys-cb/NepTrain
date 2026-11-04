@@ -363,6 +363,12 @@ neptrain workflow extend workflow 15
 neptrain workflow stop workflow --keep-jobs
 ```
 
+要调整运行中 workflow 的 `workflow.convergence` 评估阈值，可在本代精度评估任务
+创建前用 `stop --keep-jobs` 暂停 Controller，编辑运行目录的 `project.yaml`，
+再用 `status` 预览、`resume` 接纳。当前 DFT 作业继续运行；旧精度记录保留，
+新阈值只用于后续评估。放宽标准时旧的通过记录仍有效，不会重置温度递进或
+连续达标计数；旧失败也不会被追溯改判。
+
 独立手动任务使用 `neptrain task cancel` 明确取消。
 
 `workflow run` 同时接受项目 YAML 和已准备的 workflow 目录。第一次启动

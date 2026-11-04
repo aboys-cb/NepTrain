@@ -2964,6 +2964,54 @@ def test_empty_acquisition_cannot_advance_convergence_streak():
     assert "Insufficient evidence" in result["convergence_reasons"][0]
 
 
+def test_changed_convergence_policy_resets_prior_streak_and_saturation_credit():
+    policy = {"acquisition_max_rmse": {"force_rmse": 0.1},
+              "consecutive_generations": 2}
+    previous = {"acquisition_accepted": True,
+                "acquisition_convergence_streak": 1,
+                "acquisition_convergence_revision": 0}
+    result = _acquisition_convergence_status(
+        {"evaluated_count": 1, "current_model_force_rmse": 0.05},
+        policy, previous, revision=1,
+    )
+    assert result["acquisition_accepted"] is True
+    assert result["acquisition_convergence_streak"] == 1
+    assert result["acquisition_converged"] is False
+    assert result["acquisition_policy_changed"] is True
+    assert any("previous passing streak was reset" in reason
+               for reason in result["convergence_reasons"])
+
+    empty = _acquisition_convergence_status(
+        {"evaluated_count": 0, "skipped": True}, policy, previous,
+        revision=1,
+    )
+    rejected = _saturated_acquisition_convergence(
+        empty, diagnostic={"evaluated_count": 0, "skipped": True},
+        previous_signals=previous, selection={"selected_ids": []},
+        scenario_plan={"routes": []}, selected_count=0,
+        novelty_converged=True, production_ready=True,
+    )
+    assert rejected["acquisition_converged"] is False
+
+
+def test_relaxed_policy_keeps_previous_passing_generation():
+    previous = {"acquisition_accepted": True,
+                "acquisition_convergence_streak": 1,
+                "acquisition_convergence_revision": 0,
+                "acquisition_policy_revision": 0}
+    result = _acquisition_convergence_status(
+        {"evaluated_count": 1, "current_model_force_rmse": 0.15},
+        {"acquisition_max_rmse": {"force_rmse": 0.2},
+         "consecutive_generations": 2},
+        previous, revision=0, policy_revision=1,
+    )
+    assert result["acquisition_accepted"] is True
+    assert result["acquisition_convergence_streak"] == 2
+    assert result["acquisition_converged"] is True
+    assert result["acquisition_policy_revision"] == 1
+    assert result["acquisition_policy_changed"] is False
+
+
 @pytest.mark.parametrize(
     "change",
     [

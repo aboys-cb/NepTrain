@@ -386,6 +386,21 @@ def _print_acceptance(status):
         return
     latest = evaluated[-1]
     quality = latest["quality"]
+    if any(
+        str(change.get("field", "")).startswith("workflow.convergence.")
+        for change in getattr(status, "pending_config_changes", ())
+    ):
+        print("\nLatest convergence checks: Edited criteria are pending; stop the controller and resume to apply them.")
+        return
+    if int(quality.get("acquisition_policy_revision") or 0) != int(
+        getattr(status, "convergence_revision", 0)
+    ):
+        print(
+            f"\nLatest convergence checks · G{latest['generation']}: "
+            "These results used earlier criteria; the revised criteria "
+            "will apply at the next accuracy evaluation."
+        )
+        return
     if quality.get("acquisition_convergence_basis") == "no_new_labels_after_passing_accuracy":
         print(
             f"\nLatest convergence checks · G{latest['generation']}: "
