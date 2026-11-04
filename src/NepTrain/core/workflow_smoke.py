@@ -64,7 +64,10 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
         )
         for i, f in enumerate(frames):
             f.info["lammps_step"] = (i + 1) * request.steps // count
-        failed = case == "md_recovery" and current["generation"] == 1
+        failed = (
+            case == "md_recovery" and current["generation"] == 1
+            or case == "long_streak" and current["generation"] <= 2
+        )
         write(request.output_file, frames, format="extxyz")
         events.append(
             {
@@ -352,8 +355,9 @@ def run_workflow_smoke(
         ),
         "production_probes_extend_streak": (
             len(streak) == 7
-            and streak[3]["production_ready"] is True
-            and streak[3]["disposition"] == "continue"
+            and streak[4]["production_ready"] is False
+            and streak[4]["disposition"] == "continue"
+            and streak[5]["production_ready"] is True
             and streak[5]["disposition"] == "finalize"
         ),
         "insufficient_labels_do_not_converge": all(
