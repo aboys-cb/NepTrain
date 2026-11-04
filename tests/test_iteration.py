@@ -31,6 +31,7 @@ from NepTrain.core.workflow_iteration import (
     WorkflowRuntime,
     _batched_descriptors,
     _acquisition_convergence_status,
+    _saturated_acquisition_convergence,
     _progression_confidence,
     _nep_prediction_evaluation,
     _evaluation_quality,
@@ -2961,6 +2962,119 @@ def test_empty_acquisition_cannot_advance_convergence_streak():
     assert result["acquisition_converged"] is False
     assert result["acquisition_convergence_streak"] == 0
     assert "Insufficient evidence" in result["convergence_reasons"][0]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "prior_failed", "prior_missing", "selected", "novel", "md_failed",
+        "coverage_missing", "not_skipped", "unconfigured",
+    ],
+)
+def test_zero_label_saturation_requires_prior_accuracy_and_stable_coverage(change):
+    diagnostic = {"evaluated_count": 0, "skipped": True}
+    previous = {"acquisition_accepted": True, "acquisition_convergence_streak": 1}
+    selection = {"selected_ids": [], "remaining_novelty": 0.0}
+    plan = {"routes": [{"attempts": [{"attempt_id": "hot"}], "completed": {"hot": True}}]}
+    convergence = _acquisition_convergence_status(
+        diagnostic,
+        {"acquisition_max_rmse": {"force_rmse": 0.1}, "consecutive_generations": 2},
+        previous,
+    )
+    args = {"selected_count": 0, "novelty_converged": True, "production_ready": True}
+    if change == "prior_failed":
+        previous["acquisition_accepted"] = False
+    elif change == "prior_missing":
+        previous.clear()
+    elif change == "selected":
+        args["selected_count"] = 1
+    elif change == "novel":
+        args["novelty_converged"] = False
+    elif change == "md_failed":
+        plan["routes"][0]["completed"]["hot"] = False
+    elif change == "coverage_missing":
+        args["production_ready"] = False
+    elif change == "not_skipped":
+        diagnostic["skipped"] = False
+    elif change == "unconfigured":
+        convergence["acquisition_convergence_configured"] = False
+    result = _saturated_acquisition_convergence(
+        convergence, diagnostic=diagnostic, previous_signals=previous,
+        selection=selection, scenario_plan=plan, **args,
+    )
+    assert result["acquisition_converged"] is False
+
+
+def test_zero_label_saturation_finalizes_without_claiming_a_new_accuracy_pass():
+    previous = {"acquisition_accepted": True, "acquisition_convergence_streak": 1}
+    diagnostic = {"evaluated_count": 0, "skipped": True}
+    convergence = _acquisition_convergence_status(
+        diagnostic,
+        {"acquisition_max_rmse": {"force_rmse": 0.1}, "consecutive_generations": 2},
+        previous,
+    )
+    result = _saturated_acquisition_convergence(
+        convergence, diagnostic=diagnostic, previous_signals=previous,
+        selection={"selected_ids": []},
+        scenario_plan={"routes": [{"attempts": [{"attempt_id": "hot"}],
+                                   "completed": {"hot": True}}]},
+        selected_count=0, novelty_converged=True, production_ready=True,
+    )
+    assert result["acquisition_converged"] is True
+    assert result["acquisition_accepted"] is None
+    assert result["acquisition_convergence_streak"] == 1
+    assert result["acquisition_convergence_basis"] == "no_new_labels_after_passing_accuracy"
+    assert result["acquisition_evidence_count"] == 0
+
+
+def test_v4_update_routes_zero_label_saturation_to_final_training(tmp_path, monkeypatch):
+    adapter = object.__new__(WorkflowIterationAdapter)
+    adapter.config = {"workflow": {"convergence": {
+        "acquisition_max_rmse": {"force_rmse": 0.1},
+        "consecutive_generations": 2,
+    }}}
+
+    def artifact(name, content):
+        path = tmp_path / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    training_set = artifact("train.xyz", "training data")
+    model = artifact("nep.txt", "model data")
+    artifacts = {
+        "acquisition_signals": artifact("acquisition.json", json.dumps({
+            "evaluated_count": 0, "skipped": True,
+        })),
+        "model_evaluation": artifact("evaluation.json", "{}"),
+        "selection_result": artifact("selection.json", json.dumps({
+            "selected_ids": [], "remaining_novelty": 0,
+            "resolved_completion_coverage_threshold": 0,
+        })),
+        "scenario_plan": artifact("scenario.json", json.dumps({
+            "routes": [{"attempts": [{"attempt_id": "hot"}],
+                        "completed": {"hot": True}}],
+        })),
+        "selected_input": artifact("selected.xyz", ""),
+        "model": model,
+    }
+    previous = {"signals": artifact("previous-signals.json", json.dumps({
+        "acquisition_accepted": True, "acquisition_convergence_streak": 1,
+    }))}
+    monkeypatch.setattr(adapter, "_merge", lambda context: StageOutcome(
+        {"training_set": training_set}, {"added_count": 0},
+    ))
+    monkeypatch.setattr(adapter, "_record_route_histories", lambda *args, **kwargs: (
+        {"routes": {}, "counts_by_maturity": {}}, True,
+    ))
+    outcome = adapter._acquisition_merge(StageContext(
+        generation=2, generation_dir=tmp_path, plan=GenerationPlan(2, 2, 3),
+        artifacts=artifacts, previous_artifacts=previous,
+        stage_dir=tmp_path / "update",
+    ))
+    assert outcome.metrics["generation_disposition"] == "finalize"
+    assert outcome.metrics["acquisition_accepted"] is None
+    assert outcome.metrics["acquisition_convergence_streak"] == 1
+    assert json.loads(outcome.artifacts["signals"].read_text())["finalization_pending"] is True
 
 
 @pytest.mark.parametrize("model_state", ["missing", "empty"])

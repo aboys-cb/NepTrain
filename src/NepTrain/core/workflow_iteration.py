@@ -441,6 +441,52 @@ def _acquisition_convergence_status(
     }
 
 
+def _saturated_acquisition_convergence(
+    convergence: dict[str, Any],
+    *,
+    diagnostic: Mapping[str, Any],
+    previous_signals: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    scenario_plan: Mapping[str, Any],
+    selected_count: int,
+    novelty_converged: bool,
+    production_ready: bool,
+) -> dict[str, Any]:
+    """Close a covered route with no new labels after real accuracy evidence."""
+
+    if not (
+        convergence["acquisition_convergence_configured"]
+        and previous_signals.get("acquisition_accepted") is True
+        and int(previous_signals.get("acquisition_convergence_streak", 0)) > 0
+        and int(diagnostic.get("evaluated_count", 0)) == 0
+        and diagnostic.get("skipped") is True
+        and selected_count == 0
+        and not selection.get("selected_ids")
+        and novelty_converged
+        and production_ready
+        and all(
+            route.get("completed", {}).get(attempt["attempt_id"]) is True
+            for route in scenario_plan.get("routes", ())
+            for attempt in route.get("attempts", ())
+        )
+    ):
+        return convergence
+    return {
+        **convergence,
+        "acquisition_accepted": None,
+        "acquisition_convergence_streak": int(
+            previous_signals["acquisition_convergence_streak"]
+        ),
+        "acquisition_converged": True,
+        "acquisition_convergence_basis": "no_new_labels_after_passing_accuracy",
+        "convergence_reasons": [
+            "No new labels after stable sampling and full production coverage; "
+            "the previous generation passed the configured accuracy checks. "
+            "No current-generation accuracy measurement was made."
+        ],
+    }
+
+
 def _progression_confidence(
     diagnostic: Mapping[str, Any], policy: Mapping[str, Any]
 ) -> dict[str, bool]:
@@ -2724,7 +2770,6 @@ class WorkflowIterationAdapter:
             self.config.get("workflow", {}).get("convergence", {}),
             previous_signals,
         )
-        convergence_evidence = convergence["acquisition_converged"]
         validation_accepted = evaluation.get("validation_accepted")
         history, production_ready = self._record_route_histories(
             context,
@@ -2736,6 +2781,23 @@ class WorkflowIterationAdapter:
             novelty_converged=novelty_converged,
             final_model_id=file_sha256(context.artifacts["model"]),
         )
+        convergence = _saturated_acquisition_convergence(
+            convergence,
+            diagnostic=diagnostic,
+            previous_signals=previous_signals,
+            selection=selection,
+            scenario_plan=json.loads(
+                context.artifacts["scenario_plan"].read_text(encoding="utf-8")
+            ),
+            selected_count=(
+                len(_read_frames(context.artifacts["selected_input"], allow_empty=True))
+                if "selected_input" in context.artifacts
+                else -1
+            ),
+            novelty_converged=novelty_converged,
+            production_ready=production_ready,
+        )
+        convergence_evidence = convergence["acquisition_converged"]
         sampling_complete = bool(production_ready and convergence_evidence)
         disposition = "finalize" if sampling_complete else "continue"
         for route in history["routes"].values():
@@ -2749,7 +2811,7 @@ class WorkflowIterationAdapter:
                 for temperature, coverage in status["by_temperature"].items():
                     if coverage["coverage"] < status["minimum_coverage"]:
                         convergence["convergence_reasons"].append(
-                            f"{route_id} / {temperature} K: production coverage for the current model is "
+                            f"{route_id} / {temperature} K: historical production coverage is "
                             f"{coverage['coverage']:.0%}; required ≥{status['minimum_coverage']:.0%}. "
                             f"Successful replicas required per scenario: {status['minimum_successful_replicas']}."
                         )
@@ -2991,6 +3053,17 @@ class WorkflowIterationAdapter:
         selection = json.loads(
             context.artifacts["selection_result"].read_text(encoding="utf-8")
         )
+        selected_input = context.artifacts.get("selected_input")
+        selected_attempt_ids = (
+            {
+                str(attempt_id)
+                for frame in _read_frames(selected_input, allow_empty=True)
+                if (attempt_id := frame.info.get("scenario_attempt_id")) is not None
+            }
+            if selected_input is not None
+            else set()
+        )
+        evaluated_attempts = diagnostic.get("attempt_accepted", {})
         completion_threshold = float(
             selection.get(
                 "resolved_completion_coverage_threshold",
@@ -3031,9 +3104,13 @@ class WorkflowIterationAdapter:
                 previous_record, self.scenario_ladders[route_id]
             )
             attempt_accepted = {
-                str(attempt["attempt_id"]): diagnostic.get(
-                    "attempt_accepted", {}
-                ).get(str(attempt["attempt_id"]))
+                str(attempt["attempt_id"]): (
+                    False
+                    if str(attempt["attempt_id"]) in selected_attempt_ids
+                    and str(attempt["attempt_id"])
+                    not in evaluated_attempts
+                    else evaluated_attempts.get(str(attempt["attempt_id"]))
+                )
                 for attempt in route_plan["attempts"]
             }
             novelty_by_attempt = {}
@@ -3247,6 +3324,22 @@ class WorkflowIterationAdapter:
             novelty_converged=novelty_converged,
             final_model_id=active_model_sha256,
         )
+        convergence = _saturated_acquisition_convergence(
+            convergence,
+            diagnostic=diagnostic,
+            previous_signals=previous_signals,
+            selection=selection,
+            scenario_plan=json.loads(
+                context.artifacts["scenario_plan"].read_text(encoding="utf-8")
+            ),
+            selected_count=(
+                len(_read_frames(context.artifacts["selected_input"], allow_empty=True))
+                if "selected_input" in context.artifacts
+                else -1
+            ),
+            novelty_converged=novelty_converged,
+            production_ready=production_ready,
+        )
         workflow_converged = bool(
             production_ready and convergence["acquisition_converged"]
         )
@@ -3261,7 +3354,7 @@ class WorkflowIterationAdapter:
                 for temperature, coverage in status["by_temperature"].items():
                     if coverage["coverage"] < status["minimum_coverage"]:
                         convergence["convergence_reasons"].append(
-                            f"{route_id} / {temperature} K: production coverage for the current model is "
+                            f"{route_id} / {temperature} K: historical production coverage is "
                             f"{coverage['coverage']:.0%}; required ≥{status['minimum_coverage']:.0%}. "
                             f"Successful replicas required per scenario: {status['minimum_successful_replicas']}."
                         )

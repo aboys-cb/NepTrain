@@ -1312,6 +1312,9 @@ def _generation_science(
             "acquisition_metric_basis": acquisition_basis,
             "validation_metric_basis": validation_basis,
             "acquisition_accepted": decision.get("acquisition_accepted"),
+            "acquisition_convergence_basis": decision.get(
+                "acquisition_convergence_basis"
+            ),
             "acquisition_convergence_streak": decision.get(
                 "acquisition_convergence_streak"
             ),
@@ -1351,11 +1354,24 @@ def _convergence_summary_lines(quality: Mapping[str, Any]) -> list[str]:
     lines = []
     count = quality.get("acquisition_evidence_count")
     required = quality.get("acquisition_min_selected")
+    saturated = (
+        quality.get("acquisition_convergence_basis")
+        == "no_new_labels_after_passing_accuracy"
+    )
     if count is not None and required is not None:
-        lines.append(f"Accuracy evidence: {count}/{required} required new labels")
+        lines.append(
+            "Accuracy evidence: 0 new labels this round; no new accuracy measurement"
+            if saturated
+            else f"Accuracy evidence: {count}/{required} required new labels"
+        )
     streak = quality.get("acquisition_convergence_streak")
     streak_required = quality.get("acquisition_convergence_required")
     passing = quality.get("acquisition_accepted") is True
+    if saturated:
+        lines.append(
+            "Accuracy: No new labels this round; previous passing evidence and "
+            "stable production coverage closed sampling"
+        )
     if passing and streak is not None and streak_required is not None:
         lines.append(
             f"Accuracy: Passed this round; consecutive passing generations {streak}/{streak_required}"
@@ -1364,7 +1380,10 @@ def _convergence_summary_lines(quality: Mapping[str, Any]) -> list[str]:
     coverage_reasons = []
     other_reasons = []
     for reason in quality.get("convergence_reasons", []):
-        if ": production coverage for the current model is " in reason:
+        if (
+            ": historical production coverage is " in reason
+            or ": production coverage for the current model is " in reason
+        ):
             coverage_reasons.append(reason)
         elif (
             reason.startswith("Insufficient evidence: evaluated ")
@@ -1378,6 +1397,8 @@ def _convergence_summary_lines(quality: Mapping[str, Any]) -> list[str]:
             and streak is not None
             and streak_required is not None
         ):
+            continue
+        elif saturated and reason.startswith("No new labels after stable sampling"):
             continue
         else:
             other_reasons.append(reason)
@@ -1404,15 +1425,15 @@ def _convergence_summary_lines(quality: Mapping[str, Any]) -> list[str]:
                 "temperature points" if len(routes) == 1 else "route-temperature points"
             )
             lines.append(
-                f"Production validation (current model): {complete}/{total} {points} complete"
+                f"Production validation (historical): {complete}/{total} {points} complete"
             )
     elif coverage_reasons:
         # Older ledgers only record unmet points: they cannot supply a denominator.
         lines.append(
-            f"Production validation (current model): {len(coverage_reasons)} route-temperature points below required coverage"
+            f"Production validation (historical): {len(coverage_reasons)} route-temperature points below required coverage"
         )
     elif quality.get("production_ready") is True:
-        lines.append("Production validation (current model): Requirements met")
+        lines.append("Production validation (historical): Requirements met")
     return lines
 
 

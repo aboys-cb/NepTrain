@@ -386,6 +386,13 @@ def _print_acceptance(status):
         return
     latest = evaluated[-1]
     quality = latest["quality"]
+    if quality.get("acquisition_convergence_basis") == "no_new_labels_after_passing_accuracy":
+        print(
+            f"\nLatest convergence checks · G{latest['generation']}: "
+            "No new accuracy measurement; previous passing evidence and "
+            "stable production coverage closed sampling."
+        )
+        return
     rows = [("Criterion", "Observed", "Required", "Result")]
 
     def add(label, value, threshold, *, minimum=False, scale=1, unit=""):

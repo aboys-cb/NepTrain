@@ -107,8 +107,8 @@ class ScenarioLadder:
     """Own the sparse temperature/duration trust frontier.
 
     Every temperature starts with smoke. Strong, local DFT evidence permits
-    one duration shortcut and one extra adjacent temperature probe. Historical
-    experience guides scheduling; production evidence remains model-specific.
+    one duration shortcut and one extra adjacent temperature probe. A completed
+    production level retires that temperature from later acquisition rounds.
     """
 
     def __init__(
@@ -336,7 +336,7 @@ class ScenarioLadder:
                         if item.get("target_level") == target and item.get("model_id")
                     )
                     for model_id in models:
-                        if self._accepted_replicas(record, target, model_id) >= self.replicas[target]:
+                        if self._best_accepted_replicas(record, target, model_id) >= self.replicas[target]:
                             verified_model_id = model_id
                     accepted = verified_model_id is not None
                 else:
@@ -355,22 +355,8 @@ class ScenarioLadder:
                     if target == "production_ready":
                         record["verified_model_id"] = verified_model_id
                         record["canary_model_id"] = verified_model_id
-            verified = record.get("verified_model_id")
-            if verified and (
-                self._accepted_replicas(record, "production_ready", verified)
-                < self.replicas["production_ready"]
-            ):
-                record["verified_model_id"] = None
-
-        final_model_id = state.get("last_model_id")
         counts = Counter(
-            (
-                "long_stable"
-                if record["maturity"] == "production_ready"
-                and record.get("verified_model_id") != final_model_id
-                else record["maturity"]
-            )
-            for record in state["scenarios"].values()
+            record["maturity"] for record in state["scenarios"].values()
         )
         state["counts_by_maturity"] = {
             level: counts[level] for level in MATURITY_LEVELS if counts[level]
@@ -419,6 +405,8 @@ class ScenarioLadder:
             for temperature in self.temperature_path[:temperature_index]
         ]
         for index, record in enumerate(preceding):
+            if record["maturity"] == "production_ready":
+                continue
             if self._latest_failed(record):
                 return False
             if record["maturity"] != "untested":
@@ -433,7 +421,7 @@ class ScenarioLadder:
         return True
 
     def _target(
-        self, record: Mapping[str, Any], temperature: float, model_id: str
+        self, record: Mapping[str, Any], temperature: float
     ) -> str | None:
         current = str(record["maturity"])
         if current == "untested":
@@ -441,11 +429,11 @@ class ScenarioLadder:
         if temperature not in self.production_temperatures:
             return None
         if current == "production_ready":
-            verified = (
-                self._accepted_replicas(record, current, model_id)
-                >= self.replicas[current]
-            )
-            return None if verified else "production_ready"
+            return None
+        if self._latest_failed(record):
+            # Check a changed model cheaply at the failed temperature before
+            # repeating a longer run or advancing the temperature path.
+            return "smoke_passed"
         if current == "smoke_passed" and self._confident(record):
             return "long_stable"
         return MATURITY_LEVELS[MATURITY_LEVELS.index(current) + 1]
@@ -503,6 +491,30 @@ class ScenarioLadder:
             item.get("accepted") is True and int(item["generation"]) >= last_failure
             for item in relevant
         )
+
+    @staticmethod
+    def _best_accepted_replicas(
+        record: Mapping[str, Any], target: str, model_id: str
+    ) -> int:
+        """Retain a completed validation even if a later probe failed."""
+
+        relevant = [
+            item for item in record.get("evidence", [])
+            if item.get("target_level") == target
+            and item.get("model_id") == model_id
+        ]
+        generations = sorted({int(item["generation"]) for item in relevant})
+        successes = best = 0
+        for generation in generations:
+            batch = [
+                item for item in relevant
+                if int(item["generation"]) == generation
+            ]
+            if any(item.get("accepted") is False for item in batch):
+                successes = 0
+            successes += sum(item.get("accepted") is True for item in batch)
+            best = max(best, successes)
+        return best
 
     def schedule(
         self,
@@ -576,18 +588,23 @@ class ScenarioLadder:
                     temperature,
                     pressure,
                 )
-                target = self._target(record, temperature, model_id)
+                target = self._target(record, temperature)
                 if target is None:
                     continue
                 accepted = self._accepted_replicas(record, target, model_id)
-                needed = self.replicas[target] - accepted
+                retry_canary = (
+                    target == "smoke_passed"
+                    and record["maturity"] != "untested"
+                    and self._latest_failed(record)
+                )
+                needed = 1 if retry_canary else self.replicas[target] - accepted
                 if needed <= 0:
                     continue
                 evidence_count = sum(
                     item.get("target_level") == target
                     for item in record.get("evidence", [])
                 )
-                retry_priority = 0 if self._latest_failed(record, target) else 1
+                retry_priority = 0 if self._latest_failed(record) else 1
                 base_tie = tie_rank[
                     structure_index * len(self.temperature_path)
                     + temperature_index
@@ -610,52 +627,6 @@ class ScenarioLadder:
                                 "temperature": temperature,
                                 "previous_level": str(record["maturity"]),
                                 "target_level": target,
-                                "replica": replica,
-                            },
-                        )
-                    )
-
-        # Continue collecting independent sampling evidence after coverage is complete.
-        if not candidates and state.get("acquisition_pending") is True:
-            for structure in structures:
-                for temperature in self.production_temperatures:
-                    identifier = _scenario_id(
-                        route_id,
-                        route_fingerprint,
-                        structure,
-                        temperature,
-                        pressure,
-                    )
-                    record = self._record(
-                        scenarios,
-                        route_id,
-                        route_fingerprint,
-                        structure,
-                        temperature,
-                        pressure,
-                    )
-                    if record["maturity"] != "production_ready":
-                        continue
-                    replica = 1 + sum(
-                        item.get("target_level") == "production_ready"
-                        for item in record.get("evidence", [])
-                    )
-                    candidates.append(
-                        (
-                            (
-                                0,
-                                MATURITY_LEVELS.index("production_ready"),
-                                0,
-                                self.temperature_path.index(temperature),
-                                replica,
-                                identifier,
-                            ),
-                            {
-                                "scenario_id": identifier,
-                                "structure_id": structure,
-                                "temperature": temperature,
-                                "previous_level": "production_ready",
-                                "target_level": "production_ready",
                                 "replica": replica,
                             },
                         )
@@ -788,9 +759,20 @@ class ScenarioLadder:
                 or float(record["pressure"]) != attempt.pressure
             ):
                 raise ScenarioMaturityError("scenario identity metadata changed")
+            has_no_new_sample = (
+                True
+                if novelty_converged_by_attempt is None
+                else novelty_converged_by_attempt[attempt.attempt_id]
+            )
             trusted = bool(
                 completed[attempt.attempt_id]
-                and diagnostic_accepted[attempt.attempt_id] is not False
+                and (
+                    diagnostic_accepted[attempt.attempt_id] is True
+                    or (
+                        diagnostic_accepted[attempt.attempt_id] is None
+                        and has_no_new_sample
+                    )
+                )
             )
             record["evidence"].append(
                 {
@@ -854,11 +836,6 @@ class ScenarioLadder:
             )
             accepted = self._accepted_replicas(record, target, model_id)
             if accepted < self.replicas[target]:
-                if (
-                    target == "production_ready"
-                    and record.get("verified_model_id") == model_id
-                ):
-                    record["verified_model_id"] = None
                 continue
             if target != "production_ready":
                 canary_changed = record.get("canary_model_id") != model_id
@@ -881,15 +858,7 @@ class ScenarioLadder:
                 record["verified_model_id"] = model_id
                 promoted_count += int(changed and model_id == final_model_id)
 
-        counts = Counter(
-            (
-                "long_stable"
-                if record["maturity"] == "production_ready"
-                and record.get("verified_model_id") != final_model_id
-                else record["maturity"]
-            )
-            for record in scenarios.values()
-        )
+        counts = Counter(record["maturity"] for record in scenarios.values())
         state["counts_by_maturity"] = {
             level: counts[level] for level in MATURITY_LEVELS if counts[level]
         }
@@ -921,12 +890,13 @@ class ScenarioLadder:
         min_coverage: float = 1.0,
         min_successful_replicas: int | None = None,
     ) -> dict[str, Any]:
-        """Summarise current-model production coverage for one route.
+        """Summarise historical production evidence for one route.
 
         Coverage is required both across the route as a whole and within every
         production temperature.  This permits a small number of isolated
         failures without allowing an entire difficult temperature to vanish
-        behind a good aggregate fraction.
+        behind a good aggregate fraction. A later model does not erase a
+        temperature that already completed its configured long run.
         """
 
         if (
@@ -969,7 +939,20 @@ class ScenarioLadder:
                     temperature,
                     pressure,
                 )
-                successes = self._accepted_replicas(record, "production_ready", model_id)
+                models = {
+                    str(item["model_id"])
+                    for item in record.get("evidence", [])
+                    if item.get("target_level") == "production_ready"
+                    and item.get("model_id")
+                }
+                models.add(model_id)
+                successes = max(
+                    (
+                        self._best_accepted_replicas(record, "production_ready", candidate)
+                        for candidate in models
+                    ),
+                    default=0,
+                )
                 verified += int(successes >= required_successes)
             total = len(structures)
             fraction = float(verified / total) if total else 0.0
@@ -1011,7 +994,7 @@ class ScenarioLadder:
         min_coverage: float = 1.0,
         min_successful_replicas: int | None = None,
     ) -> bool:
-        """Return whether current-model production coverage meets policy."""
+        """Return whether historical production coverage meets policy."""
 
         return bool(
             self.production_status(

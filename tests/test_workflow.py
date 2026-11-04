@@ -1757,7 +1757,7 @@ def test_convergence_summary_counts_route_temperature_requirements(minimum, comp
         }},
     }
     lines = _convergence_summary_lines({"production_status_by_route": routes})
-    assert lines == [f"Production validation (current model): {complete}/3 route-temperature points complete"]
+    assert lines == [f"Production validation (historical): {complete}/3 route-temperature points complete"]
     assert _convergence_summary_lines({}) == []
 
 
@@ -1784,6 +1784,45 @@ def test_convergence_summary_keeps_failures_visible_and_reports_passing_streak()
         "Accuracy evidence: 12/10 required new labels",
         "Accuracy: Passed this round; consecutive passing generations 1/2",
     ]
+
+
+def test_convergence_summary_explains_zero_label_saturation():
+    from NepTrain.core.workflow import _convergence_summary_lines
+
+    lines = _convergence_summary_lines({
+        "acquisition_evidence_count": 0,
+        "acquisition_min_selected": 10,
+        "acquisition_accepted": None,
+        "acquisition_convergence_streak": 1,
+        "acquisition_convergence_required": 2,
+        "acquisition_convergence_basis": "no_new_labels_after_passing_accuracy",
+        "convergence_reasons": [
+            "No new labels after stable sampling and full production coverage; "
+            "the previous generation passed the configured accuracy checks. "
+            "No current-generation accuracy measurement was made."
+        ],
+    })
+    assert lines == [
+        "Accuracy evidence: 0 new labels this round; no new accuracy measurement",
+        "Accuracy: No new labels this round; previous passing evidence and "
+        "stable production coverage closed sampling",
+    ]
+
+
+def test_status_does_not_show_unmeasured_zero_label_checks_as_failures(capsys):
+    from NepTrain.cli.cli import _print_acceptance
+
+    status = SimpleNamespace(
+        convergence_policy={"min_selected": 10, "consecutive_generations": 2},
+        generations=[{"generation": 2, "quality": {
+            "acquisition_count": 0,
+            "acquisition_convergence_basis": "no_new_labels_after_passing_accuracy",
+        }}],
+    )
+    _print_acceptance(status)
+    output = capsys.readouterr().out
+    assert "No new accuracy measurement" in output
+    assert "Not met" not in output
 
 
 def test_status_keeps_per_temperature_convergence_in_details(tmp_path, capsys):

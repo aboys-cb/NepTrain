@@ -1,16 +1,18 @@
 """Cadence edits keep scientific history but never reuse execution identities."""
 import copy
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 from ase import Atoms
-from ase.io import write as ase_write
+from ase.io import read as ase_read, write as ase_write
 
 from NepTrain.core.iteration import GenerationPlan, StageContext
 from NepTrain.core.md import MdResult
 from NepTrain.core.sampling_route import load_sampling_routes
 from NepTrain.core.scenario import ScenarioLadder, ScenarioMaturityError
+from NepTrain.core.scientific_data import structure_id
 from NepTrain.core.workflow_iteration import WorkflowIterationAdapter, WorkflowRuntime
 
 
@@ -216,3 +218,54 @@ def test_workflow_planning_explore_and_update_keep_temperature_frontier(route_co
         history_path = directory / 'maturity.json'
         history_path.write_text(json.dumps(history))
         previous = {'scenario_maturity': history_path}
+
+
+def test_selected_frame_without_label_is_not_treated_as_no_new_sample(route_config, tmp_path):
+    route_config['routes'][0]['conditions']['temperature_path'] = [50]
+    initial = Path(route_config['routes'][0]['structures'][0])
+    config = {'training': {'backend': 'gpumd'}, 'md': {'backend': 'lammps'},
+              'labeling': {'backend': 'toy'}, 'sampling': route_config}
+    adapter = WorkflowIterationAdapter(config, initial_training=initial)
+    route = adapter.routes[0]
+    ladder = adapter.scenario_ladders[route.route_id]
+    attempt = ladder.schedule(
+        [structure_id(ase_read(initial))], route_id=route.route_id,
+        route_fingerprint=route.fingerprint,
+        template_sha256=route.template_sha256, pressure=0,
+        generation=1, seed=1, limit=1, model_id='model',
+    )[0]
+    scenario_plan = tmp_path / 'scenario-plan.json'
+    scenario_plan.write_text(json.dumps({
+        'version': 3, 'model_id': 'model', 'routes': [{
+            'route_id': route.route_id,
+            'route_fingerprint': route.fingerprint,
+            'attempts': [asdict(attempt)],
+            'completed': {attempt.attempt_id: True},
+            'structure_ids': [attempt.structure_id], 'pressure': 0,
+        }],
+    }))
+    selected = tmp_path / 'selected.xyz'
+    frame = ase_read(initial)
+    frame.info['scenario_attempt_id'] = attempt.attempt_id
+    ase_write(selected, frame)
+    selection = tmp_path / 'selection.json'
+    selection.write_text(json.dumps({
+        'remaining_novelty_by_condition': {'R=npt|T=50|P=0': 0},
+        'resolved_completion_coverage_threshold': 1,
+    }))
+    context = StageContext(
+        generation=1, generation_dir=tmp_path,
+        plan=GenerationPlan(1, 1, 4),
+        artifacts={'scenario_plan': scenario_plan, 'selection_result': selection,
+                   'selected_input': selected},
+        previous_artifacts={}, stage_dir=tmp_path / 'update',
+    )
+    result, _ = adapter._record_route_histories(
+        context, diagnostic={'attempt_accepted': {}},
+        validation_metrics=None, evidence_validation=None,
+        validation_accepted=None, model_improved=False,
+        novelty_converged=True, final_model_id='model',
+    )
+    record = next(iter(result['routes']['npt']['history']['scenarios'].values()))
+    assert record['maturity'] == 'untested'
+    assert record['evidence'][-1]['accepted'] is False
