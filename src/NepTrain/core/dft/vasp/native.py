@@ -133,8 +133,6 @@ def run_native_vasp(
         calculator.calculate(input_atoms, ("energy", "forces", "stress"))
         if not calculator.converged:
             raise NativeVaspError(f"VASP electronic SCF did not converge in {case_dir}")
-        energy, forces, stress = _validated_results(calculator.results, len(atoms))
-        forces = forces[resort]
         if electronic_mode == "deltaspin":
             params = deltaspin.custom_parameters(calculator)
             magnetic_result = deltaspin.read_result(
@@ -149,6 +147,11 @@ def run_native_vasp(
                 rtol=1e-4, atol=0,
             ):
                 raise deltaspin.DeltaSpinError("DeltaSpin tolerance differs between input and output")
+        energy, forces, virial = _validated_results(
+            calculator.results, len(atoms), atoms.get_volume(),
+            virial=magnetic_result.virial if magnetic_result is not None else None,
+        )
+        forces = forces[resort]
     except Exception as error:
         _write_manifest(
             case_dir,
@@ -164,7 +167,7 @@ def run_native_vasp(
         raise
 
     frame = atoms.copy()
-    frame.info["virial"] = _stress_to_virial(stress, frame.get_volume())
+    frame.info["virial"] = virial
     frame.info["dft_electronic_mode"] = electronic_mode
     if magnetic_result is not None:
         frame.set_array("spin", magnetic_result.projected[resort])
@@ -284,25 +287,28 @@ def validate_vasp_structure(
 
 
 def _validated_results(
-    results: dict, expected_atoms: int
+    results: dict, expected_atoms: int, volume: float, *, virial: np.ndarray | None
 ) -> tuple[float, np.ndarray, np.ndarray]:
-    missing = [key for key in ("energy", "forces", "stress") if key not in results]
+    required = ("energy", "forces", "stress") if virial is None else ("energy", "forces")
+    missing = [key for key in required if key not in results]
     if missing:
         raise NativeVaspError("VASP result is missing: " + ", ".join(missing))
     energy = float(results["energy"])
     forces = np.asarray(results["forces"], dtype=float)
-    stress = np.asarray(results["stress"], dtype=float)
     if forces.shape != (expected_atoms, 3):
         raise NativeVaspError(
             f"VASP force shape must be ({expected_atoms}, 3), got {forces.shape}"
         )
-    if stress.shape not in {(6,), (3, 3)}:
-        raise NativeVaspError(f"VASP stress shape must be (6,) or (3, 3), got {stress.shape}")
+    if virial is None:
+        stress = np.asarray(results["stress"], dtype=float)
+        if stress.shape not in {(6,), (3, 3)}:
+            raise NativeVaspError(f"VASP stress shape must be (6,) or (3, 3), got {stress.shape}")
+        virial = _stress_to_virial(stress, volume)
     if not np.isfinite(energy) or not np.all(np.isfinite(forces)) or not np.all(
-        np.isfinite(stress)
+        np.isfinite(virial)
     ):
         raise NativeVaspError("VASP result contains non-finite values")
-    return energy, forces, stress
+    return energy, forces, virial
 
 
 def _stress_to_virial(stress: np.ndarray, volume: float) -> np.ndarray:

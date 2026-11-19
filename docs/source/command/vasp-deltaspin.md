@@ -84,7 +84,9 @@ neptrain label selected-spin.xyz --backend vasp --project project.yaml --wait --
 
 OUTCAR 必须包含一次 `DeltaSpin final status`，其中 `SCF convergence` 和 `Moment constraint` 都为 `reached`，并满足报告的误差容限。磁矩表必须完整包含全部活动原子，磁性力表必须包含所有原子，约束标记必须与实际写出的 `DELTASPIN_ATOMS` 一致。缺失、非有限、分量约束不匹配或原子顺序错误均拒收，输入中残留的旧 `mforce` 不能代替新结果。
 
-输出 `spin` 来自实际收敛磁矩表，单位 μB；`mforce` 来自 `Magnetic force (eV/uB)` 表，按 `spin_lambda` 原符号保存，对应 `L=E+lambda.(M-M_target)`。能量、原子力和 virial 沿用 ASE 的 VASP 读取路径。`vasp-result.json` 保存输入/输出哈希、磁矩定义、误差和单位。
+输出 `spin` 来自实际收敛磁矩表，单位 μB；`mforce` 来自 `Magnetic force (eV/uB)` 表，按 `spin_lambda` 原符号保存，对应 `L=E+lambda.(M-M_target)`。能量和原子力沿用 ASE 的 VASP 读取路径。`vasp-result.json` 保存输入/输出哈希、磁矩定义、误差和单位。
+
+DeltaSpin 优先从 OUTCAR 的 `VIRIAL TENSOR (eV/cell)` 表读取 virial，按原符号保存完整的笛卡尔 3×3 张量，包括各自独立的剪切分量。旧版 OUTCAR 缺少该表时，沿用 ASE 应力换算。六分量应力只能还原对称张量。若完整表存在但数据有误，该结构标注失败。
 
 ```python
 from ase.io import read

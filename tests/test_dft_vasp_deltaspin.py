@@ -138,6 +138,57 @@ def test_ordinary_vasp_still_rejects_spin_input(tmp_path):
     assert not request.output_file.exists()
 
 
+@pytest.mark.parametrize("tensor", ["full", "full_without_ase_stress", "legacy", "truncated", "nonfinite"])
+def test_deltaspin_virial_label_round_trips(tmp_path, monkeypatch, tensor):
+    atoms = Atoms("Fe2", positions=[[0, 0, 0], [1, 1, 1]], cell=[4, 4, 4], pbc=True)
+    atoms.set_array("spin", TARGETS.copy())
+    request = _request(tmp_path, atoms, "LNONCOLLINEAR=.TRUE.\nLDELTASPIN=.TRUE.\n")
+    block = """
+ VIRIAL TENSOR (eV/cell)
+                               x                             y                             z
+--------------------------------------------------------------------------------------------
+ x           224.683794235293135             0.001300274837711            -0.002709951633648
+ y             0.001308828306185           227.061393271659199            -0.000557031115406
+ z            -0.002704551330098            -0.000558405783358           227.065333929952885
+--------------------------------------------------------------------------------------------
+"""
+    if tensor == "truncated":
+        block = block.split(" z            -")[0]
+    elif tensor == "nonfinite":
+        block = block.replace("0.001308828306185", "NaN")
+
+    class ReplayVasp(VaspInput):
+        def _run(self, **kwargs):
+            text = (FIXTURE / "OUTCAR.final.txt").read_text()
+            (Path(self.directory) / "OUTCAR").write_text(text + ("" if tensor == "legacy" else block))
+            return 0, ""
+
+        def read_results(self):
+            self.converged = True
+            self.results = {"energy": -5., "forces": np.zeros((2, 3))}
+            if tensor != "full_without_ase_stress":
+                self.results["stress"] = np.arange(6.)
+
+    monkeypatch.setattr(native, "VaspInput", ReplayVasp)
+    if tensor in {"truncated", "nonfinite"}:
+        with pytest.raises(native.NativeVaspError, match="OUTCAR VIRIAL TENSOR"):
+            label(request, "vasp")
+        assert not request.output_file.exists()
+        return
+
+    restored = read(label(request, "vasp").output_file)
+    if tensor == "legacy":
+        np.testing.assert_allclose(restored.info["virial"], -64 * np.array([
+            [0, 5, 4], [5, 1, 3], [4, 3, 2],
+        ]))
+    else:
+        np.testing.assert_array_equal(restored.info["virial"], [
+            [224.683794235293135, 0.001300274837711, -0.002709951633648],
+            [0.001308828306185, 227.061393271659199, -0.000557031115406],
+            [-0.002704551330098, -0.000558405783358, 227.065333929952885],
+        ])
+
+
 @pytest.mark.parametrize("missing_mforce", [False, True])
 @pytest.mark.parametrize("template_magmom", [None, "0 0 4 0 0 0.5 0 0 5"])
 @pytest.mark.parametrize("partial", [False, True, "auto", "project"])
