@@ -231,7 +231,7 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
         training_counts_match.append(
             science["training"]["after_count"] == actual_training_count
         )
-        decision = summary.metrics.get("update", summary.metrics.get("train", {}))
+        decision = summary.metrics["explore" if record["kind"] == "finalization" else "update"]
         rows.append(
             {
                 "generation": generation,
@@ -368,8 +368,8 @@ def run_workflow_smoke(
             "validate" not in row["stages"]
             for case in cases.values() for row in case["generations"]
         ),
-        "finalization_has_no_sampling": all(
-            case["generations"][-1]["stages"] == ["train"]
+        "finalization_rechecks_md_without_labeling": all(
+            case["generations"][-1]["stages"] == ["train", "explore"]
             for name, case in cases.items()
             if name not in {"insufficient_labels", "no_convergence"}
         ),

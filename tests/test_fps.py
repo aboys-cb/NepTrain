@@ -247,3 +247,13 @@ def test_adaptive_threshold_uses_training_resolution_not_candidate_scale():
     assert threshold > 0.0
     assert threshold_with_extreme_candidate == pytest.approx(threshold)
     assert result.selected_ids == ("novel",)
+
+def test_deferred_attempts_get_eligible_evidence_within_quota():
+    ids = ["copy", "a1", "a2", "b", "c", "hot1", "hot2"]
+    result = hierarchical_farthest_point_sampling(
+        [_atoms("Fe")] * len(ids), np.array([[0], [1], [2], [3], [4], [12], [25]]),
+        ids, ["all"] * len(ids), budget=4, min_novelty=0,
+        reference_structures=[_atoms("Fe")], reference_descriptors=np.array([[0]]),
+        evidence_groups=["empty", "a", "a", "b", "c", "", ""],
+    )
+    assert set(result.selected_ids) == {"c", "a2", "hot1", "hot2"}

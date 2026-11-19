@@ -39,6 +39,7 @@ from NepTrain.core.workflow_iteration import (
 )
 from NepTrain.core.generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
+    TRAIN_ONLY_FINALIZATION_STAGES,
     ACTIVE_LEARNING_FINALIZATION_STAGES,
     ACTIVE_LEARNING_GENERATION_PROTOCOL,
     ACTIVE_LEARNING_V3_PROTOCOL,
@@ -360,7 +361,7 @@ def test_active_learning_v4_has_no_separate_validation_stage(tmp_path):
                     "accepted": True,
                     "generation_disposition": "finalize",
                 }
-            elif context.generation_kind == "finalization" and stage == "train":
+            elif context.generation_kind == "finalization" and stage == "explore":
                 metrics = {"accepted": True, "workflow_converged": True}
             return StageOutcome({f"g{context.generation}_{stage}": path}, metrics)
 
@@ -680,7 +681,7 @@ def test_real_adapter_acquisition_trains_before_md_and_defers_completion(
     [
         (("train", "evaluate"), "evaluate"),
         (ACTIVE_LEARNING_V3_FINALIZATION_STAGES, "validate"),
-        (ACTIVE_LEARNING_FINALIZATION_STAGES, "train"),
+        (TRAIN_ONLY_FINALIZATION_STAGES, "train"),
     ],
 )
 def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
@@ -773,7 +774,7 @@ def test_real_finalization_trains_merged_dataset_and_emits_no_sampling_work(
         "omitted",
     ],
 )
-@pytest.mark.parametrize("stage_sequence", [("train", "evaluate"), ACTIVE_LEARNING_FINALIZATION_STAGES])
+@pytest.mark.parametrize("stage_sequence", [("train", "evaluate"), TRAIN_ONLY_FINALIZATION_STAGES])
 def test_finalization_test_is_diagnostic_only(
     tmp_path,
     test_case,
@@ -864,7 +865,7 @@ def test_finalization_test_is_diagnostic_only(
         active_generation_kind="finalization",
         runtime=WorkflowRuntime(train=fake_train, predict=failing_predict),
     )
-    outcome = train if stage_sequence == ACTIVE_LEARNING_FINALIZATION_STAGES else evaluate_adapter.run_stage(
+    outcome = train if stage_sequence == TRAIN_ONLY_FINALIZATION_STAGES else evaluate_adapter.run_stage(
         "evaluate",
         StageContext(
             generation=2,
@@ -3240,3 +3241,152 @@ def test_explore_filters_spin_frames_but_keeps_unstable_completion_evidence(tmp_
 def test_spin_declaration_does_not_accept_disabled_commented_or_malformed_values(text):
     from NepTrain.core.workflow_iteration import _declares_spin_model
     assert not _declares_spin_model(text)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["none", "finalize", "labels", "restart_steps", "finetune_lr", "finetune_lr_scale",
+     "backend", "template", "seed", "launch", "old_lineage", "bad_model", "bad_checkpoint"],
+)
+def test_v4_reuses_only_the_verified_model_trained_on_identical_inputs(tmp_path, change):
+    initial = tmp_path / "initial.xyz"
+    template = tmp_path / "nep.in"
+    template.write_text("type 1 Fe\nlr 0.01\n")
+    teacher = ToyTeacher("ordinary")
+    ase_write(initial, [teacher.label(toy_candidate_frames("ordinary", 91, 1)[0])])
+    # Preserve even alternate whitespace through a zero-label update.
+    initial.write_text(initial.read_text().replace("Properties=", "  Properties="))
+    config = {"training": {"backend": "gpumd", "config_path": str(template)}, "workflow": {}}
+    calls = []
+
+    def fake_train(request, backend):
+        calls.append(backend)
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model = request.output_dir / "nep.txt"
+        model.write_text(f"model {len(calls)}")
+        checkpoint = request.output_dir / "checkpoint.pt"
+        checkpoint.write_text(f"checkpoint {len(calls)}")
+        return TrainingResult(backend, model, None, checkpoint)
+
+    adapter = WorkflowIterationAdapter(
+        config, initial_training=initial, active_stage="train", active_generation_kind="acquisition",
+        runtime=WorkflowRuntime(train=fake_train),
+    )
+
+    def stage(generation, previous, *, final=False):
+        return StageContext(
+            generation=generation, generation_dir=tmp_path / str(generation),
+            plan=GenerationPlan(generation, 7, 2), artifacts={}, previous_artifacts=previous,
+            generation_kind="finalization" if final else "acquisition",
+            stage_sequence=TRAIN_ONLY_FINALIZATION_STAGES if final else ACTIVE_LEARNING_ACQUISITION_STAGES,
+            stage_input={"training_launch_sha256": "new" if generation > 1 and change == "launch" else "base"},
+        )
+
+    first = adapter.run_stage("train", stage(1, {}))
+    labels = tmp_path / "labels.xyz"
+    labels.write_bytes(initial.read_bytes() if change == "labels" else b"")
+    merged = adapter._merge(StageContext(
+        generation=1, generation_dir=tmp_path, plan=GenerationPlan(1, 7, 2),
+        artifacts={"training_input": initial, "labeled": labels}, previous_artifacts={},
+    ))
+    if change != "labels":
+        assert initial.read_bytes() == merged.artifacts["training_set"].read_bytes()
+    previous = {**first.artifacts, **merged.artifacts}
+    if change in {"restart_steps", "finetune_lr", "finetune_lr_scale"}:
+        config["training"][change] = 1234 if change == "restart_steps" else 0.02
+    elif change == "backend":
+        config["training"]["backend"] = "torchnep"
+    elif change == "template":
+        template.write_text(template.read_text() + "# edit\n")
+    elif change == "seed":
+        config["workflow"]["seed"] = 77
+    elif change == "old_lineage":
+        path = previous["active_model_lineage"]
+        lineage = json.loads(path.read_text())
+        del lineage["training_settings_sha256"]
+        path.write_text(json.dumps(lineage))
+    elif change in {"bad_model", "bad_checkpoint"}:
+        previous["activated_model" if change == "bad_model" else "activated_checkpoint"].write_text("wrong")
+        with pytest.raises(WorkflowIterationError, match="inconsistent lineage"):
+            adapter.run_stage("train", stage(2, previous))
+        assert len(calls) == 1
+        return
+
+    outcome = adapter.run_stage("train", stage(2, previous, final=change == "finalize"))
+    reused = change in {"none", "finalize", "launch"}
+    assert outcome.metrics["model_reused"] is reused
+    assert len(calls) == (1 if reused else 2)
+    active = json.loads(outcome.artifacts["active_model_lineage"].read_text())
+    assert active["training_generation"] == (1 if reused else 2)
+    if reused:
+        assert outcome.artifacts["activated_model"] == first.artifacts["activated_model"]
+        assert outcome.artifacts["activated_checkpoint"] == first.artifacts["activated_checkpoint"]
+        assert not json.loads(outcome.artifacts["model_evaluation"].read_text())["model_improved"]
+        if change != "finalize":
+            third = adapter.run_stage("train", stage(3, {**outcome.artifacts, **merged.artifacts}))
+            assert third.metrics["model_reused"] and len(calls) == 1
+        else:
+            assert outcome.metrics["workflow_converged"]
+
+
+@pytest.mark.parametrize("before,after,regression", [
+    (.199, .201, False), (.199, .24, True), (.21, .26, False), (.21, .80, True),
+    (float("nan"), .18, False), (float("nan"), .8, True), (.18, float("nan"), True), (float("nan"), float("nan"), True),
+])
+def test_anchor_gate_uses_only_common_conditions_and_rolls_back_all_active_artifacts(tmp_path, before, after, regression):
+    teacher = ToyTeacher("ordinary")
+    sample = teacher.label(toy_candidate_frames("ordinary", 91, 1)[0])
+    source = tmp_path / "initial.xyz"
+    ase_write(source, sample)
+    template = tmp_path / "nep.in"
+    template.write_text("type 1 Fe\n")
+    config = {"training": {"config_path": str(template)}, "workflow": {"convergence": {
+        "acquisition_max_rmse": {"force_rmse": .2}}}}
+    def train(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        model, checkpoint = (request.output_dir / name for name in ("nep.txt", "ckpt"))
+        model.write_text(request.output_dir.parent.name)
+        checkpoint.write_text(model.read_text())
+        return TrainingResult(backend, model, None, checkpoint)
+    def predict(model, frames, backend):
+        error = before if model.read_text() == "2" else after
+        return PredictionEvaluation({"force_rmse": 999 if frames[0].info["scenario_id"] == "new" else error})
+    adapter = WorkflowIterationAdapter(config, initial_training=source, active_stage="train",
+                active_generation_kind="acquisition", runtime=WorkflowRuntime(train=train, predict=predict))
+    def run(g, previous):
+        context = StageContext(generation=g, generation_dir=tmp_path / str(g),
+                               plan=GenerationPlan(g, 7, 4), artifacts={}, previous_artifacts=previous,
+                               generation_kind="acquisition", stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES)
+        return adapter.run_stage("train", context)
+    active = run(1, {})
+    first = tmp_path / "g1.xyz"
+    ase_write(first, [sample]*2)
+    active = run(2, {**active.artifacts, "training_set": first})
+    anchors = []
+    for group, generation in (("old", 1), ("new", 2)):
+        frame = sample.copy()
+        frame.calc = sample.calc
+        frame.info.update(scenario_id=group, anchor_generation=generation)
+        anchors.append(frame)
+    path = tmp_path / "anchors.xyz"
+    ase_write(path, anchors)
+    latest = tmp_path / "g2.xyz"
+    ase_write(latest, [sample]*3)
+    outcome = run(3, {**active.artifacts, "training_set": latest, "regression_anchors": path})
+    data = json.loads(outcome.artifacts["model_evaluation"].read_text())
+    assert set(data["anchors"]) == {"old"}
+    assert data["regressed_scenarios"] == (["old"] if regression else [])
+    assert outcome.artifacts["model_training_set"] == (first if regression else latest)
+    for name in ("activated_model", "activated_checkpoint"):
+        assert outcome.artifacts[name].read_text() == ("2" if regression else "3")
+    assert outcome.metrics["consecutive_rollbacks"] == int(regression)
+    assert bool(outcome.metrics["activation_diagnosis"]) == (regression and not np.isfinite(before))
+    if regression and np.isfinite(before):
+        retry = run(4, {**outcome.artifacts, "training_set": latest, "regression_anchors": path})
+        assert retry.metrics["consecutive_rollbacks"] == 2 and retry.metrics["activation_diagnosis"]
+        ctx = StageContext(generation=4, generation_dir=tmp_path, plan=GenerationPlan(4, 7, 4),
+                           artifacts=retry.artifacts, previous_artifacts={})
+        with pytest.raises(WorkflowIterationError, match="Two consecutive"):
+            adapter.plan_explore_attempts(ctx)
+        with pytest.raises(WorkflowIterationError, match="Two consecutive"):
+            adapter.run_stage("explore", ctx)

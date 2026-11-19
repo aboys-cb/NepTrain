@@ -300,7 +300,7 @@ def test_completed_production_temperature_retires_across_model_changes():
     )
 
 
-@pytest.mark.parametrize("novelty_converged,expected", [(True, True), (False, False)])
+@pytest.mark.parametrize("novelty_converged,expected", [(True, True), (False, None)])
 def test_unlabeled_stable_probe_needs_condition_novelty_to_be_exhausted(
     novelty_converged, expected,
 ):
@@ -351,7 +351,7 @@ def test_completed_low_temperature_does_not_block_higher_after_legacy_failure():
     assert {attempt.temperature for attempt in next_round} == {500.0}
 
 
-def test_failed_high_temperature_retries_smoke_without_resampling_completed_low():
+def test_failed_temperature_without_step_retries_full_duration_alongside_visited_high():
     ladder = _ladder(path=(300.0, 500.0, 700.0), production=(300.0, 500.0, 700.0))
     history = None
     for generation in range(1, 5):
@@ -375,7 +375,7 @@ def test_failed_high_temperature_retries_smoke_without_resampling_completed_low(
         limit=10, model_id="m5", history=history,
     )
     assert {(attempt.temperature, attempt.target_level) for attempt in retry} == {
-        (500.0, "smoke_passed"),
+        (500.0, "long_stable"), (700.0, "long_stable"),
     }
     history = _record(ladder, retry, history=history, final_model_id="m5")
     resumed = ladder.schedule(
@@ -384,7 +384,7 @@ def test_failed_high_temperature_retries_smoke_without_resampling_completed_low(
     )
     assert 300.0 not in {attempt.temperature for attempt in resumed}
     assert {(attempt.temperature, attempt.target_level) for attempt in resumed} == {
-        (500.0, "long_stable"), (700.0, "long_stable"),
+        (500.0, "production_ready"), (700.0, "production_ready"),
     }
 
 
@@ -746,7 +746,7 @@ def test_strong_local_evidence_accelerates_without_skipping_smoke_or_production(
     assert third == schedule(3, history)
 
 
-def test_failed_shortcut_gets_a_short_canary_before_resuming_duration():
+def test_retry_covers_observed_fault_and_counts_only_completed_rung():
     ladder = _ladder(path=(300,), production=(300,))
     first = ladder.schedule(
         ["a"], pressure=0, generation=1, seed=1, limit=10, model_id="m1",
@@ -756,23 +756,25 @@ def test_failed_shortcut_gets_a_short_canary_before_resuming_duration():
         ["a"], pressure=0, generation=2, seed=2, limit=10, model_id="m2", history=history,
     )
     assert second[0].target_level == "long_stable"
-    history = _record(
-        ladder, second, history=history, completed=False,
-        accepted=False, final_model_id="m2",
+    failed = second[0].attempt_id
+    history = ladder.record(
+        second, history=history, completed={failed: False}, diagnostic_accepted={failed: True},
+        failure_steps={failed: 71}, validation_accepted=None, model_improved=False,
+        novelty_converged=True, final_model_id="m2",
     )
     third = ladder.schedule(
         ["a"], pressure=0, generation=3, seed=3, limit=10, model_id="m3", history=history,
     )
-    assert third[0].target_level == "smoke_passed"
+    assert [(a.target_level, a.steps) for a in third] == [("short_stable", 89)]
     history = _record(ladder, third, history=history, final_model_id="m3")
     fourth = ladder.schedule(
         ["a"], pressure=0, generation=4, seed=4, limit=10,
         model_id="m4", history=history,
     )
-    assert fourth[0].target_level == "short_stable"
+    assert fourth[0].target_level == "long_stable"
 
 
-def test_failed_temperature_cannot_be_bridged_by_a_successful_lookahead():
+def test_failed_temperature_allows_visited_lookahead_but_blocks_new_temperature():
     ladder = _ladder(path=(300, 500, 700, 900, 1100), production=(300, 500, 700, 900, 1100))
     history = None
     for generation in (1, 2):
@@ -796,7 +798,8 @@ def test_failed_temperature_cannot_be_bridged_by_a_successful_lookahead():
         ["a"], pressure=0, generation=4, seed=1, limit=50, model_id="new", history=history,
     )
     assert any(a.temperature == 700 for a in retried)
-    assert all(a.temperature < 900 for a in retried)
+    assert any(a.temperature == 900 for a in retried)
+    assert all(a.temperature < 1100 for a in retried)
     # Keep evidence, block further expansion.
     assert any(
         r["temperature"] == 900 and r["maturity"] == "smoke_passed"
@@ -824,3 +827,30 @@ def test_legacy_later_production_failure_does_not_erase_completed_temperature():
         ["a"], pressure=0, generation=6, seed=1, limit=10,
         model_id="new", history=history,
     )
+
+def test_legacy_deferred_replica_preserves_other_successes_on_same_model():
+    ladder = _ladder(path=(300,), production=(300,), replicas={
+        "smoke_passed": 1, "short_stable": 1, "long_stable": 1, "production_ready": 3,
+    })
+    kwargs = dict(pressure=0, seed=0, limit=10, model_id="m1")
+    history = None
+    for gen in range(1, 4):
+        attempts = ladder.schedule(["a"], generation=gen, history=history, **kwargs)
+        history = _record(ladder, attempts, history=history, final_model_id="m1")
+    production = ladder.schedule(["a"], generation=4, history=history, **kwargs)
+    assert len(production) == 3
+    ok, pending, other = (a.attempt_id for a in production)
+    history = ladder.record(
+        production, history=history, completed={a.attempt_id: True for a in production},
+        diagnostic_accepted={ok: True, pending: None, other: True},
+        novelty_converged_by_attempt={a.attempt_id: False for a in production},
+        validation_accepted=None, model_improved=False, novelty_converged=False, final_model_id="m1",
+    )
+    evidence = history["scenarios"][production[0].scenario_id]["evidence"]
+    missing = next(item for item in evidence if item["attempt_id"] == pending)
+    assert missing.pop("deferred_reason") == "insufficient_evidence"
+    missing["accepted"] = False  # Pre-change history on disk.
+    resumed = ladder.schedule(["a"], generation=5, history=history, **kwargs)
+    assert [(a.target_level, a.needs_label) for a in resumed] == [("production_ready", True)]
+    assert missing["accepted"] is False
+    assert not ladder.production_ready(["a"], pressure=0, model_id="m1", history=history)

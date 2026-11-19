@@ -469,6 +469,7 @@ def hierarchical_farthest_point_sampling(
     min_novelty: float = 0.0,
     reference_structures: Sequence[Any] = (),
     reference_descriptors: np.ndarray | None = None,
+    evidence_groups: Sequence[str] | None = None,
 ) -> HierarchicalFPSResult:
     """Select candidates using element groups, stratum anchors, and conditional FPS.
 
@@ -488,6 +489,8 @@ def hierarchical_farthest_point_sampling(
         candidate_structures
     ) != len(strata):
         raise ValueError("candidate metadata must match candidate structures")
+    if evidence_groups is not None and len(evidence_groups) != len(candidate_ids):
+        raise ValueError("evidence groups must match candidates")
     ids = tuple(str(value) for value in candidate_ids)
     if len(set(ids)) != len(ids):
         raise ValueError("candidate_ids must be unique")
@@ -567,6 +570,20 @@ def hierarchical_farthest_point_sampling(
     # First honor each group's sqrt-size quota.
     for key in sorted(states):
         state = states[key]
+        if evidence_groups is not None:
+            pending = {evidence_groups[index] for index in state.original_indices} - {""}
+            # Leave at least half of a multi-seat quota for ordinary novelty sampling.
+            evidence_quota = min(state.quota, max(1, state.quota // 2))
+            while pending and len(state.selected_local) < evidence_quota:
+                eligible = (
+                    i for i in state.eligible(min_novelty)
+                    if evidence_groups[state.original_indices[i]] in pending
+                )
+                candidate = min(eligible, key=lambda i: (-state.distances[i], state.ids[i]), default=None)
+                if candidate is None:
+                    break
+                state.select(candidate)
+                pending.remove(evidence_groups[state.original_indices[candidate]])
         while len(state.selected_local) < state.quota:
             candidate = state.next_candidate(min_novelty)
             if candidate is None:

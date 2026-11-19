@@ -281,6 +281,7 @@ def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
             tmp_path / "previous" / "signals.json",
             '{"acquisition_convergence_streak": 1}\n',
         ),
+        "md_attempts": _write(tmp_path / "previous" / "md-attempts.json", '{"attempts": []}'),
         "scenario_maturity": _write(
             tmp_path / "previous" / "scenario-maturity.json",
             '{"version": 3, "routes": {}}\n',
@@ -348,9 +349,11 @@ def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
 
     descriptor = json.loads(task.descriptor.read_text())
     assert set(descriptor["previous_artifacts"]) == {
+        "md_attempts",
         "signals",
         "scenario_maturity",
     }
+    assert descriptor["previous_artifacts"]["md_attempts"] != descriptor["artifacts"]["md_attempts"]
     assert json.loads(
         (task.bundle / descriptor["previous_artifacts"]["signals"]).read_text()
     ) == {"acquisition_convergence_streak": 1}
@@ -390,10 +393,10 @@ def test_merge_stage_bundle_retains_sampling_route_identity(tmp_path):
                 "active_model_lineage",
             },
         ),
-        ("explore", {"scenario_maturity"}),
-        ("merge", {"signals", "scenario_maturity"}),
+        ("explore", {"scenario_maturity", "md_attempts"}),
+        ("merge", {"signals", "scenario_maturity", "md_attempts"}),
         ("retrain", {"signals", "scenario_maturity"}),
-        ("evaluate", {"signals", "scenario_maturity"}),
+        ("evaluate", {"signals", "scenario_maturity", "md_attempts"}),
     ),
 )
 def test_portable_stage_previous_artifact_contract(tmp_path, stage, expected):
@@ -407,6 +410,7 @@ def test_portable_stage_previous_artifact_contract(tmp_path, stage, expected):
             "active_model_lineage",
             "signals",
             "scenario_maturity",
+            "md_attempts",
         }
     }
     plan = GenerationPlan(2, 8, 2)
@@ -5753,3 +5757,79 @@ def test_force_does_not_bypass_generation_or_stage_rules(tmp_path):
         controller.restart_from(generation=9, from_stage="train", force=True)
     with pytest.raises(ControllerError, match="has not reached"):
         controller.restart_from(generation=1, from_stage="label", force=True)
+
+
+def test_diagnosis_terminal_and_targeted_resume_persist_across_controller_restart(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from NepTrain.core import workflow
+    from NepTrain.core.scenario_diagnosis import health_policy_hash
+    from NepTrain.core.sampling_route import load_sampling_routes
+
+    config, initial = _controller_inputs(tmp_path)
+    prepared = prepare_workflow(config, initial, tmp_path / "workflow")
+    controller = PersistentController(prepared.output_dir)
+    route = load_sampling_routes(controller.config["sampling"], base_dir=prepared.output_dir)[0]
+    paused = {sid: {"route": route.route_id, "maturity_fingerprint": route.maturity_fingerprint,
+                    "baseline": {"health_hash": health_policy_hash(controller.config)},
+                    "paused_generation": 1} for sid in ("a", "b")}
+    ledger = {"generations": {"1": {
+        "accepted": True, "complete": True, "kind": "acquisition",
+        "stage_sequence": ["train", "explore", "select", "label", "evaluate", "update"],
+        "stages": {"update": {"metrics": {"paused_scenarios": paused, "diagnosis_required": True}}}
+    }}}
+    monkeypatch.setattr(PersistentController, "_ledger", lambda self: ledger)
+    assert controller._next() is None and controller.state["state"] == "diagnosis_required"
+    monkeypatch.setattr(workflow, "workflow_status", lambda path: SimpleNamespace(state="diagnosis_required"))
+    monkeypatch.setattr("NepTrain.core.controller.start_controller", lambda *args, **kwargs: 1)
+    assert workflow.resume_workflow(prepared.output_dir).action == "diagnosis_required"
+    with pytest.raises(workflow.WorkflowError, match="Unknown paused scenario"):
+        workflow.resume_workflow(prepared.output_dir, release_scenarios=("missing",))
+    workflow.resume_workflow(prepared.output_dir, release_scenarios=("a",))
+    resumed = PersistentController(prepared.output_dir)
+    assert resumed.config["_diagnosis_releases"] == {"a": 1}
+    # A supported health change at a diagnostic boundary releases both affected conditions.
+    controller.workspace.ledger.write_text(json.dumps({**ledger, "workflow_id": prepared.workflow_id, "version": 1}))
+    from NepTrain.core.config import load_config, save_config
+    edited, _ = load_config(prepared.config_file)
+    edited["sampling"]["candidate_pool"]["health"]["min_volume_ratio"] = .4
+    edited["training"]["restart_steps"] = 24000
+    save_config(edited, prepared.config_file)
+    result = workflow.resume_workflow(prepared.output_dir)
+    assert {change["field"] for change in result.config_changes} >= {
+        "sampling.candidate_pool.health.min_volume_ratio", "training.restart_steps"}
+    assert PersistentController(prepared.output_dir).config["_diagnosis_releases"] == {"a": 1, "b": 1}
+
+
+def test_repeated_activation_rollback_stops_before_md_and_reopens_train_only_after_edit(tmp_path, monkeypatch):
+    from NepTrain.core import workflow
+    from NepTrain.core.config import load_config, save_config
+    from NepTrain.core.workflow_iteration import WorkflowIterationAdapter
+
+    config, initial = _controller_inputs(tmp_path)
+    prepared = prepare_workflow(config, initial, tmp_path / "workflow")
+    ctrl = PersistentController(prepared.output_dir)
+    plan, stage, ctx = ctrl._next()
+    assert stage == "train"
+    adapter = WorkflowIterationAdapter(ctrl.config, base_dir=prepared.output_dir, initial_training=None,
+                                       active_stage="train", active_generation_kind="acquisition")
+    reason = "Two consecutive candidates failed activation on paired labels."
+    status = {"activation_diagnosis": reason, "consecutive_rollbacks": 2,
+              "attempted_training_settings_sha256": adapter.training_settings_hash()}
+    ctx.work_dir.mkdir(parents=True, exist_ok=True)
+    artifact = ctx.work_dir / "lineage.json"
+    artifact.write_text(json.dumps(status))
+    ctrl.generation_controller.commit_stage(plan, "train", StageOutcome({"active_model_lineage": artifact}, status))
+    assert ctrl._next() is None and ctrl.state["state"] == "diagnosis_required"
+    assert ctrl.state["current"] is None
+    assert "training settings" in workflow.workflow_status(prepared.output_dir).next_action
+    starts = []
+    monkeypatch.setattr("NepTrain.core.controller.start_controller", lambda *a, **k: starts.append(a) or 7)
+    assert workflow.resume_workflow(prepared.output_dir).action == "diagnosis_required"
+    assert not starts
+    edited, _ = load_config(prepared.config_file)
+    edited["training"]["restart_steps"] = 7100
+    save_config(edited, prepared.config_file)
+    assert workflow.resume_workflow(prepared.output_dir).action == "resume"
+    reopened = PersistentController(prepared.output_dir)
+    assert len(starts) == 1 and reopened._next()[1] == "train"
+    assert not reopened.state.get("activation_diagnosis_generation")

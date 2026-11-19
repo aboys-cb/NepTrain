@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -22,7 +23,7 @@ from .candidate_pool import (
     validate_candidate_pool,
     write_candidate_pool,
 )
-from .content_addressing import file_sha256
+from .content_addressing import canonical_sha256, file_sha256
 from .composition import reduced_composition
 from .descriptor_features import (
     ELEMENTWISE_MEAN_STD,
@@ -37,6 +38,7 @@ from .fps import (
 from .generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
     ACTIVE_LEARNING_FINALIZATION_STAGES,
+    TRAIN_ONLY_FINALIZATION_STAGES,
     stage_implementation,
 )
 from .labeling import LabelRequest, LabelResult, label
@@ -53,6 +55,8 @@ from .reporting import (
     build_selection_pca_report,
 )
 from .persistence import atomic_write_json
+from .workflow_workspace import final_check_lines
+from .scenario_diagnosis import NonfinitePrediction, grouped_frames, health_policy_hash, observe, paired_metrics, record_paired_fit
 from .scenario import ScenarioLadder
 from .sampling_route import (
     SamplingRoute,
@@ -627,6 +631,41 @@ def _condition_stratum(stratum: str) -> str:
     )
 
 
+def _md_failure_steps(artifacts: Mapping[str, Path]) -> dict[str, int]:
+    path = artifacts.get("md_attempts")
+    if path is None:
+        return {}
+    steps = {}
+    for item in json.loads(path.read_text(encoding="utf-8"))["attempts"]:
+        if item["completed"]:
+            continue
+        health = item.get("health") or {}
+        step = (health.get("halt") or {}).get("step")
+        if step is None:
+            step = health.get("first_hard_bad_step")
+        if step is not None:
+            steps[item["scenario_attempt_id"]] = int(step)
+    return steps
+
+
+def _previous_routes(artifacts: Mapping[str, Path]) -> dict[str, Any]:
+    path = artifacts.get("scenario_maturity")
+    if path is None:
+        return {}
+    previous = json.loads(path.read_text(encoding="utf-8"))
+    if previous.get("version") != 3 or not isinstance(previous.get("routes"), dict):
+        raise WorkflowIterationError("unsupported multi-route scenario maturity history")
+    # Old histories kept the halt step only in the separate MD attempt report.
+    failure_steps = _md_failure_steps(artifacts)
+    if failure_steps:
+        for route in previous["routes"].values():
+            for record in route["history"]["scenarios"].values():
+                for item in record["evidence"]:
+                    if item["attempt_id"] in failure_steps:
+                        item.setdefault("failure_step", failure_steps[item["attempt_id"]])
+    return previous["routes"]
+
+
 class WorkflowIterationAdapter:
     """Connect real training, MD, NEP descriptor, and labeling Interfaces.
 
@@ -889,8 +928,25 @@ class WorkflowIterationAdapter:
         path.write_text("".join(output), encoding="utf-8")
         return path
 
+    def training_settings_hash(self) -> str:
+        options = dict(self.config.get("training", {}))
+        options.pop("initial_path", None)  # The actual generation dataset has its own hash.
+        options["config_path"] = file_sha256(self._path(options["config_path"]))
+        test_path = self._optional_path(options.pop("test_path", None))
+        if options.get("backend", "gpumd") != "torchnep" and test_path and not optional_dataset_issue(test_path, role="training.test_path"):
+            options["test_path"] = file_sha256(test_path)
+        return canonical_sha256({
+            "training": options,
+            "seed": int(self.config.get("workflow", {}).get("seed", 20260723)),
+        })
+
     def _adaptive_train(self, context: StageContext) -> StageOutcome:
-        """Train exactly one model on the dataset entering this generation."""
+        """Select the model for the dataset entering this generation."""
+
+        v4 = context.stage_sequence in {
+            ACTIVE_LEARNING_ACQUISITION_STAGES, TRAIN_ONLY_FINALIZATION_STAGES, ACTIVE_LEARNING_FINALIZATION_STAGES,
+        }
+        parent_model = None
 
         if context.generation == 1:
             if self.initial_training is None:
@@ -911,12 +967,37 @@ class WorkflowIterationAdapter:
                 file_sha256(parent_model) if parent_model is not None else None
             )
             warm_start = context.previous_artifacts.get("activated_checkpoint")
-        result, frame_count, _ = self._execute_training(
-            context,
-            training_input=training_input,
-            role="training",
-            warm_start=warm_start,
+        dataset_hash = file_sha256(training_input)
+        lineage_path = context.previous_artifacts.get("active_model_lineage")
+        settings_hash = self.training_settings_hash() if v4 else None
+        previous = {}
+        if v4 and parent_model is not None and lineage_path is not None:
+            previous = json.loads(lineage_path.read_text(encoding="utf-8"))
+            if (
+                previous.get("generation") != context.generation - 1
+                or previous.get("active_model_sha256") != parent_model_sha256
+            ):
+                raise WorkflowIterationError("previous active model has inconsistent lineage")
+            if "checkpoint_sha256" in previous:
+                checkpoint_hash = file_sha256(warm_start) if warm_start is not None else None
+                if checkpoint_hash != previous["checkpoint_sha256"]:
+                    raise WorkflowIterationError("previous checkpoint has inconsistent lineage")
+        reuse = bool(
+            v4 and parent_model is not None
+            and previous.get("training_settings_sha256") == settings_hash
+            and previous.get("training_dataset_sha256") == dataset_hash
         )
+        if reuse:
+            checkpoint_hash = previous["checkpoint_sha256"]
+            result = TrainingResult(
+                str(self.config["training"].get("backend", "gpumd")), parent_model, None, warm_start
+            )
+            frame_count = previous["training_count"]
+        else:
+            result, frame_count, _ = self._execute_training(
+                context, training_input=training_input, role="training", warm_start=warm_start,
+            )
+            checkpoint_hash = file_sha256(result.checkpoint) if v4 and result.checkpoint else None
         if not result.best_model.is_file() or result.best_model.stat().st_size == 0:
             raise WorkflowIterationError("trained candidate model is missing or empty")
         candidate_sha256 = file_sha256(result.best_model)
@@ -926,10 +1007,16 @@ class WorkflowIterationAdapter:
             "generation_kind": context.generation_kind,
             "parent_model_sha256": parent_model_sha256,
             "candidate_model_sha256": candidate_sha256,
-            "training_dataset_sha256": file_sha256(training_input),
+            "training_dataset_sha256": dataset_hash,
             "training_count": frame_count,
             "trained_on_generation_input": True,
         }
+        if v4:
+            lineage.update(
+                training_settings_sha256=settings_hash, model_reused=reuse,
+                training_generation=previous["training_generation"] if reuse else context.generation,
+                checkpoint_sha256=checkpoint_hash,
+            )
         artifacts: dict[str, Path] = {
             "training_input": training_input,
             "model_training_set": training_input,
@@ -954,18 +1041,16 @@ class WorkflowIterationAdapter:
             artifacts=artifacts,
             metrics={
                 "backend": result.backend,
+                **({"model_reused": reuse} if v4 else {}),
                 "training_count": frame_count,
-                "training_dataset_sha256": file_sha256(training_input),
+                "training_dataset_sha256": dataset_hash,
                 "parent_model_sha256": parent_model_sha256,
                 "candidate_model_sha256": candidate_sha256,
                 "generation_kind": context.generation_kind,
             },
         )
 
-        if context.stage_sequence in {
-            ACTIVE_LEARNING_ACQUISITION_STAGES,
-            ACTIVE_LEARNING_FINALIZATION_STAGES,
-        }:
+        if v4:
             activation = self._activate_trained_model(
                 replace(context, artifacts={**context.artifacts, **outcome.artifacts})
             )
@@ -1040,6 +1125,57 @@ class WorkflowIterationAdapter:
             )
             return None, payload
 
+    def _model_pairs(self, context, parent, candidate, parent_generation):
+        backend = str(self.config.get("evaluation", {}).get("inference_backend", "auto"))
+        limits = self.config.get("workflow", {}).get("convergence", {}).get("acquisition_max_rmse", {})
+        pairs, anchors, regressions = {}, {}, []
+        if parent is None:
+            return pairs, anchors, regressions
+        parent_hash, child_hash = file_sha256(parent), file_sha256(candidate)
+        for artifact, group_key in (("failure_frames", "scenario_attempt_id"),
+                                    ("regression_anchors", "scenario_id")):
+            path = context.previous_artifacts.get(artifact)
+            if path is None:
+                continue
+            frames = _read_frames(path, allow_empty=True)
+            if artifact == "regression_anchors":
+                frames = [f for f in frames if f.info["anchor_generation"] < parent_generation]
+            for group, batch in grouped_frames(frames, group_key).items():
+                try:
+                    before = paired_metrics(self.runtime.predict, parent, batch, backend)
+                except NonfinitePrediction:
+                    before = {}
+                try:
+                    after = before if child_hash == parent_hash else paired_metrics(
+                        self.runtime.predict, candidate, batch, backend)
+                except NonfinitePrediction:
+                    after = {}
+                item = {"before": before, "after": after, "count": len(batch),
+                        "frame_ids": [structure_id(f) for f in batch],
+                        "parent_model_sha256": parent_hash,
+                        "child_model_sha256": child_hash}
+                if artifact == "failure_frames":
+                    pairs[group] = item
+                    if not after:
+                        regressions.append(str(batch[0].info["scenario_id"]))
+                else:
+                    anchors[group] = item
+                    regressed_metrics = []
+                    for key, limit in limits.items():
+                        if key not in after:
+                            regressed_metrics.append(key)
+                        elif not before and after[key] > limit:
+                            regressed_metrics.append(key)
+                        elif key in before:
+                            previous = before[key]
+                            boundary = max(limit, 1.15 * previous) if previous <= limit else 1.35 * previous
+                            if after[key] > boundary:
+                                regressed_metrics.append(key)
+                    item["regressed_metrics"] = regressed_metrics
+                    if not after or regressed_metrics:
+                        regressions.append(group)
+        return pairs, anchors, sorted(set(regressions))
+
     def _activate_trained_model(self, context: StageContext) -> StageOutcome:
         """Check and publish a trained model, with optional test diagnostics."""
 
@@ -1060,6 +1196,32 @@ class WorkflowIterationAdapter:
                 "trained model has inconsistent lineage"
             )
 
+        parent = context.artifacts.get("parent_model")
+        prior_path = context.previous_artifacts.get("active_model_lineage")
+        prior = json.loads(prior_path.read_text()) if prior_path else {}
+        pairs, anchors, regressions = self._model_pairs(
+            context, parent, candidate, prior.get("training_generation", 0))
+        previous_rollbacks = prior.get("consecutive_rollbacks", int(prior.get("candidate_activation_accepted") is False))
+        rollback_count = previous_rollbacks + 1 if regressions else 0
+        activation_diagnosis = None
+        if regressions and any(not item["before"] for item in (*anchors.values(), *pairs.values())):
+            activation_diagnosis = "Candidate failed activation and the fallback model has invalid paired predictions."
+        elif rollback_count >= 2:
+            activation_diagnosis = "Two consecutive candidates failed activation on paired labels."
+        activation_status = {
+            "consecutive_rollbacks": rollback_count,
+            "activation_diagnosis": activation_diagnosis,
+            "attempted_training_settings_sha256": lineage.get("training_settings_sha256"),
+        }
+        active_checkpoint = context.artifacts.get("candidate_checkpoint")
+        if regressions:
+            candidate = parent
+            candidate_sha256 = file_sha256(candidate)
+            training_input = context.previous_artifacts["model_training_set"]
+            active_checkpoint = context.previous_artifacts.get("activated_checkpoint")
+            if file_sha256(training_input) != prior["training_dataset_sha256"]:
+                raise WorkflowIterationError("anchor rollback dataset does not match the parent lineage")
+
         options = self.config.get("evaluation", {})
         thresholds = dict(options.get("max_rmse", {}))
         evaluation, validation = self._validation_diagnostic(candidate, training_input)
@@ -1067,13 +1229,19 @@ class WorkflowIterationAdapter:
         validation_accepted = validation["validation_accepted"]
         evaluated_count = validation["evaluated_count"]
         spin_count = validation["spin_frame_count"]
-        accepted = True
+        accepted = not regressions or context.generation_kind != "finalization"
         active_lineage = {
             **lineage,
+            **activation_status,
+            "trained_on_generation_input": not regressions,
+            **({key: prior[key] for key in ("training_generation", "training_dataset_sha256",
+                "training_count", "training_settings_sha256", "checkpoint_sha256")} if regressions else {}),
             "active_model_sha256": candidate_sha256,
-            "candidate_activation_accepted": True,
+            "candidate_activation_accepted": not regressions,
             "activation_basis": (
-                "successful training; optional test is diagnostic only"
+                "paired prediction check failed; parent retained" if regressions else
+                "verified reuse of the previous active model" if lineage.get("model_reused")
+                else "successful training; optional test is diagnostic only"
             ),
             "validation_accepted": validation_accepted,
         }
@@ -1085,6 +1253,8 @@ class WorkflowIterationAdapter:
             "model_sha256": candidate_sha256,
             "training_dataset_sha256": file_sha256(training_input),
             "metrics": metrics,
+            **activation_status,
+            "failure_pairs": pairs, "anchors": anchors, "regressed_scenarios": regressions,
             "model_improved": bool(
                 lineage.get("parent_model_sha256") != candidate_sha256
             ),
@@ -1101,15 +1271,18 @@ class WorkflowIterationAdapter:
                 context.work_dir / "model-evaluation.json", evaluation_record
             ),
         }
-        if "candidate_checkpoint" in context.artifacts:
-            artifacts["activated_checkpoint"] = context.artifacts[
-                "candidate_checkpoint"
-            ]
+        if active_checkpoint is not None:
+            artifacts["activated_checkpoint"] = active_checkpoint
+        if regressions:
+            artifacts["model_training_set"] = training_input
         signals = {
             **validation,
             **metrics,
             "prediction_metric_basis": _PREDICTION_METRIC_BASIS,
-            "accepted": accepted,
+            "accepted": bool(accepted),
+            "regressed_scenarios": regressions,
+            **activation_status,
+            "active_training_count": active_lineage.get("training_count"),
             "generation_kind": context.generation_kind,
             "evaluation_configured": self.evaluation_configured,
             "validation_accepted": validation_accepted,
@@ -1118,7 +1291,7 @@ class WorkflowIterationAdapter:
             "active_model_sha256": candidate_sha256,
             "model_training_set_sha256": file_sha256(training_input),
             "workflow_converged": context.generation_kind == "finalization"
-            and accepted,
+            and accepted and context.stage_sequence != ACTIVE_LEARNING_FINALIZATION_STAGES,
             "generation_disposition": (
                 "finalize" if context.generation_kind == "finalization" else None
             ),
@@ -1126,9 +1299,8 @@ class WorkflowIterationAdapter:
         }
         if context.generation_kind == "finalization":
             artifacts["training_set"] = training_input
-            artifacts["signals"] = atomic_write_json(
-                context.work_dir / "signals.json", signals
-            )
+            if context.stage_sequence != ACTIVE_LEARNING_FINALIZATION_STAGES:
+                artifacts["signals"] = atomic_write_json(context.work_dir / "signals.json", signals)
         report = build_evaluation_report(
             context.work_dir,
             metrics=metrics,
@@ -1171,6 +1343,8 @@ class WorkflowIterationAdapter:
 
     def _acquisition_explore(self, context: StageContext) -> StageOutcome:
         return self._explore(context)
+
+    _finalization_explore = _acquisition_explore
 
     def _acquisition_select(self, context: StageContext) -> StageOutcome:
         return self._select(context)
@@ -1252,6 +1426,33 @@ class WorkflowIterationAdapter:
             },
         )
 
+    def _route_history(self, route, prior, ladder):
+        history = route.maturity_history(prior, ladder)
+        if not history:
+            return history
+        health_hash = health_policy_hash(self.config)
+        releases = self.config.get("_diagnosis_releases", {})
+        scenarios = dict(history["scenarios"])
+        for sid, record in history["scenarios"].items():
+            state = record.get("diagnosis", {})
+            if not state:
+                continue
+            baseline = state.get("baseline", {})
+            source_ids = {e.get("scenario_id") for e in record["evidence"]}
+            released = max(releases.get(sid, -1) for sid in source_ids | {record["scenario_id"]})
+            changed = baseline and baseline["health_hash"] != health_hash
+            if changed or (state.get("status") == "paused_for_diagnosis" and
+                           released >= state["paused_generation"]):
+                cleared = {"status", "baseline", "paused_generation", "reason", "novelty_extension"}
+                scenarios[sid] = {**record, "diagnosis": {k: v for k, v in state.items() if k not in cleared}}
+        return {**history, "scenarios": scenarios}
+
+    @staticmethod
+    def _check_sampling_model(context):
+        path = context.artifacts.get("active_model_lineage")
+        if path and (reason := json.loads(path.read_text()).get("activation_diagnosis")):
+            raise WorkflowIterationError(reason + " Inspect train/model-evaluation.json before resampling.")
+
     def plan_explore_attempts(
         self, context: StageContext
     ) -> tuple[dict[str, Any], ...]:
@@ -1263,26 +1464,14 @@ class WorkflowIterationAdapter:
         this plan.
         """
 
-        previous_route_histories: dict[str, Any] = {}
-        if "scenario_maturity" in context.previous_artifacts:
-            previous = json.loads(
-                context.previous_artifacts["scenario_maturity"].read_text(
-                    encoding="utf-8"
-                )
-            )
-            if previous.get("version") != 3 or not isinstance(
-                previous.get("routes"), dict
-            ):
-                raise WorkflowIterationError(
-                    "unsupported multi-route scenario maturity history"
-                )
-            previous_route_histories = previous["routes"]
+        self._check_sampling_model(context)
+        previous_route_histories = _previous_routes(context.previous_artifacts)
         model_id = file_sha256(context.artifacts["model"])
         planned: list[dict[str, Any]] = []
         for route_index, route in enumerate(self.routes):
             ladder = self.scenario_ladders[route.route_id]
             route_history_record = previous_route_histories.get(route.route_id)
-            route_history = route.maturity_history(route_history_record, ladder)
+            route_history = self._route_history(route, route_history_record, ladder)
             structure_ids = sorted(
                 {
                     structure_id(frame)
@@ -1305,7 +1494,7 @@ class WorkflowIterationAdapter:
                     * max(ladder.replicas.values())
                 ),
                 model_id=model_id,
-                history=route_history,
+                history=route_history, final_check=context.stage_sequence == ACTIVE_LEARNING_FINALIZATION_STAGES,
             )
             planned.extend(
                 {
@@ -1330,25 +1519,13 @@ class WorkflowIterationAdapter:
         )
 
     def _explore(self, context: StageContext) -> StageOutcome:
+        self._check_sampling_model(context)
         options = self.config.get("md", {})
         sampling = self.config.get("sampling", {})
         candidate_pool = sampling.get("candidate_pool", {})
         backend = str(options.get("backend", "lammps"))
         regular_minimum = regular_batch_minimum(context.plan.max_selected)
-        previous_route_histories: dict[str, Any] = {}
-        if "scenario_maturity" in context.previous_artifacts:
-            previous = json.loads(
-                context.previous_artifacts["scenario_maturity"].read_text(
-                    encoding="utf-8"
-                )
-            )
-            if previous.get("version") != 3 or not isinstance(
-                previous.get("routes"), dict
-            ):
-                raise WorkflowIterationError(
-                    "unsupported multi-route scenario maturity history"
-                )
-            previous_route_histories = previous["routes"]
+        previous_route_histories = _previous_routes(context.previous_artifacts)
 
         model_id = file_sha256(context.artifacts["model"])
         requested_md_runs = 0
@@ -1368,7 +1545,7 @@ class WorkflowIterationAdapter:
         for route_index, route in enumerate(self.routes):
             ladder = self.scenario_ladders[route.route_id]
             route_history_record = previous_route_histories.get(route.route_id)
-            route_history = route.maturity_history(route_history_record, ladder)
+            route_history = self._route_history(route, route_history_record, ladder)
 
             route_structures = [
                 frame
@@ -1396,7 +1573,7 @@ class WorkflowIterationAdapter:
                 seed=context.plan.seed + route_index,
                 limit=maximum_frontier,
                 model_id=model_id,
-                history=route_history,
+                history=route_history, final_check=context.stage_sequence == ACTIVE_LEARNING_FINALIZATION_STAGES,
             )
             if requested_attempt_ids:
                 available_attempts = [
@@ -1404,6 +1581,9 @@ class WorkflowIterationAdapter:
                     for attempt in available_attempts
                     if attempt.attempt_id in requested_attempt_ids
                 ]
+            from .workflow import _md_timestep_ps
+            timing = _md_timestep_ps({"template_path": route.template_path}, backend=backend,
+                                     base_dir=self.base_dir)
             requested_md_runs += len(available_attempts)
             available_md_runs += len(available_attempts)
             executed_attempts = []
@@ -1460,6 +1640,7 @@ class WorkflowIterationAdapter:
                 )
                 base_result = {
                     "source_id": source,
+                    "calculation_dir": f"generations/{context.generation:04d}/explore/calculations/{source}",
                     "route_id": route.route_id,
                     "route_fingerprint": route.fingerprint,
                     "template_sha256": route.template_sha256,
@@ -1482,6 +1663,7 @@ class WorkflowIterationAdapter:
                             "usable_frames": 0,
                             "window_counts": {},
                             "last_step": None,
+                            "trajectory_available": request.output_file.is_file(),
                             "failure_code": "md_error",
                             "failure_reason": str(error),
                         }
@@ -1536,6 +1718,7 @@ class WorkflowIterationAdapter:
                     **base_result,
                     "structure_id": attempt.structure_id,
                     "maturity_target": attempt.target_level,
+                    "needs_label": attempt.needs_label,
                     "md_steps": attempt.steps,
                     "completed": bool(result.completed),
                     "failure_code": result.failure_code,
@@ -1550,12 +1733,17 @@ class WorkflowIterationAdapter:
                     if result.health_report is not None
                     else None
                 )
+                sample_steps = [int(f.info.get("md_step", f.info.get("lammps_step", 0))) for f in run_frames]
+                intervals = np.diff(sample_steps)
                 attempt_results.append(
                     {
                         **base_result,
+                        "dump_interval": int(np.median(intervals[intervals > 0])) if (intervals > 0).any() else None,
+                        "timestep_ps": timing,
                         "completed": bool(result.completed),
                         "usable_frames": len(usable_frames),
                         "window_counts": window_counts,
+                        "trajectory_available": request.output_file.is_file(),
                         "last_step": result.last_step,
                         "failure_code": result.failure_code,
                         "failure_reason": result.failure_reason,
@@ -1592,6 +1780,9 @@ class WorkflowIterationAdapter:
                     "pressure": pressure,
                 }
             )
+
+        if context.stage_sequence == ACTIVE_LEARNING_FINALIZATION_STAGES:
+            return self._final_checks(context, attempt_results, route_plans, model_id)
 
         candidates = [
             (source, frame_index, frame)
@@ -1664,6 +1855,7 @@ class WorkflowIterationAdapter:
             if metadata["scenario_id"] is not None:
                 copied.info.update(
                     scenario_id=metadata["scenario_id"],
+                    scenario_needs_label=metadata["needs_label"],
                     scenario_attempt_id=metadata["scenario_attempt_id"],
                     maturity_target=metadata["maturity_target"],
                     scenario_replica=metadata["replica"],
@@ -1776,6 +1968,53 @@ class WorkflowIterationAdapter:
             },
         )
 
+    def _final_checks(self, context, attempts, plans, model_id):
+        steps = {a["attempt_id"]: a["steps"] for route in plans for a in route["attempts"]}
+        previous = _previous_routes(context.previous_artifacts)
+        histories = {}
+        for route in self.routes:
+            history = self._route_history(route, previous.get(route.route_id), self.scenario_ladders[route.route_id])
+            histories[route.route_id] = (history or {}).get("scenarios", {})
+        checks = []
+        for attempt in attempts:
+            route_id = attempt["route_id"]
+            ladder = self.scenario_ladders[route_id]
+            record = histories[route_id].get(attempt["scenario_id"], {})
+            historical_model, replicas = ladder.production_proof(record)
+            policy = previous.get(route_id, {}).get("production_status", {})
+            required = policy.get("minimum_successful_replicas", ladder.replicas["production_ready"])
+            certified = replicas >= required
+            directory = attempt.get("calculation_dir")
+            checks.append({
+                **{k: attempt.get(k) for k in ("scenario_id", "scenario_attempt_id", "route_id",
+                   "structure_hash", "temperature", "pressure", "seed", "completed", "last_step", "failure_reason")},
+                "requested_steps": steps[attempt["scenario_attempt_id"]],
+                "historical_model_sha256": historical_model if certified else None,
+                "historical_steps": ladder.steps["production_ready"] if certified else None,
+                "historical_replicas": replicas,
+                "historical_required_replicas": required,
+                "calculation_dir": directory,
+                "trajectory": f"{directory}/trajectory.xyz" if directory and attempt.get("trajectory_available") else None,
+            })
+        passed = bool(checks) and all(a["completed"] for a in checks)
+        lineage = context.artifacts.get("active_model_lineage")
+        if lineage and not json.loads(lineage.read_text())["candidate_activation_accepted"]:
+            passed = False
+        metrics = {"accepted": passed, "workflow_converged": passed, "active_model_sha256": model_id,
+                   "generation_kind": "finalization", "generation_disposition": "finalize", "final_model_checks": checks}
+        report = context.work_dir / "final-model-checks.md"
+        report.write_text("\n".join(["# Final model MD checks", "", f"Model: {model_id}",
+                                     f"Accepted: {passed}", "", *final_check_lines(checks)]) + "\n",
+                          encoding="utf-8")
+        return StageOutcome({
+            "final_check_report": report,
+            "signals": atomic_write_json(context.work_dir / "final-model-checks.json", metrics),
+            "md_attempts": atomic_write_json(context.work_dir / "md-attempts.json",
+                                            {"attempts": attempts, "model_sha256": model_id, "routes": []}),
+            "scenario_plan": atomic_write_json(context.work_dir / "scenario-plan.json",
+                                              {"version": 3, "routes": plans, "model_id": model_id}),
+        }, metrics)
+
     def merge_explore_outcomes(
         self,
         context: StageContext,
@@ -1825,6 +2064,13 @@ class WorkflowIterationAdapter:
                 route_plan_parts.setdefault(
                     str(item["route_id"]), []
                 ).append(item)
+        if context.stage_sequence == ACTIVE_LEARNING_FINALIZATION_STAGES:
+            expected = {a["attempt_id"] for a in self.plan_explore_attempts(context)}
+            observed = [a["scenario_attempt_id"] for a in attempts]
+            if set(observed) != expected or len(observed) != len(expected):
+                raise WorkflowIterationError("incomplete final-model canary wave")
+            return self._final_checks(context, attempts,
+                                      [p for parts in route_plan_parts.values() for p in parts], model_id)
         if not frames:
             failed = sum(not bool(item.get("completed")) for item in attempts)
             raise WorkflowIterationError(
@@ -2166,6 +2412,10 @@ class WorkflowIterationAdapter:
             min_novelty=selection_threshold,
             reference_structures=training,
             reference_descriptors=reference_descriptors,
+            evidence_groups=[
+                str(frame.info["scenario_attempt_id"]) if frame.info.get("scenario_needs_label") else ""
+                for frame in candidates
+            ],
         )
         selected = [candidates[index] for index in result.selected_indices]
         selected_path = context.work_dir / "selected-input.xyz"
@@ -2200,6 +2450,20 @@ class WorkflowIterationAdapter:
             context.work_dir / "selection-result.json",
             {
                 "selected_indices": list(result.selected_indices),
+                "selected_pre_failure_counts": {
+                    key: len(batch) for key, batch in grouped_frames(
+                        [f for f in selected if f.info.get("md_window") == "pre_failure"],
+                        "scenario_attempt_id").items()
+                },
+                "novel_pre_failure_attempts": sorted({
+                    str(f.info["scenario_attempt_id"]) for f, distance in zip(selected, result.selected_novelty)
+                    if f.info.get("md_window") == "pre_failure" and f.info.get("scenario_attempt_id")
+                    and distance > max(selection_threshold, completion_threshold)
+                }),
+                "selected_attempt_ids": sorted({
+                    str(frame.info["scenario_attempt_id"])
+                    for frame in selected if frame.info.get("scenario_attempt_id")
+                }),
                 "selected_ids": list(result.selected_ids),
                 "selected_novelty": list(result.selected_novelty),
                 "counts_by_stratum": dict(result.counts_by_stratum),
@@ -2693,6 +2957,13 @@ class WorkflowIterationAdapter:
             "evaluated_count": len(frames),
             "spin_frame_count": spin_count,
         }
+        failure_frames = [f for f in frames if f.info.get("md_window") == "pre_failure"]
+        signals["pre_failure"] = {
+            group: {"metrics": paired_metrics(self.runtime.predict, context.artifacts["model"], batch,
+                                              str(options.get("inference_backend", "auto"))),
+                    "count": len(batch), "frame_ids": [structure_id(f) for f in batch]}
+            for group, batch in grouped_frames(failure_frames, "scenario_attempt_id").items()
+        }
         signals["attempt_progression_confident"] = _progression_confidence(
             signals, convergence_policy
         )
@@ -2716,6 +2987,10 @@ class WorkflowIterationAdapter:
             "acquisition_signals": output,
             "acquisition_parity_report": parity.report,
         }
+        if failure_frames:
+            path = context.work_dir / "pre-failure-labels.xyz"
+            ase_write(path, failure_frames, format="extxyz")
+            artifacts["failure_frames"] = path
         if parity.chart is not None:
             artifacts["acquisition_parity"] = parity.chart
         return StageOutcome(artifacts=artifacts, metrics=signals)
@@ -2740,7 +3015,12 @@ class WorkflowIterationAdapter:
                 f"training merge input violates the scientific data contract: {error}"
             ) from error
         output = context.work_dir / "train.xyz"
-        ase_write(output, merged, format="extxyz")
+        source = context.artifacts["training_input"]
+        if not labeled and source.suffix.lower() in {".xyz", ".extxyz"}:
+            if source.resolve() != output.resolve():
+                shutil.copyfile(source, output)
+        else:
+            ase_write(output, merged, format="extxyz")
         return StageOutcome(
             artifacts={"training_set": output},
             metrics={
@@ -2818,7 +3098,16 @@ class WorkflowIterationAdapter:
             production_ready=production_ready,
         )
         convergence_evidence = convergence["acquisition_converged"]
-        sampling_complete = bool(production_ready and convergence_evidence)
+        paused = {
+            sid: {"route": route_id, "maturity_fingerprint": route["maturity_fingerprint"], "temperature": r["temperature"], "pressure": r["pressure"],
+                  "structure": r["structure_id"], **r["diagnosis"]}
+            for route_id, route in history["routes"].items()
+            for sid, r in route["history"].get("scenarios", {}).items()
+            if r.get("diagnosis", {}).get("status") == "paused_for_diagnosis"
+        }
+        diagnosis_required = bool(paused) and not any(
+            route.get("has_available_attempts") for route in history["routes"].values())
+        sampling_complete = bool(not paused and production_ready and convergence_evidence)
         disposition = "finalize" if sampling_complete else "continue"
         for route in history["routes"].values():
             route["history"]["acquisition_pending"] = bool(
@@ -2853,6 +3142,8 @@ class WorkflowIterationAdapter:
             "workflow_converged": False,
             "workflow_stalled": False,
             "production_ready": production_ready,
+            "paused_scenarios": paused,
+            "diagnosis_required": diagnosis_required,
             "model_validation_accepted": validation_accepted,
             "remaining_novelty": remaining_novelty,
             "novelty_threshold": novelty_threshold,
@@ -2864,6 +3155,24 @@ class WorkflowIterationAdapter:
             ),
         }
         artifacts = dict(merged.artifacts)
+        prior_anchors = context.previous_artifacts.get("regression_anchors")
+        anchors = _read_frames(prior_anchors) if prior_anchors else []
+        frozen = set(grouped_frames(anchors, "scenario_id"))
+        labels_path = context.artifacts.get("labeled")
+        labels = _read_frames(labels_path, allow_empty=True) if labels_path else []
+        for group, batch in grouped_frames(labels, "scenario_id").items():
+            if group in frozen:
+                continue
+            batch.sort(key=lambda f: (f.get_potential_energy() / len(f), structure_id(f)))
+            for index in np.linspace(0, len(batch) - 1, min(4, len(batch)), dtype=int):
+                frame = batch[index].copy()
+                frame.calc = batch[index].calc
+                frame.info["anchor_generation"] = context.generation
+                anchors.append(frame)
+        if anchors:
+            path = context.work_dir / "regression-anchors.xyz"
+            ase_write(path, anchors, format="extxyz")
+            artifacts["regression_anchors"] = path
         artifacts["scenario_maturity"] = atomic_write_json(
             context.work_dir / "scenario-maturity.json", history
         )
@@ -2881,6 +3190,8 @@ class WorkflowIterationAdapter:
                 "finalization_pending": sampling_complete,
                 "workflow_converged": False,
                 "production_ready": production_ready,
+                "paused_scenarios": paused,
+                "diagnosis_required": diagnosis_required,
                 "scenario_counts_by_maturity": history["counts_by_maturity"],
                 "production_status_by_route": {
                     route_id: route["production_status"]
@@ -3056,34 +3367,22 @@ class WorkflowIterationAdapter:
             raise WorkflowIterationError(
                 "unsupported multi-route scenario plan"
             )
-        previous_routes: dict[str, Any] = {}
-        if "scenario_maturity" in context.previous_artifacts:
-            previous = json.loads(
-                context.previous_artifacts["scenario_maturity"].read_text(
-                    encoding="utf-8"
-                )
-            )
-            if previous.get("version") != 3:
-                raise WorkflowIterationError(
-                    "unsupported multi-route scenario maturity history"
-                )
-            previous_routes = previous.get("routes", {})
-
+        previous_routes = _previous_routes(context.previous_artifacts)
         route_by_id = {route.route_id: route for route in self.routes}
         selection = json.loads(
             context.artifacts["selection_result"].read_text(encoding="utf-8")
         )
         selected_input = context.artifacts.get("selected_input")
-        selected_attempt_ids = (
-            {
+        selected_attempt_ids = set(selection.get("selected_attempt_ids", ()))
+        if "selected_attempt_ids" not in selection and selected_input is not None:
+            selected_attempt_ids.update(
                 str(attempt_id)
                 for frame in _read_frames(selected_input, allow_empty=True)
                 if (attempt_id := frame.info.get("scenario_attempt_id")) is not None
-            }
-            if selected_input is not None
-            else set()
-        )
+            )
         evaluated_attempts = diagnostic.get("attempt_accepted", {})
+        missing_labels = selected_attempt_ids.difference(evaluated_attempts)
+        failure_steps = _md_failure_steps(context.artifacts)
         completion_threshold = float(
             selection.get(
                 "resolved_completion_coverage_threshold",
@@ -3110,7 +3409,23 @@ class WorkflowIterationAdapter:
         )
         total_counts: dict[str, int] = {}
         no_progress = []
-        for route_plan in scenario_plan["routes"]:
+        md_file = context.artifacts.get("md_attempts")
+        md_rows = {x["scenario_attempt_id"]: x for x in json.loads(md_file.read_text())["attempts"]} if md_file else {}
+        eval_file = context.artifacts.get("model_evaluation")
+        pairs = json.loads(eval_file.read_text()).get("failure_pairs", {}) if eval_file else {}
+        health_hash = health_policy_hash(self.config)
+        novel_attempts = set(selection.get("novel_pre_failure_attempts", ()))
+        limits = self.config.get("workflow", {}).get("convergence", {}).get("acquisition_max_rmse", {})
+        plans = {p["route_id"]: p for p in scenario_plan["routes"]}
+        for route in self.routes:
+            if route.route_id not in plans:
+                plans[route.route_id] = {
+                    "route_id": route.route_id, "route_fingerprint": route.fingerprint,
+                    "structure_ids": sorted({structure_id(f) for path in route.structure_paths
+                                            for f in _read_frames(path) if self._sampling_structure_allowed(f)}),
+                    "pressure": route.conditions["pressure"], "attempts": [], "completed": {},
+                }
+        for route_plan in plans.values():
             route_id = str(route_plan["route_id"])
             route = route_by_id.get(route_id)
             if route is None or route.fingerprint != route_plan.get(
@@ -3120,17 +3435,11 @@ class WorkflowIterationAdapter:
                     f"scenario plan route identity changed for {route_id!r}"
                 )
             previous_record = previous_routes.get(route_id)
-            previous_history = route.maturity_history(
-                previous_record, self.scenario_ladders[route_id]
+            previous_history = self._route_history(
+                route, previous_record, self.scenario_ladders[route_id]
             )
             attempt_accepted = {
-                str(attempt["attempt_id"]): (
-                    False
-                    if str(attempt["attempt_id"]) in selected_attempt_ids
-                    and str(attempt["attempt_id"])
-                    not in evaluated_attempts
-                    else evaluated_attempts.get(str(attempt["attempt_id"]))
-                )
+                attempt["attempt_id"]: evaluated_attempts.get(attempt["attempt_id"])
                 for attempt in route_plan["attempts"]
             }
             novelty_by_attempt = {}
@@ -3153,6 +3462,8 @@ class WorkflowIterationAdapter:
                 route_plan["attempts"],
                 completed=route_plan["completed"],
                 diagnostic_accepted=attempt_accepted,
+                missing_labels=missing_labels,
+                failure_steps=failure_steps,
                 history=previous_history,
                 diagnostic=diagnostic,
                 validation=validation_metrics,
@@ -3163,6 +3474,47 @@ class WorkflowIterationAdapter:
                 novelty_converged_by_attempt=novelty_by_attempt,
                 final_model_id=final_model_id,
             )
+            rows = {}
+            for a in route_plan["attempts"]:
+                aid = a["attempt_id"]
+                md = md_rows.get(aid, {})
+                health = md.get("health") or {}
+                halt = health.get("halt") or {}
+                codes = health.get("hard_reason_codes") or []
+                if not codes and health.get("process_completed"):
+                    codes = list(health.get("reason_codes", []))
+                    if "max_spin_magnitude_above_limit" in codes:
+                        codes.extend(sorted({f"spin:{v['element']}:{v['bound']}"
+                                             for v in health.get("first_bad_spin_violations", [])}))
+                signature = str(halt.get("reason_code") or ",".join(sorted(codes)))
+                step = failure_steps.get(aid)
+                if step is None and codes:
+                    step = health.get("first_bad_step")
+                row = {
+                    "generation": context.generation, "replica": a["replica"], "attempt_id": aid,
+                    "model_sha256": a["model_id"], "model_updated": model_improved, "steps": a["steps"],
+                    "completed": route_plan["completed"][aid], "signature": signature,
+                    "health_hash": health_hash,
+                    "timestep_ps": md.get("timestep_ps"), "dump_interval": md.get("dump_interval"),
+                    "bad_step": step, "before": diagnostic.get("pre_failure", {}).get(aid, {}),
+                    "selected_pre_failure": selection.get("selected_pre_failure_counts", {}).get(aid, 0),
+                    "novel": aid in novel_attempts and aid in diagnostic.get("pre_failure", {}),
+                    "label_artifact": f"generations/{context.generation:04d}/label/selected-labels.xyz",
+                    "trajectory": (f"generations/{context.generation:04d}/explore/calculations/"
+                                   f"{md['source_id']}/trajectory.xyz" if md.get("source_id") else None),
+                }
+                rows.setdefault(a["scenario_id"], []).append(row)
+                evidence = route_history["scenarios"][a["scenario_id"]]["evidence"]
+                entry = next(item for item in reversed(evidence) if item["attempt_id"] == aid)
+                if row["dump_interval"]:
+                    entry["dump_interval"] = row["dump_interval"]
+                if step is not None:
+                    entry["failure_step"] = step
+            for sid, record in route_history["scenarios"].items():
+                if sid in rows:
+                    observe(record, rows[sid], pairs, limits)
+                elif pairs:
+                    record_paired_fit(record, pairs, final_model_id)
             production_status = ladder.production_status(
                 route_plan["structure_ids"],
                 route_id=route_id,
@@ -3177,6 +3529,11 @@ class WorkflowIterationAdapter:
                     else None
                 ),
             )
+            remaining = route_plan["structure_ids"] and ladder.schedule(
+                route_plan["structure_ids"], route_id=route_id, route_fingerprint=route.fingerprint,
+                template_sha256=route.template_sha256, pressure=route_plan["pressure"],
+                generation=context.generation + 1, seed=context.plan.seed, limit=1,
+                model_id="next-generation", history=route_history)
             ready = bool(production_status["ready"])
             all_ready = all_ready and ready
             for level, count in route_history["counts_by_maturity"].items():
@@ -3189,6 +3546,7 @@ class WorkflowIterationAdapter:
                 "maturity_fingerprint": route.maturity_fingerprint,
                 "production_ready": ready,
                 "production_status": production_status,
+                "has_available_attempts": bool(remaining),
                 "history": route_history,
             }
         return (

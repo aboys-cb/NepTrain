@@ -310,6 +310,7 @@ class PersistentController:
                 "current": None,
             },
         )
+        self.config["_diagnosis_releases"] = self.state.get("diagnosis_releases", {})
         if self.state.get("workflow_id") != self.workflow_id:
             raise ControllerError("controller state belongs to a different workflow")
 
@@ -442,6 +443,15 @@ class PersistentController:
                     self.state["current"] = None
                     self._save()
                     return None
+                update = record.get("stages", {}).get("update", {}).get("metrics", {})
+                if update.get("diagnosis_required") and plan.generation == max(map(int, ledger["generations"])):
+                    released = self.state.get("diagnosis_releases", {})
+                    paused = update["paused_scenarios"]
+                    if all(released.get(sid, -1) < item["paused_generation"] for sid, item in paused.items()):
+                        self.state.update(state="diagnosis_required", current=None,
+                            reason="Open production conditions require diagnosis: " + ", ".join(paused))
+                        self._save()
+                        return None
                 if evaluate.get("workflow_stalled") is True:
                     self.state["state"] = "stalled"
                     self.state["reason"] = (
@@ -453,6 +463,15 @@ class PersistentController:
                     return None
                 continue
             stage, context = self.generation_controller.stage_context(plan)
+            train = record.get("stages", {}).get("train", {}).get("metrics", {})
+            if stage == "explore" and train.get("activation_diagnosis"):
+                self.state.update(
+                    state="diagnosis_required", current=None,
+                    activation_diagnosis_generation=plan.generation,
+                    reason=f"G{plan.generation}: {train['activation_diagnosis']} Inspect train/model-evaluation.json.",
+                )
+                self._save()
+                return None
             return plan, stage, context
         self.state["state"] = "budget_exhausted"
         self.state["reason"] = (
@@ -2121,6 +2140,7 @@ class PersistentController:
         self.state["state"] = "idle"
         self.state.pop("reason", None)
         self.state.pop("preserve_current_on_retry", None)
+        self.state.pop("activation_diagnosis_generation", None)
         self._save()
         return plan
 
@@ -2442,7 +2462,7 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         if failures >= MAX_INTERNAL_FAILURES:
                             raise
                     if not startup_reported and tick.state not in {
-                        "complete", "rejected", "failed", "stalled", "budget_exhausted", "coverage_exhausted",
+                        "complete", "rejected", "failed", "stalled", "budget_exhausted", "coverage_exhausted", "diagnosis_required",
                     }:
                         report_controller_event(start_kind, start_context.get("detail", ""))
                         startup_reported = True
@@ -2453,7 +2473,7 @@ def run_controller(project: str | Path, *, poll_interval: float | None = None) -
                         "failed",
                         "stalled",
                         "budget_exhausted",
-                        "coverage_exhausted",
+                        "coverage_exhausted", "diagnosis_required",
                     }:
                         return 0 if tick.state == "complete" else 2
                     stop_event.wait(interval)
@@ -2584,7 +2604,7 @@ def start_controller(
                     "stalled",
                     "rejected",
                     "budget_exhausted",
-                    "coverage_exhausted",
+                    "coverage_exhausted", "diagnosis_required",
                     "complete",
                     "stopped",
                 }
@@ -2727,7 +2747,7 @@ def stop_workflow(
             "rejected",
             "stalled",
             "budget_exhausted",
-            "coverage_exhausted",
+            "coverage_exhausted", "diagnosis_required",
         }
         if prior_current is None and prior_name in no_op_states:
             result["current_execution"] = {

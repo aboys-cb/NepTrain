@@ -47,7 +47,8 @@ ACTIVE_LEARNING_ACQUISITION_STAGES = (
     "evaluate",
     "update",
 )
-ACTIVE_LEARNING_FINALIZATION_STAGES = ("train",)
+TRAIN_ONLY_FINALIZATION_STAGES = ("train",)  # Previously committed v4 generations
+ACTIVE_LEARNING_FINALIZATION_STAGES = ("train", "explore")
 
 _KIND_SEQUENCES = {
     "legacy": (LEGACY_STAGES,),
@@ -59,6 +60,7 @@ _KIND_SEQUENCES = {
     "finalization": (
         FINALIZATION_STAGES,
         ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
+        TRAIN_ONLY_FINALIZATION_STAGES,
         ACTIVE_LEARNING_FINALIZATION_STAGES,
     ),
 }
@@ -87,6 +89,7 @@ def stage_implementation(
         ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
         ACTIVE_LEARNING_ACQUISITION_STAGES,
         ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
+        TRAIN_ONLY_FINALIZATION_STAGES,
         ACTIVE_LEARNING_FINALIZATION_STAGES,
     }:
         return {
@@ -101,10 +104,13 @@ def stage_for_role(record: Mapping[str, Any], role: str) -> str | None:
     """Resolve one semantic role to the persisted stage name."""
 
     sequence = generation_stage_sequence(record)
+    if sequence == ACTIVE_LEARNING_FINALIZATION_STAGES and role == "validate":
+        return "explore"
     if sequence in {
         ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
         ACTIVE_LEARNING_ACQUISITION_STAGES,
         ACTIVE_LEARNING_V3_FINALIZATION_STAGES,
+        TRAIN_ONLY_FINALIZATION_STAGES,
         ACTIVE_LEARNING_FINALIZATION_STAGES,
     }:
         candidate = (
@@ -113,7 +119,7 @@ def stage_for_role(record: Mapping[str, Any], role: str) -> str | None:
             and sequence
             in {
                 ACTIVE_LEARNING_ACQUISITION_STAGES,
-                ACTIVE_LEARNING_FINALIZATION_STAGES,
+                TRAIN_ONLY_FINALIZATION_STAGES,
             }
             else role
         )
@@ -201,6 +207,7 @@ __all__ = [
     "ACQUISITION_STAGES",
     "ACTIVE_LEARNING_ACQUISITION_STAGES",
     "ACTIVE_LEARNING_FINALIZATION_STAGES",
+    "TRAIN_ONLY_FINALIZATION_STAGES",
     "ACTIVE_LEARNING_GENERATION_PROTOCOL",
     "ACTIVE_LEARNING_V3_PROTOCOL",
     "ACTIVE_LEARNING_V3_ACQUISITION_STAGES",

@@ -13,7 +13,7 @@ from NepTrain.core.md import MdResult
 from NepTrain.core.sampling_route import load_sampling_routes
 from NepTrain.core.scenario import ScenarioLadder, ScenarioMaturityError
 from NepTrain.core.scientific_data import structure_id
-from NepTrain.core.workflow_iteration import WorkflowIterationAdapter, WorkflowRuntime
+from NepTrain.core.workflow_iteration import WorkflowIterationAdapter, WorkflowRuntime, _previous_routes
 
 
 TEMPLATE = """units metal
@@ -220,7 +220,8 @@ def test_workflow_planning_explore_and_update_keep_temperature_frontier(route_co
         previous = {'scenario_maturity': history_path}
 
 
-def test_selected_frame_without_label_is_not_treated_as_no_new_sample(route_config, tmp_path):
+@pytest.mark.parametrize('portable', [False, True])
+def test_selected_frame_without_label_is_not_treated_as_no_new_sample(route_config, tmp_path, portable):
     route_config['routes'][0]['conditions']['temperature_path'] = [50]
     initial = Path(route_config['routes'][0]['structures'][0])
     config = {'training': {'backend': 'gpumd'}, 'md': {'backend': 'lammps'},
@@ -253,11 +254,17 @@ def test_selected_frame_without_label_is_not_treated_as_no_new_sample(route_conf
         'remaining_novelty_by_condition': {'R=npt|T=50|P=0': 0},
         'resolved_completion_coverage_threshold': 1,
     }))
+    artifacts = {'scenario_plan': scenario_plan, 'selection_result': selection}
+    if portable:
+        policy = json.loads(selection.read_text())
+        policy['selected_attempt_ids'] = [attempt.attempt_id]
+        selection.write_text(json.dumps(policy))
+    else:
+        artifacts['selected_input'] = selected
     context = StageContext(
         generation=1, generation_dir=tmp_path,
         plan=GenerationPlan(1, 1, 4),
-        artifacts={'scenario_plan': scenario_plan, 'selection_result': selection,
-                   'selected_input': selected},
+        artifacts=artifacts,
         previous_artifacts={}, stage_dir=tmp_path / 'update',
     )
     result, _ = adapter._record_route_histories(
@@ -268,4 +275,167 @@ def test_selected_frame_without_label_is_not_treated_as_no_new_sample(route_conf
     )
     record = next(iter(result['routes']['npt']['history']['scenarios'].values()))
     assert record['maturity'] == 'untested'
-    assert record['evidence'][-1]['accepted'] is False
+    assert record['evidence'][-1]['accepted'] is None
+    assert record['evidence'][-1]['deferred_reason'] == 'missing_labels'
+
+def test_legacy_failure_location_recovered_by_attempt_identity(tmp_path):
+    previous = tmp_path / 'maturity.json'
+    md = tmp_path / 'md-attempts.json'
+    evidence = [{'attempt_id': 'a'}, {'attempt_id': 'b'}, {'attempt_id': 'c'}]
+    previous.write_text(json.dumps({'version': 3, 'routes': {'r': {'history': {
+        'scenarios': {'s': {'evidence': evidence}},
+    }}}}))
+    md.write_text(json.dumps({'attempts': [
+        {'scenario_attempt_id': 'b', 'completed': False, 'last_step': 300,
+         'health': {'first_hard_bad_step': 240}},
+        {'scenario_attempt_id': 'a', 'completed': False, 'last_step': 100,
+         'health': {'halt': {'step': 123}}},
+        {'scenario_attempt_id': 'c', 'completed': False, 'last_step': 80},
+    ]}))
+    routes = _previous_routes({'scenario_maturity': previous, 'md_attempts': md})
+    patched = routes['r']['history']['scenarios']['s']['evidence']
+    assert [item.get('failure_step') for item in patched] == [123, 240, None]
+    assert 'failure_step' not in previous.read_text()
+
+
+def test_scoped_pause_survives_idle_route_and_explicit_release(route_config, tmp_path):
+    from NepTrain.core.scenario_diagnosis import health_policy_hash
+    config = {"training": {}, "labeling": {}, "md": {}, "sampling": route_config}
+    initial = Path(route_config["routes"][0]["structures"][0])
+    adapter = WorkflowIterationAdapter(config, initial_training=initial)
+    route = adapter.routes[0]
+    ladder = adapter.scenario_ladders[route.route_id]
+    opts = dict(route_id=route.route_id, route_fingerprint=route.fingerprint,
+                template_sha256=route.template_sha256, pressure=0, seed=1, limit=10)
+    attempts = ladder.schedule(["a", "b"], model_id="m1", generation=1, **opts)
+    hist = ladder.record(attempts, completed={a.attempt_id: True for a in attempts},
+                         diagnostic_accepted={a.attempt_id: True for a in attempts},
+                         validation_accepted=None, model_improved=True, novelty_converged=True,
+                         final_model_id="m1")
+    sid = attempts[0].scenario_id
+    paused = hist["scenarios"][sid]
+    paused["diagnosis"] = {"status": "paused_for_diagnosis", "paused_generation": 1,
+                           "observations": [], "reason": "repeated_failure_signature",
+                           "baseline": {"health_hash": health_policy_hash(config)}}
+    prior = {"route_fingerprint": route.fingerprint, "history": hist}
+    def available():
+        return ladder.schedule(["a", "b"], model_id="m2", generation=2,
+                               history=adapter._route_history(route, prior, ladder), **opts)
+    assert {a.structure_id for a in available()} == {"a", "b"} - {paused["structure_id"]}
+    assert not ladder.production_ready(["a", "b"], route_id=route.route_id,
+                                       route_fingerprint=route.fingerprint, pressure=0,
+                                       model_id="m2", history=hist)
+    adapter.config["_diagnosis_releases"] = {sid: 1}
+    assert {a.structure_id for a in available()} == {"a", "b"}
+    assert paused["maturity"] == "smoke_passed"
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_final_model_canaries_merge_each_worker_and_bind_the_model(route_config, tmp_path, fail):
+    from dataclasses import replace
+    from NepTrain.core.generation_policy import ACTIVE_LEARNING_FINALIZATION_STAGES
+    from NepTrain.core.workflow_iteration import WorkflowIterationError
+    initial = Path(route_config["routes"][0]["structures"][0])
+    config = {"training": {}, "labeling": {}, "md": {}, "sampling": route_config}
+    def md(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        ase_write(request.output_file, request.atoms)
+        return MdResult(backend, request.output_file, request.output_dir, "cpu",
+                        completed=not (fail and request.temperature == 100), last_step=request.steps)
+    adapter = WorkflowIterationAdapter(config, initial_training=initial, runtime=WorkflowRuntime(md=md))
+    context = StageContext(generation=5, generation_dir=tmp_path, plan=GenerationPlan(5, 31, 4),
+                           generation_kind="finalization", stage_sequence=ACTIVE_LEARNING_FINALIZATION_STAGES,
+                           artifacts={"model": initial}, previous_artifacts={})
+    specs = adapter.plan_explore_attempts(context)
+    assert {(s["temperature"], s["steps"]) for s in specs} == {(50, 40), (100, 40)}
+    outcomes = [adapter.run_stage("explore", replace(context, stage_dir=tmp_path / s["attempt_id"],
+                stage_input={"attempt_ids": [s["attempt_id"]], "allow_empty": True})) for s in specs]
+    with pytest.raises(WorkflowIterationError, match="incomplete"):
+        adapter.merge_explore_outcomes(context, outcomes[:1])
+    route = adapter.routes[0]
+    ladder = adapter.scenario_ladders[route.route_id]
+    history = ladder.empty_history()
+    for outcome in outcomes:
+        attempt = json.loads(outcome.artifacts["md_attempts"].read_text())["attempts"][0]
+        sid = attempt["scenario_id"]
+        # A later failed probe cannot erase the earlier certified batch.
+        evidence = [{"generation": g, "model_id": "old-model", "target_level": "production_ready",
+                     "steps": 640, "accepted": g == 1}
+                    for g in ((1, 1, 2) if attempt["temperature"] == 100 else (1,))]
+        history["scenarios"][sid] = {"scenario_id": sid, "maturity": "long_stable",
+            "temperature": attempt["temperature"], "evidence": evidence}
+    maturity = tmp_path / "maturity.json"
+    maturity.write_text(json.dumps({"version": 3, "routes": {route.route_id: {
+        "route_fingerprint": route.fingerprint, "history": history,
+        "production_status": {"minimum_successful_replicas": 2}}}}))
+    merged = adapter.merge_explore_outcomes(replace(context, previous_artifacts={"scenario_maturity": maturity}), outcomes)
+    assert merged.metrics["workflow_converged"] is (not fail)
+    checks = {c["temperature"]: c for c in merged.metrics["final_model_checks"]}
+    assert checks[100]["historical_model_sha256"] == "old-model"
+    assert (checks[100]["historical_steps"], checks[100]["historical_replicas"]) == (640, 2)
+    assert checks[50]["historical_model_sha256"] is None and checks[50]["historical_replicas"] == 1
+    assert checks[100]["trajectory"].startswith("generations/0005/explore/calculations/")
+    report = merged.artifacts["final_check_report"].read_text()
+    assert checks[100]["trajectory"] in report and "640 steps × 2" in report
+    assert set(merged.artifacts) == {"signals", "scenario_plan", "md_attempts", "final_check_report"}
+
+
+def test_update_pauses_one_route_keeps_other_route_running_then_reports_diagnosis(route_config, tmp_path):
+    from NepTrain.core.generation_policy import ACTIVE_LEARNING_ACQUISITION_STAGES
+    from NepTrain.core.dft.toy import ToyTeacher
+    from dataclasses import replace
+
+    other = copy.deepcopy(route_config["routes"][0])
+    other["id"] = "healthy"
+    route_config["routes"].append(other)
+    initial = Path(other["structures"][0])
+    training = tmp_path / "train.xyz"
+    ase_write(training, ToyTeacher("ordinary").label(ase_read(initial)))
+    def md(request, backend):
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        failed = request.route_id == "npt"
+        frames = [request.atoms.copy() for _ in range(3)]
+        for i, f in enumerate(frames):
+            f.info.update(md_step=i, md_window="stable_prefix")
+        ase_write(request.output_file, frames)
+        health = request.output_dir / "trajectory-health.json"
+        health.write_text(json.dumps({"halt": {"step": 2, "reason_code": "volume_ratio_above_max"}} if failed else {}))
+        return MdResult(backend, request.output_file, request.output_dir, "cpu",
+                        completed=not failed, health_report=health, last_step=2 if failed else request.steps)
+    adapter = WorkflowIterationAdapter({"md": {}, "sampling": route_config, "training": {}, "labeling": {}},
+                                       initial_training=training, runtime=WorkflowRuntime(md=md))
+    previous = {}
+    for g in range(1, 12):
+        work = tmp_path / f"g{g}"
+        work.mkdir()
+        model = work / "model"
+        model.write_text(f"model {g}")
+        ctx = StageContext(generation=g, generation_dir=work, plan=GenerationPlan(g, 11, 4),
+                           artifacts={"model": model}, previous_artifacts=previous, generation_kind="acquisition",
+                           stage_sequence=ACTIVE_LEARNING_ACQUISITION_STAGES)
+        specs = adapter.plan_explore_attempts(ctx)
+        if g > 3:
+            assert all(s["route_id"] == "healthy" for s in specs)
+        outcomes = [adapter.run_stage("explore", replace(ctx, stage_dir=work / s["attempt_id"],
+                    stage_input={"attempt_ids": [s["attempt_id"]], "allow_empty": True})) for s in specs]
+        explore = adapter.merge_explore_outcomes(ctx, outcomes)
+        empty = work / "labels.xyz"
+        empty.touch()
+        diagnostic = work / "diagnostic.json"
+        diagnostic.write_text(json.dumps({"attempt_accepted": {s["attempt_id"]: True for s in specs}}))
+        simple = work / "empty.json"
+        simple.write_text("{}")
+        update = adapter.run_stage("update", replace(ctx, artifacts={**ctx.artifacts, **explore.artifacts,
+            "training_input": training, "labeled": empty, "model_evaluation": simple,
+            "acquisition_signals": diagnostic, "selection_result": simple}))
+        previous = update.artifacts
+        if g >= 3:
+            assert len(update.metrics["paused_scenarios"]) == 1
+            assert not update.metrics["production_ready"]
+            paused = next(iter(update.metrics["paused_scenarios"].values()))
+            assert paused["route"] == "npt" and paused["baseline"]["bad_step"] == 2
+        if update.metrics["diagnosis_required"]:
+            assert g > 3
+            break
+    else:
+        pytest.fail("workflow still runnable after the healthy route completed")

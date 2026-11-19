@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -1217,6 +1217,10 @@ def _generation_science(
     retrain = metrics("retrain")
     evaluate = metrics(validate_stage or "evaluate")
 
+    if validate_stage == "explore":
+        evaluate = {**train, **evaluate}
+        # Completion requires a committed final-model MD wave.
+        evaluate["workflow_converged"] = explore.get("workflow_converged", False)
     if record is None:
         state = "not_started"
     elif record.get("complete") and record.get("accepted") is True:
@@ -1345,6 +1349,8 @@ def _generation_science(
             "validation_independent": evaluate.get("validation_independent"),
             "validation_warnings": list(evaluate.get("validation_warnings", [])),
             "convergence_reasons": list(decision.get("convergence_reasons", [])),
+            "paused_scenarios": decision.get("paused_scenarios", {}),
+            "final_model_checks": decision.get("final_model_checks", []),
             "production_ready": decision.get("production_ready"),
             "workflow_converged": decision.get("workflow_converged"),
             "finalization_pending": decision.get("finalization_pending"),
@@ -2101,6 +2107,14 @@ def workflow_status(output_dir: str | Path) -> WorkflowStatus:
             f"neptrain workflow extend {workflow_path} "
             f"{int(manifest.get('sampling_generation_budget', len(preparation.plans))) + 1}"
         )
+    elif controller_state == "diagnosis_required":
+        state = "diagnosis_required"
+        reason = str(controller.get("reason", "A production condition requires diagnosis"))
+        next_action = (
+            f"Review model-evaluation.json, revise training settings, then run neptrain workflow resume {workflow_path}"
+            if controller.get("activation_diagnosis_generation") else
+            f"neptrain workflow resume {workflow_path} --release-scenario SCENARIO_ID"
+        )
     elif controller_state == "coverage_exhausted":
         state = "coverage_exhausted"
         reason = str(
@@ -2326,9 +2340,35 @@ def _repair_damaged_workflow(preparation: WorkflowPreparation) -> tuple[str, ...
     return tuple(repaired)
 
 
+def _release_paused_scenarios(controller, requested):
+    from .sampling_route import load_sampling_routes
+    from .scenario_diagnosis import health_policy_hash
+
+    if controller.state.get("current"):
+        raise WorkflowError("Release scenarios only at a stopped boundary without an active job")
+    ledger = controller._ledger().get("generations", {})
+    updates = [r["stages"]["update"]["metrics"] for _, r in sorted(
+        ledger.items(), key=lambda pair: int(pair[0])) if "update" in r.get("stages", {})]
+    paused = updates[-1].get("paused_scenarios", {}) if updates else {}
+    unknown = set(requested) - paused.keys()
+    if unknown:
+        raise WorkflowError("Unknown paused scenario: " + ", ".join(sorted(unknown)))
+    routes = {route.route_id: route for route in load_sampling_routes(
+        controller.config["sampling"], base_dir=controller.workspace.root)}
+    health = health_policy_hash(controller.config)
+    releases = controller.state.setdefault("diagnosis_releases", {})
+    for sid, item in paused.items():
+        route = routes.get(item["route"])
+        if (sid in requested or item["baseline"]["health_hash"] != health
+                or route is None or item.get("maturity_fingerprint") != route.maturity_fingerprint):
+            releases[sid] = item["paused_generation"]
+    return any(releases.get(sid, -1) >= item["paused_generation"] for sid, item in paused.items())
+
+
 def resume_workflow(
     output_dir: str | Path,
     *,
+    release_scenarios: tuple[str, ...] = (),
     foreground: bool = False,
     poll_interval: float | None = None,
 ) -> WorkflowResume:
@@ -2344,6 +2384,8 @@ def resume_workflow(
 
     status = workflow_status(output)
     if status.state == "complete":
+        if release_scenarios:
+            raise WorkflowError("The completed workflow has no paused scenario to release")
         return WorkflowResume(
             preparation.workflow_id,
             "complete",
@@ -2395,31 +2437,55 @@ def resume_workflow(
                 "repair",
                 preparation.manifest,
             )
-    controller = PersistentController(output)
-    recovery = controller.state.get("state") in {"running", "launching", "waiting", "degraded"} or (
-        "external signal" in str(controller.state.get("reason", ""))
-    )
-    retained_execution = bool(controller.state.get("preserve_current_on_retry"))
-    action = "resume"
-    if status.state == "failed":
-        controller.retry()
-        action = "retry"
-    elif status.state == "rejected":
-        controller.retry(recover_rejected=True)
-        action = "recover_rejected"
-    elif status.state == "paused":
-        controller.resume_stopped()
+    with ExitStack() as locks:
+        diagnosing = bool(release_scenarios or status.state == "diagnosis_required")
+        if diagnosing:
+            locks.enter_context(_workflow_lock(output))
+            lock = locks.enter_context(WorkflowWorkspace.locate(output).controller_lock.open("a+"))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise WorkflowError("workflow is already running") from error
+        controller = PersistentController(output)
+        blocked_generation = controller.state.get("activation_diagnosis_generation") if diagnosing else None
+        if blocked_generation:
+            from .workflow_iteration import WorkflowIterationAdapter
+            if release_scenarios:
+                raise WorkflowError("This diagnosis concerns model training. Review the paired prediction checks.")
+            adapter = WorkflowIterationAdapter(controller.config, base_dir=output, initial_training=None,
+                                               active_stage="train", active_generation_kind="acquisition")
+            train = controller._ledger()["generations"][str(blocked_generation)]["stages"]["train"]["metrics"]
+            if adapter.training_settings_hash() == train["attempted_training_settings_sha256"]:
+                return WorkflowResume(preparation.workflow_id, "diagnosis_required", preparation.manifest,
+                                      config_changes=config_changes)
+            controller.restart_from(generation=blocked_generation, from_stage="train", task_scope="all")
+        elif diagnosing and not _release_paused_scenarios(controller, release_scenarios):
+            return WorkflowResume(preparation.workflow_id, "diagnosis_required", preparation.manifest,
+                                  config_changes=config_changes)
+        recovery = controller.state.get("state") in {"running", "launching", "waiting", "degraded"} or (
+            "external signal" in str(controller.state.get("reason", ""))
+        )
+        retained_execution = bool(controller.state.get("preserve_current_on_retry"))
         action = "resume"
-    controller.state["notification_start"] = {
-        "kind": "recovered" if recovery else "resumed",
-        "detail": (
-            "The controller will recheck retained jobs and results before continuing."
-            if retained_execution else
-            "Failed tasks will be retried; completed results are retained."
-            if action in {"retry", "recover_rejected"} else ""
-        ),
-    }
-    controller._save()
+        if status.state == "failed":
+            controller.retry()
+            action = "retry"
+        elif status.state == "rejected":
+            controller.retry(recover_rejected=True)
+            action = "recover_rejected"
+        elif status.state == "paused":
+            controller.resume_stopped()
+            action = "resume"
+        controller.state["notification_start"] = {
+            "kind": "recovered" if recovery else "resumed",
+            "detail": (
+                "The controller will recheck retained jobs and results before continuing."
+                if retained_execution else
+                "Failed tasks will be retried; completed results are retained."
+                if action in {"retry", "recover_rejected"} else ""
+            ),
+        }
+        controller._save()
     try:
         controller_result = start_controller(
             output,

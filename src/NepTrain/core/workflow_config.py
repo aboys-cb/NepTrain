@@ -176,7 +176,7 @@ def _sampling_policy_boundary(project: Path) -> bool:
     state = project.parent / ".neptrain"
     try:
         controller = json.loads((state / "controller.json").read_text())
-        if controller.get("state") != "stopped":
+        if controller.get("state") not in {"stopped", "diagnosis_required"}:
             return False
         records = json.loads((state / "ledger.json").read_text())["generations"]
         if not records:
@@ -335,6 +335,10 @@ def inspect_config(
         scope = _scope(parts, old, new)
         if parts[:2] == ("workflow", "convergence") and convergence_boundary:
             scope = "next accuracy evaluation; prior results retained"
+        if sampling_boundary and parts in {
+            ("training", "restart_steps"), ("training", "finetune_lr"), ("training", "finetune_lr_scale")
+        }:
+            scope = "next newly packaged training job; existing checkpoints and jobs retained"
         if (len(parts) == 4 and parts[:2] == ("sampling", "routes")
                 and parts[3] == "template_path" and sampling_boundary):
             scope = "future sampling only; existing training and labels retained"

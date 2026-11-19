@@ -16,6 +16,7 @@ from .scientific_data import optional_dataset_issue
 from .generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
     ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
+    ACTIVE_LEARNING_FINALIZATION_STAGES,
     generation_stage_sequence,
     stage_for_role,
 )
@@ -42,6 +43,25 @@ _PUBLICATION_FILENAMES = (
     "summary.json",
     "summary.md",
 )
+
+
+def final_check_lines(checks):
+    lines = []
+    for check in checks:
+        history = check.get("historical_model_sha256")
+        proof = "no recorded production certificate"
+        if history:
+            proof = f"{history}, {check['historical_steps']} steps × {check['historical_replicas']} replicas"
+        elif check.get("historical_required_replicas"):
+            proof += f" ({check['historical_replicas']}/{check['historical_required_replicas']} replicas)"
+        outcome = "passed" if check["completed"] else f"failed ({check.get('failure_reason') or 'see MD logs'})"
+        lines.append(f"- {check['route_id']} / {check.get('structure_hash', '?')} / {check['temperature']:g} K / "
+                     f"P={check.get('pressure')}. Historical: {proof}. "
+                     f"Final: {check['requested_steps']} steps, {outcome}.")
+        path = check.get("trajectory") or check.get("calculation_dir")
+        if path:
+            lines.append(f"  - {'Trajectory' if check.get('trajectory') else 'Calculation directory'}: `{path}`")
+    return lines
 
 
 def _copy_file(source: Path, target: Path) -> None:
@@ -246,6 +266,7 @@ class WorkflowWorkspace:
             and stage_sequence in {
                 ACTIVE_LEARNING_ACQUISITION_STAGES,
                 ACTIVE_LEARNING_V3_ACQUISITION_STAGES,
+                ACTIVE_LEARNING_FINALIZATION_STAGES,
             }
         ):
             relative = "explore"
@@ -362,6 +383,8 @@ class WorkflowWorkspace:
         metrics = summary["metrics"]
         validation_stage = stage_for_role(record, "validate")
         evaluation = metrics.get(validation_stage or "evaluate", {})
+        if validation_stage == "explore":
+            evaluation = {**metrics.get("train", {}), **evaluation}
         acquisition_stage = stage_for_role(record, "evaluate")
         acquisition = metrics.get(acquisition_stage, {})
         update_stage = stage_for_role(record, "update")
@@ -383,6 +406,27 @@ class WorkflowWorkspace:
             f"- Latest completed generation: {generation}",
             f"- Convergence: {state}",
         ]
+        diagnosis_actions = {
+            "low_pre_failure_errors": "Inspect the trajectory, integrator and health limits.",
+            "novel_pre_failure_budget_exhausted": "Review coverage and the selection quota for new pre-failure frames.",
+            "poor_fit_on_same_frames": "Inspect training weights and DFT label consistency.",
+            "repeated_failure_signature": "Inspect the failure window and available labels.",
+        }
+        for sid, paused in decision.get("paused_scenarios", {}).items():
+            lines.append(f"- Paused for diagnosis: {sid}, {paused['route']}, {paused['temperature']:g} K, "
+                         f"P={paused['pressure']:g}, structure {paused['structure']}, {paused['reason']}. "
+                         f"{diagnosis_actions.get(paused['reason'], '')}")
+            for row in paused["observations"]:
+                lines.append(f"  - G{row['generation']}, step {row['bad_step']}, {row['signature']}, "
+                             f"selected {row['selected_pre_failure']}, labeled {row['before'].get('count', 0)}, "
+                             f"before {row['before'].get('metrics', {})}, paired {row.get('paired', {})}, "
+                             f"labels {row['label_artifact']}, trajectory {row.get('trajectory')}")
+                for replica in row.get("batch", ()):
+                    if not replica.get("completed") and "before" in replica and row["replicas"] > 1:
+                        lines.append(f"    - Replica {replica['replica']}: {replica['signature']}, "
+                                     f"step {replica['bad_step']}, before {replica['before'].get('metrics', {})}, "
+                                     f"paired {replica.get('paired', {})}, trajectory {replica.get('trajectory')}")
+        lines.extend(final_check_lines(decision.get("final_model_checks", [])))
         for reason in decision.get("convergence_reasons", []):
             lines.append(f"- Convergence note: {reason}")
         if decision.get("production_ready") is not None:
@@ -402,6 +446,8 @@ class WorkflowWorkspace:
         lines.extend(["", "## Predictions on new labels before training on them", ""])
         if record["kind"] == "finalization":
             lines.append(
+                "This generation rechecked the final model on each production condition."
+                if validation_stage == "explore" else
                 "This generation performs final training only, with no sampling. See the previous sampling generation for acceptance evidence."
             )
         else:

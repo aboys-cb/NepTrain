@@ -95,6 +95,7 @@ _STATE_LABELS = {
     "rejected": "Acceptance criteria not met",
     "stalled": "Stalled",
     "budget_exhausted": "Sampling budget exhausted",
+    "diagnosis_required": "Scenario diagnosis required",
     "coverage_exhausted": "Sampling coverage exhausted",
     "damaged": "Invalid workflow state",
 }
@@ -293,9 +294,8 @@ def _print_precision(status, *, details=False):
             and generation.get("kind") == "finalization"
             and generation["state"] != "not_started"
         ):
-            print(
-                f"G{generation['generation']} Final training: {_generation_state(generation, status)} (no sampling)"
-            )
+            checks = "short MD checks" if "explore" in generation.get("stage_sequence", ()) else "no sampling"
+            print(f"G{generation['generation']} Final training: {_generation_state(generation, status)} ({checks})")
     if not observed:
         print(
             "New structure evaluation: No predictions available yet"
@@ -515,7 +515,7 @@ def _print_current_progress(status, generation):
         return
     print(f"\nGeneration progress · G{generation}:")
     if record.get("kind") == "finalization":
-        print("Final training (no sampling)")
+        print("Final training and MD checks" if "explore" in record.get("stage_sequence", ()) else "Final training")
     else:
         completed = record.get("completed_stages", ())
         stages = ("train", "explore", "select", "label", "evaluate", "update")
@@ -775,7 +775,7 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
         "rejected",
         "stalled",
         "budget_exhausted",
-        "coverage_exhausted",
+        "coverage_exhausted", "diagnosis_required",
         "damaged",
     }:
         print(f"Reason: {status.reason}")
@@ -804,6 +804,11 @@ def _print_workflow_status(status, *, show_jobs: bool = True, details: bool = Fa
         visible_generations if details else visible_generations[-1:]
     ):
         quality = generation_record["quality"]
+        checks = quality.get("final_model_checks", ())
+        if checks:
+            from NepTrain.core.workflow_workspace import final_check_lines
+            for line in final_check_lines([c for c in checks if details or not c.get("completed")]):
+                print(line)
         test_metrics = quality.get("validation_rmse", {})
         if (
             details
@@ -1126,7 +1131,8 @@ def run_resume_command(args):
     from NepTrain.core.workflow import WorkflowError, resume_workflow
 
     try:
-        result = resume_workflow(args.project)
+        scenarios = tuple(getattr(args, "release_scenario", ()))
+        result = resume_workflow(args.project, release_scenarios=scenarios) if scenarios else resume_workflow(args.project)
     except WorkflowError as error:
         raise SystemExit(f"NepTrain: error: {error}") from error
     payload = _workflow_resume_payload(result)
@@ -2700,6 +2706,8 @@ def build_workflow_commands(subparsers):
     )
     resume.set_defaults(func=run_resume_command)
     resume.add_argument("--json", action="store_true", help="Output machine-readable JSON.")
+    resume.add_argument("--release-scenario", action="append", default=[], metavar="ID",
+                        help="Release this paused scenario after diagnosis (repeatable).")
     resume.add_argument("project")
 
     restart = actions.add_parser(

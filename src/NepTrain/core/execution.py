@@ -31,6 +31,7 @@ from .scientific_data import optional_dataset_issue
 from .generation_policy import (
     ACTIVE_LEARNING_ACQUISITION_STAGES,
     ACTIVE_LEARNING_FINALIZATION_STAGES,
+    TRAIN_ONLY_FINALIZATION_STAGES,
     stage_implementation,
     stage_sequence_for_kind,
 )
@@ -105,7 +106,7 @@ _STAGE_CONFIG_PATH_FIELDS = {
 }
 _STAGE_ARTIFACTS = {
     "train": (),
-    "explore": ("model",),
+    "explore": ("model", "active_model_lineage"),
     "select": (
         "candidates",
         "candidate_pool_manifest",
@@ -159,18 +160,18 @@ _STAGE_PREVIOUS_ARTIFACTS = {
         "training_set",
         "activated_model",
         "activated_checkpoint",
-        "active_model_lineage",
+        "active_model_lineage", "model_training_set", "regression_anchors", "failure_frames",
     ),
-    "explore": ("scenario_maturity",),
+    "explore": ("scenario_maturity", "md_attempts"),
     "select": (),
     "label": (),
     "diagnose": (),
     # adaptive_v2 commits acquisition history in its terminal merge stage.
     # Keep the previous frontier and convergence streak in portable bundles;
     # legacy merge ignores these small JSON artifacts.
-    "merge": ("signals", "scenario_maturity"),
+    "merge": ("signals", "scenario_maturity", "md_attempts", "regression_anchors"),
     "retrain": ("signals", "scenario_maturity"),
-    "evaluate": ("signals", "scenario_maturity"),
+    "evaluate": ("signals", "scenario_maturity", "md_attempts"),
 }
 _PORTABLE_ARTIFACT_STEMS = {
     "model": "nep",
@@ -685,7 +686,7 @@ def build_stage_task(
         stage == "train"
         and context.stage_sequence in {
             ACTIVE_LEARNING_ACQUISITION_STAGES,
-            ACTIVE_LEARNING_FINALIZATION_STAGES,
+            TRAIN_ONLY_FINALIZATION_STAGES, ACTIVE_LEARNING_FINALIZATION_STAGES,
         }
     ):
         path_fields.add("evaluation.validation_path")
@@ -773,7 +774,7 @@ def build_stage_task(
     artifact_destinations: dict[Path, str] = {}
 
     def copy_artifacts(
-        values: Mapping[str, Path], required: Sequence[str]
+        values: Mapping[str, Path], required: Sequence[str], *, previous: bool = False
     ) -> dict[str, str]:
         copied = {}
         for name in required:
@@ -786,6 +787,8 @@ def build_stage_task(
                 name,
                 name.replace("_", "-"),
             )
+            if previous and name == "md_attempts":
+                stem = "previous-md-attempts"
             destination = inputs / f"{stem}{source.suffix}"
             previous_name = artifact_destinations.get(destination)
             if previous_name is not None:
@@ -853,6 +856,7 @@ def build_stage_task(
         "previous_artifacts": copy_artifacts(
             context.previous_artifacts,
             _STAGE_PREVIOUS_ARTIFACTS[implementation_stage],
+            previous=True,
         ),
     }
     records = [

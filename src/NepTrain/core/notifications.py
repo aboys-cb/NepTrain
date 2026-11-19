@@ -31,7 +31,7 @@ _TERMINAL_STATES = {
     "failed",
     "stalled",
     "budget_exhausted",
-    "coverage_exhausted",
+    "coverage_exhausted", "diagnosis_required",
 }
 _MAX_DELIVERY_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 1.0
@@ -295,7 +295,9 @@ def _generation_event(
                 f"{_number(training.get('after_count'))} structures"
             ),
             "Result: Sampling criteria met and final training complete.",
-            "This generation ran final training and model checks only, with no MD, selection, or labeling. Optional tests do not determine convergence.",
+            (f"Short MD checks passed for {len(science['quality']['final_model_checks'])} production conditions."
+             if "explore" in record.get("stage_sequence", ()) else
+             "This generation ran final training and model checks only, with no MD, selection, or labeling."),
         ]
         model = training.get("active_model_sha256")
         if model:
@@ -389,7 +391,7 @@ def _terminal_event(
         "rejected": "❌",
         "stalled": "⚠️",
         "budget_exhausted": "⚠️",
-        "coverage_exhausted": "⚠️",
+        "coverage_exhausted": "⚠️", "diagnosis_required": "⚠️",
     }
     labels = {
         "complete": "Workflow completed",
@@ -397,7 +399,7 @@ def _terminal_event(
         "rejected": "Acceptance criteria not met",
         "stalled": "Workflow stalled",
         "budget_exhausted": "Sampling budget exhausted",
-        "coverage_exhausted": "Sampling coverage exhausted",
+        "coverage_exhausted": "Sampling coverage exhausted", "diagnosis_required": "Scenario diagnosis required",
     }
     if state == "failed" and controller_state.get("preserve_current_on_retry"):
         labels[state] = "Controller failed"
@@ -429,6 +431,11 @@ def _terminal_event(
     if state != "complete":
         advice = {
             "budget_exhausted": "Review the remaining accuracy and coverage requirements, then use neptrain workflow extend to increase the sampling budget.",
+            "diagnosis_required": (
+                "Review train/model-evaluation.json, adjust training settings, then use workflow resume."
+                if controller_state.get("activation_diagnosis_generation") else
+                "Review the paused conditions in results/summary.md, then use workflow resume --release-scenario ID."
+            ),
             "coverage_exhausted": "No sampling tasks remain, but convergence is not established. Review the sampling conditions and workflow.convergence.",
             "stalled": (
                 f"Next: neptrain workflow restart {shlex.quote(str(workflow_path))} --generation {generation} --from {stage} --tasks failed --dry-run"

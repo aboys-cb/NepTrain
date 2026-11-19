@@ -148,6 +148,12 @@ def bind_labeled_frames_to_inputs(
                 "cell, or PBC"
             )
         identifier = structure_id(source)
+        # DFT readers may return fresh Atoms objects without sampling provenance.
+        for key in ("route_id", "route_fingerprint", "scenario_id", "scenario_attempt_id",
+                    "temperature", "pressure", "md_window", "md_step", "lammps_step",
+                    "sampling_model_sha256"):
+            if key in source.info:
+                result.info[key] = source.info[key]
         result.info[INPUT_STRUCTURE_ID_KEY] = identifier
         identifiers.append(identifier)
     return identifiers

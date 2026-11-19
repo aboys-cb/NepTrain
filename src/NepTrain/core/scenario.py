@@ -6,9 +6,11 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 import hashlib
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 import numpy as np
+
+from .scenario_diagnosis import crossing_step
 
 
 MATURITY_LEVELS = (
@@ -43,6 +45,7 @@ class ScenarioAttempt:
     generation: int
     model_id: str
     seed: int
+    needs_label: bool = False
 
 
 def _scenario_id(
@@ -73,6 +76,8 @@ def _attempt_id(
     target_level: str,
     replica: int,
     model_id: str,
+    *,
+    steps: int | None = None,
 ) -> str:
     payload = json.dumps(
         {
@@ -81,6 +86,7 @@ def _attempt_id(
             "target_level": target_level,
             "replica": int(replica),
             "model_id": model_id,
+            **({"steps": steps} if steps is not None else {}),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -266,7 +272,7 @@ class ScenarioLadder:
                 raise ScenarioMaturityError("scenario maturity id is inconsistent")
             if record.get("maturity") not in MATURITY_LEVELS:
                 raise ScenarioMaturityError("scenario maturity level is invalid")
-            if not isinstance(record.get("evidence", []), list):
+            if not isinstance(record.setdefault("evidence", []), list):
                 raise ScenarioMaturityError("scenario evidence must be a list")
         self._reconcile_maturity(copied)
         return copied
@@ -321,6 +327,15 @@ class ScenarioLadder:
         """
 
         for record in state["scenarios"].values():
+            for item in record["evidence"]:
+                if (
+                    item.get("accepted") is False
+                    and item.get("md_completed") is True
+                    and "diagnostic_accepted" in item
+                    and item["diagnostic_accepted"] is None
+                    and item.get("novelty_converged") is False
+                ):
+                    item.update(accepted=None, deferred_reason="insufficient_evidence")
             levels = (
                 _TARGET_LEVELS
                 if float(record["temperature"])
@@ -405,9 +420,11 @@ class ScenarioLadder:
             for temperature in self.temperature_path[:temperature_index]
         ]
         for index, record in enumerate(preceding):
+            if record.get("diagnosis", {}).get("status") == "paused_for_diagnosis":
+                return False
             if record["maturity"] == "production_ready":
                 continue
-            if self._latest_failed(record):
+            if self._latest_failures(record):
                 return False
             if record["maturity"] != "untested":
                 continue
@@ -430,29 +447,37 @@ class ScenarioLadder:
             return None
         if current == "production_ready":
             return None
-        if self._latest_failed(record):
-            # Check a changed model cheaply at the failed temperature before
-            # repeating a longer run or advancing the temperature path.
-            return "smoke_passed"
         if current == "smoke_passed" and self._confident(record):
             return "long_stable"
         return MATURITY_LEVELS[MATURITY_LEVELS.index(current) + 1]
 
     @staticmethod
-    def _latest_failed(record: Mapping[str, Any], target: str | None = None) -> bool:
-        relevant = [
-            item
-            for item in record.get("evidence", [])
-            if target is None or item.get("target_level") == target
+    def _latest_failures(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        decided = [
+            item for item in record.get("evidence", []) if item.get("accepted") is not None
         ]
-        if not relevant:
-            return False
-        latest = max(int(item["generation"]) for item in relevant)
-        return any(
-            item.get("accepted") is False
-            for item in relevant
-            if int(item["generation"]) == latest
-        )
+        latest = max((int(item["generation"]) for item in decided), default=-1)
+        return [
+            item for item in decided
+            if int(item["generation"]) == latest and item["accepted"] is False
+        ]
+
+    def _retry(
+        self, failures: Sequence[Mapping[str, Any]], baseline: Mapping[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        smoke = self.steps["smoke_passed"]
+        # Leave one smoke interval beyond the latest fault, bounded by the original run.
+        steps = smoke
+        for item in failures:
+            duration = int(item["steps"])
+            failure_step = int(item.get("failure_step", duration))
+            desired = max(failure_step + smoke, crossing_step(failure_step, item.get("dump_interval", 0)))
+            steps = max(steps, min(duration, desired))
+        if baseline:
+            required = crossing_step(baseline["bad_step"], baseline.get("comparison_dump_interval", baseline["dump_interval"]))
+            steps = max(steps, min(baseline["original_target"], required))
+        target = next(level for level in reversed(_TARGET_LEVELS) if self.steps[level] <= steps)
+        return target, steps
 
     @staticmethod
     def _confident(record: Mapping[str, Any]) -> bool:
@@ -516,6 +541,14 @@ class ScenarioLadder:
             best = max(best, successes)
         return best
 
+    def production_proof(self, record):
+        """Best uninterrupted production replica count from a single model."""
+        models = {e["model_id"] for e in record.get("evidence", ())
+                  if e.get("target_level") == "production_ready" and e.get("model_id")}
+        best = max(((self._best_accepted_replicas(record, "production_ready", m),
+                     m == record.get("verified_model_id"), m) for m in models), default=(0, False, None))
+        return best[2], best[0]
+
     def schedule(
         self,
         structure_ids: Sequence[str],
@@ -528,6 +561,7 @@ class ScenarioLadder:
         seed: int,
         limit: int,
         model_id: str,
+        final_check: bool = False,
         history: Mapping[str, Any] | None = None,
     ) -> tuple[ScenarioAttempt, ...]:
         """Return deterministic recovery-first attempts on the unlocked frontier."""
@@ -564,15 +598,6 @@ class ScenarioLadder:
         candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         for structure_index, structure in enumerate(structures):
             for temperature_index, temperature in enumerate(self.temperature_path):
-                if not self._temperature_unlocked(
-                    scenarios,
-                    route_id,
-                    route_fingerprint,
-                    structure,
-                    temperature_index,
-                    pressure,
-                ):
-                    continue
                 identifier = _scenario_id(
                     route_id,
                     route_fingerprint,
@@ -588,27 +613,56 @@ class ScenarioLadder:
                     temperature,
                     pressure,
                 )
+                if final_check:
+                    if temperature in self.production_temperatures:
+                        target = "short_stable"
+                        candidates.append(((temperature_index, structure_index), {
+                            "scenario_id": identifier, "structure_id": structure,
+                            "temperature": temperature, "previous_level": record["maturity"],
+                            "target_level": target, "replica": 1, "steps": self.steps[target],
+                            "needs_label": False,
+                        }))
+                    continue
+                if record.get("diagnosis", {}).get("status") == "paused_for_diagnosis":
+                    continue
+                if not record["evidence"] and not self._temperature_unlocked(
+                    scenarios,
+                    route_id,
+                    route_fingerprint,
+                    structure,
+                    temperature_index,
+                    pressure,
+                ):
+                    continue
                 target = self._target(record, temperature)
                 if target is None:
                     continue
-                accepted = self._accepted_replicas(record, target, model_id)
-                retry_canary = (
-                    target == "smoke_passed"
-                    and record["maturity"] != "untested"
-                    and self._latest_failed(record)
-                )
-                needed = 1 if retry_canary else self.replicas[target] - accepted
+                failures = self._latest_failures(record)
+                steps = self.steps[target]
+                baseline = record.get("diagnosis", {}).get("baseline")
+                if failures or baseline:
+                    target, steps = self._retry(failures, baseline)
+                    needed = 1
+                else:
+                    needed = self.replicas[target] - self._accepted_replicas(
+                        record, target, model_id
+                    )
                 if needed <= 0:
                     continue
                 evidence_count = sum(
                     item.get("target_level") == target
                     for item in record.get("evidence", [])
                 )
-                retry_priority = 0 if self._latest_failed(record) else 1
+                retry_priority = 0 if failures else 1
                 base_tie = tie_rank[
                     structure_index * len(self.temperature_path)
                     + temperature_index
                 ]
+                last_generation = max((item["generation"] for item in record["evidence"]), default=0)
+                needs_label = any(
+                    item["generation"] == last_generation and item.get("accepted") is None
+                    for item in record["evidence"]
+                )
                 for offset in range(needed):
                     replica = evidence_count + offset + 1
                     candidates.append(
@@ -628,6 +682,8 @@ class ScenarioLadder:
                                 "previous_level": str(record["maturity"]),
                                 "target_level": target,
                                 "replica": replica,
+                                "steps": steps,
+                                "needs_label": needs_label,
                             },
                         )
                     )
@@ -640,6 +696,7 @@ class ScenarioLadder:
                 value["target_level"],
                 value["replica"],
                 model_id,
+                steps=value["steps"] if value["steps"] != self.steps[value["target_level"]] else None,
             )
             attempts.append(
                 ScenarioAttempt(
@@ -654,11 +711,12 @@ class ScenarioLadder:
                     pressure=float(pressure),
                     previous_level=value["previous_level"],
                     target_level=value["target_level"],
-                    steps=self.steps[value["target_level"]],
+                    steps=value["steps"],
                     replica=int(value["replica"]),
                     generation=generation,
                     model_id=model_id,
                     seed=_replica_seed(attempt_id),
+                    needs_label=value["needs_label"],
                 )
             )
         return tuple(attempts)
@@ -678,6 +736,8 @@ class ScenarioLadder:
         novelty_converged: bool,
         final_model_id: str,
         novelty_converged_by_attempt: Mapping[str, bool] | None = None,
+        missing_labels: Collection[str] = (),
+        failure_steps: Mapping[str, int] | None = None,
     ) -> dict[str, Any]:
         """Append attempt evidence and promote only trusted completed replicas."""
 
@@ -731,9 +791,11 @@ class ScenarioLadder:
                     "scenario attempt was planned from stale history"
                 )
             if attempt.steps != self.steps[attempt.target_level]:
-                raise ScenarioMaturityError(
-                    "scenario attempt steps do not match its level"
-                )
+                prior = scenarios.get(attempt.scenario_id, {})
+                failures = self._latest_failures(prior)
+                baseline = prior.get("diagnosis", {}).get("baseline")
+                if (attempt.target_level, attempt.steps) != self._retry(failures, baseline):
+                    raise ScenarioMaturityError("scenario retry steps do not match its history")
             record = scenarios.setdefault(
                 attempt.scenario_id,
                 {
@@ -764,16 +826,18 @@ class ScenarioLadder:
                 if novelty_converged_by_attempt is None
                 else novelty_converged_by_attempt[attempt.attempt_id]
             )
-            trusted = bool(
-                completed[attempt.attempt_id]
-                and (
-                    diagnostic_accepted[attempt.attempt_id] is True
-                    or (
-                        diagnostic_accepted[attempt.attempt_id] is None
-                        and has_no_new_sample
-                    )
-                )
-            )
+            diagnostic_passed = diagnostic_accepted[attempt.attempt_id]
+            deferred_reason = None
+            if not completed[attempt.attempt_id]:
+                trusted = False
+            elif attempt.attempt_id in missing_labels:
+                trusted = None
+                deferred_reason = "missing_labels"
+            elif diagnostic_passed is None and not has_no_new_sample:
+                trusted = None
+                deferred_reason = "insufficient_evidence"
+            else:
+                trusted = diagnostic_passed is not False
             record["evidence"].append(
                 {
                     "attempt_id": attempt.attempt_id,
@@ -787,10 +851,11 @@ class ScenarioLadder:
                     "target_level": attempt.target_level,
                     "steps": attempt.steps,
                     "accepted": trusted,
+                    **({"deferred_reason": deferred_reason} if deferred_reason else {}),
+                    **({"failure_step": failure_steps[attempt.attempt_id]}
+                       if failure_steps and attempt.attempt_id in failure_steps else {}),
                     "md_completed": completed[attempt.attempt_id],
-                    "diagnostic_accepted": diagnostic_accepted[
-                        attempt.attempt_id
-                    ],
+                    "diagnostic_accepted": diagnostic_passed,
                     "progression_confident": bool(
                         trusted
                         and diagnostic is not None
@@ -798,13 +863,7 @@ class ScenarioLadder:
                             attempt.attempt_id
                         ) is True
                     ),
-                    "novelty_converged": (
-                        True
-                        if novelty_converged_by_attempt is None
-                        else novelty_converged_by_attempt[
-                            attempt.attempt_id
-                        ]
-                    ),
+                    "novelty_converged": has_no_new_sample,
                     "diagnostic": _compact_metrics(
                         attempt_diagnostics.get(attempt.attempt_id, {})
                     ),
@@ -835,7 +894,11 @@ class ScenarioLadder:
                 if attempt.scenario_id == scenario_id
             )
             accepted = self._accepted_replicas(record, target, model_id)
-            if accepted < self.replicas[target]:
+            batch_passed = any(
+                item["accepted"] is True and item["attempt_id"] in attempt_ids
+                for item in record["evidence"]
+            )
+            if not batch_passed or accepted < self.replicas[target]:
                 continue
             if target != "production_ready":
                 canary_changed = record.get("canary_model_id") != model_id
@@ -939,20 +1002,7 @@ class ScenarioLadder:
                     temperature,
                     pressure,
                 )
-                models = {
-                    str(item["model_id"])
-                    for item in record.get("evidence", [])
-                    if item.get("target_level") == "production_ready"
-                    and item.get("model_id")
-                }
-                models.add(model_id)
-                successes = max(
-                    (
-                        self._best_accepted_replicas(record, "production_ready", candidate)
-                        for candidate in models
-                    ),
-                    default=0,
-                )
+                _, successes = self.production_proof(record)
                 verified += int(successes >= required_successes)
             total = len(structures)
             fraction = float(verified / total) if total else 0.0
@@ -964,8 +1014,10 @@ class ScenarioLadder:
             }
         total = len(structures) * len(self.production_temperatures)
         coverage = float(verified_total / total) if total else 0.0
+        paused = [sid for sid, r in scenarios.items()
+                  if r.get("diagnosis", {}).get("status") == "paused_for_diagnosis"]
         ready = bool(
-            total
+            not paused and total
             and coverage >= float(min_coverage)
             and all(
                 item["coverage"] >= float(min_coverage)
@@ -974,6 +1026,7 @@ class ScenarioLadder:
         )
         return {
             "ready": ready,
+            "paused_scenarios": paused,
             "minimum_coverage": float(min_coverage),
             "minimum_successful_replicas": required_successes,
             "verified": verified_total,
