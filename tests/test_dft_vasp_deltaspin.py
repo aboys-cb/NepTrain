@@ -144,7 +144,7 @@ def test_deltaspin_virial_label_round_trips(tmp_path, monkeypatch, tensor):
     atoms.set_array("spin", TARGETS.copy())
     request = _request(tmp_path, atoms, "LNONCOLLINEAR=.TRUE.\nLDELTASPIN=.TRUE.\n")
     block = """
- VIRIAL TENSOR (eV/cell)
+ Virial tensor (eV/cell)
                                x                             y                             z
 --------------------------------------------------------------------------------------------
  x           224.683794235293135             0.001300274837711            -0.002709951633648
@@ -171,7 +171,7 @@ def test_deltaspin_virial_label_round_trips(tmp_path, monkeypatch, tensor):
 
     monkeypatch.setattr(native, "VaspInput", ReplayVasp)
     if tensor in {"truncated", "nonfinite"}:
-        with pytest.raises(native.NativeVaspError, match="OUTCAR VIRIAL TENSOR"):
+        with pytest.raises(native.NativeVaspError, match="OUTCAR Virial tensor"):
             label(request, "vasp")
         assert not request.output_file.exists()
         return

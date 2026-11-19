@@ -118,24 +118,24 @@ class DeltaSpinResult:
 
 
 def _read_virial(text: str) -> np.ndarray | None:
-    blocks = re.split(r"^[ \t]*VIRIAL TENSOR \(eV/cell\)[ \t]*$", text, flags=re.MULTILINE)
+    blocks = re.split(r"^[ \t]*Virial tensor \(eV/cell\)[ \t]*$", text, flags=re.MULTILINE)
     if len(blocks) == 1:
         return None
     if len(blocks) != 2:
-        raise DeltaSpinError("OUTCAR contains multiple VIRIAL TENSOR (eV/cell) blocks")
+        raise DeltaSpinError("OUTCAR contains multiple Virial tensor (eV/cell) blocks")
 
     lines = blocks[1].split("\n", 7)[1:7]
     rows = [line.split() for line in lines[2:5]]
     if (len(lines) != 6 or lines[0].split() != list("xyz")
             or any(set(lines[i].strip()) != {"-"} for i in (1, 5))
             or any(len(row) != 4 or row[0] != axis for axis, row in zip("xyz", rows))):
-        raise DeltaSpinError("malformed OUTCAR VIRIAL TENSOR (eV/cell)")
+        raise DeltaSpinError("malformed OUTCAR Virial tensor (eV/cell)")
     try:
         virial = np.asarray([row[1:] for row in rows], dtype=float)
     except ValueError as error:
-        raise DeltaSpinError("invalid OUTCAR VIRIAL TENSOR (eV/cell) values") from error
+        raise DeltaSpinError("invalid OUTCAR Virial tensor (eV/cell) values") from error
     if not np.isfinite(virial).all():
-        raise DeltaSpinError("OUTCAR VIRIAL TENSOR (eV/cell) contains non-finite values")
+        raise DeltaSpinError("OUTCAR Virial tensor (eV/cell) contains non-finite values")
     return virial
 
 
