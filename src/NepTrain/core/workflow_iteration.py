@@ -895,16 +895,10 @@ class WorkflowIterationAdapter:
         generation_dir: Path,
         options: Mapping[str, Any],
     ) -> Path:
-        """Lower only the incremental TorchNEP learning rate.
+        """Apply the configured rate or the official Stage 2 rate as a baseline."""
 
-        A newly added high-gradient minibatch can destroy an otherwise good
-        checkpoint before TorchNEP records its first best model. Keep initial
-        training unchanged and make the safer fine-tune rate explicit in the
-        generated artifact for reproducibility.
-        """
-
-        scale = float(options.get("finetune_lr_scale", 0.1))
         explicit = options.get("finetune_lr")
+        scale = options.get("finetune_lr_scale")
         text = source.read_text(encoding="utf-8")
         output = []
         replaced = False
@@ -916,7 +910,12 @@ class WorkflowIterationAdapter:
                 output.append(line)
                 continue
             current = float(match.group(2))
-            value = float(explicit) if explicit is not None else current * scale
+            if explicit is not None:
+                value = float(explicit)
+            elif scale is not None:
+                value = current * float(scale)
+            else:
+                value = 1e-3
             output.append(
                 f"{match.group(1)}{value:.12g}{match.group(3)}{newline}"
             )

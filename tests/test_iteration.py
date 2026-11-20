@@ -1660,7 +1660,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert summary.metrics["merge"]["added_count"] == 3
     assert summary.metrics["retrain"]["training_count"] == 6
     assert summary.artifacts["retraining_config"].read_text(encoding="utf-8").endswith(
-        "lr 0.0003\n"
+        "lr 0.001\n"
     )
     assert summary.metrics["evaluate"]["added_training_count"] == 3
     assert summary.metrics["evaluate"]["mforce_rmse"] == 0.4
@@ -1685,7 +1685,7 @@ def test_workflow_adapter_connects_real_stage_contracts_with_toy_teacher(tmp_pat
     assert calls[0] == ("train", "torchnep", "cuda")
     assert training_requests[0].config_file == config_file
     assert training_requests[1].config_file.name == "torchnep-finetune.in"
-    assert "lr 0.0003\n" in training_requests[1].config_file.read_text(
+    assert "lr 0.001\n" in training_requests[1].config_file.read_text(
         encoding="utf-8"
     )
     assert ("md", "lammps", 300.0, 40) in calls
@@ -3241,6 +3241,22 @@ def test_explore_filters_spin_frames_but_keeps_unstable_completion_evidence(tmp_
 def test_spin_declaration_does_not_accept_disabled_commented_or_malformed_values(text):
     from NepTrain.core.workflow_iteration import _declares_spin_model
     assert not _declares_spin_model(text)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [({}, "0.001"), ({"finetune_lr": 0.0005}, "0.0005"),
+     ({"finetune_lr_scale": 0.1}, "0.0003")],
+)
+def test_torchnep_finetune_lr_defaults_to_stage2_and_keeps_explicit_overrides(
+    tmp_path, options, expected
+):
+    source = tmp_path / "nep.in"
+    source.write_text("type 1 Fe\nlr 0.003\n", encoding="utf-8")
+    result = WorkflowIterationAdapter._torchnep_finetune_config(
+        source, tmp_path / "generation", options
+    )
+    assert f"lr {expected}\n" in result.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
