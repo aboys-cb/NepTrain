@@ -71,6 +71,15 @@ class SubmissionDeferred(ExecutionError):
 
 def _failure_kind(detail: str) -> str | None:
     normalized = detail.lower()
+    if "deviceshortfall;" in normalized:
+        return "device_shortfall"
+    if (
+        "cuda_error_out_of_memory" in normalized
+        or "cuda error: out of memory" in normalized
+        or "during: allocating gpu workspace\n  reason: out of memory" in normalized
+        or re.search(r"^\s*reason: allocationfailed;[^\n]*; out of memory\b", normalized, re.MULTILINE)
+    ):
+        return "device_allocation_failure"
     if any(
         marker in normalized
         for marker in (
@@ -80,7 +89,6 @@ def _failure_kind(detail: str) -> str | None:
             "oom kill",
             "cannot allocate memory",
             "std::bad_alloc",
-            "cuda error: out of memory",
         )
     ):
         return "out_of_memory"
@@ -2887,6 +2895,11 @@ done
         exit_code = observation.exit_code
         if state in _ACTIVE:
             return ExecutionStatus("running", state + (f" on node {observation.nodes}" if observation.nodes else ""))
+        scheduler_kind = {
+            "NODE_FAIL": "node_failure",
+            "OUT_OF_MEMORY": "out_of_memory",
+            "TIMEOUT": "timeout",
+        }.get(state)
         if worker_status is not None and worker_status.state == "failed":
             scheduler_detail = f"Slurm {state} exit={exit_code}"
             detail = worker_status.detail
@@ -2895,18 +2908,13 @@ done
             return ExecutionStatus(
                 "failed",
                 detail,
-                worker_status.failure_kind
-                or ("out_of_memory" if state == "OUT_OF_MEMORY" else None),
+                scheduler_kind or worker_status.failure_kind,
             )
         if state in _TERMINAL_SUCCESS and exit_code.startswith("0:0"):
             return ExecutionStatus("completed", state)
         if state in _TERMINAL_FAILURE or state in _TERMINAL_SUCCESS:
             detail = f"Slurm {state} exit={exit_code}"
-            return ExecutionStatus(
-                "failed",
-                detail,
-                "out_of_memory" if state == "OUT_OF_MEMORY" else None,
-            )
+            return ExecutionStatus("failed", detail, scheduler_kind)
         return ExecutionStatus("running", state + (f" on node {observation.nodes}" if observation.nodes else ""))
 
     def inspect(self, handle: ExecutionHandle) -> ExecutionStatus:

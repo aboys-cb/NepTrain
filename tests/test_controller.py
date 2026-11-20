@@ -4070,6 +4070,36 @@ def test_execution_failure_kind_classifies_scf_nonconvergence():
     )
 
 
+@pytest.mark.parametrize(
+    ("reason", "kind"),
+    [
+        ("DeviceShortfall; owner=All fixed solver storage", "device_shortfall"),
+        (
+            "AllocationFailed; VMM orbital promotion; CUDA_ERROR_OUT_OF_MEMORY",
+            "device_allocation_failure",
+        ),
+        ("AllocationFailed; trial onsite density; out of memory", "device_allocation_failure"),
+        ("out of memory", "out_of_memory"),
+    ],
+)
+def test_execution_failure_kind_distinguishes_cuda_capacity_from_oom(reason, kind):
+    assert execution_module._failure_kind(f"Reason: {reason}") == kind
+
+
+@pytest.mark.parametrize(
+    "state,kind",
+    [("NODE_FAIL", "node_failure"), ("TIMEOUT", "timeout"), ("OUT_OF_MEMORY", "out_of_memory")],
+)
+@pytest.mark.parametrize(
+    "worker", [None, ExecutionStatus("failed", "worker error", "device_allocation_failure")]
+)
+def test_slurm_terminal_state_classifies_infrastructure_failure(state, kind, worker):
+    status = SlurmExecutor._execution_status(worker, execution_module.SlurmQuery(state, "1:0"))
+    assert status.state == "failed"
+    assert status.failure_kind == kind
+    assert f"Slurm {state} exit=1:0" in status.detail
+
+
 def test_remote_slurm_failure_collection_is_compact(tmp_path):
     executor = SlurmExecutor(
         ExecutionTarget(
