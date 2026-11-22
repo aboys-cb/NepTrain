@@ -14,6 +14,7 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from .content_addressing import file_sha256
+from .structures import StructureReadError, read_structures
 
 
 SPIN_KEY = "spin"
@@ -237,8 +238,10 @@ def migrate_spin_dataset(
         raise SpinDataError(
             f"spin migration output exists: {output_path}; use --force to replace it"
         )
-    loaded = ase_read(source_path, index=":")
-    frames = loaded if isinstance(loaded, list) else [loaded]
+    try:
+        frames = read_structures(source_path)
+    except StructureReadError as error:
+        raise SpinDataError(str(error)) from error
     migrated_fields = 0
     for index, frame in enumerate(frames):
         before = set(frame.arrays)

@@ -189,6 +189,23 @@ def test_training_parity_reports_bad_files_without_inventing_predictions(tmp_pat
     assert "training-parity-train.png" not in artifacts
 
 
+def test_gpumd_training_parity_preserves_nine_virial_pairs(tmp_path):
+    from NepTrain.core.reporting import build_training_parity_reports
+
+    path = tmp_path / "virial_train.out"
+    reference = np.arange(1., 10.)
+    prediction = reference.copy()
+    prediction[3] += 3  # yx differs from xy, giving RMSE = 3 / sqrt(9).
+    np.savetxt(path, [np.r_[prediction, reference], np.r_[prediction, np.full(9, -1e6)]])
+    artifacts = build_training_parity_reports(
+        tmp_path, outputs={path.name: path}, backend="gpumd", model=None
+    )
+    report = json.loads(artifacts["training-parity-train-report.json"].read_text())
+    assert report["source"]["warnings"] == []
+    assert report["panels"]["virial"]["finite_pairs"] == 9
+    np.testing.assert_allclose(report["panels"]["virial"]["rmse"], 1.0)
+
+
 def test_selection_pca_uses_one_basis_and_preserves_selected_indices(tmp_path):
     from NepTrain.core.reporting import build_selection_pca_report
 

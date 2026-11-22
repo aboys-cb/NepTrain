@@ -36,6 +36,10 @@ neptrain train train.xyz \
 best 模型不同。使用远程 target 时，原始图表留在计算侧，可按 `remote.txt` 找到目录；
 最终模型发布到 `-o` 指定的路径。
 
+使用 GPUMD 训练 NEP-Spin 时，NepTrain 将 ASE 列序的 `virial` 转成 GPUMD 行序，
+保留九项。已是 GPUMD 行序的外部训练／测试数据，应在每个带 `virial` 的帧的注释行加
+`neptrain_virial_order=row_major`，以免重复转换。详见 [工作流数据约定](workflow.md)。
+
 ### TorchNEP 单节点多卡训练
 
 当 `training.backend: torchnep` 且 `training.device: cuda` 时，NepTrain 根据任务内可见的 GPU 数选择训练入口：一张卡使用单设备训练，多张卡通过 torchrun 启动 `train_nep_sharded`，每卡一个 DDP 进程。独立 `neptrain train` 命令也使用同一规则。

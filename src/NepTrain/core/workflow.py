@@ -370,20 +370,18 @@ def _validate_labeled_dataset_for_preparation(
     role: str,
     expect_spin: bool,
 ) -> None:
-    from ase.io import read as ase_read
-
     from .scientific_data import ScientificDataError, validate_labeled_frames
     from .spin import SpinDataError, validate_spin_dataset
+    from .structures import StructureReadError, read_structures
 
     try:
-        loaded = ase_read(path, index=":")
-        frames = loaded if isinstance(loaded, list) else [loaded]
+        frames = read_structures(path)
         validate_labeled_frames(frames)
         total, spin_frames = validate_spin_dataset(
             frames,
             require_mforce=True,
         )
-    except (OSError, ScientificDataError, SpinDataError, ValueError) as error:
+    except (StructureReadError, ScientificDataError, SpinDataError, ValueError) as error:
         raise WorkflowError(f"{role} dataset is invalid at {path}: {error}") from error
     if (spin_frames == total) != expect_spin:
         expected = "spin/mforce" if expect_spin else "ordinary"

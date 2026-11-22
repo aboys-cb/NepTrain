@@ -7,8 +7,10 @@ import types
 from ase import Atoms
 from ase.io import write
 
+import numpy as np
 import pytest
 
+from NepTrain.core.structures import read_structures
 from NepTrain.core.training import TrainingError, TrainingRequest, train
 
 
@@ -152,6 +154,52 @@ def test_gpumd_restart_overrides_only_restart_owned_config(
     assert "generation 2500 # original duration" in captured["config"]
     assert "lambda_1 0 # regularization" in captured["config"]
     assert captured["restart"] == b"previous checkpoint"
+
+
+def test_gpumd_spin_stages_nine_components_in_row_order(tmp_path, monkeypatch):
+    tensor = np.arange(1, 10).reshape(3, 3)
+    atoms = Atoms("Fe", cell=[3, 3, 3], pbc=True, info={"virial": tensor, "weight": 2.5})
+    atoms.set_array("spin", np.array([[0., 0., 2.]]))
+    atoms.set_array("mforce", np.zeros((1, 3)))
+    atoms.info["comment"] = 'keep virial="as written"'
+    source = tmp_path / "ase.xyz"
+    write(source, atoms, format="extxyz")
+    original = source.read_text()
+    ase_field = 'virial="1 4 7 2 5 8 3 6 9"'
+    gpumd_field = 'virial="1 2 3 4 5 6 7 8 9" neptrain_virial_order=row_major'
+    assert ase_field in original
+    exported = original.replace(ase_field, gpumd_field)
+    # Include both disk conventions in one dataset, as in an imported seed set.
+    test = tmp_path / "externally-prepared.xyz"
+    test.write_text(exported + original)
+    config = tmp_path / "source.in"
+    config.write_text("type 1 Fe\n")
+
+    def fake_run(command, *, stdout, stderr, cwd, check):
+        assert (cwd / "train.xyz").read_text() == exported
+        assert (cwd / "test.xyz").read_text() == exported * 2
+        for frame in read_structures(cwd / "test.xyz"):
+            np.testing.assert_array_equal(frame.info["virial"], tensor)
+            assert "neptrain_virial_order" not in frame.info
+        (cwd / "nep.txt").write_text("mock spin model\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("NepTrain.core.training.subprocess.run", fake_run)
+    monkeypatch.setattr("NepTrain.core.training._validate_adapter_model", lambda *_, **__: None)
+    train(TrainingRequest(config, source, tmp_path / "output", test_file=test), "gpumd")
+    assert source.read_text() == original
+    assert test.read_text() == exported + original
+
+
+def test_gpumd_spin_rejects_in_place_conversion(tmp_path):
+    from NepTrain.core.gpumd.training_xyz import stage_gpumd_xyz
+
+    source = tmp_path / "train.xyz"
+    text = '1\nvirial="1 4 7 2 5 8 3 6 9"\nFe 0 0 0\n'
+    source.write_text(text)
+    with pytest.raises(ValueError, match="cannot convert .* in place"):
+        stage_gpumd_xyz(source, source)
+    assert source.read_text() == text
 
 
 def test_gpumd_training_failure_reports_process_detail_and_rejects_stale_model(

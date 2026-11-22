@@ -18,12 +18,13 @@ import tempfile
 from typing import Mapping
 
 from ase.data import atomic_numbers
-from ase.io import read as ase_read
 import numpy as np
 
+from .gpumd.training_xyz import stage_gpumd_xyz
 from .reporting import build_training_report, build_training_parity_reports
 from .scientific_data import optional_dataset_issue
 from .spin import validate_spin_dataset
+from .structures import StructureReadError, read_structures
 
 
 class TrainingError(RuntimeError):
@@ -56,7 +57,10 @@ class TrainingResult:
 
 
 def _validate_training_data(path: Path) -> tuple[bool, tuple[str, ...]]:
-    frames = ase_read(path, index=":", format="extxyz")
+    try:
+        frames = read_structures(path)
+    except StructureReadError as error:
+        raise TrainingError(str(error)) from error
     _, spin_frames = validate_spin_dataset(frames, require_mforce=True)
     symbols = {
         symbol
@@ -103,6 +107,8 @@ def _replace_gpumd_keyword(
 def _prepare_gpumd_inputs(
     request: TrainingRequest,
     elements: tuple[str, ...],
+    *,
+    spin: bool,
 ) -> None:
     request.output_dir.mkdir(parents=True, exist_ok=True)
     lines = request.config_file.read_text(encoding="utf-8").splitlines(
@@ -137,11 +143,16 @@ def _prepare_gpumd_inputs(
     else:
         # A reused run directory must not reintroduce an old optional test set.
         (request.output_dir / "test.xyz").unlink(missing_ok=True)
-    if request.restart_file is not None:
-        sources.append(
-            (request.restart_file, request.output_dir / "nep.restart")
-        )
     for source, target in sources:
+        if spin:
+            try:
+                stage_gpumd_xyz(source, target)
+            except (OSError, ValueError) as error:
+                raise TrainingError(f"could not stage GPUMD input: {error}") from error
+        elif source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+    if request.restart_file is not None:
+        source, target = request.restart_file, request.output_dir / "nep.restart"
         if source.resolve() != target.resolve():
             shutil.copy2(source, target)
 
@@ -189,6 +200,8 @@ def _validate_adapter_model(path: Path, *, expects_spin: bool) -> None:
 def _train_gpumd(
     request: TrainingRequest,
     elements: tuple[str, ...],
+    *,
+    spin: bool,
 ) -> TrainingResult:
     if request.finetune_file is not None:
         raise TrainingError("GPUMD training does not support finetune_file")
@@ -198,7 +211,7 @@ def _train_gpumd(
         )
     if request.continue_steps <= 0:
         raise TrainingError("continue_steps must be positive")
-    _prepare_gpumd_inputs(request, elements)
+    _prepare_gpumd_inputs(request, elements, spin=spin)
     model = request.output_dir / "nep.txt"
     model.unlink(missing_ok=True)
     stdout = request.output_dir / "nep.out"
@@ -388,7 +401,7 @@ def train(request: TrainingRequest, backend: str) -> TrainingResult:
             logging.getLogger(__name__).warning(issue)
             request = replace(request, test_file=None)
     if backend == "gpumd":
-        result = _train_gpumd(request, elements)
+        result = _train_gpumd(request, elements, spin=expects_spin)
     elif backend == "torchnep":
         result = _train_torchnep(request)
     else:
