@@ -71,6 +71,9 @@ def test_default_gpumd_nvt_input_uses_temperature_steps_and_seed(
     assert "velocity 500.0 seed 9" in captured["input"]
     assert "ensemble nvt_nhc 500.0 500.0 100" in captured["input"]
     assert "time_step 1.0" in captured["input"]
+    assert [line for line in captured["input"].splitlines() if line.startswith("dump_")] == [
+        "dump_xyz 1 dump.xyz force",
+    ]
     assert "run 25" in captured["input"]
     assert result.completed is True
     assert result.last_step == 25
@@ -117,7 +120,7 @@ def test_custom_gpumd_template_renders_without_ensemble_inference(
         "velocity {{ temperature }} seed {{ seed }}\n"
         f"ensemble {ensemble}\n"
         "time_step {{ timestep_fs }}\n"
-        "dump_exyz {{ dump_interval }} 0 1\n"
+        "dump_xyz {{ dump_interval }} {{ trajectory_file }} force\n"
         "run {{ steps }}\n",
         encoding="utf-8",
     )
@@ -145,7 +148,7 @@ def test_custom_gpumd_template_renders_without_ensemble_inference(
         "velocity 500.0 seed 9\n"
         f"ensemble {rendered_ensemble}\n"
         "time_step 1.0\n"
-        "dump_exyz 1 0 1\n"
+        "dump_xyz 1 dump.xyz force\n"
         "run 25\n"
     )
     assert result.completed is True
@@ -159,9 +162,11 @@ def test_gpumd_template_preserves_fixed_values_comments_and_multiple_stages(tmp_
         "velocity 50 seed 17\n"
         "ensemble nvt_nhc 50 900 100  # Heating ramp\n"
         "time_step 2\n"
-        "dump_exyz 1000 0 0\n"
+        "dump_xyz 1000 dump.xyz\n"
         "run 100000\n\n"
         "ensemble npt_scr 900 600 100 1 2 3 4 5 6 100 101 102 103 104 105 1000\n"
+        "dump_xyz 25 dump.xyz precision double force\n"
+        "dump_xyz 5 velocities.xyz velocity\n"
         "run {{ steps }}\n"
     )
     template = tmp_path / "route.in"
@@ -173,7 +178,7 @@ def test_gpumd_template_preserves_fixed_values_comments_and_multiple_stages(tmp_
     run.write_run(output)
 
     assert output.read_text() == text.replace("{{ steps }}", "25")
-    assert run.dump_interval() == 1000
+    assert run.dump_interval() == 25
     assert run.timestep_fs() == 2
     # Rendering again uses the original placeholders, not the previous result.
     run.configure(temperature=600, pressure=3, steps=50, timestep_fs=1, seed=10)
@@ -226,11 +231,15 @@ def test_gpumd_missing_template_variable_fails_before_launch(tmp_path, monkeypat
 @pytest.mark.parametrize(
     ("text", "message"),
     [
-        ("run 25\n", "must define dump_exyz"),
-        ("dump_exyz 0 0 1\n", "interval must be positive"),
-        ("dump_exyz bad 0 1\n", "integer interval"),
-        ("dump_exyz 1 0 1 0 1\n", "separated dump_exyz"),
-        ("dump_exyz 1 0 1\n", "time_step must be positive"),
+        ("run 25\n", "must define dump_xyz"),
+        ("dump_exyz 1 0 1\n", "must define dump_xyz"),
+        ("dump_xyz 1 other.xyz force\n", "must define dump_xyz"),
+        ("dump_xyz 1 dump.xyz* force\n", "must define dump_xyz"),
+        ("dump_xyz 0 dump.xyz force\n", "interval must be positive"),
+        ("dump_xyz bad dump.xyz force\n", "integer interval"),
+        ("dump_xyz 1 dump.xyz split 10 force\n", "must omit split and group"),
+        ("dump_xyz 1 dump.xyz group 0 0 force\n", "must omit split and group"),
+        ("dump_xyz 1 dump.xyz force\n", "time_step must be positive"),
     ],
 )
 def test_gpumd_checks_trajectory_contract_before_launch(tmp_path, text, message):

@@ -90,8 +90,7 @@ class RunInput:
             ["velocity", [temperature, "seed", seed]],
             ["ensemble", ensemble_values],
             ["time_step", [timestep_fs]],
-            ["dump_thermo", [dump_interval]],
-            ["dump_exyz", [dump_interval, 0, 1]],
+            ["dump_xyz", [dump_interval, "dump.xyz", "force"]],
             ["run", [steps]],
         ]
         self._text = "".join(
@@ -133,21 +132,24 @@ class RunInput:
             raise GpumdInputError(str(error)) from error
 
     def dump_interval(self) -> int:
-        dumps = self._arguments("dump_exyz")
+        dumps = [
+            args for args in self._arguments("dump_xyz")
+            if len(args) >= 2 and Path(args[1]) == Path("dump.xyz")
+        ]
         if not dumps:
-            raise GpumdInputError("GPUMD input must define dump_exyz for dump.xyz")
+            raise GpumdInputError(
+                "GPUMD input must define dump_xyz <interval> dump.xyz [force]"
+            )
         intervals = []
         for values in dumps:
             try:
                 interval = int(values[0])
-            except (IndexError, ValueError) as error:
-                raise GpumdInputError("dump_exyz requires an integer interval") from error
+            except ValueError as error:
+                raise GpumdInputError("dump_xyz requires an integer interval") from error
             if interval < 1:
-                raise GpumdInputError("dump_exyz interval must be positive")
-            if len(values) >= 5 and values[4] == "1":
-                raise GpumdInputError(
-                    "separated dump_exyz output is not supported by the workflow adapter"
-                )
+                raise GpumdInputError("dump_xyz interval must be positive")
+            if "split" in values[2:] or "group" in values[2:]:
+                raise GpumdInputError("dump_xyz for dump.xyz must omit split and group")
             intervals.append(interval)
         return intervals[-1]
 

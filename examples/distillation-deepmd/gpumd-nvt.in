@@ -5,5 +5,5 @@ potential {{ model_file }}
 velocity {{ temperature }} seed {{ seed }}
 ensemble nvt_nhc {{ temperature }} {{ temperature }} 100
 time_step 0.1
-dump_exyz 1 0 1
+dump_xyz 1 {{ trajectory_file }} force
 run {{ steps }}

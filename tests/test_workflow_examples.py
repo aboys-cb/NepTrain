@@ -124,7 +124,7 @@ def test_gpumd_examples_prepare_and_recover_every_sampling_stage(
              if example == "distillation-deepmd" else
              ["ensemble", "npt_scr", str(expected["temperature"]), str(expected["temperature"]), "100", "0.0", "100", "1000"]),
             ["time_step", str(timestep_fs)],
-            ["dump_exyz", "1", "0", "1"],
+            ["dump_xyz", "1", "dump.xyz", "force"],
             ["run", str(expected["steps"])],
         ]
         assert (run_dir / "nep.txt").read_bytes() == model.read_bytes()

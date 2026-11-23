@@ -94,7 +94,7 @@ potential {{ model_file }}
 velocity {{ temperature }} seed {{ seed }}
 ensemble nve
 time_step {{ timestep_fs }}
-dump_exyz {{ dump_interval }} 0 1
+dump_xyz {{ dump_interval }} {{ trajectory_file }} force
 run {{ steps }}
 ```
 

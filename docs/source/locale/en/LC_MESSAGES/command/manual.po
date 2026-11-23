@@ -448,7 +448,7 @@ msgstr "With `--project`, the backend, template, temperature, pressure, and step
 msgid "训练图位于运行目录的 `jobs/000000/calculation/`，包括 `training-convergence.png` 和有有效训练器输出时的 `training-parity-train.png`；test 输出可用时另有 `training-parity-test.png`。TorchNEP 原生对角线图对应最后一个 epoch，可能与发布的 best 模型不同。使用远程 target 时，原始图表留在计算侧，可按 `remote.txt` 找到目录； 最终模型发布到 `-o` 指定的路径。"
 msgstr "Training plots are in `jobs/000000/calculation/` under the run directory: `training-convergence.png`, `training-parity-train.png` when valid trainer outputs exist, and `training-parity-test.png` when test outputs are available. Native TorchNEP parity plots use the final epoch, which may differ from the published best model. For remote targets, raw plots remain on the compute side; locate the directory via `remote.txt`. The final model is published to the path specified by `-o`."
 
-msgid "potential {{ model_file }}\nvelocity {{ temperature }} seed {{ seed }}\nensemble nve\ntime_step {{ timestep_fs }}\ndump_exyz {{ dump_interval }} 0 1\nrun {{ steps }}\n"
+msgid "potential {{ model_file }}\nvelocity {{ temperature }} seed {{ seed }}\nensemble nve\ntime_step {{ timestep_fs }}\ndump_xyz {{ dump_interval }} {{ trajectory_file }} force\nrun {{ steps }}\n"
 msgstr ""
 
 msgid "neptrain select trajectories.xyz \\\n  --base train.xyz \\\n  --nep nep.txt \\\n  --backend auto \\\n  --max-selected 64 \\\n  --min-novelty 0.01 \\\n  --out selected.xyz \\\n  --report selected.selection.json\n"

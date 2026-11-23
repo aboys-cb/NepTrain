@@ -216,8 +216,10 @@ GPUMD 模板可用变量：
 原样。工作流按 route 条件组织任务，因此需要模板显式引用相应温压变量，才能实际
 施加这些条件。旧的纯数值模板仍按字面执行，不再自动更新温压、步数或种子。
 
-模板须显式设置 `time_step` 和输出到单个 `dump.xyz` 的 `dump_exyz`；分文件输出
-尚不支持。建议使用 `dump_exyz {{ dump_interval }} 0 1` 输出力以供轨迹健康检查。
+模板须显式设置 `time_step`。在每个需要采样的 `run` 前使用
+`dump_xyz {{ dump_interval }} {{ trajectory_file }} force`，将全体系轨迹写入单个
+`dump.xyz`，供轨迹健康检查读取原子力。该轨迹须省略 `split` 和 `group` 选项。
+旧模板中的 `dump_exyz` 写法需要迁移到 `dump_xyz`。
 固定 dump 间隔不会自动缩短，须保证运行期间有完整帧输出。当前步号恢复沿用末次
 `time_step`（缺失 Time 时还使用末次 dump 间隔）；变时间步长或变输出间隔的多阶段
 轨迹尚不能保证恢复正确步号。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。

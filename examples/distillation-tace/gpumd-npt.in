@@ -6,5 +6,5 @@ potential {{ model_file }}
 velocity {{ temperature }} seed {{ seed }}
 ensemble npt_scr {{ temperature }} {{ temperature }} 100 {{ pressure }} 100 1000
 time_step 0.1
-dump_exyz 1 0 1
+dump_xyz 1 {{ trajectory_file }} force
 run {{ steps }}

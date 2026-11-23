@@ -137,9 +137,10 @@ neptrain md structures/ \
 NVE/NVT/NPT 输入；`--seed` 控制初速度随机种子，`--pressure` 的 GPUMD 单位为
 GPa。提供 `run.in` 模板时，只替换 `{{ model_file }}`、`{{ temperature }}`、
 `{{ pressure }}`、`{{ steps }}`、`{{ seed }}` 等显式占位符；系综、固定值和多阶段
-命令由模板决定，不再按参数位置覆盖。模板需显式设置 `time_step` 和 `dump_exyz`，
-建议使用 `dump_exyz {{ dump_interval }} 0 1` 输出力。旧模板中需要随任务变化的
-常量应改成占位符，参见 [GPUMD 模板说明](docs/source/command/workflow.md)。
+命令由模板决定，不再按参数位置覆盖。模板需显式设置 `time_step`，并使用
+`dump_xyz {{ dump_interval }} {{ trajectory_file }} force` 将带原子力的轨迹写入
+`dump.xyz`。若使用旧模板，请迁移 `dump_exyz` 命令，并将需要随任务变化的常量
+改成占位符。参见 [GPUMD 模板说明](docs/source/command/workflow.md)。
 GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留稳定段和炸前
 帧。Spin MD 仍只支持 LAMMPS DynSpin。
 
