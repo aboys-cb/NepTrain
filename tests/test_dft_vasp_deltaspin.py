@@ -199,16 +199,18 @@ def test_deltaspin_virial_label_round_trips(tmp_path, monkeypatch, tensor):
 
 @pytest.mark.parametrize("missing_mforce", [False, True])
 @pytest.mark.parametrize("template_magmom", [None, "0 0 4 0 0 0.5 0 0 5"])
-@pytest.mark.parametrize("partial", [False, True, "auto", "project"])
+@pytest.mark.parametrize("partial", [False, True, "auto", "project", "all-table"])
 def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, missing_mforce, template_magmom, partial):
     monkeypatch.delenv("NEPTRAIN_VASP_COMMAND", raising=False)
     atoms = Atoms("FeAlFe", positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]], cell=[6, 6, 6], pbc=True)
     spin = np.asarray([[0.1, 0, 2], [0.2, 0, 0.1], [-0.1, 0, 2]])
+    full_table = partial == "all-table"
+    induced = [0.0391234567, -0.0102345678, 0.0023456789]
     if partial:
         spin[1] = [0.025, 0, 0]  # Unconstrained initial moments may be nonzero.
         if partial == "auto":
             spin[1] = 0
-        elif partial is True:
+        elif partial is True or full_table:
             atoms.set_array("spin_active", np.asarray([1, 0, 1]))
     atoms.set_array("spin", spin)
     atoms.set_initial_magnetic_moments(np.full((3, 3), 9.0))
@@ -221,6 +223,8 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
         incar += "MAGMOM=" + template_magmom + "\n"
     incar += "M_DELTASPIN = 9*99\n"  # Each sampled input owns its targets.
     incar += "SCF_CUDA_NCL_GGA_MODE = 1\n"
+    if full_table:
+        incar += "LORBIT=0\nDELTASPIN_MOMENT_DEF=2\n"
     if partial is True or partial == "project":
         incar += "DELTASPIN_ATOMS = 2*0 2*1 6*0\n"  # Stale primitive mask must be replaced.
     request = _request(tmp_path, atoms, incar)
@@ -245,17 +249,23 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
             assert "mforce" not in self.atoms.arrays
             header = (FIXTURE / "OUTCAR.final.txt").read_text().split("   ion elem")[0]
             header = header.replace("8.0856E-08", "0.0000E+00")
+            if full_table:
+                assert parsed.int_params["lorbit"] == 0
+                header = header.replace("DELTASPIN_MOMENT_DEF = 0", "DELTASPIN_MOMENT_DEF = 2")
+                header += " Moments below list all ions in POSCAR order.\n"
             moment_rows, force_rows = [], []
             for i, (symbol, target) in enumerate(zip(["Fe", "Fe", "Al"], spin[[0, 2, 1]]), 1):
                 if expected_mask[i - 1]:
                     moment_rows.append(f"{i} {symbol} 1 1 1 " + " ".join(map(str, target)) + " 0")
                     force_rows.append(f"{i} {symbol} 1 1 1 {i} {-i} {i * 2}")
                 else:
+                    if full_table:
+                        moment_rows.append(f"{i} {symbol} 0 0 0 " + " ".join(map(str, induced)) + " 0")
                     force_rows.append(f"{i} {symbol} 0 0 0 0 0 0")
             text = header + "ion elem cx cy cz Mx My Mz |M|\n---\n" + "\n".join(moment_rows)
             text += "\n\nMagnetic force (eV/uB)\nion elem cx cy cz MFx MFy MFz\n---\n" + "\n".join(force_rows)
             text += "\nmagnetic force = spin_lambda for L=E+lambda.(M-M_target)\n"
-            if partial:
+            if partial and not full_table:
                 for axis in "xyz":
                     text += f"\nmagnetization ({axis})\n# of ion s p d tot\n---\n1 0 0 0 2.0\n2 0 0 0 2.0\n3 0 0 0 0.039\n---\n"
             if missing_mforce:
@@ -280,8 +290,8 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
     assert frame.get_chemical_symbols() == ["Fe", "Al", "Fe"]
     expected_spin = spin.copy()
     if partial:
-        expected_spin[1] = 0.039
-    np.testing.assert_array_equal(frame.arrays["spin"], expected_spin)
+        expected_spin[1] = induced if full_table else 0.039
+    np.testing.assert_array_equal(frame.arrays["spin"], np.round(expected_spin, 8))
     assert not {"spin_projected", "initial_magmoms"} & frame.arrays.keys()
     np.testing.assert_array_equal(frame.arrays["spin_active"], [1, 0 if partial else 1, 1])
     np.testing.assert_array_equal(frame.arrays["mforce"], [[1, -1, 2], [0, 0, 0] if partial else [3, -3, 6], [2, -2, 4]])
@@ -291,6 +301,11 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
     assert manifest["spin_force_labels"] is True
     assert manifest["status"] == "completed"
     assert manifest["deltaspin"]["mforce_unit"] == "eV/uB"
+    assert manifest["deltaspin"]["unconstrained_moment_print_precision_muB"] == (
+        (1e-10 if full_table else 0.001) if partial else None
+    )
+    if full_table:
+        assert manifest["deltaspin"]["projected_moments_muB"][2] == induced
     assert "OUTCAR" in manifest["output_sha256"]
     assert "neptrain_input_structure_id" in frame.info
 
@@ -352,7 +367,7 @@ def test_partial_bfo_preserves_induced_diagnostics_and_active_labels():
 
 @pytest.mark.parametrize('mutation', [
     'missing_moment', 'missing_force', 'wrong_mask', 'missing_induced',
-    'unconverged', 'inactive_force', 'nonfinite_induced', 'unsupported_moment_def',
+    'unconverged', 'inactive_force', 'nonfinite_induced', 'unsupported_moment_def', 'truncated_all_ion',
 ])
 def test_partial_bfo_rejects_incomplete_or_inconsistent_output(tmp_path, mutation):
     mask = np.array([0, 0, 1, 1, 0, 0, 0, 0, 0, 0])
@@ -375,6 +390,9 @@ def test_partial_bfo_rejects_incomplete_or_inconsistent_output(tmp_path, mutatio
         text = text.replace('-0.039', 'NaN')
     elif mutation == 'unsupported_moment_def':
         text = text.replace('DELTASPIN_MOMENT_DEF = 0', 'DELTASPIN_MOMENT_DEF = 1')
+    elif mutation == 'truncated_all_ion':
+        text = text.replace('DELTASPIN_MOMENT_DEF = 0', 'DELTASPIN_MOMENT_DEF = 0\n'
+                            ' Moments below list all ions in POSCAR order.')
     else:
         text = text.replace('SCF convergence        : reached', 'SCF convergence        : failed')
     path = tmp_path/'OUTCAR'; path.write_text(text)

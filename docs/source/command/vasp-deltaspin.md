@@ -51,7 +51,7 @@ atoms.set_array("spin_active", np.array([0, 0, 1, 1, 0, 0, 0, 0, 0, 0]))
 
 实际写出的 `DELTASPIN_ATOMS` 为 `0 0 1 1 0 0 0 0 0 0`。DFT 输出保留实际使用的 `spin_active`，LAMMPS 轨迹也按原子 ID 继承输入掩码，因此再次标注时不会把感应磁矩误当成约束目标。已有逐原子掩码会覆盖项目默认值；若要改变旧结构的约束策略，需要相应修改或删除其 `spin_active`。
 
-训练 XYZ 保留 `species、pos、spin、spin_active、mforce、forces`，不导出 `initial_magmoms、spin_projected`。`spin_active` 是约束元数据，不定义模型的自旋自由度。`spin` 保存所有原子最后收敛的磁矩：受约束原子来自高精度最终约束表，未约束 Bi/O 来自最后的 `magnetization (x/y/z)`，保留其非零感应磁矩。后者的原始打印分辨率为 0.001 μB，记录在 manifest 中。部分原子约束当前要求 `DELTASPIN_MOMENT_DEF=0`。
+训练 XYZ 保留 `species、pos、spin、spin_active、mforce、forces`，不导出 `initial_magmoms、spin_projected`。`spin_active` 是约束元数据，不定义模型的自旋自由度。新版 c516 的 `spin` 统一取自最终 DeltaSpin 磁矩表，保留未约束 Bi/O 的感应磁矩，打印分辨率为 10⁻¹⁰ μB。部分原子约束也可使用磁矩定义 0、1 或 2，且可设 `LORBIT=0`。旧版 OUTCAR 只列受约束原子时，定义 0 仍可使用 `LORBIT=11` 的 `magnetization (x/y/z)` 补齐，打印分辨率为 0.001 μB。实际分辨率记录在 `vasp-result.json`。
 
 `mforce` 保留 VASP 最终约束乘子；未约束原子为程序输出的零乘子。保存全原子磁矩不意味着独立 O 自旋扰动或其磁能曲率已得到验证。
 
@@ -82,7 +82,7 @@ neptrain label selected-spin.xyz --backend vasp --project project.yaml --wait --
 
 ## 检查结果
 
-OUTCAR 必须包含一次 `DeltaSpin final status`，其中 `SCF convergence` 和 `Moment constraint` 都为 `reached`，并满足报告的误差容限。磁矩表必须完整包含全部活动原子，磁性力表必须包含所有原子，约束标记必须与实际写出的 `DELTASPIN_ATOMS` 一致。缺失、非有限、分量约束不匹配或原子顺序错误均拒收，输入中残留的旧 `mforce` 不能代替新结果。
+OUTCAR 必须包含一次 `DeltaSpin final status`，其中 `SCF convergence` 和 `Moment constraint` 都为 `reached`，并满足报告的误差容限。新版磁矩表与磁力表都须覆盖所有原子，约束标记须与实际写出的 `DELTASPIN_ATOMS` 一致。缺失、非有限、分量约束不匹配或原子顺序错误均拒收，输入中残留的旧 `mforce` 不能代替新结果。
 
 输出 `spin` 来自实际收敛磁矩表，单位 μB；`mforce` 来自 `Magnetic force (eV/uB)` 表，按 `spin_lambda` 原符号保存，对应 `L=E+lambda.(M-M_target)`。能量和原子力沿用 ASE 的 VASP 读取路径。`vasp-result.json` 保存输入/输出哈希、磁矩定义、误差和单位。
 

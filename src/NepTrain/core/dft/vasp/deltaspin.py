@@ -62,8 +62,6 @@ def validate_input(calculator) -> None:
         mask = numbers(params["deltaspin_atoms"])
         if not np.isin(mask, [0, 1]).all() or not mask.any():
             raise DeltaSpinError("DELTASPIN_ATOMS must be a nonempty binary active-atom mask")
-        if not mask.all() and int(params.get("deltaspin_moment_def", "0")) != 0:
-            raise DeltaSpinError("partial atom constraints currently support moment definition 0 only")
     saxis = calculator.list_float_params.get("saxis")
     if saxis is not None and not np.array_equal(saxis, [0, 0, 1]):
         raise DeltaSpinError("VASP DeltaSpin labeling currently requires SAXIS=0 0 1")
@@ -115,6 +113,7 @@ class DeltaSpinResult:
     active: np.ndarray
     projected: np.ndarray
     virial: np.ndarray | None = None
+    unconstrained_moment_print_precision: float | None = None
 
 
 def _read_virial(text: str) -> np.ndarray | None:
@@ -173,7 +172,7 @@ def read_result(path: Path, symbols: list[str], targets: np.ndarray, *, active=N
     if "magnetic force = spin_lambda for L=E+lambda.(M-M_target)" not in table_text:
         raise DeltaSpinError("DeltaSpin output is missing the magnetic-force sign convention")
 
-    def table(header, indices):
+    def table(header):
         lines = table_text.splitlines()
         matches = [i for i, line in enumerate(lines) if line.split() == header.split()]
         if len(matches) != 1:
@@ -181,33 +180,45 @@ def read_result(path: Path, symbols: list[str], targets: np.ndarray, *, active=N
         start = matches[0] + 1
         if start >= len(lines) or set(lines[start].strip()) != {"-"}:
             raise DeltaSpinError("malformed DeltaSpin table separator")
-        rows = []
+        indices, rows = [], []
         for line in lines[start + 1:]:
             fields = line.split()
             if not fields or not fields[0].isdigit():
                 break
-            if len(rows) >= len(indices):
-                raise DeltaSpinError("extra DeltaSpin rows")
-            index = indices[len(rows)]
+            index = int(fields[0]) - 1
+            if not 0 <= index < len(symbols):
+                raise DeltaSpinError("DeltaSpin table contains an invalid atom index")
             flags = [str(int(active[index]))] * 3
-            if (len(fields) != len(header.split()) or int(fields[0]) != index + 1
-                    or fields[1] != symbols[index] or fields[2:5] != flags):
+            if (len(fields) != len(header.split()) or fields[1] != symbols[index]
+                    or fields[2:5] != flags):
                 raise DeltaSpinError("DeltaSpin table has incomplete constraints or wrong atom order")
+            indices.append(index)
             rows.append(numbers(" ".join(fields[5:8])))
-        if len(rows) != len(indices):
-            raise DeltaSpinError("DeltaSpin table is missing required labels")
-        return np.asarray(rows)
+        return indices, np.asarray(rows)
 
-    spin = np.zeros((len(symbols), 3))
-    spin[active] = table("ion elem cx cy cz Mx My Mz |M|", np.flatnonzero(active))
-    mforce = table("ion elem cx cy cz MFx MFy MFz", np.arange(len(symbols)))
+    all_indices = list(range(len(symbols)))
+    moment_indices, moment_rows = table("ion elem cx cy cz Mx My Mz |M|")
+    full_moments = moment_indices == all_indices
+    if full_moments:
+        spin = moment_rows
+    elif ("Moments below list all ions in POSCAR order." not in table_text
+            and moment_indices == np.flatnonzero(active).tolist()):
+        spin = np.zeros((len(symbols), 3))
+        spin[active] = moment_rows
+    else:
+        raise DeltaSpinError("DeltaSpin moment table has missing rows or wrong atom order")
+    force_indices, mforce = table("ion elem cx cy cz MFx MFy MFz")
+    if force_indices != all_indices:
+        raise DeltaSpinError("DeltaSpin magnetic force table has missing rows or wrong atom order")
     if np.any(mforce[~active] != 0):
         raise DeltaSpinError("inactive constraint multipliers must be zero")
     if np.max(np.abs(spin[active] - targets[active])) > tolerance * (1 + 1e-4) + 1e-10:
         raise DeltaSpinError("DeltaSpin final moments do not match active input targets")
+    moment_def = int(definition.group(1))
     projected = spin.copy()
-    if not active.all():
-        if int(definition.group(1)) != 0:
+    precision = None if active.all() else 1e-10
+    if not full_moments:
+        if moment_def != 0:
             raise DeltaSpinError("partial-mask diagnostics require projector moment definition 0")
         for k, axis in enumerate("xyz"):
             marker = f"magnetization ({axis})"
@@ -225,7 +236,8 @@ def read_result(path: Path, symbols: list[str], targets: np.ndarray, *, active=N
             if len(rows) != len(symbols):
                 raise DeltaSpinError("incomplete induced-moment diagnostic")
             projected[~active, k] = np.asarray(rows)[~active]
+        precision = 0.001
     return DeltaSpinResult(
-        spin, mforce, int(definition.group(1)), max_error, tolerance, active, projected,
-        virial=_read_virial(text),
+        spin, mforce, moment_def, max_error, tolerance, active, projected,
+        virial=_read_virial(text), unconstrained_moment_print_precision=precision,
     )

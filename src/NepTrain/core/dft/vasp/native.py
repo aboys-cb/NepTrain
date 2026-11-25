@@ -363,7 +363,7 @@ def _write_manifest(
             "active_atom_mask": magnetic_result.active.astype(int).tolist(),
             "projected_moments_muB": magnetic_result.projected.tolist(),
             "label_scope": "final moments on all atoms; mforce is the constraint multiplier (zero on unconstrained atoms)",
-            "unconstrained_moment_print_precision_muB": 0.001 if not magnetic_result.active.all() else None,
+            "unconstrained_moment_print_precision_muB": magnetic_result.unconstrained_moment_print_precision,
             "moment_def": magnetic_result.moment_def,
             "max_moment_error_uB": magnetic_result.max_error,
             "tolerance_uB": magnetic_result.tolerance,
