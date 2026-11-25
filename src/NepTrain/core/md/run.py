@@ -13,6 +13,7 @@ from ase.io import iread as ase_iread
 from ase.io import write as ase_write
 
 from ..persistence import atomic_write_json
+from ..spin import MFORCE_KEY, SPIN_KEY, validate_spin_structure
 from .dump import adaptive_dump_interval
 from .lammps import LammpsError, run_lammps
 from .health import (
@@ -98,6 +99,7 @@ def _read_gpumd_frames(
     timestep_fs: float,
     dump_interval: int,
     allow_incomplete_tail: bool,
+    spin_reference: Atoms | None,
 ) -> list[Atoms]:
     frames: list[Atoms] = []
     try:
@@ -123,6 +125,26 @@ def _read_gpumd_frames(
                     "nep_force",
                     np.asarray(frame.calc.results["forces"], dtype=np.float64),
                 )
+            if spin_reference is not None:
+                for key in (SPIN_KEY, MFORCE_KEY):
+                    values = frame.arrays.get(key)
+                    if values is None and key == MFORCE_KEY:
+                        continue
+                    if (
+                        values is None
+                        or values.shape != (len(frame), 3)
+                        or not np.issubdtype(values.dtype, np.floating)
+                    ):
+                        raise MdError(
+                            f"GPUMD dump.xyz frame {index + 1} requires {key}:R:3"
+                        )
+                if MFORCE_KEY in frame.arrays:
+                    frame.set_array("nep_mforce", frame.arrays.pop(MFORCE_KEY))
+                active = spin_reference.arrays.get("spin_active")
+                if active is not None:
+                    if not np.array_equal(frame.numbers, spin_reference.numbers):
+                        raise MdError("cannot restore spin_active: GPUMD dump elements changed")
+                    frame.set_array("spin_active", active.copy())
             frames.append(frame)
     except (EOFError, OSError, ValueError):
         if not allow_incomplete_tail or not frames:
@@ -134,12 +156,19 @@ def _run_gpumd(
     request: MdRequest,
     health_policy: TrajectoryHealthPolicy,
 ) -> MdResult:
-    if request.spin:
-        raise MdError("spin evolution uses the LAMMPS DynSpin backend")
     from ..gpumd.io import GpumdInputError, RunInput
 
     timestep_fs = request.timestep * 1000.0
+    atoms = request.atoms
     try:
+        if request.spin:
+            if request.template_path is None:
+                raise MdError("GPUMD spin MD requires a custom run.in template")
+            if not validate_spin_structure(atoms, require_mforce=False):
+                raise MdError("GPUMD spin MD requires spin:R:3 in the input structure")
+            if not np.issubdtype(atoms.arrays[SPIN_KEY].dtype, np.floating):
+                atoms = atoms.copy()
+                atoms.arrays[SPIN_KEY] = atoms.arrays[SPIN_KEY].astype(np.float64)
         run = RunInput(request.model_file)
         if request.template_path is None:
             run.use_default(
@@ -161,10 +190,11 @@ def _run_gpumd(
                 replica=request.replica,
                 route_id=request.route_id,
                 route_fingerprint=request.route_fingerprint,
+                spin_temperature=request.spin_temperature,
             )
-        dump_interval = run.dump_interval()
+        dump_interval = run.dump_interval(require_spin=request.spin)
         effective_timestep_fs = run.timestep_fs()
-        process = run.calculate(request.atoms, request.output_dir)
+        process = run.calculate(atoms, request.output_dir)
     except (GpumdInputError, OSError, ValueError) as error:
         raise MdError(str(error)) from error
 
@@ -189,6 +219,7 @@ def _run_gpumd(
             timestep_fs=effective_timestep_fs,
             dump_interval=dump_interval,
             allow_incomplete_tail=not process_completed,
+            spin_reference=atoms if request.spin else None,
         )
     except (EOFError, OSError, ValueError) as error:
         if process_failure is None:
@@ -272,7 +303,7 @@ def run_md(request: MdRequest, backend: str) -> MdResult:
         raise MdError(
             "pre_failure_frames must be non-negative and bad_tail_frames at least 1"
         )
-    if request.spin and request.spin_temperature is None:
+    if backend == "lammps" and request.spin and request.spin_temperature is None:
         raise MdError("spin MD requires spin_temperature")
     try:
         health_policy = TrajectoryHealthPolicy.from_mapping(request.health)

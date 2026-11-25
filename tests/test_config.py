@@ -599,9 +599,10 @@ def test_torchnep_finetune_learning_rate_must_be_positive(tmp_path):
         )
 
 
-def test_spin_md_uses_lattice_temperature_by_default(tmp_path):
+@pytest.mark.parametrize("backend", ["lammps", "gpumd"])
+def test_spin_md_uses_lattice_temperature_by_default(tmp_path, backend):
     value = _project(
-        md={"spin": True},
+        md={"backend": backend, "spin": True},
         labeling={"backend": "abacus"},
         evaluation={
             "max_rmse": {
@@ -612,6 +613,7 @@ def test_spin_md_uses_lattice_temperature_by_default(tmp_path):
         },
     )
     config, _ = load_config(_write(tmp_path, value))
+    assert config["md"]["backend"] == backend
     assert "spin_temperature" not in config["sampling"]["routes"][0]["conditions"]
 
 

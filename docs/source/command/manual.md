@@ -106,8 +106,29 @@ run {{ steps }}
 结构目录统一识别 `*.xyz`、`*.extxyz`、`*.vasp` 和 `POSCAR*`，按文件名排序读取；手动标注、工作流和 DFT 后端使用相同规则。
 
 两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧；
-GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS
-DynSpin。
+GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。
+
+GPUMD 磁性采样需要支持自旋演化的 GPUMD、NEP-Spin 势和带 `spin:R:3` 的初始结构。
+使用 `--spin --template run.in`，在模板内选择 TSPIN、GLSD 或其他可用积分器，并在
+`dump_xyz` 中请求 `spin`。若同时请求 `mforce`，NepTrain 将预测磁力写为 `nep_mforce`，
+供轨迹健康检查使用。`{{ spin_temperature }}` 默认取任务温度，可用 `--spin-temperature`
+覆盖，适用于模板中需要显式传入自旋温度的命令。
+
+以下 `run.in` 使用固定晶胞的 TSPIN 自旋晶格动力学。
+
+```text
+potential {{ model_file }}
+velocity {{ temperature }} seed {{ seed }}
+ensemble nvt_tspin {{ temperature }} {{ temperature }} 100 mass_factor 0.001 seed {{ seed }}
+time_step 0.1
+dump_xyz {{ dump_interval }} {{ trajectory_file }} force spin mforce
+run {{ steps }}
+```
+
+```bash
+neptrain md spin.xyz --backend gpumd --spin --model nep.txt \
+  --template run.in --temperature 300 --steps 1000 -o spin-trajectory.xyz
+```
 
 ## 手动采样
 

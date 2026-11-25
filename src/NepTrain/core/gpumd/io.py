@@ -109,10 +109,14 @@ class RunInput:
         replica: int = 1,
         route_id: str = "",
         route_fingerprint: str = "",
+        spin_temperature: float | None = None,
     ) -> None:
         """Replace explicit placeholders; leave all physical commands untouched."""
         variables = {
             "temperature": temperature,
+            "spin_temperature": (
+                temperature if spin_temperature is None else spin_temperature
+            ),
             "pressure": pressure,
             "steps": steps,
             "timestep_fs": timestep_fs,
@@ -131,7 +135,7 @@ class RunInput:
         except ValueError as error:
             raise GpumdInputError(str(error)) from error
 
-    def dump_interval(self) -> int:
+    def dump_interval(self, *, require_spin: bool = False) -> int:
         dumps = [
             args for args in self._arguments("dump_xyz")
             if len(args) >= 2 and Path(args[1]) == Path("dump.xyz")
@@ -150,6 +154,10 @@ class RunInput:
                 raise GpumdInputError("dump_xyz interval must be positive")
             if "split" in values[2:] or "group" in values[2:]:
                 raise GpumdInputError("dump_xyz for dump.xyz must omit split and group")
+            if require_spin and "spin" not in values[2:]:
+                raise GpumdInputError(
+                    "dump_xyz for dump.xyz must include spin for GPUMD spin MD"
+                )
             intervals.append(interval)
         return intervals[-1]
 

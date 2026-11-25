@@ -634,11 +634,6 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 "backend input"
             )
 
-    if md.get("spin", False):
-        if md.get("backend") != "lammps":
-            raise ConfigError("spin MD currently requires md.backend=lammps")
-
-
     if workflow:
         workflow_id = workflow.get("id")
         if workflow_id is not None and (

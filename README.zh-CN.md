@@ -141,8 +141,9 @@ GPa。提供 `run.in` 模板时，只替换 `{{ model_file }}`、`{{ temperature
 `dump_xyz {{ dump_interval }} {{ trajectory_file }} force` 将带原子力的轨迹写入
 `dump.xyz`。若使用旧模板，请迁移 `dump_exyz` 命令，并将需要随任务变化的常量
 改成占位符。参见 [GPUMD 模板说明](docs/source/command/workflow.md)。
-GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留稳定段和炸前
-帧。Spin MD 仍只支持 LAMMPS DynSpin。
+GPUMD 和 LAMMPS 的轨迹都会生成同一格式的健康报告，失败任务可保留稳定段和炸前帧。
+GPUMD 磁性采样使用 `--backend gpumd --spin --template run.in`，积分器由模板选择。
+输入结构提供 `spin:R:3`，模板用 `dump_xyz` 输出 `spin`。参见 [TSPIN 示例](docs/source/command/manual.md)。
 
 ### 手动采样
 

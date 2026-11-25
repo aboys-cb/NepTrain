@@ -2512,7 +2512,7 @@ def build_manual_md(subparsers):
     parser.add_argument("--steps", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--ensemble", choices=["nve", "nvt", "npt"])
-    parser.add_argument("--template")
+    parser.add_argument("--template", help="MD input template, required for GPUMD spin MD.")
     parser.add_argument(
         "--route",
         help=(

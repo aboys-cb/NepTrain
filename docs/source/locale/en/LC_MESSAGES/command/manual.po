@@ -100,8 +100,14 @@ msgstr "For example, this template initializes velocities at the task temperatur
 msgid "温度单位为 K，`{{ pressure }}` 为 GPa，`{{ timestep_fs }}` 为 fs（从任务时间步长 的 ps 换算）。完整变量和轨迹输出要求见 [工作流模板说明](workflow.md)。旧模板中 希望随任务变化的常量需要改成占位符，尤其是 `potential`、`velocity` 和 `run`； 原来的按参数位置自动覆盖行为已移除。"
 msgstr "Temperature is in K, `{{ pressure }}` is in GPa, and `{{ timestep_fs }}` is in fs (converted from the task timestep in ps). See [Workflow templates](workflow.md) for all variables and trajectory requirements. Replace constants in old templates with placeholders wherever values should follow the task, especially in `potential`, `velocity`, and `run`; automatic positional overrides have been removed."
 
-msgid "两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧； GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。Spin MD 只支持 LAMMPS DynSpin。"
-msgstr "Both backends write `trajectory-health.json` and identify stable, pre-failure, and bad-tail frames. If GPUMD exits nonzero after writing complete dump frames, those frames are still recovered. Spin MD is supported only through LAMMPS DynSpin."
+msgid "两种 backend 都会输出 `trajectory-health.json` 并标注稳定段、炸前帧和坏尾帧； GPUMD 非零退出但已有完整 dump 帧时也会回收这些帧。"
+msgstr "Both backends write `trajectory-health.json` and identify stable, pre-failure, and bad-tail frames. If GPUMD exits nonzero after writing complete dump frames, those frames are still recovered."
+
+msgid "GPUMD 磁性采样需要支持自旋演化的 GPUMD、NEP-Spin 势和带 `spin:R:3` 的初始结构。 使用 `--spin --template run.in`，在模板内选择 TSPIN、GLSD 或其他可用积分器，并在 `dump_xyz` 中请求 `spin`。若同时请求 `mforce`，NepTrain 将预测磁力写为 `nep_mforce`， 供轨迹健康检查使用。`{{ spin_temperature }}` 默认取任务温度，可用 `--spin-temperature` 覆盖，适用于模板中需要显式传入自旋温度的命令。"
+msgstr "GPUMD magnetic sampling requires a GPUMD build with spin dynamics, a NEP-Spin potential, and an initial structure with `spin:R:3`. Use `--spin --template run.in`, choose TSPIN, GLSD, or another available integrator in the template, and request `spin` in `dump_xyz`. If you also request `mforce`, NepTrain writes the predicted magnetic forces as `nep_mforce` for trajectory health checks. The `{{ spin_temperature }}` placeholder defaults to the task temperature. Use `--spin-temperature` to override it for commands that accept an explicit spin temperature."
+
+msgid "以下 `run.in` 使用固定晶胞的 TSPIN 自旋晶格动力学。"
+msgstr "The following `run.in` uses fixed-cell TSPIN spin-lattice dynamics."
 
 #: ../../source/command/manual.md:68 01cb13f765a54029aa3df83a8e919c41
 msgid "手动采样"

@@ -24,7 +24,7 @@ User-provided names, paths, and external program messages are preserved.
 ## What NepTrain provides
 
 - GPUMD or TorchNEP training with a canonical `nep.txt` result.
-- GPUMD or LAMMPS sampling, including LAMMPS DynSpin for spin MD.
+- GPUMD or LAMMPS sampling, including [spin MD](docs/source/command/manual.md) with GPUMD templates or LAMMPS DynSpin.
 - VASP, ABACUS, MACE, DeepMD/DPA, or TACE labeling.
 - Element-set-aware farthest-point sampling with deterministic provenance.
 - Local process, local Slurm, and SSH + Slurm execution targets.

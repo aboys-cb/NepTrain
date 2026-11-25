@@ -205,6 +205,7 @@ sampling:
 GPUMD 模板可用变量：
 
 - `temperature`（K）、`pressure`（GPa）、`steps`、`seed`。
+- `spin_temperature`（K，工作流中取当前任务的温度）。
 - `timestep_fs`（fs，由任务的 ps 时间步长换算）。
 - `dump_interval`（按任务步数计算的建议输出间隔，只有显式引用才生效）。
 - `replica`、`route_id`、`route_fingerprint`。
@@ -223,7 +224,11 @@ GPUMD 模板可用变量：
 固定 dump 间隔不会自动缩短，须保证运行期间有完整帧输出。当前步号恢复沿用末次
 `time_step`（缺失 Time 时还使用末次 dump 间隔）；变时间步长或变输出间隔的多阶段
 轨迹尚不能保证恢复正确步号。GPUMD 与 LAMMPS 共用轨迹健康检查和失败窗口契约。
-Spin workflow 仍使用 LAMMPS DynSpin。
+
+GPUMD 磁性工作流设置 `md.backend: gpumd` 和 `md.spin: true`，并在 route 的
+`template_path` 指定磁性 `run.in`。积分器和物理参数由模板决定。起始结构须含
+`spin:R:3`，采样用的 `dump_xyz` 须输出 `spin`；可同时输出 `mforce`，NepTrain
+将其保存为 `nep_mforce`。参见 [TSPIN 示例](manual.md)。
 
 每条 route 的 `conditions.temperature_path` 是有顺序的温度探路路径。例如
 `[300, 500, 700, 900]` 会先验证 300 K，只有通过后才解锁 500 K。
@@ -413,9 +418,9 @@ labeling:
 
 逐原子 `spin_active:I:1` 优先于元素列表，适用于同种元素只有部分位点受约束的情况。不设置元素列表时兼容原有行为：优先使用逐原子掩码；VASP 其次使用 INCAR 的 `DELTASPIN_ATOMS`；没有掩码时按输入磁矩是否严格非零判断，不设大小阈值。元素列表不从 `nep.in` 推断，训练模型的 `spin_dof_type`、`spin_env_type` 与 DFT 约束应分别按物理问题设置。
 
-此设置同时用于 workflow 和 `neptrain label --project project.yaml`。DFT 输出保留实际约束掩码，LAMMPS 轨迹按原子 ID 传递它；若要改变已有结构的约束策略，也需修改或删除其 `spin_active`。未配置此字段的旧项目无需迁移，仍使用 schema 8。它改变物理标注设置，不属于队列或资源参数调整，已有 workflow 应按科学输入变更处理。
+此设置同时用于 workflow 和 `neptrain label --project project.yaml`。DFT 输出保留实际约束掩码，LAMMPS 按原子 ID 传递它，GPUMD 按全体系 dump 的原子顺序传递它；若要改变已有结构的约束策略，也需修改或删除其 `spin_active`。未配置此字段的旧项目无需迁移，仍使用 schema 8。它改变物理标注设置，不属于队列或资源参数调整，已有 workflow 应按科学输入变更处理。
 
-LAMMPS 输出的模型磁性力保存为 `nep_mforce`，继续用于轨迹健康检查；DFT 的 `mforce` 保存实际约束乘子。两者分开，避免把未约束位点上的模型预测误判成非法 DFT 标签。
+LAMMPS 和 GPUMD 输出的模型磁力保存为 `nep_mforce`，供轨迹健康检查使用。DFT 的 `mforce` 保存实际约束乘子。
 
 ## 第一性原理标注与 k 点
 

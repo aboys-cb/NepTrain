@@ -337,20 +337,90 @@ def test_failed_gpumd_run_recovers_frames_and_marks_fallback_tail(
     ]
 
 
-def test_gpumd_spin_recovery_remains_usable_without_stable_completion(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("ensemble", "spin_temperature", "rendered"),
+    [
+        ("nvt_tspin {{ spin_temperature }} {{ temperature }} 100", None,
+         "nvt_tspin 500.0 500.0 100"),
+        ("nvt_glsd {{ temperature }} {{ temperature }} 100 damping 0.01 stemp {{ spin_temperature }}",
+         350.0, "nvt_glsd 500.0 500.0 100 damping 0.01 stemp 350.0"),
+    ],
+)
+def test_gpumd_spin_recovery_remains_usable_without_stable_completion(
+    tmp_path, monkeypatch, ensemble, spin_temperature, rendered,
+):
+    atoms = _atoms()
+    atoms.set_array("spin", np.array([[0, 0, 3], [0, 0, 3]]))
+    atoms.set_array("spin_active", np.array([1, 0]))
+    template = tmp_path / "run.in"
+    template.write_text(
+        f"ensemble {ensemble}\n"
+        "time_step {{ timestep_fs }}\n"
+        "dump_xyz {{ dump_interval }} {{ trajectory_file }} force spin mforce\n"
+        "run {{ steps }}\n"
+    )
     frames = [_atoms() for _ in range(3)]
+    mforce = np.array([[0.2, 0., 0.], [0., 0.3, 0.]])
     for frame, moment in zip(frames, [3., .5, 3.]):
         frame.set_array("spin", np.array([[0., 0., moment], [0., 0., 3.]]))
+        frame.set_array("mforce", mforce.copy())
+
     def fake_run(command, *, stdout, stderr, cwd, check):
+        assert f"ensemble {rendered}\n" in (cwd / "run.in").read_text()
+        model_xyz = cwd / "model.xyz"
+        assert ":spin:R:3" in model_xyz.read_text().splitlines()[1]
+        np.testing.assert_array_equal(ase_read(model_xyz).arrays["spin"], atoms.arrays["spin"])
         _write_dump(Path(cwd), frames, [10., 20., 25.])
         return subprocess.CompletedProcess(command, 0)
+
     monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", fake_run)
-    result = run_md(_request(tmp_path, health={
-        "spin_magnitude_by_element": {"Fe": {"min": 2, "max": 6}}}), "gpumd")
+    result = run_md(_request(
+        tmp_path, atoms=atoms, spin=True, spin_temperature=spin_temperature,
+        template_path=template,
+        health={"spin_magnitude_by_element": {"Fe": {"min": 2, "max": 6}}},
+    ), "gpumd")
     saved = ase_read(result.trajectory, index=":")
     assert [f.info["md_window"] for f in saved] == ["pre_failure", "spin_filtered", "recovered"]
     assert [f.info["md_frame_usable"] for f in saved] == [True, False, True]
+    for frame, raw in zip(saved, frames):
+        np.testing.assert_array_equal(frame.arrays["spin"], raw.arrays["spin"])
+        np.testing.assert_array_equal(frame.arrays["spin_active"], [1, 0])
+        np.testing.assert_array_equal(frame.arrays["nep_mforce"], mforce)
+        assert "mforce" not in frame.arrays
     health = json.loads(result.health_report.read_text())
     assert health["process_completed"] and not health["trajectory_stable"]
+    assert "mforce" in health["available_signals"]
     assert health["spin_filtered_frame_count"] == 1
     assert not result.completed
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("template", "requires a custom run.in template"),
+        ("input", "requires spin:R:3 in the input structure"),
+        ("dump_command", "must include spin"),
+        ("dump_frame", "frame 1 requires spin:R:3"),
+    ],
+)
+def test_gpumd_spin_contract(tmp_path, monkeypatch, fault, message):
+    atoms = _atoms()
+    if fault != "input":
+        atoms.set_array("spin", np.array([[0., 0., 3.], [0., 0., 3.]]))
+    template = tmp_path / "run.in"
+    fields = "force" if fault == "dump_command" else "force spin"
+    template.write_text(f"time_step 1\ndump_xyz 1 dump.xyz {fields}\nrun 1\n")
+
+    def fake_run(command, *, cwd, **kwargs):
+        assert fault == "dump_frame"
+        _write_dump(cwd, [_atoms()], [1.0])
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("NepTrain.core.gpumd.io.subprocess.run", fake_run)
+    request = _request(
+        tmp_path, atoms=atoms, spin=True,
+        template_path=None if fault == "template" else template,
+    )
+    with pytest.raises(MdError, match=message):
+        run_md(request, "gpumd")
+    assert not request.output_file.exists()
