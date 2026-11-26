@@ -6,11 +6,10 @@ import os
 from pathlib import Path
 
 from ase import Atoms
-from ase.io import write as ase_write
 from rich.progress import track
 
 from ...structures import read_structures
-from ...spin import apply_constraint_elements
+from ...spin import apply_constraint_elements, write_spin_extxyz
 from .native import NativeVaspRequest, run_native_vasp
 from .io import default_vasp_command
 
@@ -91,7 +90,7 @@ def run_vasp(args):
         result = [atoms for group in result for atoms in group]
     if not result:
         raise RuntimeError("VASP produced no labeled structures")
-    ase_write(output, result, format="extxyz", append=args.append)
+    write_spin_extxyz(output, result, append=args.append)
     print("VASP calculation task completed!")
     return result
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 import tempfile
 from typing import Iterable
@@ -12,6 +13,7 @@ from ase import Atoms
 from ase.data import atomic_numbers
 from ase.io import read as ase_read
 from ase.io import write as ase_write
+from ase.io.extxyz import key_val_str_to_dict, parse_properties, write_xyz
 
 from .content_addressing import file_sha256
 from .structures import StructureReadError, read_structures
@@ -31,6 +33,43 @@ _MFORCE_ALIASES = (
 
 class SpinDataError(ValueError):
     """Raised when a structure violates the spin data contract."""
+
+
+def write_spin_extxyz(path: Path, frames: Iterable[Atoms], *, append: bool = False) -> None:
+    """Write standard ASE extxyz with round-trip precision for spin and mforce."""
+    with path.open("a" if append else "w", encoding="utf-8") as output:
+        for atoms in frames:
+            fields = [key for key in (SPIN_KEY, MFORCE_KEY)
+                      if key in atoms.arrays and atoms.arrays[key].dtype.kind == "f"]
+            if not fields:
+                write_xyz(output, atoms)
+                continue
+
+            # Use ASE's schema and calculator serialization, then replace the
+            # rounded magnetic columns with the original values.
+            with StringIO() as buffer:
+                write_xyz(buffer, atoms)
+                buffer.seek(0)
+                output.write(buffer.readline())
+                header = buffer.readline()
+                output.write(header)
+                schema = key_val_str_to_dict(header)["Properties"]
+                properties, order, _, _ = parse_properties(schema)
+                offset = 0
+                magnetic_columns = {}
+                for name in order:
+                    key, width = properties[name]
+                    if key in fields:
+                        magnetic_columns[key] = slice(offset, offset + width)
+                    offset += width
+                for index, line in enumerate(buffer):
+                    row = line.split()
+                    if len(row) != offset:
+                        raise SpinDataError("extxyz atom row does not match its Properties schema")
+                    for key, columns in magnetic_columns.items():
+                        values = np.atleast_1d(atoms.arrays[key][index])
+                        row[columns] = [f"{value:.17g}" for value in values]
+                    output.write(" ".join(row) + "\n")
 
 
 def _vector_array(atoms: Atoms, key: str) -> np.ndarray | None:

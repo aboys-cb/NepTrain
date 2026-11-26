@@ -73,7 +73,7 @@ from .scientific_data import (
     structure_id,
     validate_labeled_frames,
 )
-from .spin import validate_spin_dataset
+from .spin import validate_spin_dataset, write_spin_extxyz
 from .training import TrainingRequest, TrainingResult, train
 
 
@@ -2756,7 +2756,7 @@ class WorkflowIterationAdapter:
                 "label batches reported inconsistent labeling backends"
             )
         output = context.work_dir / "selected-labels.xyz"
-        ase_write(output, frames, format="extxyz")
+        write_spin_extxyz(output, frames)
         backend = next(
             iter(backends),
             str(self.config.get("labeling", {}).get("backend", "toy")),
@@ -3019,7 +3019,7 @@ class WorkflowIterationAdapter:
             if source.resolve() != output.resolve():
                 shutil.copyfile(source, output)
         else:
-            ase_write(output, merged, format="extxyz")
+            write_spin_extxyz(output, merged)
         return StageOutcome(
             artifacts={"training_set": output},
             metrics={

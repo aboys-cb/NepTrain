@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 import re
 
@@ -193,11 +194,12 @@ def read_result(path: Path, symbols: list[str], targets: np.ndarray, *, active=N
                     or fields[2:5] != flags):
                 raise DeltaSpinError("DeltaSpin table has incomplete constraints or wrong atom order")
             indices.append(index)
-            rows.append(numbers(" ".join(fields[5:8])))
-        return indices, np.asarray(rows)
+            rows.append(fields[5:8])
+        return indices, rows
 
     all_indices = list(range(len(symbols)))
-    moment_indices, moment_rows = table("ion elem cx cy cz Mx My Mz |M|")
+    moment_indices, moment_tokens = table("ion elem cx cy cz Mx My Mz |M|")
+    moment_rows = np.asarray([numbers(" ".join(row)) for row in moment_tokens])
     full_moments = moment_indices == all_indices
     if full_moments:
         spin = moment_rows
@@ -207,16 +209,23 @@ def read_result(path: Path, symbols: list[str], targets: np.ndarray, *, active=N
         spin[active] = moment_rows
     else:
         raise DeltaSpinError("DeltaSpin moment table has missing rows or wrong atom order")
-    force_indices, mforce = table("ion elem cx cy cz MFx MFy MFz")
+    force_indices, force_tokens = table("ion elem cx cy cz MFx MFy MFz")
     if force_indices != all_indices:
         raise DeltaSpinError("DeltaSpin magnetic force table has missing rows or wrong atom order")
+    mforce = np.asarray([numbers(" ".join(row)) for row in force_tokens])
     if np.any(mforce[~active] != 0):
         raise DeltaSpinError("inactive constraint multipliers must be zero")
     if np.max(np.abs(spin[active] - targets[active])) > tolerance * (1 + 1e-4) + 1e-10:
         raise DeltaSpinError("DeltaSpin final moments do not match active input targets")
     moment_def = int(definition.group(1))
     projected = spin.copy()
-    precision = None if active.all() else 1e-10
+    precision = None
+    if full_moments and not active.all():
+        exponent = max(
+            Decimal(token.upper().replace("D", "E")).as_tuple().exponent
+            for index in np.flatnonzero(~active) for token in moment_tokens[index]
+        )
+        precision = float(Decimal(1).scaleb(exponent))
     if not full_moments:
         if moment_def != 0:
             raise DeltaSpinError("partial-mask diagnostics require projector moment definition 0")

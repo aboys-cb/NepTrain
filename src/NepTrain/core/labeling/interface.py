@@ -11,7 +11,6 @@ from typing import Any, Callable, Mapping
 
 from ase import Atoms
 from ase.io import read as ase_read
-from ase.io import write as ase_write
 
 from ..structures import StructureReadError, read_structures
 
@@ -23,6 +22,7 @@ from ..scientific_data import (
     structure_id,
     validate_labeled_frames,
 )
+from ..spin import write_spin_extxyz
 
 
 class LabelingError(RuntimeError):
@@ -339,11 +339,7 @@ def label(request: LabelRequest, backend: str) -> LabelResult:
                 f"{backend} result violates the scientific data contract: {error}"
             ) from error
         expected_ids = [*previous_ids, *bound_ids]
-        ase_write(
-            temporary,
-            [*previous_frames, *output_frames],
-            format="extxyz",
-        )
+        write_spin_extxyz(temporary, [*previous_frames, *output_frames])
         restored = ase_read(temporary, index=":", format="extxyz")
         restored_frames = restored if isinstance(restored, list) else [restored]
         try:

@@ -49,7 +49,7 @@ from .slurm import (
     setup_line,
     submit_job,
 )
-from .spin import SpinDataError, validate_spin_dataset
+from .spin import SpinDataError, validate_spin_dataset, write_spin_extxyz
 
 
 class ManualTaskError(RuntimeError):
@@ -1608,8 +1608,8 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
                 )
         elif not frames:
             raise ManualTaskError("cannot merge an empty MD trajectory")
-        ase_write(temporary, frames, format="extxyz")
         if operation.kind == "label":
+            write_spin_extxyz(temporary, frames)
             restored = ase_read(temporary, index=":", format="extxyz")
             restored_frames = (
                 restored if isinstance(restored, list) else [restored]
@@ -1620,6 +1620,8 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
                 raise ManualTaskError(
                     "label merge did not survive the final extxyz round trip"
                 )
+        else:
+            ase_write(temporary, frames, format="extxyz")
     if output.exists() or output.is_symlink():
         archive = (
             operation.root

@@ -199,13 +199,16 @@ def test_deltaspin_virial_label_round_trips(tmp_path, monkeypatch, tensor):
 
 @pytest.mark.parametrize("missing_mforce", [False, True])
 @pytest.mark.parametrize("template_magmom", [None, "0 0 4 0 0 0.5 0 0 5"])
-@pytest.mark.parametrize("partial", [False, True, "auto", "project", "all-table"])
+@pytest.mark.parametrize("partial", [False, True, "auto", "project", "all-table", "all-table-15"])
 def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, missing_mforce, template_magmom, partial):
     monkeypatch.delenv("NEPTRAIN_VASP_COMMAND", raising=False)
     atoms = Atoms("FeAlFe", positions=[[0, 0, 0], [1, 1, 1], [2, 2, 2]], cell=[6, 6, 6], pbc=True)
     spin = np.asarray([[0.1, 0, 2], [0.2, 0, 0.1], [-0.1, 0, 2]])
-    full_table = partial == "all-table"
-    induced = [0.0391234567, -0.0102345678, 0.0023456789]
+    full_table = partial in {"all-table", "all-table-15"}
+    digits = 15 if partial == "all-table-15" else 10
+    induced = [0.039123456789123, -0.010234567812345, 0.002345678912345]
+    induced = [float(f"{value:.{digits}f}") for value in induced]
+    force_z = ["2.000000000000123", "4.000000000000246", "6.000000000000369"]
     if partial:
         spin[1] = [0.025, 0, 0]  # Unconstrained initial moments may be nonzero.
         if partial == "auto":
@@ -257,10 +260,10 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
             for i, (symbol, target) in enumerate(zip(["Fe", "Fe", "Al"], spin[[0, 2, 1]]), 1):
                 if expected_mask[i - 1]:
                     moment_rows.append(f"{i} {symbol} 1 1 1 " + " ".join(map(str, target)) + " 0")
-                    force_rows.append(f"{i} {symbol} 1 1 1 {i} {-i} {i * 2}")
+                    force_rows.append(f"{i} {symbol} 1 1 1 {i} {-i} {force_z[i - 1]}")
                 else:
                     if full_table:
-                        moment_rows.append(f"{i} {symbol} 0 0 0 " + " ".join(map(str, induced)) + " 0")
+                        moment_rows.append(f"{i} {symbol} 0 0 0 " + " ".join(f"{value:.{digits}f}" for value in induced) + " 0")
                     force_rows.append(f"{i} {symbol} 0 0 0 0 0 0")
             text = header + "ion elem cx cy cz Mx My Mz |M|\n---\n" + "\n".join(moment_rows)
             text += "\n\nMagnetic force (eV/uB)\nion elem cx cy cz MFx MFy MFz\n---\n" + "\n".join(force_rows)
@@ -291,10 +294,14 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
     expected_spin = spin.copy()
     if partial:
         expected_spin[1] = induced if full_table else 0.039
-    np.testing.assert_array_equal(frame.arrays["spin"], np.round(expected_spin, 8))
+    np.testing.assert_array_equal(frame.arrays["spin"], expected_spin)
     assert not {"spin_projected", "initial_magmoms"} & frame.arrays.keys()
     np.testing.assert_array_equal(frame.arrays["spin_active"], [1, 0 if partial else 1, 1])
-    np.testing.assert_array_equal(frame.arrays["mforce"], [[1, -1, 2], [0, 0, 0] if partial else [3, -3, 6], [2, -2, 4]])
+    np.testing.assert_array_equal(frame.arrays["mforce"], [
+        [1, -1, float(force_z[0])],
+        [0, 0, 0] if partial else [3, -3, float(force_z[2])],
+        [2, -2, float(force_z[1])],
+    ])
     np.testing.assert_array_equal(frame.get_forces(), [[1, 2, 3], [7, 8, 9], [4, 5, 6]])
     assert frame.info["dft_electronic_mode"] == "deltaspin"
     manifest = json.loads(next(request.work_dir.glob("*/vasp-result.json")).read_text())
@@ -302,7 +309,7 @@ def test_input_and_labels_restore_mixed_element_order(tmp_path, monkeypatch, mis
     assert manifest["status"] == "completed"
     assert manifest["deltaspin"]["mforce_unit"] == "eV/uB"
     assert manifest["deltaspin"]["unconstrained_moment_print_precision_muB"] == (
-        (1e-10 if full_table else 0.001) if partial else None
+        (10.0 ** -digits if full_table else 0.001) if partial else None
     )
     if full_table:
         assert manifest["deltaspin"]["projected_moments_muB"][2] == induced

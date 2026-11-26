@@ -51,9 +51,9 @@ atoms.set_array("spin_active", np.array([0, 0, 1, 1, 0, 0, 0, 0, 0, 0]))
 
 实际写出的 `DELTASPIN_ATOMS` 为 `0 0 1 1 0 0 0 0 0 0`。DFT 输出保留实际使用的 `spin_active`，LAMMPS 轨迹也按原子 ID 继承输入掩码，因此再次标注时不会把感应磁矩误当成约束目标。已有逐原子掩码会覆盖项目默认值；若要改变旧结构的约束策略，需要相应修改或删除其 `spin_active`。
 
-训练 XYZ 保留 `species、pos、spin、spin_active、mforce、forces`，不导出 `initial_magmoms、spin_projected`。`spin_active` 是约束元数据，不定义模型的自旋自由度。新版 c516 的 `spin` 统一取自最终 DeltaSpin 磁矩表，保留未约束 Bi/O 的感应磁矩，打印分辨率为 10⁻¹⁰ μB。部分原子约束也可使用磁矩定义 0、1 或 2，且可设 `LORBIT=0`。旧版 OUTCAR 只列受约束原子时，定义 0 仍可使用 `LORBIT=11` 的 `magnetization (x/y/z)` 补齐，打印分辨率为 0.001 μB。实际分辨率记录在 `vasp-result.json`。
+训练 XYZ 保留 `species、pos、spin、spin_active、mforce、forces`，不导出 `initial_magmoms、spin_projected`。`spin_active` 是约束元数据，不定义模型的自旋自由度。新版 c516 的 `spin` 统一取自最终 DeltaSpin 磁矩表，保留未约束 Bi/O 的感应磁矩。磁矩表的打印分辨率从 OUTCAR 实际字段读取（例如 10⁻¹⁰ 或 10⁻¹⁵ μB）。部分原子约束也可使用磁矩定义 0、1 或 2，且可设 `LORBIT=0`。旧版 OUTCAR 只列受约束原子时，定义 0 仍可使用 `LORBIT=11` 的 `magnetization (x/y/z)` 补齐，打印分辨率为 0.001 μB。实际分辨率记录在 `vasp-result.json`。
 
-`mforce` 保留 VASP 最终约束乘子；未约束原子为程序输出的零乘子。保存全原子磁矩不意味着独立 O 自旋扰动或其磁能曲率已得到验证。
+`mforce` 保留 VASP 最终约束乘子；未约束原子为程序输出的零乘子。标注 XYZ 以足够的有效位数写出 `spin` 和 `mforce`，重新读入时保留这两个字段的双精度数值。保存全原子磁矩不意味着独立 O 自旋扰动或其磁能曲率已得到验证。
 
 `MAGMOM` 是初始猜测，流程统一将其设为每帧输入 `spin`，与 `M_DELTASPIN` 使用相同的目标磁矩；模板中已有的 `MAGMOM` 也会被覆盖。NepTrain 会随 POSCAR 一起重排这两个字段，输出再还原原子顺序。非共线计算写入 `ISPIN=1`，避免 ASE 自动生成共线设置。
 
