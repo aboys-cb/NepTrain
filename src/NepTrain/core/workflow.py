@@ -322,7 +322,7 @@ def _plans(
 
 
 def _sampling_frames(config: Mapping[str, Any]) -> list[Any]:
-    from ase.io import read as ase_read
+    from .xyz import read_atoms
 
     frames = []
     for route in config["sampling"]["routes"]:
@@ -340,7 +340,7 @@ def _sampling_frames(config: Mapping[str, Any]) -> list[Any]:
                 )
             for path in paths:
                 try:
-                    loaded = ase_read(path, index=":")
+                    loaded = read_atoms(path, index=":")
                 except Exception as error:
                     raise WorkflowError(
                         f"cannot read sampling structure while validating DFT "

@@ -23,8 +23,7 @@ import time
 import traceback
 from typing import Any, Mapping, Sequence
 
-from ase.io import read as ase_read
-from ase.io import write as ase_write
+from .xyz import read_atoms, write_extxyz
 
 from .structures import StructureReadError, read_structures
 
@@ -623,10 +622,9 @@ def prepare_labeling(
     for index, start in enumerate(range(0, len(frames), structures_per_job)):
         job = root / "jobs" / f"{index:06d}"
         job.mkdir()
-        ase_write(
+        write_extxyz(
             job / "input.xyz",
             frames[start : start + structures_per_job],
-            format="extxyz",
         )
         request = {
             "backend": backend,
@@ -741,7 +739,7 @@ def prepare_md(
         for temperature in temperatures:
             job = root / "jobs" / f"{index:06d}"
             job.mkdir()
-            ase_write(job / "input.xyz", frame, format="extxyz")
+            write_extxyz(job / "input.xyz", frame)
             request = {
                 "backend": backend,
                 "source": str((job / "input.xyz").relative_to(root)),
@@ -936,7 +934,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                     ),
                     request["backend"],
                 )
-                written = ase_read(result_file, index=":")
+                written = read_atoms(result_file, index=":")
                 written_frames = (
                     written if isinstance(written, list) else [written]
                 )
@@ -962,7 +960,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
             elif operation.kind == "md":
                 from .md import MdRequest, run_md
 
-                atoms = ase_read(
+                atoms = read_atoms(
                     _resolve(operation.root, request["source"]), index=0
                 )
                 result = run_md(
@@ -1021,7 +1019,7 @@ def run_manual_worker(root_path: str | Path, index: int) -> int:
                 result_descriptor["frame_ids"] = frame_ids
                 result_descriptor["frame_count"] = len(frame_ids)
             elif operation.kind == "md":
-                trajectory = ase_read(result_file, index=":")
+                trajectory = read_atoms(result_file, index=":")
                 trajectory_frames = (
                     trajectory if isinstance(trajectory, list) else [trajectory]
                 )
@@ -1410,7 +1408,7 @@ def _validate_job_result(
     ):
         raise ManualTaskError(f"job {index} result artifact drifted or is missing")
     if operation.kind == "label":
-        loaded = ase_read(artifact, index=":")
+        loaded = read_atoms(artifact, index=":")
         frames = loaded if isinstance(loaded, list) else [loaded]
         try:
             validate_labeled_frames(frames)
@@ -1544,7 +1542,7 @@ def _final_result_error(
         return f"final result drifted or is missing: {output}"
     if operation.kind == "label":
         try:
-            loaded = ase_read(output, index=":")
+            loaded = read_atoms(output, index=":")
             frames = loaded if isinstance(loaded, list) else [loaded]
             validate_labeled_frames(frames)
             actual_ids = labeled_input_structure_ids(frames)
@@ -1589,7 +1587,7 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
                 operation,
                 operation.jobs_root / f"{index:06d}",
             )
-            loaded = ase_read(path, index=":")
+            loaded = read_atoms(path, index=":")
             frames.extend(loaded if isinstance(loaded, list) else [loaded])
         if operation.kind == "label":
             try:
@@ -1610,7 +1608,7 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
             raise ManualTaskError("cannot merge an empty MD trajectory")
         if operation.kind == "label":
             write_spin_extxyz(temporary, frames)
-            restored = ase_read(temporary, index=":", format="extxyz")
+            restored = read_atoms(temporary, index=":", format="extxyz")
             restored_frames = (
                 restored if isinstance(restored, list) else [restored]
             )
@@ -1621,7 +1619,7 @@ def _collect_unlocked(operation: ManualOperation) -> Path:
                     "label merge did not survive the final extxyz round trip"
                 )
         else:
-            ase_write(temporary, frames, format="extxyz")
+            write_extxyz(temporary, frames)
     if output.exists() or output.is_symlink():
         archive = (
             operation.root

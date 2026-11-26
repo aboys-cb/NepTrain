@@ -25,6 +25,7 @@ from NepTrain.core.scientific_data import (
     INPUT_STRUCTURE_ID_KEY,
     structure_id,
 )
+from NepTrain.core.xyz import read_atoms
 
 
 def _arguments(tmp_path: Path, source: Path, resources: Path) -> SimpleNamespace:
@@ -127,9 +128,9 @@ def _spin_log() -> str:
  Fe2 2.0 2.1 2.2
  Al1 3.0 3.1 3.2
  TOTAL-STRESS (KBAR)
- 1.0 0.0 0.0
- 0.0 2.0 0.0
- 0.0 0.0 3.0
+ 1.0 0.25 -0.5
+ 0.125 2.0 0.375
+ 0.75 -0.625 3.0
  Total Magnetism (uB)
  Fe 1.0 0.0 0.0
     0.0 0.0 3.0
@@ -282,9 +283,16 @@ def test_native_abacus_spin_roundtrip_writes_deltaspin_and_replaces_mforce(
     )
     assert frame.info["spin_constraint_rms_uB"] == pytest.approx(0.0)
     assert frame.info["dft_electronic_mode"] == "constrained_vector_spin_force"
-    reread = read(result.output_file)
+    reread = read_atoms(result.output_file)
     np.testing.assert_allclose(reread.arrays["spin"], spin)
     np.testing.assert_allclose(reread.arrays["mforce"], frame.arrays["mforce"])
+    expected_virial = np.array([
+        [1.0, 0.125, 0.75], [0.25, 2.0, -0.625], [-0.5, 0.375, 3.0],
+    ]) * atoms.get_volume() * 0.0006241509125883258
+    np.testing.assert_allclose(frame.info["virial"], expected_virial)
+    np.testing.assert_allclose(reread.info["virial"], expected_virial)
+    values = result.output_file.read_text().splitlines()[1].split('virial="', 1)[1].split('"')[0]
+    np.testing.assert_allclose(np.fromstring(values, sep=" "), expected_virial.ravel())
 
     case = tmp_path / "work" / "000001-AlFe2"
     rendered_input = (case / "INPUT").read_text(encoding="utf-8")

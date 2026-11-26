@@ -14,7 +14,7 @@ import numpy as np
 from ase import Atoms
 from ase.calculators.lammps.coordinatetransform import Prism
 from ase.data import atomic_masses, atomic_numbers
-from ase.io import write as ase_write
+from ..xyz import write_extxyz
 
 from ..nep.calculator import resolve_backend
 from ..persistence import atomic_write_json
@@ -551,7 +551,7 @@ def run_lammps(
         result_failure_code = "lammps_nonzero_exit"
         result_failure_reason = failure_reason
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(output_file, frames, format="extxyz")
+    write_extxyz(output_file, frames)
     return LammpsRunResult(
         output_file,
         input_file,

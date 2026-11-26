@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from ase import Atoms
-from ase.io import write as ase_write
+from ..xyz import write_extxyz
 
 from ..structures import read_structures
 
@@ -117,10 +117,9 @@ def run_perturb(args) -> None:
     )
     output = Path(args.out_file_path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(
+    write_extxyz(
         output,
         frames,
-        format="extxyz",
         append=args.append,
     )
 

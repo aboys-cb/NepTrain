@@ -102,6 +102,13 @@ NepTrain 只接受 `schema_version: 8`。旧版命令参数和旧配置不再兼
 也不会被静默迁移。当前训练入口仍是 `neptrain train`；旧的顶层 `vasp/gpumd/nep`
 命令分别由 `label/md/train` 统一入口替代。
 
+## XYZ 数据与 virial 顺序
+
+NepTrain 的 XYZ 数据集统一使用 GPUMD 行序，九个胞 virial 分量的单位为 eV/cell。
+注释行写作 `virial="xx xy xz yx yy yz zx zy zz"`。`neptrain label` 导出的 XYZ 可以直接
+拷贝为 GPUMD 的 `train.xyz`。用 ASE 导出的列序 virial 须先转换成行序再作为 NepTrain 输入。
+在 Python 中可用 `NepTrain.core.xyz.read_atoms` 查看 3×3 张量。
+
 ## 独立运行一个步骤
 
 ### 训练

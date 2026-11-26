@@ -20,7 +20,6 @@ from typing import Mapping
 from ase.data import atomic_numbers
 import numpy as np
 
-from .gpumd.training_xyz import stage_gpumd_xyz
 from .reporting import build_training_report, build_training_parity_reports
 from .scientific_data import optional_dataset_issue
 from .spin import validate_spin_dataset
@@ -107,8 +106,6 @@ def _replace_gpumd_keyword(
 def _prepare_gpumd_inputs(
     request: TrainingRequest,
     elements: tuple[str, ...],
-    *,
-    spin: bool,
 ) -> None:
     request.output_dir.mkdir(parents=True, exist_ok=True)
     lines = request.config_file.read_text(encoding="utf-8").splitlines(
@@ -144,12 +141,7 @@ def _prepare_gpumd_inputs(
         # A reused run directory must not reintroduce an old optional test set.
         (request.output_dir / "test.xyz").unlink(missing_ok=True)
     for source, target in sources:
-        if spin:
-            try:
-                stage_gpumd_xyz(source, target)
-            except (OSError, ValueError) as error:
-                raise TrainingError(f"could not stage GPUMD input: {error}") from error
-        elif source.resolve() != target.resolve():
+        if source.resolve() != target.resolve():
             shutil.copy2(source, target)
     if request.restart_file is not None:
         source, target = request.restart_file, request.output_dir / "nep.restart"
@@ -211,7 +203,7 @@ def _train_gpumd(
         )
     if request.continue_steps <= 0:
         raise TrainingError("continue_steps must be positive")
-    _prepare_gpumd_inputs(request, elements, spin=spin)
+    _prepare_gpumd_inputs(request, elements)
     model = request.output_dir / "nep.txt"
     model.unlink(missing_ok=True)
     stdout = request.output_dir / "nep.out"

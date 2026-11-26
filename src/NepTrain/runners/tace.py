@@ -14,6 +14,8 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 from ase.stress import voigt_6_to_full_3x3_stress
 
+from ..core.xyz import read_atoms, write_extxyz
+
 
 class TaceRunnerError(RuntimeError):
     """Raised when TACE cannot produce the required training labels."""
@@ -67,7 +69,7 @@ def label_frames(
     if fidelity_index is not None and fidelity_index < 0:
         raise TaceRunnerError("fidelity index must be non-negative")
 
-    loaded = ase_read(source_path, index=":")
+    loaded = read_atoms(source_path, index=":")
     frames = loaded if isinstance(loaded, list) else [loaded]
     if not frames:
         raise TaceRunnerError(f"input contains no structures: {source_path}")
@@ -230,5 +232,5 @@ def label_frames(
             frame.arrays["mforce"] = mforce
         labeled_frames.append(frame)
 
-    ase_write(output_path, labeled_frames, format="extxyz")
+    write_extxyz(output_path, labeled_frames)
     return labeled_frames

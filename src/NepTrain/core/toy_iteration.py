@@ -11,8 +11,7 @@ from typing import Any, Mapping
 
 import numpy as np
 from ase import Atoms
-from ase.io import read as ase_read
-from ase.io import write as ase_write
+from .xyz import read_atoms, write_extxyz
 
 from .content_addressing import file_sha256
 from .labeling import LabelRequest, label
@@ -74,7 +73,7 @@ class ToyIterationReport:
 
 
 def _frames(path: Path) -> list[Atoms]:
-    loaded = ase_read(path, index=":", format="extxyz")
+    loaded = read_atoms(path, index=":", format="extxyz")
     return loaded if isinstance(loaded, list) else [loaded]
 
 
@@ -86,7 +85,7 @@ def _prepare_inputs(root: Path, profile: str, seed: int) -> tuple[Path, Path]:
     )
     initial = [teacher.label(frame) for frame in initial_raw]
     initial_path = root / "initial-train.xyz"
-    ase_write(initial_path, initial, format="extxyz")
+    write_extxyz(initial_path, initial)
 
     validation_raw = toy_candidate_frames(
         profile,
@@ -97,7 +96,7 @@ def _prepare_inputs(root: Path, profile: str, seed: int) -> tuple[Path, Path]:
     )
     validation = [teacher.label(frame) for frame in validation_raw]
     validation_path = root / "validation.xyz"
-    ase_write(validation_path, validation, format="extxyz")
+    write_extxyz(validation_path, validation)
     return initial_path, validation_path
 
 
@@ -205,7 +204,7 @@ class ToyIterationAdapter:
                 md_steps=attempt.steps,
             )
         output = context.generation_dir / "candidates.xyz"
-        ase_write(output, candidates, format="extxyz")
+        write_extxyz(output, candidates)
         scenario_plan = context.generation_dir / "scenario-plan.json"
         atomic_write_json(
             scenario_plan,
@@ -258,7 +257,7 @@ class ToyIterationAdapter:
         )
         selected = [candidates[index] for index in result.selected_indices]
         selected_path = context.generation_dir / "selected-input.xyz"
-        ase_write(selected_path, selected, format="extxyz")
+        write_extxyz(selected_path, selected)
         result_path = context.generation_dir / "selection-result.json"
         atomic_write_json(result_path, asdict(result))
         return StageOutcome(
@@ -328,7 +327,7 @@ class ToyIterationAdapter:
                 merged.append(frame)
         validate_spin_dataset(merged, require_mforce=True)
         output = context.generation_dir / "train.xyz"
-        ase_write(output, merged, format="extxyz")
+        write_extxyz(output, merged)
         return StageOutcome(
             artifacts={"training_set": output},
             metrics={"training_count": len(merged)},

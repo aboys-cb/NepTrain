@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from ase import Atoms
-from ase.io import write as ase_write
+from ...xyz import write_extxyz
 from rich.progress import track
 
 from ...structures import read_structures
@@ -74,7 +74,7 @@ def run_abacus(args):
         result = [atoms for _list in result for atoms in _list]
     if not result:
         raise RuntimeError("ABACUS produced no labeled structures")
-    ase_write(args.out_file_path, result, format="extxyz", append=args.append)
+    write_extxyz(args.out_file_path, result, append=args.append)
 
     print("ABACUS calculation task completed!")
     return result

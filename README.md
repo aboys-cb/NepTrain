@@ -101,6 +101,14 @@ neptrain doctor --project project.yaml
 environment. It checks the actual GPUMD/TorchNEP, LAMMPS/GPUMD,
 VASP/ABACUS, or MACE/DeepMD/TACE runtime required by each target.
 
+## XYZ data and virial order
+
+NepTrain XYZ datasets use GPUMD row order for the nine cell virial components
+in eV/cell, written as `virial="xx xy xz yx yy yz zx zy zz"`. You can copy the XYZ
+produced by `neptrain label` directly to GPUMD as `train.xyz`. Convert ASE-generated
+column-order virials to row order before using those files as NepTrain inputs.
+In Python, use `NepTrain.core.xyz.read_atoms` to inspect the 3×3 tensor.
+
 ## Standalone steps
 
 Train one model:

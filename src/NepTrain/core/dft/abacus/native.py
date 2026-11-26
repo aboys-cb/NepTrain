@@ -157,9 +157,8 @@ def run_native_abacus(
         energy=parsed.energy,
         forces=forces,
     )
-    frame.info["virial"] = (
-        parsed.stress_kbar * frame.get_volume() * KBAR_ANGSTROM3_TO_EV
-    )
+    # ABACUS prints the displacement direction first; the virial uses position first.
+    frame.info["virial"] = parsed.stress_kbar.T * frame.get_volume() * KBAR_ANGSTROM3_TO_EV
     frame.info.setdefault("Config_type", "NepTrain scf ")
     frame.info["Weight"] = 1.0
     frame.info["dft_electronic_mode"] = electronic_mode

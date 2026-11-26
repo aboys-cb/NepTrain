@@ -23,8 +23,7 @@ import time
 import traceback
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from ase.io import read as ase_read
-from ase.io import write as ase_write
+from .xyz import read_atoms, write_extxyz
 
 from .content_addressing import canonical_sha256, file_sha256
 from .scientific_data import optional_dataset_issue
@@ -824,7 +823,7 @@ def build_stage_task(
                             "label frame_indices must be unique sorted "
                             "non-negative integers"
                         )
-                    frames = ase_read(source, index=":")
+                    frames = read_atoms(source, index=":")
                     if not isinstance(frames, list):
                         frames = [frames]
                     if indices[-1] >= len(frames):
@@ -832,10 +831,9 @@ def build_stage_task(
                             "label frame_indices exceed selected input size"
                         )
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    ase_write(
+                    write_extxyz(
                         destination,
                         [frames[index] for index in indices],
-                        format="extxyz",
                     )
             else:
                 _copy_input(source, destination)

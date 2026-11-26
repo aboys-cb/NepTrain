@@ -40,6 +40,7 @@ from NepTrain.core.manual import (
     submit_operation,
     wait_operation,
 )
+from NepTrain.core.xyz import read_atoms
 import NepTrain.core.manual as manual_module
 import NepTrain.core.execution as execution_module
 
@@ -103,7 +104,7 @@ def test_local_manual_model_labeling_runs_all_shards_and_keeps_provenance(
 import argparse
 import numpy as np
 from ase.calculators.singlepoint import SinglePointCalculator
-from ase.io import read, write
+from NepTrain.core.xyz import read_atoms, write_extxyz
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", required=True)
@@ -112,15 +113,15 @@ parser.add_argument("--output", required=True)
 parser.add_argument("--device", required=True)
 parser.add_argument("--precision", required=True)
 args = parser.parse_args()
-frames = read(args.input, index=":")
+frames = read_atoms(args.input, index=":")
 for index, frame in enumerate(frames):
-    frame.info["virial"] = np.eye(3) * (index + 1)
+    frame.info["virial"] = np.arange(1, 10).reshape(3, 3) * (index + 1)
     frame.calc = SinglePointCalculator(
         frame,
         energy=-float(index + 1),
         forces=np.zeros((len(frame), 3)),
     )
-write(args.output, frames, format="extxyz")
+write_extxyz(args.output, frames)
 """.lstrip(),
         encoding="utf-8",
     )
@@ -142,8 +143,12 @@ write(args.output, frames, format="extxyz")
     status = submit_operation(operation)
 
     assert status["state"] == "complete"
-    frames = read(output, index=":")
+    frames = read_atoms(output, index=":")
     assert len(frames) == 3
+    np.testing.assert_array_equal(frames[0].info["virial"], np.arange(1, 10).reshape(3, 3))
+    header = output.read_text().splitlines()[1]
+    values = header.split('virial="', 1)[1].split('"')[0]
+    np.testing.assert_array_equal(np.fromstring(values, sep=" "), np.arange(1, 10))
     assert [frame.info["neptrain_label_origin"] for frame in frames] == [
         "teacher_model"
     ] * 3

@@ -9,8 +9,7 @@ from typing import Mapping
 
 import numpy as np
 from ase import Atoms
-from ase.io import iread as ase_iread
-from ase.io import write as ase_write
+from ..xyz import iread_extxyz, write_extxyz
 
 from ..persistence import atomic_write_json
 from ..spin import MFORCE_KEY, SPIN_KEY, validate_spin_structure
@@ -104,7 +103,7 @@ def _read_gpumd_frames(
     frames: list[Atoms] = []
     try:
         for index, frame in enumerate(
-            ase_iread(dump, index=":", format="extxyz")
+            iread_extxyz(dump, index=":")
         ):
             time_value = frame.info.get("Time")
             if isinstance(time_value, int | float | np.number):
@@ -267,7 +266,7 @@ def _run_gpumd(
         failure_code = "gpumd_nonzero_exit"
         failure_reason = process_failure
     request.output_file.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(request.output_file, frames, format="extxyz")
+    write_extxyz(request.output_file, frames)
     return MdResult(
         backend="gpumd",
         trajectory=request.output_file,

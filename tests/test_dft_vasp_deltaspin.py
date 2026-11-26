@@ -13,9 +13,8 @@ from NepTrain.core.dft.vasp.deltaspin import (
     DeltaSpinError, numbers, prepare_input, read_result,
 )
 from NepTrain.core.dft.vasp.io import VaspInput, read_vasp_input
-from NepTrain.core.gpumd.training_xyz import stage_gpumd_xyz
 from NepTrain.core.labeling import LabelRequest, label
-from NepTrain.core.structures import read_structures
+from NepTrain.core.xyz import read_atoms
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "vasp_deltaspin"
@@ -178,23 +177,21 @@ def test_deltaspin_virial_label_round_trips(tmp_path, monkeypatch, tensor):
         assert not request.output_file.exists()
         return
 
-    restored = read(label(request, "vasp").output_file)
+    output = label(request, "vasp").output_file
+    restored = read_atoms(output)
     if tensor == "legacy":
         np.testing.assert_allclose(restored.info["virial"], -64 * np.array([
             [0, 5, 4], [5, 1, 3], [4, 3, 2],
         ]))
     else:
         expected = np.array([
-            [224.683794235293135, 0.001300274837711, -0.002709951633648],
-            [0.001308828306185, 227.061393271659199, -0.000557031115406],
-            [-0.002704551330098, -0.000558405783358, 227.065333929952885],
+            [224.683794235293135, 0.001308828306185, -0.002704551330098],
+            [0.001300274837711, 227.061393271659199, -0.000558405783358],
+            [-0.002709951633648, -0.000557031115406, 227.065333929952885],
         ])
         np.testing.assert_array_equal(restored.info["virial"], expected)
-        training = tmp_path / "train.xyz"
-        stage_gpumd_xyz(request.output_file, training)
-        values = training.read_text().splitlines()[1].split('virial="', 1)[1].split('"')[0]
+        values = output.read_text().splitlines()[1].split('virial="', 1)[1].split('"')[0]
         np.testing.assert_array_equal(np.fromstring(values, sep=" "), expected.ravel())
-        np.testing.assert_array_equal(read_structures(training)[0].info["virial"], expected)
 
 
 @pytest.mark.parametrize("missing_mforce", [False, True])

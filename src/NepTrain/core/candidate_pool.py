@@ -9,7 +9,7 @@ from collections import Counter
 from typing import Mapping, Sequence
 
 from ase import Atoms
-from ase.io import write as ase_write
+from .xyz import write_extxyz
 
 from .content_addressing import file_sha256
 from .persistence import atomic_write_json
@@ -93,7 +93,7 @@ def write_candidate_pool(
         counts_by_route[route_id] += 1
         output.append(copied)
     candidates_path.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(candidates_path, output, format="extxyz")
+    write_extxyz(candidates_path, output)
     manifest = CandidatePoolManifest(
         generation=int(generation),
         model_sha256=model_id,

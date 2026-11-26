@@ -136,7 +136,8 @@ def _read_virial(text: str) -> np.ndarray | None:
         raise DeltaSpinError("invalid OUTCAR Virial tensor (eV/cell) values") from error
     if not np.isfinite(virial).all():
         raise DeltaSpinError("OUTCAR Virial tensor (eV/cell) contains non-finite values")
-    return virial
+    # VASP prints the displacement direction first; the virial uses position first.
+    return virial.T
 
 
 def read_result(path: Path, symbols: list[str], targets: np.ndarray, *, active=None) -> DeltaSpinResult:

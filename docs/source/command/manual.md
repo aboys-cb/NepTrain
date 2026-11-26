@@ -36,9 +36,8 @@ neptrain train train.xyz \
 best 模型不同。使用远程 target 时，原始图表留在计算侧，可按 `remote.txt` 找到目录；
 最终模型发布到 `-o` 指定的路径。
 
-使用 GPUMD 训练 NEP-Spin 时，NepTrain 将 ASE 列序的 `virial` 转成 GPUMD 行序，
-保留九项。已是 GPUMD 行序的外部训练／测试数据，应在每个带 `virial` 的帧的注释行加
-`neptrain_virial_order=row_major`，以免重复转换。详见 [工作流数据约定](workflow.md)。
+训练输入的 `virial` 按 GPUMD 行序列出 `xx xy xz yx yy yz zx zy zz`，单位为 eV/cell。
+`neptrain label` 的输出可以直接用作 GPUMD 的 `train.xyz`。详见 [工作流数据约定](workflow.md)。
 
 ### TorchNEP 单节点多卡训练
 
@@ -263,7 +262,7 @@ TACE 先写临时预测 extxyz，NepTrain 再校验并归一化
 `TACE_noncollinear_magnetic_forces`，否则任务失败，不会补零。
 
 所有模型 runner 都遵守五参数协议：`--model`、`--input`、`--output`、
-`--device` 和 `--precision`。runner 必须输出顺序不变的规范 extxyz。
+`--device` 和 `--precision`。runner 必须保持结构顺序，输出 `virial` 按 GPUMD 行序写出的 extxyz。
 NepTrain 负责模型 hash、结构身份、energy/forces/virial、可选 spin/mforce
 和最终原子发布；runner 失败或标签不完整时不会产生部分结果。完整示例见仓库的
 `examples/distillation-mace/`、`examples/distillation-deepmd/` 和

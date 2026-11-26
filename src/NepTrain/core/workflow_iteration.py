@@ -12,10 +12,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from ase import Atoms
-from ase.io import read as ase_read
-from ase.io import write as ase_write
 
 from .structures import StructureReadError, read_structures
+from .xyz import write_extxyz
 
 from .candidate_pool import (
     CandidatePoolError,
@@ -2419,7 +2418,7 @@ class WorkflowIterationAdapter:
         selected = [candidates[index] for index in result.selected_indices]
         selected_path = context.work_dir / "selected-input.xyz"
         if selected:
-            ase_write(selected_path, selected, format="extxyz")
+            write_extxyz(selected_path, selected)
         else:
             selected_path.touch()
         regular_minimum = regular_batch_minimum(context.plan.max_selected)
@@ -2988,7 +2987,7 @@ class WorkflowIterationAdapter:
         }
         if failure_frames:
             path = context.work_dir / "pre-failure-labels.xyz"
-            ase_write(path, failure_frames, format="extxyz")
+            write_extxyz(path, failure_frames)
             artifacts["failure_frames"] = path
         if parity.chart is not None:
             artifacts["acquisition_parity"] = parity.chart
@@ -3170,7 +3169,7 @@ class WorkflowIterationAdapter:
                 anchors.append(frame)
         if anchors:
             path = context.work_dir / "regression-anchors.xyz"
-            ase_write(path, anchors, format="extxyz")
+            write_extxyz(path, anchors)
             artifacts["regression_anchors"] = path
         artifacts["scenario_maturity"] = atomic_write_json(
             context.work_dir / "scenario-maturity.json", history

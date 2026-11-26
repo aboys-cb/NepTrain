@@ -10,7 +10,7 @@ import tempfile
 from typing import Any, Callable, Mapping
 
 from ase import Atoms
-from ase.io import read as ase_read
+from ..xyz import read_atoms
 
 from ..structures import StructureReadError, read_structures
 
@@ -186,7 +186,7 @@ def _label_model(request: LabelRequest) -> LabelResult:
         raise LabelingError(
             f"{model_name} runner completed without producing its output"
         )
-    loaded = ase_read(request.output_file, index=":", format="extxyz")
+    loaded = read_atoms(request.output_file, index=":", format="extxyz")
     frames = loaded if isinstance(loaded, list) else [loaded]
     return LabelResult(
         "model",
@@ -265,7 +265,7 @@ def label(request: LabelRequest, backend: str) -> LabelResult:
 
     previous_frames = []
     if request.append and request.output_file.is_file():
-        previous = ase_read(request.output_file, index=":")
+        previous = read_atoms(request.output_file, index=":")
         previous_frames = previous if isinstance(previous, list) else [previous]
         try:
             validate_labeled_frames(previous_frames)
@@ -310,7 +310,7 @@ def label(request: LabelRequest, backend: str) -> LabelResult:
             )
         if not temporary.is_file():
             raise LabelingError(f"{backend} did not produce {temporary}")
-        persisted = ase_read(temporary, index=":", format="extxyz")
+        persisted = read_atoms(temporary, index=":", format="extxyz")
         output_frames = persisted if isinstance(persisted, list) else [persisted]
         if len(output_frames) != len(result.frames):
             raise LabelingError(
@@ -340,7 +340,7 @@ def label(request: LabelRequest, backend: str) -> LabelResult:
             ) from error
         expected_ids = [*previous_ids, *bound_ids]
         write_spin_extxyz(temporary, [*previous_frames, *output_frames])
-        restored = ase_read(temporary, index=":", format="extxyz")
+        restored = read_atoms(temporary, index=":", format="extxyz")
         restored_frames = restored if isinstance(restored, list) else [restored]
         try:
             validate_labeled_frames(restored_frames)

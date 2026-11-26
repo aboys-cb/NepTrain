@@ -20,7 +20,7 @@ import time
 import uuid
 from typing import Any, Callable, Mapping
 
-from ase.io import read as ase_read
+from .xyz import read_atoms
 
 from .content_addressing import canonical_sha256, file_sha256
 from .scientific_data import optional_dataset_issue
@@ -1618,7 +1618,7 @@ class PersistentController:
             in {"vasp", "abacus"}
             and context.artifacts["selected_input"].stat().st_size > 0
         ):
-            frames = ase_read(context.artifacts["selected_input"], index=":")
+            frames = read_atoms(context.artifacts["selected_input"], index=":")
             if not isinstance(frames, list):
                 frames = [frames]
             structures_per_job = int(

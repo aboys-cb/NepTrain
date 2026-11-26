@@ -86,11 +86,11 @@ OUTCAR 必须包含一次 `DeltaSpin final status`，其中 `SCF convergence` �
 
 输出 `spin` 来自实际收敛磁矩表，单位 μB；`mforce` 来自 `Magnetic force (eV/uB)` 表，按 `spin_lambda` 原符号保存，对应 `L=E+lambda.(M-M_target)`。能量和原子力沿用 ASE 的 VASP 读取路径。`vasp-result.json` 保存输入/输出哈希、磁矩定义、误差和单位。
 
-DeltaSpin 优先从 OUTCAR 的 `Virial tensor (eV/cell)` 表读取 virial，按原符号保存完整的笛卡尔 3×3 张量，包括各自独立的剪切分量。旧版 OUTCAR 缺少该表时，沿用 ASE 应力换算。六分量应力只能还原对称张量。若完整表存在但数据有误，该结构标注失败。
+DeltaSpin 优先从 OUTCAR 的 `Virial tensor (eV/cell)` 表读取并转置为位置方向在前的 virial，保留九个分量及原符号。标注文件按 GPUMD 行序 `xx xy xz yx yy yz zx zy zz` 写出。旧版 OUTCAR 缺少完整表时，沿用 ASE 应力换算。六分量应力只能还原对称张量。若完整表存在但数据有误，该结构标注失败。
 
 ```python
-from ase.io import read
-frame = read("labeled-spin.xyz")
+from NepTrain.core.xyz import read_atoms
+frame = read_atoms("labeled-spin.xyz")
 print(frame.arrays["spin"])
 print(frame.arrays["mforce"])
 print(frame.info["deltaspin_max_error"], frame.info["deltaspin_tolerance"])

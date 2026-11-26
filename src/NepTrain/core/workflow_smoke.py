@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ase.io import read, write
+from .xyz import read_atoms, write_extxyz
 from .dft.toy import ToyTeacher
 from .toy_workflow import toy_candidate_frames, toy_raw_features
 from .training import TrainingResult
@@ -39,8 +39,8 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
     labels = [teacher.label(f) for f in toy_candidate_frames(profile, seed, 4)]
     for f in labels:
         f.info["smoke_test"] = True
-    write(initial, labels, format="extxyz")
-    write(structures, toy_candidate_frames(profile, seed + 1, 1), format="extxyz")
+    write_extxyz(initial, labels)
+    write_extxyz(structures, toy_candidate_frames(profile, seed + 1, 1))
     events = []
     current = {"generation": 0, "stage": None}
 
@@ -68,7 +68,7 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
             case == "md_recovery" and current["generation"] == 1
             or case == "long_streak" and current["generation"] <= 2
         )
-        write(request.output_file, frames, format="extxyz")
+        write_extxyz(request.output_file, frames)
         events.append(
             {
                 "generation": current["generation"],
@@ -179,7 +179,7 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
             ]
             for f in test_frames:
                 f.info["smoke_test"] = True
-            write(test_file, test_frames, format="extxyz")
+            write_extxyz(test_file, test_frames)
         config["evaluation"] = {
             "validation_path": str(test_file),
             "max_rmse": {"energy_rmse": 0.01, "force_rmse": 0.1},
@@ -227,7 +227,7 @@ def _run_case(root: Path, case: str, profile: str, seed: int) -> dict[str, Any]:
         science = _generation_science(
             {"generation": generation, "max_selected": 8}, record
         )
-        actual_training_count = len(read(summary.artifacts["training_set"], index=":"))
+        actual_training_count = len(read_atoms(summary.artifacts["training_set"], index=":"))
         training_counts_match.append(
             science["training"]["after_count"] == actual_training_count
         )

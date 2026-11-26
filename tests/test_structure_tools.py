@@ -136,7 +136,7 @@ def test_structure_reader_does_not_swallow_keyboard_interrupt(
     def interrupted(*_args, **_kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("NepTrain.core.structures.ase_read", interrupted)
+    monkeypatch.setattr("NepTrain.core.structures.read_atoms", interrupted)
     with pytest.raises(KeyboardInterrupt):
         read_structures(source)
 
@@ -146,6 +146,23 @@ def test_structure_reader_rejects_unreadable_input(tmp_path):
     source.write_text("not an xyz file\n", encoding="utf-8")
 
     with pytest.raises(StructureReadError, match="failed to read"):
+        read_structures(source)
+
+
+@pytest.mark.parametrize("field", ["virial", "Virial"])
+def test_structure_reader_decodes_gpumd_virial(tmp_path, field):
+    source = tmp_path / "gpumd.xyz"
+    source.write_text(f'1\n{field}="1 2 3 4 5 6 7 8 9"\nFe 0 0 0\n')
+    np.testing.assert_array_equal(
+        read_structures(source)[0].info["virial"], np.arange(1, 10).reshape(3, 3)
+    )
+
+
+def test_structure_reader_rejects_duplicate_virials(tmp_path):
+    source = tmp_path / "duplicate.xyz"
+    field = 'virial="1 2 3 4 5 6 7 8 9"'
+    source.write_text(f"1\n{field} {field}\nFe 0 0 0\n")
+    with pytest.raises(StructureReadError, match="expected one virial"):
         read_structures(source)
 
 

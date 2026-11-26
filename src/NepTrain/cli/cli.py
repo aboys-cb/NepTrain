@@ -1766,10 +1766,10 @@ def run_doctor(args):
         and md_backend == "lammps"
         and not failures
     ):
-        from ase.io import read as ase_read
+        from NepTrain.core.xyz import read_atoms
         from NepTrain.core.md import MdRequest, run_md
 
-        atoms = ase_read(args.structure, index=0)
+        atoms = read_atoms(args.structure, index=0)
         spin = bool(model_info and model_info.supports("spin"))
         with tempfile.TemporaryDirectory(prefix="neptrain-doctor-") as directory:
             root = Path(directory)

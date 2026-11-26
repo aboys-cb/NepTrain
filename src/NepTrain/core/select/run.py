@@ -8,8 +8,7 @@ from typing import Any, Sequence
 
 import numpy as np
 from ase import Atoms
-from ase.io import read as ase_read
-from ase.io import write as ase_write
+from ..xyz import read_atoms, write_extxyz
 
 from ..content_addressing import file_sha256
 from ..descriptor_features import (
@@ -45,7 +44,7 @@ def _frames(path: str | Path, *, role: str) -> list[Atoms]:
     if not source.is_file():
         raise SelectionError(f"{role} does not exist: {source}")
     try:
-        value = ase_read(source, index=":", format="extxyz")
+        value = read_atoms(source, index=":", format="extxyz")
     except Exception as error:
         raise SelectionError(f"cannot read {role} {source}: {error}") from error
     frames = value if isinstance(value, list) else [value]
@@ -171,7 +170,7 @@ def run_select(args) -> dict[str, Any]:
     if args.rejected_out and rejected:
         rejected_path = Path(args.rejected_out).expanduser().resolve()
         rejected_path.parent.mkdir(parents=True, exist_ok=True)
-        ase_write(rejected_path, rejected, format="extxyz")
+        write_extxyz(rejected_path, rejected)
 
     unique: dict[str, _Candidate] = {}
     for record in records:
@@ -235,7 +234,7 @@ def run_select(args) -> dict[str, Any]:
     selected = [candidates[index] for index in result.selected_indices]
     output = Path(args.out_file_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(output, selected, format="extxyz")
+    write_extxyz(output, selected)
     report_path = (
         Path(args.report).expanduser().resolve()
         if args.report

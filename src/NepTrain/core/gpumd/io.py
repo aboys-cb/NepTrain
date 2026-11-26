@@ -10,7 +10,7 @@ import shutil
 import subprocess
 
 from ase import Atoms
-from ase.io import write as ase_write
+from ..xyz import write_extxyz
 
 from ..md.dump import adaptive_dump_interval
 from ..md.template import render_template
@@ -177,7 +177,7 @@ class RunInput:
         directory = Path(directory).expanduser().resolve()
         directory.mkdir(parents=True, exist_ok=True)
         self.write_run(directory / "run.in")
-        ase_write(directory / "model.xyz", atoms, format="extxyz")
+        write_extxyz(directory / "model.xyz", atoms)
         model_source = self.nep_txt_path.resolve()
         if not model_source.is_file():
             raise GpumdInputError(f"GPUMD model does not exist: {model_source}")

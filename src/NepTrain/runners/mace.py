@@ -9,8 +9,7 @@ import numpy as np
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
-from ase.io import read as ase_read
-from ase.io import write as ase_write
+from ..core.xyz import read_atoms, write_extxyz
 from ase.stress import voigt_6_to_full_3x3_stress
 
 
@@ -67,7 +66,7 @@ def label_frames(
     if precision not in {"float32", "float64"}:
         raise MaceRunnerError("precision must be float32 or float64")
 
-    loaded = ase_read(source_path, index=":")
+    loaded = read_atoms(source_path, index=":")
     frames = loaded if isinstance(loaded, list) else [loaded]
     if not frames:
         raise MaceRunnerError(f"input contains no structures: {source_path}")
@@ -115,5 +114,5 @@ def label_frames(
         labeled_frames.append(frame)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(output_path, labeled_frames, format="extxyz")
+    write_extxyz(output_path, labeled_frames)
     return labeled_frames

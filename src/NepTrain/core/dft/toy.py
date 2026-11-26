@@ -9,8 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
-from ase.io import read as ase_read
-from ase.io import write as ase_write
+from ..xyz import read_atoms, write_extxyz
 
 from ..spin import validate_spin_dataset, validate_spin_structure
 
@@ -115,7 +114,7 @@ def _read_frames(source: Path) -> list[Atoms]:
     )
     frames: list[Atoms] = []
     for path in paths:
-        loaded = ase_read(path, index=":", format=None)
+        loaded = read_atoms(path, index=":", format=None)
         frames.extend(loaded if isinstance(loaded, list) else [loaded])
     return frames
 
@@ -130,7 +129,7 @@ def run_toy_teacher(request: "LabelRequest") -> list[Atoms]:
     validate_spin_dataset(labeled, require_mforce=True)
     request.work_dir.mkdir(parents=True, exist_ok=True)
     request.output_file.parent.mkdir(parents=True, exist_ok=True)
-    ase_write(request.output_file, labeled, format="extxyz", append=request.append)
+    write_extxyz(request.output_file, labeled, append=request.append)
     return labeled
 
 

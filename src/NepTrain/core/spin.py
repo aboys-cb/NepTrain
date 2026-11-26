@@ -11,12 +11,11 @@ from typing import Iterable
 import numpy as np
 from ase import Atoms
 from ase.data import atomic_numbers
-from ase.io import read as ase_read
-from ase.io import write as ase_write
-from ase.io.extxyz import key_val_str_to_dict, parse_properties, write_xyz
+from ase.io.extxyz import key_val_str_to_dict, parse_properties
 
 from .content_addressing import file_sha256
 from .structures import StructureReadError, read_structures
+from .xyz import read_atoms, write_extxyz
 
 
 SPIN_KEY = "spin"
@@ -36,19 +35,19 @@ class SpinDataError(ValueError):
 
 
 def write_spin_extxyz(path: Path, frames: Iterable[Atoms], *, append: bool = False) -> None:
-    """Write standard ASE extxyz with round-trip precision for spin and mforce."""
+    """Write GPUMD-compatible extxyz with full precision for spin and mforce."""
     with path.open("a" if append else "w", encoding="utf-8") as output:
         for atoms in frames:
             fields = [key for key in (SPIN_KEY, MFORCE_KEY)
                       if key in atoms.arrays and atoms.arrays[key].dtype.kind == "f"]
             if not fields:
-                write_xyz(output, atoms)
+                write_extxyz(output, atoms)
                 continue
 
             # Use ASE's schema and calculator serialization, then replace the
             # rounded magnetic columns with the original values.
             with StringIO() as buffer:
-                write_xyz(buffer, atoms)
+                write_extxyz(buffer, atoms)
                 buffer.seek(0)
                 output.write(buffer.readline())
                 header = buffer.readline()
@@ -300,8 +299,8 @@ def migrate_spin_dataset(
     ) as handle:
         temporary = Path(handle.name)
     try:
-        ase_write(temporary, frames, format="extxyz")
-        restored = ase_read(temporary, index=":", format="extxyz")
+        write_extxyz(temporary, frames)
+        restored = read_atoms(temporary, index=":", format="extxyz")
         restored_frames = restored if isinstance(restored, list) else [restored]
         restored_total, restored_spin = validate_spin_dataset(
             restored_frames,

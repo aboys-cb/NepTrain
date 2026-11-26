@@ -9,8 +9,7 @@ import shutil
 
 import numpy as np
 from ase import Atoms
-from ase.io import read as ase_read
-from ase.io import write as ase_write
+from .xyz import read_atoms, write_extxyz
 
 from .content_addressing import file_sha256
 from .labeling import LabelRequest, label
@@ -111,7 +110,7 @@ def _recovery_probe(root: Path, frames: list[Atoms], profile: str) -> bool:
     direct_input = root / "recovery-direct-input.xyz"
     direct_output = root / "recovery-direct.xyz"
     resumed_output = root / "recovery-resumed.xyz"
-    ase_write(direct_input, frames, format="extxyz")
+    write_extxyz(direct_input, frames)
     label(
         LabelRequest(direct_input, direct_output, root / "direct", settings={"profile": profile}),
         "toy",
@@ -120,8 +119,8 @@ def _recovery_probe(root: Path, frames: list[Atoms], profile: str) -> bool:
     midpoint = len(frames) // 2
     first = root / "recovery-first.xyz"
     second = root / "recovery-second.xyz"
-    ase_write(first, frames[:midpoint], format="extxyz")
-    ase_write(second, frames[midpoint:], format="extxyz")
+    write_extxyz(first, frames[:midpoint])
+    write_extxyz(second, frames[midpoint:])
     label(
         LabelRequest(first, resumed_output, root / "resumed-1", settings={"profile": profile}),
         "toy",
@@ -161,7 +160,7 @@ def run_smoke(
     seed_frame = toy_base_frame(teacher_profile == "spin")
     candidates = toy_candidate_frames(teacher_profile, seed)
     candidate_file = root / "candidates.xyz"
-    ase_write(candidate_file, candidates, format="extxyz")
+    write_extxyz(candidate_file, candidates)
     truth_file = root / "teacher-truth.xyz"
     truth = label(
         LabelRequest(candidate_file, truth_file, root / "teacher", settings={"profile": teacher_profile}),
@@ -187,12 +186,12 @@ def run_smoke(
     selected_frames = [candidates[index] for index in selected]
     selected_input = root / "selected-input.xyz"
     selected_output = root / "selected-labels.xyz"
-    ase_write(selected_input, selected_frames, format="extxyz")
+    write_extxyz(selected_input, selected_frames)
     selected_result = label(
         LabelRequest(selected_input, selected_output, root / "selected", settings={"profile": teacher_profile}),
         "toy",
     )
-    restored = ase_read(selected_output, index=":", format="extxyz")
+    restored = read_atoms(selected_output, index=":", format="extxyz")
     restored = restored if isinstance(restored, list) else [restored]
     validate_spin_dataset(restored, require_mforce=True)
     label_roundtrip = len(restored) == len(selected) and all(
