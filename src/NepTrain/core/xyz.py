@@ -49,17 +49,26 @@ def iread_extxyz(path, index=":"):
     return iread(path, index=index, format="extxyz", properties_parser=_read_header)
 
 
-def _encode_virial(atoms):
-    if "virial" not in atoms.info:
+def _encode_frame(atoms):
+    has_virial = "virial" in atoms.info
+    active = atoms.arrays.get("spin_active")
+    encode_active = active is not None and (
+        active.dtype.kind == "b"
+        or (active.dtype.kind == "f" and np.isin(active, (0, 1)).all())
+    )
+    if not has_virial and not encode_active:
         return atoms
-    # A flat vector is written by ASE without reordering its entries.
     frame = copy(atoms)
-    frame.info = {**atoms.info, "virial": np.asarray(atoms.info["virial"]).ravel()}
+    if has_virial:
+        # A flat vector is written by ASE without reordering its entries.
+        frame.info = {**atoms.info, "virial": np.asarray(atoms.info["virial"]).ravel()}
+    if encode_active:
+        frame.arrays = {**atoms.arrays, "spin_active": active.astype(np.int32)}
     return frame
 
 
 def write_extxyz(path, frames, *, append=False):
-    """Write EXTXYZ with virial entries in GPUMD row order."""
+    """Write EXTXYZ with row-major virials and integer spin masks."""
     if isinstance(frames, Atoms):
         frames = (frames,)
-    write(path, (_encode_virial(frame) for frame in frames), format="extxyz", append=append)
+    write(path, (_encode_frame(frame) for frame in frames), format="extxyz", append=append)

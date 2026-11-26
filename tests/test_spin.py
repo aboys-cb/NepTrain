@@ -15,7 +15,9 @@ from NepTrain.core.spin import (
     spin_from_lammps,
     spin_to_lammps,
     validate_spin_dataset,
+    write_spin_extxyz,
 )
+from NepTrain.core.xyz import read_atoms
 
 
 def test_element_constraints_include_zero_targets_and_exclude_induced_moments():
@@ -88,6 +90,34 @@ def test_extxyz_roundtrip_uses_singular_spin_and_mforce(tmp_path: Path):
     validate_spin_dataset([restored], require_mforce=True)
     np.testing.assert_allclose(restored.arrays["spin"], spins)
     np.testing.assert_allclose(restored.arrays["mforce"], mforces)
+
+
+@pytest.mark.parametrize("dtype", [bool, float, int])
+def test_spin_mask_export_is_numeric(tmp_path, dtype):
+    atoms = Atoms("FeO", positions=[[0, 0, 0], [1, 1, 1]], cell=[3, 3, 3], pbc=True)
+    atoms.set_array("spin", np.array([[3.0, 0, 0], [0, 0.25, 0]]))
+    atoms.set_array("mforce", np.array([[0.123456789123, 0, 0], [0, 0, 0]]))
+    atoms.set_array("spin_active", np.array([1, 0], dtype=dtype))
+    virial = np.arange(9, dtype=float).reshape(3, 3)
+    legacy = tmp_path / "legacy.xyz"
+    write(legacy, atoms, format="extxyz")
+    frame = read_atoms(legacy)
+    frame.info["virial"] = virial
+    mask_dtype = frame.arrays["spin_active"].dtype
+
+    path = tmp_path / "spin.xyz"
+    write_spin_extxyz(path, [frame])
+
+    output = path.read_text().splitlines()
+    assert "spin_active:I:1" in output[1]
+    assert [row.split()[-1] for row in output[2:]] == ["1", "0"]
+    restored = read_atoms(path)
+    assert restored.arrays["spin_active"].dtype.kind in "iu"
+    assert frame.arrays["spin_active"].dtype == mask_dtype
+    np.testing.assert_array_equal(restored.arrays["spin_active"], [1, 0])
+    np.testing.assert_array_equal(restored.arrays["mforce"], frame.arrays["mforce"])
+    np.testing.assert_array_equal(restored.info["virial"], virial)
+    validate_spin_dataset([restored], require_mforce=True)
 
 
 def test_spin_lammps_roundtrip_preserves_evolving_magnitude():
