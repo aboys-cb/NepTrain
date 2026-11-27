@@ -1976,6 +1976,375 @@ def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
     ), bulk_collections
 
 
+@pytest.fixture
+def slurm_label_workflow(tmp_path, monkeypatch, legacy_workflow_protocol):
+    config, initial = _controller_inputs(tmp_path)
+    _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
+    resources, _ = _write_vasp_resources(tmp_path)
+    remote = tmp_path / "remote"
+    config.write_text(
+        config.read_text().replace(
+            "labeling:\n  backend: toy\n",
+            "labeling:\n  backend: vasp\n  input_path: ./INCAR\n"
+            "  resource_path: ./potpaw\n  potcar_manifest_path: ./vasp-resources.json\n"
+            "  max_concurrent: 2\n",
+        ).replace(
+            "    label: {executor: process}",
+            f"    label: {{executor: slurm, host: login, work_root: {remote}, "
+            f"partition: cpu, labeling_resource_path: {resources}, cpus_per_task: 4}}",
+        )
+    )
+    prep = prepare_workflow(config, initial, tmp_path / "workflow")
+    scheduler = tmp_path / "scheduler"
+    bin_dir = tmp_path / "bin"
+    scheduler.mkdir()
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_SCHEDULER", str(scheduler))
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    for filename in ("queue", "account", "queue_names", "account_names", "submissions", "cancelled"):
+        _write(scheduler / filename, "")
+    commands = {
+        "sbatch": r"""
+printf '%s\n' "$PWD" >> "$FAKE_SCHEDULER/submissions"
+if [ -f "$FAKE_SCHEDULER/throttle" ]; then
+  cat "$FAKE_SCHEDULER/throttle" >&2
+  exit 1
+fi
+count=$(wc -l < "$FAKE_SCHEDULER/submissions")
+printf '%s;testcluster\n' "$((100 + count))"
+""",
+        "squeue": r"""
+case "$*" in
+  *--name*) cat "$FAKE_SCHEDULER/queue_names" ;;
+  *'%i|%T|%N'*|*'%A|%T|%N'*) cat "$FAKE_SCHEDULER/queue" ;;
+esac
+""",
+        "sacct": r"""
+case "$*" in
+  *'JobID%64,JobName%64'*) cat "$FAKE_SCHEDULER/account_names" ;;
+  *'JobID%64,State,ExitCode'*|*'JobIDRaw,State,ExitCode'*) cat "$FAKE_SCHEDULER/account" ;;
+esac
+""",
+        "scancel": r"""
+printf '%s\n' "$@" >> "$FAKE_SCHEDULER/cancelled"
+for job in "$@"; do
+  printf '%s|CANCELLED|0:0\n' "$job" >> "$FAKE_SCHEDULER/account"
+done
+: > "$FAKE_SCHEDULER/queue"
+""",
+        "neptrain": r"""
+[ "$1" = stage-worker ]
+[ "$PWD" = "$2" ]
+echo "worker: $OMP_NUM_THREADS"
+""",
+    }
+    for name, body in commands.items():
+        _write(bin_dir / name, "#!/bin/bash\nset -e\n" + body).chmod(0o755)
+
+    network = {"lose_reply": False, "lose_receipt": False, "fail_before_claim": False}
+    immediate = ImmediateExecutor(None, [])
+
+    def ssh(args, **kwargs):
+        assert args[0] == "ssh"
+        command = args[args.index("bash"):]
+        if network["fail_before_claim"] and command[-1] == "submit":
+            network["fail_before_claim"] = False
+            return subprocess.CompletedProcess(args, 255, "", "connection lost")
+        completed = subprocess.run(command, **kwargs)
+        if network["lose_reply"] and command[-1] == "submit":
+            assert completed.returncode == 0 and completed.stdout == "JOB 101\n"
+            if network["lose_receipt"]:
+                (Path(command[-3]) / "receipt").unlink()
+            network["lose_reply"] = False
+            return subprocess.CompletedProcess(args, 255, "", "connection lost")
+        return completed
+
+    def factory(target):
+        if target.executor != "slurm":
+            return immediate
+        executor = SlurmExecutor(target, runner=ssh)
+
+        def deploy(tasks, *, resolved_root=None):
+            bundles = []
+            for task in tasks:
+                bundle = Path(resolved_root) / task.workflow_id / "jobs" / task.bundle.name
+                bundle.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(task.bundle, bundle, dirs_exist_ok=True)
+                bundles.append(str(bundle))
+            return tuple(bundles)
+
+        executor.transport.deploy_many = deploy
+        executor.collect_many = lambda handles: tuple(immediate.collect(handle) for handle in handles)
+        executor.collect = immediate.collect
+        executor.collect_failure = immediate.collect
+        return executor
+
+    def open_controller():
+        return PersistentController(prep.output_dir, executor_factory=factory)
+
+    return prep, scheduler, network, factory, open_controller
+
+
+def _advance_to_label(controller):
+    for _ in range(20):
+        controller.tick()
+        current = controller.state.get("current") or {}
+        if current.get("stage") == "label":
+            return current
+    pytest.fail("controller did not reach DFT submission")
+
+
+def _lower_label_limit(controller):
+    project = controller.workspace.project_file
+    project.write_text(project.read_text().replace("max_concurrent: 2", "max_concurrent: 1"))
+
+
+@pytest.mark.parametrize("recovery_source", ["receipt", "squeue", "sacct"])
+def test_workflow_resume_recovers_dft_array_after_lost_ssh_reply(
+    slurm_label_workflow, monkeypatch, recovery_source,
+):
+    prep, scheduler, network, _, open_controller = slurm_label_workflow
+    network.update(lose_reply=True, lose_receipt=recovery_source != "receipt")
+    controller = open_controller()
+    with pytest.raises(ExecutionError, match="returned no receipt: connection lost"):
+        _advance_to_label(controller)
+
+    current = controller.state["current"]
+    pending = current["pending_label_submission"]
+    journal = Path((scheduler / "submissions").read_text().strip())
+    submission_name = journal.name.removeprefix(".")
+    assert pending["task_ids"] == [item["task_id"] for item in current["tasks"][:2]]
+    assert not any(item.get("handle") for item in current["tasks"])
+    assert "#SBATCH --array=0-1" in (journal / "submit.sh").read_text()
+    with pytest.raises(ControllerError, match="waiting for"):
+        open_controller().plan_restart(generation=1, from_stage="label")
+
+    if recovery_source != "receipt":
+        # In the gap before accounting appears, a new controller must wait.
+        with pytest.raises(ExecutionError, match="remains unconfirmed"):
+            open_controller().tick()
+        assert (scheduler / "submissions").read_text().splitlines() == [str(journal)]
+        if recovery_source == "squeue":
+            _write(scheduler / "queue_names", f"101|{submission_name}\n")
+        else:
+            _write(scheduler / "account_names", f"909|unrelated-job\n101_[0-1]|{submission_name}\n")
+
+    if recovery_source == "receipt":
+        # The already submitted cohort survives a lower limit when resuming.
+        _lower_label_limit(controller)
+
+    def start(*_args, **_kwargs):
+        open_controller().tick()
+        return 0
+
+    monkeypatch.setattr(controller_module, "start_controller", start)
+    assert resume_workflow(prep.output_dir, foreground=True).action == "resume"
+    controller = open_controller()
+    current = controller.state["current"]
+    assert "pending_label_submission" not in current
+    assert current["max_concurrent"] == (1 if recovery_source == "receipt" else 2)
+    assert [item["handle"]["execution_id"] for item in current["tasks"][:2]] == ["101_0", "101_1"]
+    assert current["tasks"][2]["handle"] is None
+    assert (scheduler / "submissions").read_text().splitlines() == [str(journal)]
+    assert (journal / "receipt").read_text() == "JOB 101\n"
+    for index, item in enumerate(current["tasks"][:2]):
+        subprocess.run(
+            ["bash", str(journal / "submit.sh")],
+            env={
+                **os.environ, "SLURM_ARRAY_JOB_ID": "101",
+                "SLURM_ARRAY_TASK_ID": str(index), "SLURM_CPUS_PER_TASK": "4",
+            },
+            check=True,
+        )
+        remote_bundle = Path(item["handle"]["remote_bundle"])
+        assert (remote_bundle / f"stdout-101_{index}.log").read_text() == "worker: 4\n"
+
+
+def test_resume_applies_lower_limit_to_unsubmitted_dft_array(slurm_label_workflow, monkeypatch):
+    prep, scheduler, network, _, open_controller = slurm_label_workflow
+    network["fail_before_claim"] = True
+    controller = open_controller()
+    with pytest.raises(ExecutionError, match="returned no receipt: connection lost"):
+        _advance_to_label(controller)
+    _lower_label_limit(controller)
+
+    def start(*_args, **_kwargs):
+        resumed = open_controller()
+        resumed.tick()
+        assert not (scheduler / "submissions").read_text()
+        resumed.tick()
+        return 0
+
+    monkeypatch.setattr(controller_module, "start_controller", start)
+    resume_workflow(prep.output_dir, foreground=True)
+    current = open_controller().state["current"]
+    assert current["max_concurrent"] == 1
+    assert current["tasks"][0]["handle"]["execution_id"] == "101"
+    assert all(item["handle"] is None for item in current["tasks"][1:])
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_dft_array_rolls_forward_and_retries_only_unsuccessful_element(
+    slurm_label_workflow, timed_out,
+):
+    prep, scheduler, _, factory, open_controller = slurm_label_workflow
+    controller = open_controller()
+    _advance_to_label(controller)
+
+    _write(scheduler / "queue", "101_0|PENDING|\n101_1|PENDING|\n")
+    controller.tick()
+    assert len((scheduler / "submissions").read_text().splitlines()) == 1
+    first, second, third = controller.state["current"]["tasks"]
+    assert third["handle"] is None
+
+    def finish(item):
+        ImmediateExecutor(None, []).launch(
+            StageTask(
+                item["task_id"], controller.workflow_id, 1, "label",
+                item["target"], Path(item["bundle"]),
+            )
+        )
+
+    finish(first)
+    _write(scheduler / "account", "101_0|COMPLETED|0:0\n")
+    _write(scheduler / "queue", "101_1|PENDING|\n")
+    controller.tick()
+    first, second, third = controller.state["current"]["tasks"]
+    assert first["collected_bundle"]
+    assert third["handle"]["execution_id"] == "102"
+    assert len((scheduler / "submissions").read_text().splitlines()) == 2
+
+    # Complete the singleton while the other array element is still pending.
+    finish(third)
+    with (scheduler / "account").open("a") as account:
+        account.write("102|COMPLETED|0:0\n")
+        if timed_out:
+            account.write("101_1|TIMEOUT|0:9\n")
+    if timed_out:
+        _write(scheduler / "queue", "")
+    stop_workflow(prep.output_dir, cancel_jobs=True, executor_factory=factory)
+    assert (scheduler / "cancelled").read_text().splitlines() == ([] if timed_out else ["101_1"])
+
+    controller = open_controller()
+    controller.resume_stopped()
+    first, second, third = controller.state["current"]["tasks"]
+    old_task_id = second["task_id"]
+    preserved = [item["task_id"] for item in (first, third)]
+    assert all(item["collected_bundle"] for item in (first, third))
+    restart = controller.restart_from(generation=1, from_stage="label", task_scope="failed")
+    assert (restart.preserved_tasks, restart.retried_tasks) == (2, 1)
+    controller.tick()
+    first, second, third = controller.state["current"]["tasks"]
+    assert [item["task_id"] for item in (first, third)] == preserved
+    assert second["task_id"] != old_task_id
+    assert second["handle"]["execution_id"] == "103"
+    assert second["retry_history"][-1]["handle"]["execution_id"] == "101_1"
+    finish(second)
+    with (scheduler / "account").open("a") as account:
+        account.write("103|COMPLETED|0:0\n")
+    controller.tick()
+    merged = prep.output_dir / "generations/0001/label/selected-labels.xyz"
+    assert [frame.positions[0, 0] for frame in ase_read(merged, index=":")] == [0.01, 0.02, 0.03]
+
+
+def test_stop_recovers_unacknowledged_dft_array_before_cancelling(slurm_label_workflow):
+    prep, scheduler, network, factory, open_controller = slurm_label_workflow
+    network["lose_reply"] = True
+    with pytest.raises(ExecutionError, match="returned no receipt: connection lost"):
+        _advance_to_label(open_controller())
+    _write(scheduler / "queue", "101_0|PENDING|\n101_1|PENDING|\n")
+
+    stop_workflow(prep.output_dir, cancel_jobs=True, executor_factory=factory)
+
+    current = open_controller().state["current"]
+    assert "pending_label_submission" not in current
+    assert [item["cancellation"]["action"] for item in current["tasks"]] == [
+        "cancelled", "cancelled", "cancelled_before_launch",
+    ]
+    assert (scheduler / "cancelled").read_text().splitlines() == ["101_0", "101_1"]
+    assert len((scheduler / "submissions").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    "reason", ["QOSMaxSubmitJobPerUserLimit", "Invalid job array specification"],
+)
+def test_dft_array_uses_smaller_submissions_after_limit_refusal(slurm_label_workflow, reason):
+    _, scheduler, _, _, open_controller = slurm_label_workflow
+    throttle = _write(scheduler / "throttle", f"sbatch: error: {reason}\n")
+    controller = open_controller()
+    current = _advance_to_label(controller)
+    assert controller.state["state"] == "waiting"
+    assert "pending_label_submission" not in current
+    assert not any(item["handle"] for item in current["tasks"])
+    throttle.unlink()
+    controller.tick()
+    _write(scheduler / "queue", "102|PENDING|\n")
+    controller.tick()
+    current = controller.state["current"]
+    assert [item["handle"]["execution_id"] for item in current["tasks"][:2]] == ["102", "103"]
+    assert current["tasks"][2]["handle"] is None
+    scripts = [Path(path) / "submit.sh" for path in (scheduler / "submissions").read_text().splitlines()]
+    assert ["#SBATCH --array" in script.read_text() for script in scripts] == [True, False, False]
+
+
+def test_existing_dft_group_keeps_the_single_job_recovery_path(slurm_label_workflow, monkeypatch):
+    _, scheduler, _, _, open_controller = slurm_label_workflow
+    controller = open_controller()
+    for _ in range(20):
+        controller.tick(
+            should_stop=lambda: (controller.state.get("current") or {}).get("stage") == "label",
+        )
+        current = controller.state.get("current") or {}
+        if current.get("stage") == "label":
+            break
+    else:
+        pytest.fail("controller did not reach DFT submission")
+    current.pop("slurm_label_arrays")
+    controller._save()
+
+    def recover_single_jobs(_executor, tasks):
+        return tuple(
+            ExecutionHandle(task.task_id, task.target, "slurm", str(91 + index), str(task.bundle))
+            for index, task in enumerate(tasks)
+        )
+
+    monkeypatch.setattr(SlurmExecutor, "launch_many", recover_single_jobs)
+    controller = open_controller()
+    controller.tick()
+    current = controller.state["current"]
+    assert "pending_label_submission" not in current
+    assert [item["handle"]["execution_id"] for item in current["tasks"][:2]] == ["91", "92"]
+    assert not (scheduler / "submissions").read_text()
+
+
+def test_remote_fetch_archives_aliased_artifact_path_once(tmp_path):
+    remote = tmp_path / "remote"
+    destination = tmp_path / "local"
+    _write(remote / "output/nep.txt", "model")
+    transport = ExecutionTransport(
+        ExecutionTarget("remote", "slurm", host="fixture", work_root=str(remote), partition="cpu")
+    )
+
+    def run_script(script, *arguments, **_kwargs):
+        if "tar -czf" in script:
+            assert arguments[2:] == ("output/nep.txt",)
+        return subprocess.run(
+            ["bash", "-s", "--", *arguments], input=script,
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "COPYFILE_DISABLE": "1"},
+        )
+
+    transport.run_script = run_script
+    transport.copy = lambda source, target, **_kwargs: shutil.copyfile(
+        str(source).split(":", 1)[1], target
+    )
+    fetched = transport.fetch_paths(
+        remote, ("output/nep.txt", "output/nep.txt"), destination,
+    )
+    assert fetched == ("output/nep.txt",)
+    assert (destination / "output/nep.txt").read_text() == "model"
+
+
 @pytest.mark.usefixtures("legacy_workflow_protocol")
 def test_remote_batch_collection_uses_one_compact_archive(tmp_path):
     config, initial = _controller_inputs(tmp_path)

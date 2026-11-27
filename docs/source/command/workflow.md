@@ -441,12 +441,21 @@ labeling:
 中的 `kspacing`。输入中没有这些设置时，适配器才按默认参数生成网格。
 
 `structures_per_job` 决定每个 VASP/ABACUS 调度任务包含多少个 FPS 选中结构；
-`max_concurrent` 限制 workflow 同时运行的标注任务数。默认值分别为 `1` 和
-`20`。例如 FPS 选中 100 个结构时，默认生成 100 个单结构任务，最多同时运行
-20 个。Controller 只合并正常完成并通过标签校验的结构。任何失败或取消的标注任务
-都会保存诊断后跳过，不再重试，也不会阻塞其余任务；最终结果仍按原始 FPS 顺序写入
-`selected-labels.xyz`。如果本轮没有任何标注通过，workflow 会进入 `stalled`，
-不会用空数据继续训练。
+`max_concurrent` 限制 workflow 已提交但尚未收集或记为终态失败的标注分片数，
+包括仍在排队的分片。默认值分别为 `1` 和 `20`。例如 FPS 选中 100 个结构时，
+默认生成 100 个单结构任务。Slurm target 首次最多提交 20 个分片，之后按可用名额
+滚动补交。启动环境和资源请求一致的多个分片共享一次 array 提交，只有一个分片时
+提交普通作业。若 Slurm 因队列配额或 array 大小限制拒绝整批，Controller 会缩小后续批次。
+更新时已创建的标注任务组沿用原提交方式，新任务组开始使用 array。
+
+每个 array 元素仍有自己的任务目录、`jobid_index` 和结果。提交前保存分片映射，
+`workflow resume` 可通过提交端回执或 Slurm 记录恢复对应 job ID。若提交结果
+暂时无法确认，Controller 等待确认，避免重复提交。`workflow stop` 按元素取消，
+`workflow restart <目录> --generation N --from label --tasks failed` 可重跑失败或未完成的分片。
+
+Controller 只合并正常完成并通过标签校验的结构。常规推进时，失败或取消的分片
+会保存诊断并跳过；最终结果仍按原始 FPS 顺序写入 `selected-labels.xyz`。
+如果本轮没有任何标注通过，workflow 会进入 `stalled`。
 
 VASP 的 `potcar_manifest_path` 和 ABACUS 的 `resource_manifest_path` 是
 必填 provenance。它们固定逐元素资源相对路径与 SHA256；VASP 还固定精确

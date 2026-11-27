@@ -201,3 +201,18 @@ def test_completing_queue_state_takes_precedence_over_cancelled_accounting():
     assert result.source == "squeue"
     assert len(calls) == 1
     assert aggregate_states(["COMPLETING", "COMPLETED"]) == "COMPLETING"
+
+
+def test_array_element_query_ignores_siblings_and_steps():
+    def run(command):
+        if command[0] == "squeue":
+            assert command[command.index("--jobs") + 1] == "123_2"
+            return subprocess.CompletedProcess(command, 0, "123_1|RUNNING|node1\n", "")
+        assert command[command.index("--jobs") + 1] == "123"
+        return subprocess.CompletedProcess(
+            command, 0,
+            "123_1|RUNNING|0:0\n123_2|TIMEOUT|0:9\n123_2.batch|FAILED|1:0\n", "",
+        )
+
+    result = query_job(run, "123_2")
+    assert (result.state, result.exit_code, result.source) == ("TIMEOUT", "0:9", "sacct")

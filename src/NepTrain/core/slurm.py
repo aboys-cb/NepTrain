@@ -234,6 +234,11 @@ def parse_submission_job_id(output: str) -> str | None:
     return value if value.isdigit() else None
 
 
+def valid_job_id(value: str) -> bool:
+    """Accept regular jobs and individual array elements."""
+    return re.fullmatch(r"[0-9]+(?:_[0-9]+)?", value) is not None
+
+
 def submit_job(run: SchedulerRunner, script_name: str) -> str:
     """Submit one script and return its numeric id with shared diagnostics."""
 
@@ -256,24 +261,33 @@ def submit_job(run: SchedulerRunner, script_name: str) -> str:
 def query_job(run: SchedulerRunner, job_id: str | None) -> SlurmQuery:
     """Query ``squeue`` then ``sacct`` through an injected command adapter."""
 
-    if not job_id or not str(job_id).isdigit():
+    if not job_id or not valid_job_id(str(job_id)):
         return SlurmQuery(None)
     selected_id = str(job_id)
+    is_element = "_" in selected_id
+
+    def rows(output: str) -> list[list[str]]:
+        values = [line.split("|") for line in output.splitlines() if line.strip()]
+        if is_element:
+            return [row[1:] for row in values if row[0].strip() == selected_id and len(row) > 1]
+        return values
+
     queue = run(
         [
             "squeue",
             "--noheader",
+            *(["--array"] if is_element else []),
             "--jobs",
             selected_id,
             "--format",
-            "%T|%N",
+            "%i|%T|%N" if is_element else "%T|%N",
         ]
     )
     if queue.returncode == 0:
-        rows = [line.split("|", 1) for line in queue.stdout.splitlines() if line.strip()]
-        state = aggregate_states([row[0] for row in rows])
+        queue_rows = rows(queue.stdout)
+        state = aggregate_states([row[0] for row in queue_rows])
         if state is not None:
-            nodes = ",".join(sorted({row[1].strip() for row in rows if len(row) > 1 and row[1].strip()}))
+            nodes = ",".join(sorted({row[1].strip() for row in queue_rows if len(row) > 1 and row[1].strip()}))
             return SlurmQuery(state, source="squeue", nodes=nodes)
 
     account = run(
@@ -283,20 +297,16 @@ def query_job(run: SchedulerRunner, job_id: str | None) -> SlurmQuery:
             "-X",
             "--parsable2",
             "--jobs",
-            selected_id,
+            selected_id.split("_", 1)[0],
             "--format",
-            "State,ExitCode",
+            "JobID%64,State,ExitCode" if is_element else "State,ExitCode",
         ]
     )
     if account.returncode == 0:
-        rows = [
-            line.split("|")
-            for line in account.stdout.splitlines()
-            if line.strip()
-        ]
-        state = aggregate_states([row[0] for row in rows])
+        account_rows = rows(account.stdout)
+        state = aggregate_states([row[0] for row in account_rows])
         if state is not None:
-            exits = [row[1] for row in rows if len(row) > 1 and row[1]]
+            exits = [row[1] for row in account_rows if len(row) > 1 and row[1]]
             exit_code = next(
                 (value for value in exits if not value.startswith("0:0")),
                 exits[0] if exits else "",
@@ -326,4 +336,5 @@ __all__ = [
     "setup_line",
     "submit_job",
     "submission_is_throttled",
+    "valid_job_id",
 ]

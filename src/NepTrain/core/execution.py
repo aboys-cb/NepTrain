@@ -53,6 +53,7 @@ from .slurm import (
     setup_line,
     submission_is_throttled,
     submit_job,
+    valid_job_id,
 )
 
 
@@ -1433,7 +1434,7 @@ fi
 """,
             remote_base,
             archive_name,
-            *relative_members,
+            *dict.fromkeys(relative_members),
         )
         if prepared.returncode != 0:
             raise ExecutionError(
@@ -2717,6 +2718,204 @@ cat "$bundle/execution.json"
             metadata={"job_name": name},
         )
 
+    def launch_label_batch(
+        self,
+        tasks: Sequence[StageTask],
+        submission_id: str,
+        *,
+        recovering: bool = False,
+        close_unsubmitted: bool = False,
+    ) -> tuple[ExecutionHandle, ...]:
+        """Submit one DFT wave, or recover its receipt on the login filesystem."""
+        if os.environ.get("SLURM_JOB_ID") and not close_unsubmitted:
+            raise ExecutionError("workflow controller must run on the Slurm login node")
+        first = tasks[0]
+        root = None
+        if self.target.host:
+            root = self.transport.resolve_remote_path(str(self.target.work_root))
+            parent = f"{root.rstrip('/')}/{first.workflow_id}/jobs"
+            bundles = tuple(f"{parent}/{task.bundle.name}" for task in tasks)
+        else:
+            parent = str(first.bundle.parent)
+            bundles = tuple(str(task.bundle) for task in tasks)
+        name = f"nt-label-{submission_id}"
+        journal = f"{parent}/.{name}"
+        is_array = len(tasks) > 1
+
+        def transact(mode: str, script: str = "") -> str:
+            # Claim before sbatch. An inconclusive claim must never be submitted again.
+            body = "submission_script=" + shlex.quote(script) + "\n" + r"""set -eo pipefail
+trap '' HUP PIPE
+journal=$1
+name=$2
+mode=$3
+receipt="$journal/receipt"
+save_receipt() {
+  printf '%s\n' "$1" > "$receipt.$$"
+  mv -f -- "$receipt.$$" "$receipt"
+}
+if [ "$mode" != recover ]; then
+  mkdir -p -- "$journal"
+  if mkdir -- "$journal/claimed" 2>/dev/null; then
+    if [ "$mode" = close ]; then
+      save_receipt CLOSED
+    else
+      printf '%s' "$submission_script" > "$journal/submit.sh"
+      date '+%Y-%m-%dT%H:%M:%S' > "$journal/started"
+      unset SBATCH_ARRAY_INX
+      if output=$(cd "$journal" && sbatch --parsable --job-name="$name" submit.sh 2>sbatch.stderr); then
+        job_id=${output%%;*}
+        if [[ "$job_id" =~ ^[0-9]+$ ]]; then
+          save_receipt "JOB $job_id"
+        fi
+      else
+        detail=$(cat "$journal/sbatch.stderr")
+        detail=${detail:-$output}
+        case "$(printf '%s' "$detail" | tr '[:upper:]' '[:lower:]')" in
+          ''|*'timed out'*|*'timeout'*|*'communication'*|*'socket'*|*'connection'*|*'protocol'*)
+            ;;
+          *) save_receipt "ERROR $detail" ;;
+        esac
+      fi
+    fi
+  elif [ ! -d "$journal/claimed" ]; then
+    exit 1
+  fi
+fi
+if [ -f "$receipt" ]; then
+  cat "$receipt"
+  exit 0
+fi
+if [ ! -d "$journal/claimed" ]; then
+  printf 'UNSTARTED\n'
+  exit 0
+fi
+jobs=$({
+  squeue --noheader --name "$name" --format '%F|%j' 2>/dev/null || true
+  if [ -s "$journal/started" ]; then
+    started=$(cat "$journal/started")
+    sacct --noheader -X --parsable2 --starttime "${started%T*}" \
+      --user "$(id -un)" --format 'JobID%64,JobName%64' 2>/dev/null || true
+  fi
+} | awk -F'|' -v name="$name" '
+  { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2) }
+  $2 == name && $1 ~ /^[0-9]+(_[0-9]+|_\[[0-9,:%-]+\])?$/ {
+    split($1, id, "_"); jobs[id[1]] = 1
+  }
+  END { for (job in jobs) print job }
+')
+if [[ "$jobs" =~ ^[0-9]+$ ]]; then
+  save_receipt "JOB $jobs"
+fi
+if [ -f "$receipt" ]; then
+  cat "$receipt"
+else
+  printf 'UNKNOWN\n'
+fi
+"""
+            args = (journal, name, mode)
+            completed = (
+                self.transport.run_script(body, *args)
+                if self.target.host
+                else self.transport.run(["bash", "-s", "--", *args], input_text=body)
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise ExecutionError(f"Slurm submission {name} returned no receipt: {detail}")
+            return completed.stdout.strip()
+
+        receipt = "UNSTARTED"
+        if close_unsubmitted or recovering:
+            receipt = transact("close" if close_unsubmitted else "recover")
+        if receipt == "UNSTARTED":
+            directives = self._task_directives(first)
+            if any(self._task_directives(task) != directives for task in tasks[1:]):
+                raise PermanentExecutionError("DFT batch tasks require identical Slurm resources")
+            if any(
+                re.match(r"--array(?:[=\s]|$)", item.removeprefix("#SBATCH "))
+                for item in directives
+            ):
+                raise PermanentExecutionError("DFT array indices are assigned by the workflow")
+            for task in tasks:
+                _prepare_setup(self.target, task)
+            setup = setup_line(self.target.setup_script, local=self.target.host is None)
+            packaged_setup = (first.bundle / "target-setup.sh").is_file()
+            if is_array:
+                dispatch = ['case "$SLURM_ARRAY_TASK_ID" in']
+                dispatch.extend(
+                    f"  {index}) neptrain_bundle={shlex.quote(bundle)} ;;"
+                    for index, bundle in enumerate(bundles)
+                )
+                dispatch.extend([
+                    "  *) exit 2 ;;",
+                    "esac",
+                    'cd "$neptrain_bundle"',
+                    'exec >> "stdout-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log" 2>&1',
+                ])
+                if packaged_setup:
+                    dispatch.append('source "$neptrain_bundle/target-setup.sh"')
+                elif setup:
+                    dispatch.append(setup)
+                setup = "\n".join(dispatch)
+                command = (
+                    shlex.join([*shlex.split(self.target.command), "stage-worker"])
+                    + ' "$neptrain_bundle"'
+                )
+            else:
+                if packaged_setup:
+                    setup = f"source {shlex.quote(f'{bundles[0]}/target-setup.sh')}"
+                command = _worker_command(self.target, bundles[0])
+            script = render_script(
+                SlurmScript(
+                    job_name=name,
+                    output_path=(
+                        f"{journal}/scheduler-%A_%a.log"
+                        if is_array else f"{bundles[0]}/stdout-%j.log"
+                    ),
+                    workdir=journal if is_array else bundles[0],
+                    command=command,
+                    partition=str(self.target.partition),
+                    time_limit=self.target.time,
+                    qos=self.target.qos,
+                    cpus_per_task=self.target.cpus_per_task,
+                    gpus_per_node=self.target.gpus_per_node,
+                    directives=directives,
+                    environment=self.target.environment,
+                    setup_line=setup,
+                    array=f"0-{len(tasks) - 1}" if is_array else None,
+                )
+            )
+            self.transport.deploy_many(tasks, resolved_root=root)
+            receipt = transact("submit", script)
+        kind, _, value = receipt.partition(" ")
+        if close_unsubmitted and kind in {"CLOSED", "ERROR"}:
+            return ()
+        if kind == "ERROR":
+            if submission_is_throttled(value) or (
+                is_array and "invalid job array specification" in value.lower()
+            ):
+                raise SubmissionDeferred(value)
+            raise PermanentExecutionError(value)
+        job_id = parse_submission_job_id(value) if kind == "JOB" else None
+        if job_id is None:
+            raise ExecutionError(
+                f"Slurm submission {name} remains unconfirmed; check {journal} "
+                "and scheduler accounting before retrying the stage"
+            )
+        return tuple(
+            ExecutionHandle(
+                task.task_id,
+                self.target.name,
+                "slurm",
+                f"{job_id}_{index}" if is_array else job_id,
+                str(task.bundle),
+                remote_bundle=bundle if self.target.host else None,
+                metadata={"job_name": name, "submission_dir": journal},
+            )
+            for index, (task, bundle) in enumerate(zip(tasks, bundles, strict=True))
+        )
+
     def launch_many(
         self,
         tasks: Sequence[StageTask],
@@ -2955,10 +3154,10 @@ while [ "$#" -gt 0 ]; do
   job_ids+=("$2")
   shift 2
 done
-numeric=()
+valid_ids=()
 for job_id in "${job_ids[@]}"; do
-  if [[ "$job_id" =~ ^[0-9]+$ ]]; then
-    numeric+=("$job_id")
+  if [[ "$job_id" =~ ^[0-9]+(_[0-9]+)?$ ]]; then
+    valid_ids+=("$job_id")
   fi
 done
 for index in "${!bundles[@]}"; do
@@ -2975,16 +3174,24 @@ for index in "${!bundles[@]}"; do
   fi
   printf 'W\t%s\t%s\n' "$index" "$state"
 done
-if [ "${#numeric[@]}" -eq 0 ]; then
+if [ "${#valid_ids[@]}" -eq 0 ]; then
   exit 0
 fi
-csv=$(IFS=,; printf '%s' "${numeric[*]}")
+csv=$(IFS=,; printf '%s' "${valid_ids[*]}")
+queue_options=(--format '%A|%T|%N')
+account_csv=$csv
+account_format='JobIDRaw,State,ExitCode'
+if [[ "$csv" == *_* ]]; then
+  queue_options=(--array --format '%i|%T|%N')
+  account_csv=$(printf '%s\n' "${valid_ids[@]%%_*}" | sort -u | paste -sd, -)
+  account_format='JobID%64,State,ExitCode'
+fi
 while IFS='|' read -r job_id state nodes; do
   [ -n "$job_id" ] && printf 'Q\t%s\t%s\t%s\n' "$job_id" "$state" "$nodes"
-done < <(squeue --noheader --jobs "$csv" --format '%A|%T|%N' 2>/dev/null || true)
+done < <(squeue --noheader --jobs "$csv" "${queue_options[@]}" 2>/dev/null || true)
 while IFS='|' read -r job_id state exit_code _rest; do
   [ -n "$job_id" ] && printf 'A\t%s\t%s\t%s\n' "$job_id" "$state" "$exit_code"
-done < <(sacct --noheader -X --parsable2 --jobs "$csv" --format 'JobIDRaw,State,ExitCode' 2>/dev/null || true)
+done < <(sacct --noheader -X --parsable2 --jobs "$account_csv" --format "$account_format" 2>/dev/null || true)
 """,
             *arguments,
         )
@@ -3008,12 +3215,14 @@ done < <(sacct --noheader -X --parsable2 --jobs "$csv" --format 'JobIDRaw,State,
                 if len(columns) == 3 and columns[0] == "W":
                     worker_states[int(columns[1])] = columns[2]
                 elif len(columns) >= 3 and columns[0] == "Q":
-                    queue_states.setdefault(columns[1], []).append(columns[2])
+                    job_id = columns[1].strip()
+                    queue_states.setdefault(job_id, []).append(columns[2])
                     if len(columns) > 3 and columns[3]:
-                        queue_nodes.setdefault(columns[1], set()).add(columns[3])
+                        queue_nodes.setdefault(job_id, set()).add(columns[3])
                 elif len(columns) >= 4 and columns[0] == "A":
-                    account_states.setdefault(columns[1], []).append(columns[2])
-                    account_exits.setdefault(columns[1], []).append(columns[3])
+                    job_id = columns[1].strip()
+                    account_states.setdefault(job_id, []).append(columns[2])
+                    account_exits.setdefault(job_id, []).append(columns[3])
         except (ValueError, IndexError) as error:
             raise ExecutionError(
                 "remote batch Slurm inspection returned invalid output"
@@ -3123,13 +3332,20 @@ done
             ),
             evidence,
         )
+        submission_dir = handle.metadata.get("submission_dir")
+        if submission_dir:
+            self.transport.fetch_paths(
+                submission_dir,
+                ("submit.sh", "sbatch.stderr", f"scheduler-{handle.execution_id}.log"),
+                evidence,
+            )
         return evidence
 
     def cancel(self, handle: ExecutionHandle) -> ExecutionStatus:
         status = self.inspect(handle)
         if status.terminal:
             return status
-        if not handle.execution_id.isdigit():
+        if not valid_job_id(handle.execution_id):
             raise ExecutionError(
                 f"Slurm execution has an invalid job id: {handle.execution_id}"
             )
@@ -3198,7 +3414,7 @@ done
         invalid = [
             handle.execution_id
             for handle in active_handles
-            if not handle.execution_id.isdigit()
+            if not valid_job_id(handle.execution_id)
         ]
         if invalid:
             raise ExecutionError(
