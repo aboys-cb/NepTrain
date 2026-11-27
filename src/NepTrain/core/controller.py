@@ -704,7 +704,11 @@ class PersistentController:
         item["retryable"] = stage != "label"
         item["failure"] = detail
 
-    def _resolve_label_submission(
+    @staticmethod
+    def _pending_submission_key(current: Mapping[str, Any]) -> str:
+        return f"pending_{current.get('stage')}_submission"
+
+    def _resolve_slurm_submission(
         self,
         current: dict[str, Any],
         *,
@@ -713,19 +717,20 @@ class PersistentController:
     ) -> int:
         from .execution import StageTask
 
-        intent = current["pending_label_submission"]
+        pending_key = self._pending_submission_key(current)
+        intent = current[pending_key]
         by_id = {item["task_id"]: item for item in current["tasks"]}
         items = [by_id[task_id] for task_id in intent["task_ids"]]
         executor = self.executor_factory(self._task_target(items[0]))
-        launch_batch = getattr(executor, "launch_label_batch", None)
+        launch_batch = getattr(executor, "launch_stage_batch", None)
         if not callable(launch_batch):
-            raise ExecutionError("the saved DFT submission requires a Slurm batch executor")
+            raise ExecutionError("the saved submission requires a Slurm batch executor")
         tasks = [
             StageTask(
                 item["task_id"],
                 self.workflow_id,
                 int(current["generation"]),
-                "label",
+                str(current["stage"]),
                 item["target"],
                 Path(item["bundle"]),
             )
@@ -736,10 +741,10 @@ class PersistentController:
         )
         if handles or not close_unsubmitted:
             if len(handles) != len(items):
-                raise ControllerError("Slurm returned an incomplete DFT submission")
+                raise ControllerError("Slurm returned an incomplete submission")
             for item, handle in zip(items, handles, strict=True):
                 item.update(handle=asdict(handle), submitted_at=_now())
-        current.pop("pending_label_submission")
+        current.pop(pending_key)
         self.state.pop("last_submission_error", None)
         self.state.pop("reason", None)
         self._save()
@@ -754,7 +759,8 @@ class PersistentController:
         from .execution import StageTask
 
         stage = str(current["stage"])
-        slurm_labeling = current.get("slurm_label_arrays", False)
+        slurm_arrays = current.get(f"slurm_{stage}_arrays", False)
+        pending_key = self._pending_submission_key(current)
         maximum = int(current.get("max_concurrent", len(current["tasks"])))
         if stage == "label":
             maximum = int(self.config.get("labeling", {}).get(
@@ -1024,7 +1030,7 @@ class PersistentController:
                 )
 
         inflight = len(observed_items)
-        if slurm_labeling:
+        if slurm_arrays:
             inflight = sum(
                 not item.get("collected_bundle") and not item.get("terminal_failure")
                 for item in observed_items
@@ -1093,38 +1099,43 @@ class PersistentController:
                 raise transport_error
 
         used_bulk_launch = False
-        if slurm_labeling and not (should_stop is not None and should_stop()):
-            recovering = "pending_label_submission" in current
+        if slurm_arrays and not (should_stop is not None and should_stop()):
+            recovering = pending_key in current
+            batch_limit_key = f"{stage}_submission_limit"
             if not recovering and launch_candidates and not group_failed:
-                first = launch_candidates[0]
-                target = self._task_target(first)
-                executor = self.executor_factory(target)
-                if callable(getattr(executor, "launch_label_batch", None)):
+                first = next(
+                    (item for item in launch_candidates
+                     if self.targets[item["target"]].executor == "slurm"),
+                    None,
+                )
+                if first is not None and callable(getattr(
+                    self.executor_factory(self._task_target(first)), "launch_stage_batch", None,
+                )):
                     target_key = self._task_target_key(first)
-                    batch_limit = current.get("label_submission_limit", maximum)
+                    batch_limit = current.get(batch_limit_key, maximum)
                     task_ids = [
                         item["task_id"]
                         for item in launch_candidates
                         if self._task_target_key(item) == target_key
                     ][:batch_limit]
-                    current["pending_label_submission"] = {
+                    current[pending_key] = {
                         "id": uuid.uuid4().hex,
                         "task_ids": task_ids,
                     }
                     self._save()
-            intent = current.get("pending_label_submission")
+            intent = current.get(pending_key)
             if intent is not None:
                 used_bulk_launch = True
                 try:
-                    running += self._resolve_label_submission(
+                    running += self._resolve_slurm_submission(
                         current,
                         recovering=recovering,
                         close_unsubmitted=recovering and len(intent["task_ids"]) > slots,
                     )
                 except (SubmissionDeferred, PermanentExecutionError) as error:
-                    task_ids = current.pop("pending_label_submission")["task_ids"]
+                    task_ids = current.pop(pending_key)["task_ids"]
                     if isinstance(error, SubmissionDeferred) and len(task_ids) > 1:
-                        current["label_submission_limit"] = len(task_ids) // 2
+                        current[batch_limit_key] = len(task_ids) // 2
                     first = next(
                         item for item in current["tasks"]
                         if item["task_id"] == task_ids[0]
@@ -1690,6 +1701,10 @@ class PersistentController:
                 "tasks": tasks,
                 "created_at": _now(),
             }
+            if self.config.get("md", {}).get("backend", "lammps") == "lammps" and any(
+                self.targets[item["target"]].executor == "slurm" for item in tasks
+            ):
+                self.state["current"]["slurm_explore_arrays"] = True
             self.state["state"] = "launching"
             self._save()
             return self.tick(should_stop=should_stop)
@@ -1836,11 +1851,12 @@ class PersistentController:
 
     def retry(self, *, recover_rejected: bool = False) -> None:
         state = str(self.state.get("state", "idle"))
+        current = self.state.get("current") or {}
         if state == "complete":
             raise ControllerError("workflow is already complete")
         if state == "failed" and (
             self.state.pop("preserve_current_on_retry", False)
-            or (self.state.get("current") or {}).get("pending_label_submission")
+            or current.get(self._pending_submission_key(current))
         ):
             self.state["state"] = "launching"
             self.state.pop("reason", None)
@@ -1983,7 +1999,7 @@ class PersistentController:
     @staticmethod
     def _current_execution_is_terminal(current: Mapping[str, Any]) -> bool:
         if current.get("kind") == "task_group":
-            return not current.get("pending_label_submission") and all(
+            return not current.get(PersistentController._pending_submission_key(current)) and all(
                 item.get("collected_bundle")
                 or item.get("terminal_failure")
                 or item.get("observed_state")
@@ -2201,7 +2217,7 @@ class PersistentController:
                 archived["abandoned_at"] = _now()
                 archived["abandoned_jobs"] = list(plan.unconfirmed_jobs)
                 self.state.setdefault("history", []).append(archived)
-            current.pop("pending_label_submission", None)
+            current.pop(self._pending_submission_key(current), None)
             for item in current["tasks"]:
                 if not item.get("collected_bundle"):
                     item["retryable"] = True
@@ -2918,12 +2934,12 @@ def stop_workflow(
             result["current_execution"] = {"action": "none"}
             return finish()
         if current.get("kind") == "task_group":
-            if current.get("pending_label_submission"):
+            if current.get(controller._pending_submission_key(current)):
                 try:
-                    controller._resolve_label_submission(current, close_unsubmitted=True)
+                    controller._resolve_slurm_submission(current, close_unsubmitted=True)
                 except ExecutionError as error:
                     raise ControllerError(
-                        f"cannot cancel DFT tasks before confirming their submission: {error}"
+                        f"cannot cancel tasks before confirming their Slurm submission: {error}"
                     ) from error
             records_by_task: dict[str, dict[str, Any]] = {}
             cancellable_by_target: dict[

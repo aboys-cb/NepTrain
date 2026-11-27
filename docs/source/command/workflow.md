@@ -422,6 +422,11 @@ labeling:
 
 LAMMPS 和 GPUMD 输出的模型磁力保存为 `nep_mforce`，供轨迹健康检查使用。DFT 的 `mforce` 保存实际约束乘子。
 
+新创建的 LAMMPS 采样任务组会把执行目标、资源请求和启动环境一致的轨迹合并为
+Slurm job array。每条轨迹仍有独立的任务目录和日志。Controller 可按元素回收、
+取消和重跑；若提交回执丢失，`workflow resume` 会先找回原作业。升级时已创建的
+采样任务组沿用原提交方式。
+
 ## 第一性原理标注与 k 点
 
 默认让用户输入文件管理 k 点：

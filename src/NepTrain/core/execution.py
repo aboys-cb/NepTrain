@@ -2718,7 +2718,7 @@ cat "$bundle/execution.json"
             metadata={"job_name": name},
         )
 
-    def launch_label_batch(
+    def launch_stage_batch(
         self,
         tasks: Sequence[StageTask],
         submission_id: str,
@@ -2726,7 +2726,7 @@ cat "$bundle/execution.json"
         recovering: bool = False,
         close_unsubmitted: bool = False,
     ) -> tuple[ExecutionHandle, ...]:
-        """Submit one DFT wave, or recover its receipt on the login filesystem."""
+        """Submit compatible stage tasks, or recover their receipt on the login filesystem."""
         if os.environ.get("SLURM_JOB_ID") and not close_unsubmitted:
             raise ExecutionError("workflow controller must run on the Slurm login node")
         first = tasks[0]
@@ -2738,7 +2738,7 @@ cat "$bundle/execution.json"
         else:
             parent = str(first.bundle.parent)
             bundles = tuple(str(task.bundle) for task in tasks)
-        name = f"nt-label-{submission_id}"
+        name = f"nt-{first.stage}-{submission_id}"
         journal = f"{parent}/.{name}"
         is_array = len(tasks) > 1
 
@@ -2831,12 +2831,12 @@ fi
         if receipt == "UNSTARTED":
             directives = self._task_directives(first)
             if any(self._task_directives(task) != directives for task in tasks[1:]):
-                raise PermanentExecutionError("DFT batch tasks require identical Slurm resources")
+                raise PermanentExecutionError("batch tasks require identical Slurm resources")
             if any(
                 re.match(r"--array(?:[=\s]|$)", item.removeprefix("#SBATCH "))
                 for item in directives
             ):
-                raise PermanentExecutionError("DFT array indices are assigned by the workflow")
+                raise PermanentExecutionError("Slurm array indices are assigned by the workflow")
             for task in tasks:
                 _prepare_setup(self.target, task)
             setup = setup_line(self.target.setup_script, local=self.target.host is None)

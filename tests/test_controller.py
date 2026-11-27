@@ -1977,23 +1977,43 @@ def test_grouped_stages_use_bulk_launch_and_collection_when_supported(
 
 
 @pytest.fixture
-def slurm_label_workflow(tmp_path, monkeypatch, legacy_workflow_protocol):
+def slurm_workflow(tmp_path, monkeypatch, legacy_workflow_protocol, request):
     config, initial = _controller_inputs(tmp_path)
     _write(tmp_path / "INCAR", "IBRION = -1\nNSW = 0\nISPIN = 1\n")
     resources, _ = _write_vasp_resources(tmp_path)
     remote = tmp_path / "remote"
-    config.write_text(
-        config.read_text().replace(
-            "labeling:\n  backend: toy\n",
-            "labeling:\n  backend: vasp\n  input_path: ./INCAR\n"
-            "  resource_path: ./potpaw\n  potcar_manifest_path: ./vasp-resources.json\n"
-            "  max_concurrent: 2\n",
-        ).replace(
-            "    label: {executor: process}",
-            f"    label: {{executor: slurm, host: login, work_root: {remote}, "
-            f"partition: cpu, labeling_resource_path: {resources}, cpus_per_task: 4}}",
-        )
+    text = config.read_text().replace(
+        "labeling:\n  backend: toy\n",
+        "labeling:\n  backend: vasp\n  input_path: ./INCAR\n"
+        "  resource_path: ./potpaw\n  potcar_manifest_path: ./vasp-resources.json\n"
+        "  max_concurrent: 2\n",
+    ).replace(
+        "    label: {executor: process}",
+        f"    label: {{executor: slurm, host: login, work_root: {remote}, "
+        f"partition: cpu, labeling_resource_path: {resources}, cpus_per_task: 4}}",
     )
+    if getattr(request, "param", "label") == "explore":
+        ase_write(
+            tmp_path / "structures.xyz",
+            [Atoms("Fe", cell=[a] * 3, pbc=True) for a in (4.0, 4.2)],
+            format="extxyz",
+        )
+        start = text.index("    - id: default\n")
+        stop = text.index("  candidate_pool:")
+        route = text[start:stop].replace("id: default", "id: a-local").replace(
+            "./structures.xyz", "./local.xyz",
+        )
+        ase_write(tmp_path / "local.xyz", Atoms("Fe"), format="extxyz")
+        text = (text[:stop] + route + text[stop:]).replace(
+            "  sampling_route_targets: {}",
+            "  sampling_route_targets: {a-local: md-local}",
+        ).replace(
+            "    md: {executor: process}",
+            f"    md: {{executor: slurm, host: login, work_root: {remote}, "
+            "partition: DSPRHBM, qos: huge-cpu, cpus_per_task: 1, "
+            "directives: [--ntasks=4]}\n    md-local: {executor: process}",
+        )
+    config.write_text(text)
     prep = prepare_workflow(config, initial, tmp_path / "workflow")
     scheduler = tmp_path / "scheduler"
     bin_dir = tmp_path / "bin"
@@ -2099,11 +2119,70 @@ def _lower_label_limit(controller):
     project.write_text(project.read_text().replace("max_concurrent: 2", "max_concurrent: 1"))
 
 
+@pytest.mark.parametrize("slurm_workflow", ["explore"], indirect=True)
+def test_resume_md_array_reuses_receipt_and_retries_only_failed_trajectory(
+    slurm_workflow, monkeypatch,
+):
+    prep, scheduler, network, _, open_controller = slurm_workflow
+    network["lose_reply"] = True
+    controller = open_controller()
+    controller.tick()
+    with pytest.raises(ExecutionError, match="returned no receipt: connection lost"):
+        controller.tick()
+
+    current = controller.state["current"]
+    local, first, second = current["tasks"]
+    assert local["target"] == "md-local"
+    assert current["pending_explore_submission"]["task_ids"] == [first["task_id"], second["task_id"]]
+    assert not any(item["handle"] for item in current["tasks"])
+    assert first["scenario_attempt_id"] != second["scenario_attempt_id"]
+    journal = Path((scheduler / "submissions").read_text().strip())
+    script = (journal / "submit.sh").read_text()
+    for header in ("--array=0-1", "--partition=DSPRHBM", "--qos=huge-cpu", "--ntasks=4", "--cpus-per-task=1"):
+        assert f"#SBATCH {header}\n" in script
+    assert "--gpus" not in script
+
+    def start(*_args, **_kwargs):
+        open_controller().tick()
+        return 0
+
+    monkeypatch.setattr(controller_module, "start_controller", start)
+    assert resume_workflow(prep.output_dir, foreground=True).action == "resume"
+    controller = open_controller()
+    local, first, second = controller.state["current"]["tasks"]
+    assert [task["handle"]["execution_id"] for task in (first, second)] == ["101_0", "101_1"]
+    assert (scheduler / "submissions").read_text().splitlines() == [str(journal)]
+
+    _write(scheduler / "queue", "101_0|PENDING|\n101_1|PENDING|\n")
+    controller.tick()
+    local, first, second = controller.state["current"]["tasks"]
+    assert local["handle"]["executor"] == "process"
+    old_task_id = second["task_id"]
+    ImmediateExecutor(None, []).launch(
+        StageTask(first["task_id"], controller.workflow_id, 1, "explore",
+                  first["target"], Path(first["bundle"]))
+    )
+    _write(scheduler / "queue", "")
+    _write(scheduler / "account", "101_0|COMPLETED|0:0\n101_1|NODE_FAIL|1:0\n")
+    assert controller.tick().state == "failed"
+    local, first, second = controller.state["current"]["tasks"]
+    assert all(item["collected_bundle"] for item in (local, first))
+    assert second["failure_kind"] == "node_failure"
+    controller.retry()
+    controller.tick()
+    local, first, second = controller.state["current"]["tasks"]
+    assert all(item["collected_bundle"] for item in (local, first))
+    assert first["handle"]["execution_id"] == "101_0"
+    assert second["task_id"] != old_task_id
+    assert second["handle"]["execution_id"] == "102"
+    assert second["retry_history"][-1]["handle"]["execution_id"] == "101_1"
+
+
 @pytest.mark.parametrize("recovery_source", ["receipt", "squeue", "sacct"])
 def test_workflow_resume_recovers_dft_array_after_lost_ssh_reply(
-    slurm_label_workflow, monkeypatch, recovery_source,
+    slurm_workflow, monkeypatch, recovery_source,
 ):
-    prep, scheduler, network, _, open_controller = slurm_label_workflow
+    prep, scheduler, network, _, open_controller = slurm_workflow
     network.update(lose_reply=True, lose_receipt=recovery_source != "receipt")
     controller = open_controller()
     with pytest.raises(ExecutionError, match="returned no receipt: connection lost"):
@@ -2160,8 +2239,8 @@ def test_workflow_resume_recovers_dft_array_after_lost_ssh_reply(
         assert (remote_bundle / f"stdout-101_{index}.log").read_text() == "worker: 4\n"
 
 
-def test_resume_applies_lower_limit_to_unsubmitted_dft_array(slurm_label_workflow, monkeypatch):
-    prep, scheduler, network, _, open_controller = slurm_label_workflow
+def test_resume_applies_lower_limit_to_unsubmitted_dft_array(slurm_workflow, monkeypatch):
+    prep, scheduler, network, _, open_controller = slurm_workflow
     network["fail_before_claim"] = True
     controller = open_controller()
     with pytest.raises(ExecutionError, match="returned no receipt: connection lost"):
@@ -2185,9 +2264,9 @@ def test_resume_applies_lower_limit_to_unsubmitted_dft_array(slurm_label_workflo
 
 @pytest.mark.parametrize("timed_out", [False, True])
 def test_dft_array_rolls_forward_and_retries_only_unsuccessful_element(
-    slurm_label_workflow, timed_out,
+    slurm_workflow, timed_out,
 ):
-    prep, scheduler, _, factory, open_controller = slurm_label_workflow
+    prep, scheduler, _, factory, open_controller = slurm_workflow
     controller = open_controller()
     _advance_to_label(controller)
 
@@ -2247,8 +2326,8 @@ def test_dft_array_rolls_forward_and_retries_only_unsuccessful_element(
     assert [frame.positions[0, 0] for frame in ase_read(merged, index=":")] == [0.01, 0.02, 0.03]
 
 
-def test_stop_recovers_unacknowledged_dft_array_before_cancelling(slurm_label_workflow):
-    prep, scheduler, network, factory, open_controller = slurm_label_workflow
+def test_stop_recovers_unacknowledged_dft_array_before_cancelling(slurm_workflow):
+    prep, scheduler, network, factory, open_controller = slurm_workflow
     network["lose_reply"] = True
     with pytest.raises(ExecutionError, match="returned no receipt: connection lost"):
         _advance_to_label(open_controller())
@@ -2268,8 +2347,8 @@ def test_stop_recovers_unacknowledged_dft_array_before_cancelling(slurm_label_wo
 @pytest.mark.parametrize(
     "reason", ["QOSMaxSubmitJobPerUserLimit", "Invalid job array specification"],
 )
-def test_dft_array_uses_smaller_submissions_after_limit_refusal(slurm_label_workflow, reason):
-    _, scheduler, _, _, open_controller = slurm_label_workflow
+def test_dft_array_uses_smaller_submissions_after_limit_refusal(slurm_workflow, reason):
+    _, scheduler, _, _, open_controller = slurm_workflow
     throttle = _write(scheduler / "throttle", f"sbatch: error: {reason}\n")
     controller = open_controller()
     current = _advance_to_label(controller)
@@ -2287,8 +2366,8 @@ def test_dft_array_uses_smaller_submissions_after_limit_refusal(slurm_label_work
     assert ["#SBATCH --array" in script.read_text() for script in scripts] == [True, False, False]
 
 
-def test_existing_dft_group_keeps_the_single_job_recovery_path(slurm_label_workflow, monkeypatch):
-    _, scheduler, _, _, open_controller = slurm_label_workflow
+def test_existing_dft_group_keeps_the_single_job_recovery_path(slurm_workflow, monkeypatch):
+    _, scheduler, _, _, open_controller = slurm_workflow
     controller = open_controller()
     for _ in range(20):
         controller.tick(
