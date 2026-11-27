@@ -60,7 +60,7 @@ __all__ = ["VaspInput"]
 
 
 def read_vasp_input(calculator, filename):
-    """Preserve complete DeltaSpin values through ASE's custom-key interface."""
+    """Preserve VASP values that ASE cannot round-trip directly."""
     text = Path(filename).read_text(encoding="utf-8")
     ordinary = []
     custom = {}
@@ -76,7 +76,8 @@ def read_vasp_input(calculator, filename):
             if key in seen:
                 raise ValueError(f"duplicate INCAR key: {key.upper()}")
             seen.add(key)
-            if key in {"ldeltaspin", "m_deltaspin", "ediff_rho"} or key.startswith(
+            # VASP defines NLSPLINE as logical, but ASE registers it as an integer.
+            if key in {"ldeltaspin", "m_deltaspin", "ediff_rho", "nlspline"} or key.startswith(
                 ("deltaspin_", "scf_cuda_")
             ):
                 custom[key] = value.strip()

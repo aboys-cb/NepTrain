@@ -90,6 +90,22 @@ def test_incar_keeps_custom_lists_comments_and_continuations(tmp_path):
     assert calc.input_params["custom"]["deltaspin_atoms"] == "2*1"
 
 
+@pytest.mark.parametrize("value", [".TRUE.", ".FALSE."])
+def test_incar_roundtrips_nlspline(tmp_path, value):
+    path = tmp_path / "INCAR"
+    path.write_text(f"NLSPLINE = {value}\nENCUT = 600\n")
+    calc = Vasp()
+    read_vasp_input(calc, path)
+    calc.spinpol = False
+    calc.sort = [0]
+    calc.write_incar(Atoms("Fe"), directory=tmp_path)
+
+    written = Vasp()
+    read_vasp_input(written, path)
+    assert written.input_params["custom"]["nlspline"] == value
+    assert written.float_params["encut"] == 600
+
+
 @pytest.mark.parametrize("setting", [
     "LNONCOLLINEAR = .FALSE.", "DELTASPIN_CONSTRAINT_MODE = 1",
     "DELTASPIN_COMPONENTS = 1 0 1", "DELTASPIN_ATOMS = 1 2", "DELTASPIN_ATOMS = 0 0",
