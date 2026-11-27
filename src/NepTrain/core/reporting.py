@@ -696,7 +696,7 @@ def build_training_parity_reports(
                 continue
             try:
                 values = np.loadtxt(path, ndmin=2)
-                if name == "virial" and backend == "gpumd" and values.shape[1] == 18:
+                if name == "virial" and values.shape[1] == 18:
                     width = 9
                 if values.shape[1] != width * 2:
                     raise ValueError(
