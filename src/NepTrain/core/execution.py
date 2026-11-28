@@ -97,8 +97,12 @@ def _failure_kind(detail: str) -> str | None:
     return None
 
 
+_TRAINING_PATH_FIELDS = (
+    "training.config_path", "training.test_path", "training.response_path",
+    "training.supplement_path",
+)
 _STAGE_CONFIG_PATH_FIELDS = {
-    "train": ("training.config_path", "training.test_path"),
+    "train": _TRAINING_PATH_FIELDS,
     "explore": (),
     "select": (),
     "label": (
@@ -109,7 +113,7 @@ _STAGE_CONFIG_PATH_FIELDS = {
     ),
     "diagnose": (),
     "merge": (),
-    "retrain": ("training.config_path", "training.test_path"),
+    "retrain": _TRAINING_PATH_FIELDS,
     "evaluate": (),
 }
 _STAGE_ARTIFACTS = {

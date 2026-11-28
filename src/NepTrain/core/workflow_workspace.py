@@ -302,6 +302,8 @@ class WorkflowWorkspace:
 
         copy_path("training", "config_path", "training/nep")
         copy_path("training", "test_path", "validation/training-test")
+        copy_path("training", "response_path", "training/response")
+        copy_path("training", "supplement_path", "training/supplement")
         for route in snapshot.get("sampling", {}).get("routes", []):
             route_root = (
                 self.inputs_dir / "sampling" / "routes" / str(route["id"])

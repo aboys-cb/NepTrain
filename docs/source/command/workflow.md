@@ -722,6 +722,12 @@ workflow 使用 `resume` 是安全 no-op。`workflow run` 接受项目 YAML 或 
 重叠帧数、参考阈值结果和告警会保留；未提供测试、预测失败或存在重叠时，`validation_accepted` 保持为空。
 这两个可选数据集未配置、文件为空（包括仅含空白字符）或路径不存在时，跳过对应测试；已配置但不可用时提示，不阻塞准备、训练、任务打包或恢复。主训练数据、模型产物和新增标签仍必须有效；非空测试文件仍进行格式与标签校验；doctor 和准备流程发现格式损坏、标签缺失或不匹配时，也会提示并跳过该测试集。
 
+TorchNEP 可在 `training.response_path` 配置配对监督 extxyz。打开 `nep.in` 的
+`lambda_spin_response` 后，训练使用该文件计算第二阶段的响应损失。需要补入普通训练集的
+完整标签可放在 `training.supplement_path`，仅追加主训练集中缺少的构型。两份输入随训练
+任务保存，文件内容参与模型复用判断。运行中更新时用新文件路径，停止控制器并保留在跑的
+作业，再恢复工作流，后续打包的任务读取新版本。
+
 VASP DeltaSpin 和 ABACUS 标注在读取应力或 virial 表时统一张量方向。标注、训练、测试和验证 XYZ
 数据集的 `virial` 都采用 GPUMD 行序 `xx xy xz yx yy yz zx zy zz`，单位是 eV/cell。
 GPUMD 训练目录中的 `train.xyz` 和 `test.xyz` 直接使用相同内容。外部 ASE 列序文件须先转换成

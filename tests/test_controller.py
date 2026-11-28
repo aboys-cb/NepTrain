@@ -1110,6 +1110,8 @@ def test_adaptive_followup_train_bundle_keeps_training_config(tmp_path):
     initial = _write(tmp_path / "initial.xyz")
     training_config = _write(tmp_path / "nep.in")
     previous_training = _write(tmp_path / "previous-train.xyz")
+    response = _write(tmp_path / "references.xyz")
+    supplement = _write(tmp_path / "extra.xyz")
     previous_model = _write(tmp_path / "previous-nep.txt")
     plan = GenerationPlan(2, 8, 2)
     task = build_stage_task(
@@ -1122,7 +1124,8 @@ def test_adaptive_followup_train_bundle_keeps_training_config(tmp_path):
         target=ExecutionTarget("local", "process"),
         plan=plan,
         config={
-            "training": {"config_path": str(training_config)},
+            "training": {"config_path": str(training_config),
+                         "response_path": str(response), "supplement_path": str(supplement)},
             "sampling": {},
             "md": {"spin": False},
             "labeling": {},
@@ -1154,6 +1157,10 @@ def test_adaptive_followup_train_bundle_keeps_training_config(tmp_path):
     assert descriptor["config"]["training"]["config_path"].startswith(
         "input/config/training/config_path"
     )
+    for key, source in (("response_path", response), ("supplement_path", supplement)):
+        bundled = task.bundle / descriptor["config"]["training"][key]
+        assert bundled != source
+        assert bundled.read_bytes() == source.read_bytes()
     assert set(descriptor["previous_artifacts"]) == {
         "training_set",
         "activated_model",

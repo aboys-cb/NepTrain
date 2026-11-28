@@ -866,6 +866,7 @@ class WorkflowIterationAdapter:
         request = TrainingRequest(
             config_file=config_file,
             train_file=training_input,
+            response_file=self._optional_path(options.get("response_path")),
             output_dir=output_dir,
             test_file=self._path(options["test_path"])
             if backend != "torchnep" and options.get("test_path")
@@ -926,10 +927,31 @@ class WorkflowIterationAdapter:
         path.write_text("".join(output), encoding="utf-8")
         return path
 
+    def _with_training_supplement(self, training_input: Path, work_dir: Path) -> Path:
+        path = self._optional_path(self.config["training"].get("supplement_path"))
+        if path is None:
+            return training_input
+        original = _read_frames(training_input)
+        supplement = _read_frames(path)
+        validate_labeled_frames(supplement)
+        known = {structure_id(frame) for frame in original}
+        # Check repeated labels without changing multiplicity in the active dataset.
+        unique, _ = deduplicate_labeled_frames([*original, *supplement])
+        added = [frame for frame in unique if structure_id(frame) not in known]
+        if not added:
+            return training_input
+        output = work_dir / "supplemented-train.xyz"
+        write_spin_extxyz(output, [*original, *added])
+        return output
+
     def training_settings_hash(self) -> str:
         options = dict(self.config.get("training", {}))
         options.pop("initial_path", None)  # The actual generation dataset has its own hash.
         options["config_path"] = file_sha256(self._path(options["config_path"]))
+        for key in ("response_path", "supplement_path"):
+            path = self._optional_path(options.pop(key, None))
+            if path is not None:
+                options[key] = file_sha256(path)
         test_path = self._optional_path(options.pop("test_path", None))
         if options.get("backend", "gpumd") != "torchnep" and test_path and not optional_dataset_issue(test_path, role="training.test_path"):
             options["test_path"] = file_sha256(test_path)
@@ -965,6 +987,7 @@ class WorkflowIterationAdapter:
                 file_sha256(parent_model) if parent_model is not None else None
             )
             warm_start = context.previous_artifacts.get("activated_checkpoint")
+        training_input = self._with_training_supplement(training_input, context.work_dir)
         dataset_hash = file_sha256(training_input)
         lineage_path = context.previous_artifacts.get("active_model_lineage")
         settings_hash = self.training_settings_hash() if v4 else None
@@ -1373,7 +1396,9 @@ class WorkflowIterationAdapter:
                     "the previous round did not publish a valid active model lineage"
                 )
             artifacts = {
-                "training_input": context.previous_artifacts["training_set"],
+                "training_input": self._with_training_supplement(
+                    context.previous_artifacts["training_set"], context.work_dir
+                ),
                 "model": previous_model,
             }
             if "activated_checkpoint" in context.previous_artifacts:
@@ -1394,7 +1419,7 @@ class WorkflowIterationAdapter:
             raise WorkflowIterationError(
                 "train stage requires an initial training set"
             )
-        training_input = self.initial_training
+        training_input = self._with_training_supplement(self.initial_training, context.work_dir)
         result, frame_count, _ = self._execute_training(
             context,
             training_input=training_input,

@@ -428,7 +428,8 @@ def test_torchnep_multigpu_launches_only_trainer_and_collects_once(tmp_path, mon
 
     def sharded(config_file, data_file, output_dir, precision, use_compile,
                 restart, finetune_from, resume_from, run_seed=None,
-                use_gpumd_qscaler=True, print_interval=10, prediction_interval=20):
+                use_gpumd_qscaler=True, print_interval=10, prediction_interval=20,
+                response_file=None):
         pytest.fail("The stage worker must not itself become a DDP rank")
 
     monkeypatch.setitem(sys.modules, "torchnep", types.SimpleNamespace(
@@ -440,6 +441,8 @@ def test_torchnep_multigpu_launches_only_trainer_and_collects_once(tmp_path, mon
     ))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,4,6,7")
     calls = []
+    response = tmp_path / "phase references.xyz"
+    response.write_text("sidecar")
     output = tmp_path / "training output"
 
     def launch(command, *, check):
@@ -454,6 +457,7 @@ def test_torchnep_multigpu_launches_only_trainer_and_collects_once(tmp_path, mon
         assert "device" not in options
         assert "backend" not in options  # Current TorchNEP selects this internally.
         assert options["run_seed"] == 17
+        assert options["response_file"] == str(response.resolve())
         assert options["use_gpumd_qscaler"] is False
         assert options["print_interval"] == 1
         assert options["prediction_interval"] == 100
@@ -468,7 +472,7 @@ def test_torchnep_multigpu_launches_only_trainer_and_collects_once(tmp_path, mon
 
     monkeypatch.setattr(subprocess, "run", launch)
     request = TrainingRequest(tmp_path / "nep.in", tmp_path / "train.xyz", output,
-                              seed=17, **({warm_start: tmp_path / "previous.pt"} if warm_start else {}))
+                              seed=17, response_file=response, **({warm_start: tmp_path / "previous.pt"} if warm_start else {}))
     result = _train_torchnep(request)
     assert len(calls) == 1
     assert result.best_model.read_text() == "best model"

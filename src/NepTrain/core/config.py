@@ -29,6 +29,8 @@ _FIELDS: dict[str, set[str]] = {
         "backend",
         "initial_path",
         "test_path",
+        "response_path",
+        "supplement_path",
         "config_path",
         "device",
         "torch_backend",
@@ -419,6 +421,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
     if training.get("backend") not in {"gpumd", "torchnep"}:
         raise ConfigError("training.backend must be gpumd or torchnep")
+    if training.get("response_path") and training["backend"] != "torchnep":
+        raise ConfigError("training.response_path requires the torchnep backend")
     if not training.get("initial_path"):
         raise ConfigError("training.initial_path is required")
     if not training.get("config_path"):

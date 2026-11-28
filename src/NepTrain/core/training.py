@@ -44,6 +44,7 @@ class TrainingRequest:
     precision: str = "float32"
     use_compile: bool = False
     seed: int = 20260723
+    response_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -328,6 +329,14 @@ def _train_torchnep(request: TrainingRequest) -> TrainingResult:
         resume_from=str(request.restart_file.resolve()) if request.restart_file else None,
     )
     parameters = inspect.signature(trainer).parameters
+    if request.response_file is not None:
+        if "response_file" not in parameters and not any(
+            item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        ):
+            raise TrainingError("training.response_path requires TorchNEP with response_file support")
+        if not request.response_file.is_file():
+            raise TrainingError(f"TorchNEP response file does not exist: {request.response_file}")
+        options["response_file"] = str(request.response_file.resolve())
     if "backend" in parameters or any(
         item.kind is inspect.Parameter.VAR_KEYWORD
         for item in parameters.values()

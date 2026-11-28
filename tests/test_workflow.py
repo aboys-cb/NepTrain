@@ -2600,3 +2600,42 @@ def test_template_restart_adopts_only_after_archiving_sampling(tmp_path, monkeyp
     assert controller.config["sampling"]["routes"][0]["template_path"] == str(replacement)
     manifest = json.loads(prep.manifest.read_text())
     assert any(r["path"] == str(replacement) for r in manifest["dependencies"])
+
+
+def test_config_revision_tracks_response_and_supplement(tmp_path):
+    from ase.io import read as ase_read
+
+    from NepTrain.core.config import load_config
+    from NepTrain.core.workflow_config import accept_config_changes
+    from NepTrain.core.workflow_iteration import WorkflowIterationAdapter
+
+    config, initial = _inputs(tmp_path)
+    prep = prepare_workflow(config, initial, tmp_path / "workflow")
+    response = tmp_path / "reference-contrasts.xyz"
+    response.write_text("response")
+    updated_config = tmp_path / "response.in"
+    updated_config.write_bytes((tmp_path / "nep.in").read_bytes())
+    supplement = tmp_path / "new-labels.xyz"
+    supplement.write_text(initial.read_text().replace("0.00000000", "0.10000000", 1))
+    _edit_runtime_project(prep, {
+        "training.config_path": str(updated_config),
+        "training.response_path": str(response),
+        "training.supplement_path": str(supplement),
+    })
+    changes = accept_config_changes(prep.output_dir)
+    assert {c["field"] for c in changes} == {
+        "training.config_path", "training.response_path", "training.supplement_path"
+    }
+    manifest = json.loads(prep.manifest.read_text())
+    assert {"training_config", "training_response", "training_supplement"} <= {
+        d["role"] for d in manifest["dependencies"]
+    }
+    settings, _ = load_config(prep.config_file)
+    adapter = WorkflowIterationAdapter(settings, base_dir=prep.output_dir, initial_training=prep.initial_training)
+    before = adapter.training_settings_hash()
+    response.write_text("new response")
+    assert adapter.training_settings_hash() != before
+    merged = adapter._with_training_supplement(initial, tmp_path)
+    assert merged != initial
+    assert len(ase_read(merged, index=":")) == 2
+    assert adapter._with_training_supplement(merged, tmp_path) == merged

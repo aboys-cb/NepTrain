@@ -262,7 +262,7 @@ def _absolute_path(value: Any, base_dir: Path) -> str | None:
 def _resolved_config(config: Mapping[str, Any], base_dir: Path) -> dict[str, Any]:
     resolved = json.loads(json.dumps(config))
     training = resolved.get("training", {})
-    for key in ("config_path", "test_path"):
+    for key in ("config_path", "test_path", "response_path", "supplement_path"):
         if training.get(key):
             training[key] = _absolute_path(training[key], base_dir)
     for route in resolved.get("sampling", {}).get("routes", []):
@@ -524,6 +524,8 @@ def _dependencies(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     for role, value in (
         ("training_config", training.get("config_path")),
         ("training_test", training.get("test_path")),
+        ("training_response", training.get("response_path")),
+        ("training_supplement", training.get("supplement_path")),
         ("labeling_input", labeling.get("input_path")),
         (
             "labeling_potcar_manifest",
@@ -618,6 +620,14 @@ def prepare_workflow(
         role="initial training",
         expect_spin=expect_spin,
     )
+    training = config["training"]
+    if training.get("response_path") and not Path(training["response_path"]).is_file():
+        raise WorkflowError(f"training.response_path does not exist: {training['response_path']}")
+    if training.get("supplement_path"):
+        _validate_labeled_dataset_for_preparation(
+            Path(training["supplement_path"]), role="training.supplement_path",
+            expect_spin=expect_spin,
+        )
     for section, key, role in (
         ("training", "test_path", "Training test dataset"),
         ("evaluation", "validation_path", "Optional evaluation dataset"),

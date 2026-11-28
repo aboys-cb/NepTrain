@@ -24,6 +24,11 @@ _RESOURCE_FIELDS = {
     "memory_ladder", "directives",
 }
 _LAUNCH_FIELDS = {"command", "environment", "setup_script"}
+_TRAINING_INPUT_ROLES = {
+    "training.config_path": "training_config",
+    "training.response_path": "training_response",
+    "training.supplement_path": "training_supplement",
+}
 _LAUNCH_SCOPE = "new task bundles; prepared and submitted tasks keep their launch settings"
 _LAUNCH_WARNING = (
     "Launch settings can change the software or numerical environment. "
@@ -88,6 +93,8 @@ def _scope(path: tuple[str, ...], before: Any, after: Any) -> str | None:
         return "controller restart"
     if path == ("execution", "poll_interval"):
         return "controller restart"
+    if ".".join(path) in _TRAINING_INPUT_ROLES:
+        return "next training task bundle; prepared jobs and prior results retained"
     if path == ("labeling", "max_concurrent"):
         return "new submissions, including the current labeling group"
     if path == ("labeling", "structures_per_job"):
@@ -525,6 +532,28 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
                            "template_sha256": route.template_sha256,
                            "structure_source_sha256": list(route.structure_source_sha256)}
                           for route in load_sampling_routes(config["sampling"], base_dir=root)]
+        training_roles = {_TRAINING_INPUT_ROLES[c["field"]] for c in changes
+                          if c["field"] in _TRAINING_INPUT_ROLES}
+        old_training = [r for r in manifest.get("dependencies", []) if r.get("role") in training_roles]
+        new_training = []
+        if training_roles:
+            from .workflow import _path_record, _resolved_config, _validate_labeled_dataset_for_preparation
+            config, _ = load_config(workspace.project_file)
+            config = _resolved_config(config, workspace.project_file.parent)
+            for field, role in _TRAINING_INPUT_ROLES.items():
+                if role not in training_roles:
+                    continue
+                path = config["training"].get(field.removeprefix("training."))
+                if path is None:
+                    continue
+                source = Path(path)
+                if not source.is_file():
+                    raise WorkflowConfigError(f"{field} does not exist: {source}")
+                if role == "training_supplement":
+                    _validate_labeled_dataset_for_preparation(
+                        source, role=field, expect_spin=bool(config.get("md", {}).get("spin"))
+                    )
+                new_training.append(_path_record(role, source))
         updated = snapshot_config({**record, "sha256": current_hash})
         new_launch = snapshot_setup_records(root, launch_records)
         if current_hash != record["sha256"] or changes:
@@ -538,6 +567,8 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
                 "sampling_inputs_after": new_sampling if new_sampling is not None else old_sampling,
                 "launch_inputs_before": old_launch,
                 "launch_inputs_after": new_launch,
+                **({"training_inputs_before": old_training, "training_inputs_after": new_training}
+                   if training_roles else {}),
                 "label_inputs_before": old_label_inputs,
                 "label_inputs_after": new_label_inputs if new_label_inputs is not None else old_label_inputs,
             })
@@ -559,6 +590,10 @@ def accept_config_changes(root: Path) -> tuple[dict[str, Any], ...]:
             manifest["dependencies"] = [r for r in manifest.get("dependencies", [])
                                         if not r.get("role", "").startswith("sampling_route_")] + new_sampling
             manifest["sampling_routes"] = new_routes
+        if training_roles:
+            manifest["dependencies"] = [
+                r for r in manifest.get("dependencies", []) if r.get("role") not in training_roles
+            ] + new_training
         manifest["config"] = updated
         manifest["dependencies"] = [
             r for r in manifest.get("dependencies", []) if not r.get("role", "").startswith("execution_setup_")

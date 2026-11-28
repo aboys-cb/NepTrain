@@ -60,6 +60,10 @@ def check_project_inputs(
         initial = str((base_dir / initial).resolve())
     dataset(initial, "training.initial_path")
     required_file(training.get("config_path"), "training.config_path")
+    if training.get("response_path"):
+        required_file(training["response_path"], "training.response_path")
+    if training.get("supplement_path"):
+        dataset(training["supplement_path"], "training.supplement_path")
     for section, key in (("training", "test_path"), ("evaluation", "validation_path")):
         dataset(resolved.get(section, {}).get(key), f"{section}.{key}", optional=True)
     for route in resolved.get("sampling", {}).get("routes", []):
